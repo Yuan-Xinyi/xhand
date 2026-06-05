@@ -17,7 +17,7 @@ from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import DirectRLEnv
 from isaaclab.markers import VisualizationMarkers
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.utils.math import quat_conjugate, quat_from_angle_axis, quat_mul, sample_uniform, saturate
+from isaaclab.utils.math import quat_apply, quat_conjugate, quat_from_angle_axis, quat_mul, sample_uniform, saturate
 
 if TYPE_CHECKING:
     from xhand_inhand.tasks.direct.xhand_repose.xhand_repose_env_cfg import XHandReposeEnvCfg
@@ -76,6 +76,17 @@ class InHandManipulationEnv(DirectRLEnv):
         self.x_unit_tensor = torch.tensor([1, 0, 0], dtype=torch.float, device=self.device).repeat((self.num_envs, 1))
         self.y_unit_tensor = torch.tensor([0, 1, 0], dtype=torch.float, device=self.device).repeat((self.num_envs, 1))
         self.z_unit_tensor = torch.tensor([0, 0, 1], dtype=torch.float, device=self.device).repeat((self.num_envs, 1))
+
+        # axis-only alignment (for axisymmetric objects like a pen): only the object's
+        # main axis must point at the goal direction; rotation about that axis is free.
+        self.axis_only_alignment = getattr(self.cfg, "axis_only_alignment", False)
+        object_axis = getattr(self.cfg, "object_axis", (0.0, 0.0, 1.0))
+        self.object_axis = torch.tensor(object_axis, dtype=torch.float, device=self.device).repeat((self.num_envs, 1))
+
+        # 1-DOF heading goal: rotate the object's main axis about world Z to a target
+        # azimuth angle theta. Only the heading (azimuth) is scored; tilt is ignored.
+        self.goal_heading_only = getattr(self.cfg, "goal_heading_only", False)
+        self.goal_heading = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
     def _setup_scene(self):
         # add hand, in-hand object, and goal object
@@ -151,9 +162,8 @@ class InHandManipulationEnv(DirectRLEnv):
             self.consecutive_successes,
             self.max_episode_length,
             self.object_pos,
-            self.object_rot,
             self.in_hand_pos,
-            self.goal_rot,
+            self._orientation_distance(),
             self.cfg.dist_reward_scale,
             self.cfg.rot_reward_scale,
             self.cfg.rot_eps,
@@ -186,7 +196,7 @@ class InHandManipulationEnv(DirectRLEnv):
 
         if self.cfg.max_consecutive_success > 0:
             # Reset progress (episode length buf) on goal envs if max_consecutive_success > 0
-            rot_dist = rotation_distance(self.object_rot, self.goal_rot)
+            rot_dist = self._orientation_distance()
             self.episode_length_buf = torch.where(
                 torch.abs(rot_dist) <= self.cfg.success_tolerance,
                 torch.zeros_like(self.episode_length_buf),
@@ -198,6 +208,30 @@ class InHandManipulationEnv(DirectRLEnv):
         if self.cfg.max_consecutive_success > 0:
             time_out = time_out | max_success_reached
         return out_of_reach, time_out
+
+    def _orientation_distance(self) -> torch.Tensor:
+        """Angle (rad) between current and goal orientation used for reward/success.
+
+        - goal_heading_only=True    -> 1-DOF: difference between the object axis' azimuth
+          (heading about world Z) and the target heading `goal_heading`. Tilt is ignored.
+        - axis_only_alignment=True  -> angle between the object's main axis (rotated by
+          the current and the goal orientation). Rotation about that axis is ignored,
+          which is what we want for an axisymmetric object like a pen.
+        - axis_only_alignment=False -> full 3D orientation distance (e.g. for a cube).
+        """
+        if self.goal_heading_only:
+            obj_axis = quat_apply(self.object_rot, self.object_axis)
+            heading = torch.atan2(obj_axis[:, 1], obj_axis[:, 0])  # azimuth about world Z
+            diff = heading - self.goal_heading
+            # wrap to [-pi, pi], then take magnitude in [0, pi]
+            diff = torch.atan2(torch.sin(diff), torch.cos(diff))
+            return torch.abs(diff)
+        if self.axis_only_alignment:
+            obj_axis = quat_apply(self.object_rot, self.object_axis)
+            goal_axis = quat_apply(self.goal_rot, self.object_axis)
+            cos_angle = torch.sum(obj_axis * goal_axis, dim=-1).clamp(-1.0, 1.0)
+            return torch.acos(cos_angle)
+        return rotation_distance(self.object_rot, self.goal_rot)
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
@@ -247,11 +281,22 @@ class InHandManipulationEnv(DirectRLEnv):
         self._compute_intermediate_values()
 
     def _reset_target_pose(self, env_ids):
-        # reset goal rotation
-        rand_floats = sample_uniform(-1.0, 1.0, (len(env_ids), 2), device=self.device)
-        new_rot = randomize_rotation(
-            rand_floats[:, 0], rand_floats[:, 1], self.x_unit_tensor[env_ids], self.y_unit_tensor[env_ids]
-        )
+        if self.goal_heading_only:
+            # sample a target heading (azimuth about world Z) in [0, 2*pi)
+            theta = sample_uniform(0.0, 2.0 * np.pi, (len(env_ids),), device=self.device)
+            self.goal_heading[env_ids] = theta
+            # marker: lay the object's axis horizontal pointing at azimuth theta
+            # (rotate local axis +Z by 90 deg about (-sin theta, cos theta, 0))
+            marker_axis = torch.zeros((len(env_ids), 3), device=self.device)
+            marker_axis[:, 0] = -torch.sin(theta)
+            marker_axis[:, 1] = torch.cos(theta)
+            new_rot = quat_from_angle_axis(torch.full_like(theta, np.pi / 2.0), marker_axis)
+        else:
+            # reset goal rotation (random full orientation)
+            rand_floats = sample_uniform(-1.0, 1.0, (len(env_ids), 2), device=self.device)
+            new_rot = randomize_rotation(
+                rand_floats[:, 0], rand_floats[:, 1], self.x_unit_tensor[env_ids], self.y_unit_tensor[env_ids]
+            )
 
         # update goal pose and markers
         self.goal_rot[env_ids] = new_rot
@@ -383,9 +428,8 @@ def compute_rewards(
     consecutive_successes: torch.Tensor,
     max_episode_length: float,
     object_pos: torch.Tensor,
-    object_rot: torch.Tensor,
     target_pos: torch.Tensor,
-    target_rot: torch.Tensor,
+    rot_dist: torch.Tensor,
     dist_reward_scale: float,
     rot_reward_scale: float,
     rot_eps: float,
@@ -398,7 +442,6 @@ def compute_rewards(
     av_factor: float,
 ):
     goal_dist = torch.norm(object_pos - target_pos, p=2, dim=-1)
-    rot_dist = rotation_distance(object_rot, target_rot)
 
     dist_rew = goal_dist * dist_reward_scale
     rot_rew = 1.0 / (torch.abs(rot_dist) + rot_eps) * rot_reward_scale
