@@ -13,6 +13,8 @@ Everything tagged ``# TUNE`` is geometry/physics that must be dialed in
 visually (palm orientation, grasp pose, cube placement/scale, joint gains).
 """
 
+import os
+
 import isaaclab.envs.mdp as mdp
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
@@ -25,10 +27,14 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import PhysxCfg, SimulationCfg
 from isaaclab.sim.spawners.materials.physics_materials_cfg import RigidBodyMaterialCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.noise import GaussianNoiseCfg, NoiseModelWithAdditiveBiasCfg
 
 from xhand_inhand.robots import XHAND_RIGHT_CFG
+
+# converted whiteboard-pen object (Onshape OBJ -> USD, units in meters, ~14 cm)
+BB_PEN_USD_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "assets", "bb_pen", "bb_pen.usd")
+)
 
 ##
 # XHand-specific constants (derived from the URDF / USD articulation).
@@ -141,7 +147,7 @@ class EventCfg:
 
 
 @configclass
-class XHandReposeEnvCfg(DirectRLEnvCfg):
+class XHandPenEnvCfg(DirectRLEnvCfg):
     """Full-observation feed-forward base config (12-DOF XHand)."""
 
     # env
@@ -214,13 +220,14 @@ class XHandReposeEnvCfg(DirectRLEnvCfg):
     fingertip_body_names = XHAND_FINGERTIPS
 
     # in-hand object ------------------------------------------------------ TUNE
-    # XHand is smaller than the Shadow Hand, so the dex cube is scaled down and
-    # placed above the palm. Tune `scale` and `pos` together with the hand pose.
+    # Whiteboard pen (~14 cm long, ~2.2 cm dia, 23 g). Long axis is the mesh's
+    # local +Z; with identity rot it spawns standing vertical, so tune `rot`/`pos`
+    # to lay it across the palm. Origin is the pen's centroid (no recenter needed).
     object_cfg: RigidObjectCfg = RigidObjectCfg(
         prim_path="/World/envs/env_.*/object",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Blocks/DexCube/dex_cube_instanceable.usd",
-            scale=(1.0, 1.0, 1.0),  # TUNE: cube size relative to the hand
+            usd_path=BB_PEN_USD_PATH,
+            scale=(1.0, 1.0, 1.0),  # mesh already in meters
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 kinematic_enabled=False,
                 disable_gravity=False,
@@ -231,18 +238,18 @@ class XHandReposeEnvCfg(DirectRLEnvCfg):
                 stabilization_threshold=0.0025,
                 max_depenetration_velocity=1000.0,
             ),
-            mass_props=sim_utils.MassPropertiesCfg(density=567.0),
-            semantic_tags=[("class", "cube")],
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.023),  # measured pen weight 23 g
+            semantic_tags=[("class", "pen")],
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.1, 0.65), rot=(1.0, 0.0, 0.0, 0.0)),  # TUNE
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.1, 0.55), rot=(1.0, 0.0, 0.0, 0.0)),  # TUNE
     )
     # goal object (visualization marker only)
     goal_object_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
         prim_path="/Visuals/goal_marker",
         markers={
             "goal": sim_utils.UsdFileCfg(
-                usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Blocks/DexCube/dex_cube_instanceable.usd",
-                scale=(1.0, 1.0, 1.0),  # TUNE: match object scale
+                usd_path=BB_PEN_USD_PATH,
+                scale=(1.0, 1.0, 1.0),
             )
         },
     )
@@ -265,15 +272,20 @@ class XHandReposeEnvCfg(DirectRLEnvCfg):
     fall_penalty = 0
     fall_dist = 0.24  # TUNE: cube "dropped" distance, scale to hand size
     vel_obs_scale = 0.2
-    success_tolerance = 0.1
+    success_tolerance = 0.1745  # 10 degrees: pen axis within 10° of the goal direction
     max_consecutive_success = 0
     av_factor = 0.1
     act_moving_average = 1.0
     force_torque_obs_scale = 10.0
+    # goal = 2-DOF: point the pen's long axis at a random target direction on the
+    # sphere; spin about the pen's own axis is ignored (axisymmetric object).
+    goal_heading_only = False  # set True for the 1-DOF heading-about-Z variant
+    axis_only_alignment = True
+    object_axis = (0.0, 0.0, 1.0)  # pen long axis in its local frame (+Z)
 
 
 @configclass
-class XHandReposeOpenAIEnvCfg(XHandReposeEnvCfg):
+class XHandPenOpenAIEnvCfg(XHandPenEnvCfg):
     """OpenAI-LSTM variant: asymmetric (reduced policy obs + full critic state)."""
 
     # env
@@ -314,7 +326,7 @@ class XHandReposeOpenAIEnvCfg(XHandReposeEnvCfg):
     fall_penalty = -50
     fall_dist = 0.24  # TUNE
     vel_obs_scale = 0.2
-    success_tolerance = 0.4
+    success_tolerance = 0.1745  # 10 degrees: pen axis within 10° of the goal direction
     max_consecutive_success = 50
     av_factor = 0.1
     act_moving_average = 0.3
