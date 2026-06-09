@@ -37,7 +37,7 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from xhand_inhand.robots import FR3_XHAND_CFG
 
 _PEN_USD = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "..", "assets", "bb_pen", "bb_pen.usd")
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "assets", "pen", "pen.usd")
 )
 
 

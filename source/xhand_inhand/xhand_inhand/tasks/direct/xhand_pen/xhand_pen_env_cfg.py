@@ -33,7 +33,7 @@ from xhand_inhand.robots import XHAND_RIGHT_CFG
 
 # converted whiteboard-pen object (Onshape OBJ -> USD, units in meters, ~14 cm)
 BB_PEN_USD_PATH = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "..", "assets", "bb_pen", "bb_pen.usd")
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "assets", "pen", "pen.usd")
 )
 
 ##
