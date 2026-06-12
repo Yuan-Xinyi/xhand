@@ -16,7 +16,6 @@ from isaaclab.markers import VisualizationMarkers
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.math import quat_apply, quat_from_angle_axis, quat_mul, sample_uniform
 
-from ..scene_lighting import add_ceiling_fluorescent_lights
 from .pick_repose_pen_env_cfg import PickReposePenEnvCfg
 
 
@@ -116,7 +115,8 @@ class PickReposePenEnv(DirectRLEnv):
         self.scene.clone_environments(copy_from_source=False)
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[])
-        add_ceiling_fluorescent_lights()
+        light_cfg = sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75))
+        light_cfg.func("/World/Light", light_cfg)
 
     # ------------------------------------------------------------------ step
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
