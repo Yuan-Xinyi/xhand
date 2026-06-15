@@ -1,0 +1,50 @@
+<?xml version="1.0"?>
+<robot name="handle_head">
+
+  <link name="handle_head">
+    <!-- Handle -->
+    <visual>
+              <origin xyz="0 0 0" rpy="0 -1.5707963267948966 0"/>
+        <geometry>
+          <cylinder length="0.10986488676370698" radius="0.01076307336565371"/>
+        </geometry>
+        
+      <material name="brown">
+        <color rgba="0.55 0.27 0.07 1.0"/>
+      </material>
+    </visual>
+    <collision>
+              <origin xyz="0 0 0" rpy="0 -1.5707963267948966 0"/>
+        <geometry>
+          <cylinder length="0.10986488676370698" radius="0.01076307336565371"/>
+        </geometry>
+        
+    </collision>
+
+    <!-- Head -->
+    <visual>
+              <origin xyz="0.10535209034459012 0 0" rpy="0 0 0"/>
+        <geometry>
+          <box size="0.10083929392547324 0.0459379622609153 0.0283448705561421"/>
+        </geometry>
+        
+      <material name="gray">
+        <color rgba="0.5 0.5 0.5 1.0"/>
+      </material>
+    </visual>
+    <collision>
+              <origin xyz="0.10535209034459012 0 0" rpy="0 0 0"/>
+        <geometry>
+          <box size="0.10083929392547324 0.0459379622609153 0.0283448705561421"/>
+        </geometry>
+        
+    </collision>
+
+    <inertial>
+      <origin xyz="0.07250738544901641 0 0" rpy="0 0 0"/>
+      <mass value="0.06250531216502622"/>
+      <inertia ixx="1.1547997200914057e-05" iyy="0.00021392036952805135" izz="0.0002186053242115277" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+
+</robot>

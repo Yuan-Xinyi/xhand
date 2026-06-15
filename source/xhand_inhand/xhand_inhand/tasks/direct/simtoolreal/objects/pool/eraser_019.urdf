@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<robot name="handle_head">
+
+  <link name="handle_head">
+    <!-- Handle -->
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.10877367025046886 0.061666256268433764 0.031330303501158854"/>
+      </geometry>
+      <material name="brown">
+        <color rgba="0.55 0.27 0.07 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.10877367025046886 0.061666256268433764 0.031330303501158854"/>
+      </geometry>
+    </collision>
+
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.12384229951453066"/>
+      <inertia ixx="4.937504842204357e-05" iyy="0.00013223570369862465" izz="0.0001613504013080433" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+
+</robot>

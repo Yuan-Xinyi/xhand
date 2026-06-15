@@ -12,6 +12,8 @@
 from isaaclab_tasks.utils import import_packages
 
 # The blacklist is used to prevent importing configs from sub-packages
-_BLACKLIST_PKGS = ["utils", ".mdp"]
+# (simtoolreal.objects / .xarm7 are asset-build helpers, not task modules -- the former
+# launches an Isaac Sim app at import time, the latter imports the optional `wrs` package).
+_BLACKLIST_PKGS = ["utils", ".mdp", "simtoolreal.objects", "simtoolreal.xarm7"]
 # Import all configs in this package
 import_packages(__name__, _BLACKLIST_PKGS)
