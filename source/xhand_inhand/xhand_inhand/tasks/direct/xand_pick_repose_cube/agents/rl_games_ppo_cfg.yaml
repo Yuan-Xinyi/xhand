@@ -37,7 +37,7 @@ params:
   load_path: ''
 
   config:
-    name: pick_cube
+    name: pick_repose_cube
     env_name: rlgpu
     device: 'cuda:0'
     device_name: 'cuda:0'
@@ -72,8 +72,9 @@ params:
     entropy_coef: 0.0
     truncate_grads: True
     e_clip: 0.2
+    # 8192 envs x horizon 32 = 262144 batch; 262144 / 32768 = 8 minibatches per epoch
     horizon_length: 32
-    minibatch_size: 16384
+    minibatch_size: 32768
     mini_epochs: 8
     critic_coef: 4
     clip_value: True

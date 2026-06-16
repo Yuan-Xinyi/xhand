@@ -150,7 +150,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
     # specify directory for logging runs
-    log_dir = agent_cfg["params"]["config"].get("full_experiment_name", datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+    # NOTE: the rl_games resolving here is the SAPG fork (/disk2/simtoolreal/rl_games), whose
+    # A2CBase does `policy_idx = int(experiment_name.split('_')[0])` -- so the experiment name MUST
+    # start with an integer policy index. Prefix the timestamped default with "0_" (single policy).
+    log_dir = agent_cfg["params"]["config"].get("full_experiment_name") or datetime.now().strftime(
+        "%Y-%m-%d_%H-%M-%S"
+    )
+    # the SAPG fork requires the name to START with an int policy index -> force a "0_" prefix.
+    if not str(log_dir).split("_")[0].isdigit():
+        log_dir = "0_" + str(log_dir)
     # set directory into agent config
     # logging directory path: <train_dir>/<full_experiment_name>
     agent_cfg["params"]["config"]["train_dir"] = log_root_path

@@ -136,6 +136,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         resume_path = retrieve_file_path(args_cli.checkpoint)
     log_dir = os.path.dirname(os.path.dirname(resume_path))
 
+    # the SAPG-fork A2CBase parses policy_idx = int(experiment_name.split('_')[0]); use the run
+    # dir name (already "0_<timestamp>") as the experiment name so it starts with an int.
+    run_name = os.path.basename(log_dir)
+    if not str(run_name).split("_")[0].isdigit():
+        run_name = "0_" + str(run_name)
+    agent_cfg["params"]["config"]["full_experiment_name"] = run_name
+
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
 

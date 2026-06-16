@@ -22,13 +22,13 @@ from isaaclab.utils.math import (
     sample_uniform,
 )
 
-from .pick_cube_env_cfg import PickCubeEnvCfg
+from .pick_repose_cube_env_cfg import PickReposeCubeEnvCfg
 
 
-class PickCubeEnv(DirectRLEnv):
-    cfg: PickCubeEnvCfg
+class PickReposeCubeEnv(DirectRLEnv):
+    cfg: PickReposeCubeEnvCfg
 
-    def __init__(self, cfg: PickCubeEnvCfg, render_mode: str | None = None, **kwargs):
+    def __init__(self, cfg: PickReposeCubeEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
 
         # reach assembly: the 5 fingertips + the palm-center point
@@ -58,6 +58,15 @@ class PickCubeEnv(DirectRLEnv):
         # cube rest height -> "lifted" threshold (mirror of franka `object_is_lifted`)
         self.object_default_z = self.object.data.default_root_state[:, 2].clone()
         self.lift_height = self.object_default_z + self.cfg.lift_margin
+
+        # ---- per-episode buffers ----
+        # PICK/CARRY are anti-camping: lift is a one-shot latched bonus; carry is a ratchet that
+        # pays only for beating the closest distance reached so far (sentinel 1e3 = not yet armed).
+        self.lifted_once = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.best_pos_dist = torch.full((self.num_envs,), 1.0e3, device=self.device)
+        # REPOSE is the xhand_repose-style continuous reorientation: count of goals solved this
+        # episode (each success resamples a new goal orientation).
+        self.successes = torch.zeros(self.num_envs, device=self.device)
 
         # fixed goal point (env-local) + per-episode target orientation
         self.target_pos = torch.tensor(self.cfg.target_pos, dtype=torch.float, device=self.device).repeat(
@@ -199,53 +208,70 @@ class PickCubeEnv(DirectRLEnv):
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
-        # ---- reaching: grasp assembly (palm-center + fingertips) -> cube center ----
-        reach_points = torch.cat([self.palm_center_w.unsqueeze(1), self.ee_pos_w], dim=1)  # (N, 6, 3)
-        reach_dist = torch.norm(reach_points - self.object_pos_w.unsqueeze(1), dim=-1)  # (N, 6)
-        reach = (1.0 - torch.tanh(reach_dist / self.cfg.reach_std)).mean(dim=1) * self.cfg.w_reach
+        # _get_dones() runs first each step and refreshes self.object_pos_w / object_quat_w
+        # (via _compute_intermediate_values), which we use here.
+        lifted = self.object_pos_w[:, 2] > self.lift_height
+        liftedf = lifted.float()
 
-        # ---- lifting: height-gated (mirror of franka `object_is_lifted`) ----
-        lifted = (self.object_pos_w[:, 2] > self.lift_height).float()
-        lift_reward = lifted * self.cfg.w_lift
-
-        # ---- position tracking: cube -> fixed target point, GATED by lift ----
         target_w = self.target_pos + self.scene.env_origins
         pos_dist = torch.norm(self.object_pos_w - target_w, p=2, dim=-1)
-        goal_track = lifted * (1.0 - torch.tanh(pos_dist / self.cfg.goal_track_std)) * self.cfg.w_goal_track
-        goal_track_fine = (
-            lifted * (1.0 - torch.tanh(pos_dist / self.cfg.goal_track_fine_std)) * self.cfg.w_goal_track_fine
-        )
-
-        # ---- orientation tracking: cube -> target orientation, GATED by lift ----
         rot_err = quat_error_magnitude(self.object_quat_w, self.target_quat)
-        orient_track = lifted * (1.0 - torch.tanh(rot_err / self.cfg.orient_track_std)) * self.cfg.w_orient_track
+        at_center = pos_dist < self.cfg.inhand_pos_thresh
 
-        # ---- success: combined position + orientation error, GATED by lift ----
-        success_val = (
-            (1.0 - torch.tanh(pos_dist / self.cfg.success_pos_std))
-            * (1.0 - torch.tanh(rot_err / self.cfg.success_rot_std))
-            * lifted
-        )
-        success_reward = success_val * self.cfg.w_success
+        # ---- grasp approach (dense, DECAYS to zero after lift): palm-center + fingertips -> cube.
+        # Bootstraps the grasp; gating by (1 - lifted) closes the "hold the grasp and farm reach"
+        # loophole (dropping the cube terminates the episode, so the grasp is still enforced).
+        reach_points = torch.cat([self.palm_center_w.unsqueeze(1), self.ee_pos_w], dim=1)  # (N, 6, 3)
+        reach_dist = torch.norm(reach_points - self.object_pos_w.unsqueeze(1), dim=-1)  # (N, 6)
+        reach = (1.0 - torch.tanh(reach_dist / self.cfg.reach_std)).mean(dim=1) * self.cfg.w_reach * (1.0 - liftedf)
 
-        # ---- regularization (franka weights: tiny) ----
+        # ---- PICK: ONE-SHOT bonus the first time the cube clears the table (latched) ----
+        newly_lifted = lifted & ~self.lifted_once
+        lift_reward = newly_lifted.float() * self.cfg.w_lift
+        self.lifted_once |= lifted
+
+        # ---- CARRY (ratchet): pay ONLY for beating the closest distance reached so far.
+        # holding still -> no new record -> 0; drifting back -> 0 (clamped, never negative).
+        uninit_p = lifted & (self.best_pos_dist > 1.0e2)  # arm the ratchet at the lift moment
+        self.best_pos_dist = torch.where(uninit_p, pos_dist, self.best_pos_dist)
+        carry_reward = torch.clamp(self.best_pos_dist - pos_dist, min=0.0) * liftedf * self.cfg.w_carry
+        self.best_pos_dist = torch.where(lifted, torch.minimum(self.best_pos_dist, pos_dist), self.best_pos_dist)
+
+        # ---- REPOSE: xhand_repose / InHandManipulationEnv reward, VERBATIM but STAGED ----
+        # active only once the cube is lifted AND carried to the goal point (the in-hand phase).
+        repose_active = (lifted & at_center).float()
+        # dense hyperbolic orientation reward: 1/(|rot_err| + rot_eps) * rot_reward_scale
+        rot_reward = (1.0 / (torch.abs(rot_err) + self.cfg.rot_eps)) * self.cfg.rot_reward_scale * repose_active
+
+        # success: orientation within tolerance, while at the goal point -> one-shot bonus, then
+        # RESAMPLE a new target orientation (continuous in-hand reorientation; the moving goalpost
+        # is what prevents camping here, exactly as in the original xhand_repose).
+        solved_now = (torch.abs(rot_err) <= self.cfg.success_tolerance) & lifted & at_center
+        success_bonus = solved_now.float() * self.cfg.reach_goal_bonus
+        if solved_now.any():
+            ids = solved_now.nonzero(as_tuple=False).squeeze(-1)
+            self.successes[ids] += 1.0
+            self._resample_goal(ids)
+
+        # ---- regularization (tiny) ----
         action_rate = torch.sum((self.actions - self.prev_actions) ** 2, dim=-1) * self.cfg.w_action_rate
         joint_vel_pen = torch.sum(self.robot.data.joint_vel**2, dim=-1) * self.cfg.w_joint_vel
         self.prev_actions = self.actions.clone()
 
         if "log" not in self.extras:
             self.extras["log"] = dict()
-        self.extras["log"]["lifted_frac"] = lifted.mean()
+        self.extras["log"]["lifted_frac"] = liftedf.mean()
+        self.extras["log"]["at_center_frac"] = (liftedf * at_center.float()).mean()
+        self.extras["log"]["solved_frac"] = solved_now.float().mean()
+        self.extras["log"]["successes_mean"] = self.successes.mean()
         self.extras["log"]["reach_mean"] = reach.mean()
-        self.extras["log"]["success_frac"] = (
-            (pos_dist < 0.05) & (rot_err < 0.2) & (lifted > 0.5)
-        ).float().mean()
 
-        return reach + lift_reward + goal_track + goal_track_fine + orient_track + success_reward + action_rate + joint_vel_pen
+        return reach + lift_reward + carry_reward + rot_reward + success_bonus + action_rate + joint_vel_pen
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         self._compute_intermediate_values()
         time_out = self.episode_length_buf >= self.max_episode_length - 1
+        # dropping the cube terminates (success no longer terminates -- it resamples the goal)
         dropped = self.object_pos_w[:, 2] < (self.object_default_z - self.cfg.drop_height)
         return dropped, time_out
 
@@ -253,6 +279,16 @@ class PickCubeEnv(DirectRLEnv):
         if env_ids is None:
             env_ids = self.robot._ALL_INDICES
         super()._reset_idx(env_ids)
+
+        # reset per-episode buffers (carry-ratchet sentinel 1e3 = not yet armed)
+        self.lifted_once[env_ids] = False
+        self.best_pos_dist[env_ids] = 1.0e3
+        self.successes[env_ids] = 0.0
+        # guard against a vectorized-indexing bug silently locking the carry ratchet across
+        # episodes: after reset these envs MUST read the sentinel. Costs nothing when disabled.
+        if self.cfg.debug_ratchet_asserts:
+            assert torch.all(self.best_pos_dist[env_ids] == 1.0e3), "carry ratchet not reset"
+            assert torch.all(self.successes[env_ids] == 0.0), "successes not reset"
 
         # robot to default pose
         joint_pos = self.default_joint_pos[env_ids]

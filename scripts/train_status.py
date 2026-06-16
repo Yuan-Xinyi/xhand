@@ -31,13 +31,13 @@ def fmt(x, p=4):
 
 
 rew = last("rewards/iter")
-shaped = last("shaped_rewards/iter")
 lifted = last("Episode/lifted_frac")
+lifted_ft = last("Episode/lifted_frac_fromtable")
 succ = last("Episode/mean_successes")
 tol = last("Episode/success_tolerance")
-eplen = last("episode_lengths/iter")
 n = len(ea.Scalars("rewards/iter")) if "rewards/iter" in tags else 0
 print(
-    f"[train] iter~{n} | reward={fmt(rew,2)} shaped={fmt(shaped,3)} "
-    f"| lifted_frac={fmt(lifted)} mean_succ={fmt(succ)} tol={fmt(tol,3)} eplen={fmt(eplen,0)}"
+    f"[train] iter~{n} | reward={fmt(rew,1)} "
+    f"| lifted={fmt(lifted,3)} lifted_FROMTABLE={fmt(lifted_ft,4)} "
+    f"mean_succ={fmt(succ,4)} tol={fmt(tol,3)}"
 )

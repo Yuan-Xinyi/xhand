@@ -3,21 +3,42 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Direct-workflow config: FR3 + XHand pick a cube up and reorient it to a target pose.
+"""Direct-workflow config: FR3 + XHand pick a cube up, carry it to a target point,
+then REORIENT it in-hand to a target pose -- a STAGED pick-and-repose task.
 
-This replicates IsaacLab's `Isaac-Lift-Cube-Franka-v0` (the manager-based lift task
+This builds on IsaacLab's `Isaac-Lift-Cube-Franka-v0` (the manager-based lift task
 that actually trains), keeping the single design decision that makes it learnable --
 the lift / tracking rewards are gated on the object's HEIGHT, not on a contact
-sensor -- and ADDS a target ORIENTATION on top of the lift target:
+sensor -- and stages the reward into three phases:
 
-  * lift the cube off the table (height-gated bootstrap, +w_lift)
-  * track a FIXED target point in the air (gated by lifted)
-  * track a per-episode RANDOM target orientation (gated by lifted)
+  1. PICK:    lift the cube off the table (height-gated bootstrap, +w_lift)
+  2. CARRY:   track a FIXED target POINT in the air (gated by `lifted`)
+  3. REPOSE:  track a per-episode RANDOM target ORIENTATION via in-hand manipulation,
+              only rewarded once the cube is BOTH lifted AND near the target point
+              (gated by `lifted & at_center`)
 
 Height-gating is trivially discoverable (any upward nudge of the cube -> instant
 lift reward), and lifting a cube off a table is only possible by grasping it, so
-the height gate induces the grasp without ever detecting one.  Once the cube is
-held, the orientation term shapes it toward the shown target pose.
+the height gate induces the grasp without ever detecting one.  Gating the
+orientation term on `at_center` defers reorientation until the cube has been
+transported to the goal point, so the policy learns to first carry, then reorient
+in-hand -- rather than fighting both objectives during transport.
+
+SUCCESS RATCHET (anti-camping): the rewards never pay for merely OCCUPYING a good
+state -- which would let the policy farm reward by holding the cube still.  Instead:
+  * reach  -> dense grasp-approach, but DECAYS to zero once the cube is lifted (so it
+              cannot be farmed by holding the grasp still)
+  * lift   -> a ONE-SHOT latched bonus (paid once, the first time the cube lifts)
+  * carry  -> pays only for beating the CLOSEST distance to the goal reached so far
+
+The REPOSE phase is taken VERBATIM from xhand_repose / InHandManipulationEnv -- the proven
+ShadowHand/OpenAI in-hand reorientation reward -- only gated behind pick+carry:
+  * a dense hyperbolic orientation reward  rot_rew = 1/(|rot_err| + rot_eps) * rot_reward_scale,
+    active only while (lifted & at_center)
+  * on |rot_err| <= success_tolerance: a one-shot reach_goal_bonus, then the goal orientation
+    RESAMPLES (continuous in-hand reorientation -- the moving goalpost is what prevents camping
+    here, exactly as in the original).
+Dropping the cube terminates the episode.
 """
 
 import isaaclab.sim as sim_utils
@@ -35,7 +56,7 @@ _CUBE_USD = f"{ISAAC_NUCLEUS_DIR}/Props/Blocks/DexCube/dex_cube_instanceable.usd
 
 
 @configclass
-class PickCubeEnvCfg(DirectRLEnvCfg):
+class PickReposeCubeEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 2
     episode_length_s = 5.0
@@ -122,21 +143,30 @@ class PickCubeEnvCfg(DirectRLEnvCfg):
     # the cube counts as "lifted" once its center rises this far above its table rest
     lift_margin = 0.04
 
-    # ---- reward weights (franka lift weights + an orientation term) ----
-    reach_std = 0.2  # reaching tanh width (m)
-    goal_track_std = 0.3  # coarse position-tracking tanh width (m)
-    goal_track_fine_std = 0.05  # fine position-tracking tanh width (m)
-    orient_track_std = 0.3  # orientation-tracking tanh width (rad)
-    success_pos_std = 0.05
-    success_rot_std = 0.1
-    w_reach = 1.0
-    w_lift = 15.0
-    w_goal_track = 16.0
-    w_goal_track_fine = 5.0
-    w_orient_track = 8.0
-    w_success = 10.0
+    # ---- in-hand REPOSE staging gate ----
+    # the orientation (in-hand manipulation) reward only switches on once the cube has
+    # been carried to within this radius of the target point -- i.e. the policy must
+    # PICK + CARRY first, then REPOSE in-hand. Kept loose enough to be reachable yet
+    # tight enough that reorientation happens AT the goal, not mid-flight.
+    inhand_pos_thresh = 0.08  # m
+
+    # ---- PICK + CARRY rewards (anti-camping: progress + latched events, no occupancy farming) ----
+    reach_std = 0.2          # grasp-approach tanh width (m); dense, DECAYS to 0 after lift
+    w_reach = 1.0            # dense grasp-approach (grasp bootstrap)
+    w_lift = 5.0             # ONE-SHOT bonus the first time the cube clears the table
+    w_carry = 50.0           # per metre of NEW closest-distance progress (carry ratchet, gated by lift)
+
+    # ---- REPOSE: VERBATIM from xhand_repose / InHandManipulationEnv (the proven ShadowHand/OpenAI
+    # in-hand reorientation reward) -- dense hyperbolic orientation reward + instant success bonus +
+    # goal RESAMPLE on success (continuous reorientation), but STAGED so it only activates once the
+    # cube is lifted AND carried to the goal point (lifted & at_center). ----
+    rot_eps = 0.1            # softening in rot_rew = 1/(|rot_err| + rot_eps)
+    rot_reward_scale = 1.0   # dense orientation-reward weight
+    success_tolerance = 0.1  # orientation tolerance (rad) to count a success
+    reach_goal_bonus = 250.0 # one-shot bonus on hitting the goal orientation, then the goal resamples
     w_action_rate = -1e-4
     w_joint_vel = -1e-4
+    debug_ratchet_asserts = False  # set True to assert the carry-ratchet buffers reset correctly
 
     # termination: cube fell this far below its rest height
     drop_height = 0.10
