@@ -62,20 +62,20 @@ params:
     learning_rate: 5e-4
     lr_schedule: adaptive
     schedule_type: standard
-    kl_threshold: 0.008
+    kl_threshold: 0.012  # was 0.008 -- loosen the adaptive-lr step cap (more exploration)
     score_to_win: 100000
     max_epochs: 5000
     save_best_after: 100
     save_frequency: 200
     print_stats: True
     grad_norm: 1.0
-    entropy_coef: 0.0
+    entropy_coef: 0.005  # was 0.0 -- maintain exploration (we must explore HOW to grasp)
     truncate_grads: True
     e_clip: 0.2
     # 8192 envs x horizon 32 = 262144 batch; 262144 / 32768 = 8 minibatches per epoch
     horizon_length: 32
     minibatch_size: 32768
-    mini_epochs: 8
+    mini_epochs: 4  # was 8 -- 8 over-exploited each batch, collapsing sigma / exploration too fast
     critic_coef: 4
     clip_value: True
     bounds_loss_coef: 0.0001

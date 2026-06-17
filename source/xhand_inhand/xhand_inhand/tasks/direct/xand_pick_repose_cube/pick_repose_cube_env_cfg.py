@@ -3,42 +3,34 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Direct-workflow config: FR3 + XHand pick a cube up, carry it to a target point,
-then REORIENT it in-hand to a target pose -- a STAGED pick-and-repose task.
+"""Direct-workflow config: FR3 + XHand pick a cube up off a table and reorient it to a
+target pose. The reward is borrowed VERBATIM in structure from SimToolReal (the
+sim2real-validated arm+hand pick-and-reorient task this project is porting), which
+sidesteps the reward-farming traps we hit with hand-tuned staged rewards.
 
-This builds on IsaacLab's `Isaac-Lift-Cube-Franka-v0` (the manager-based lift task
-that actually trains), keeping the single design decision that makes it learnable --
-the lift / tracking rewards are gated on the object's HEIGHT, not on a contact
-sensor -- and stages the reward into three phases:
+Every term is PROGRESS(delta) / GATED / ONE-SHOT -- there is NO persistent occupancy
+term, so the policy cannot farm reward by holding the cube still (the failure mode of
+both the "hug the cube" and "lift but don't carry" local optima we observed). Two
+phases, gated on a latched `lifted` flag:
 
-  1. PICK:    lift the cube off the table (height-gated bootstrap, +w_lift)
-  2. CARRY:   track a FIXED target POINT in the air (gated by `lifted`)
-  3. REPOSE:  track a per-episode RANDOM target ORIENTATION via in-hand manipulation,
-              only rewarded once the cube is BOTH lifted AND near the target point
-              (gated by `lifted & at_center`)
+  PRE-LIFT:
+    * lifting   -> dense clamp(z_lift, 0, 0.5) height reward (shut off once lifted)
+    * fingertip -> SUM over 5 fingertips of closest-distance PROGRESS to the object
+                   (sum, not mean, so every finger is encouraged to participate)
+  AT LIFT:
+    * a SPARSE one-shot lift bonus the instant the cube clears the table
+  POST-LIFT:
+    * keypoint  -> PROGRESS on the max distance between the 4 cube-corner keypoints and
+                   the goal-pose corners. A keypoint (corner) distance unifies POSITION
+                   and ORIENTATION error into one scalar, so this single term drives both
+                   carrying to the goal point and reorienting to the goal pose.
+  ON SUCCESS (keypoint error within tolerance for `success_steps` steps):
+    * an amortized goal bonus, then the goal pose RESAMPLES -> continuous reorientation
+      (the moving goalpost prevents camping, exactly as in SimToolReal / xhand_repose).
 
-Height-gating is trivially discoverable (any upward nudge of the cube -> instant
-lift reward), and lifting a cube off a table is only possible by grasping it, so
-the height gate induces the grasp without ever detecting one.  Gating the
-orientation term on `at_center` defers reorientation until the cube has been
-transported to the goal point, so the policy learns to first carry, then reorient
-in-hand -- rather than fighting both objectives during transport.
-
-SUCCESS RATCHET (anti-camping): the rewards never pay for merely OCCUPYING a good
-state -- which would let the policy farm reward by holding the cube still.  Instead:
-  * reach  -> dense grasp-approach, but DECAYS to zero once the cube is lifted (so it
-              cannot be farmed by holding the grasp still)
-  * lift   -> a ONE-SHOT latched bonus (paid once, the first time the cube lifts)
-  * carry  -> pays only for beating the CLOSEST distance to the goal reached so far
-
-The REPOSE phase is taken VERBATIM from xhand_repose / InHandManipulationEnv -- the proven
-ShadowHand/OpenAI in-hand reorientation reward -- only gated behind pick+carry:
-  * a dense hyperbolic orientation reward  rot_rew = 1/(|rot_err| + rot_eps) * rot_reward_scale,
-    active only while (lifted & at_center)
-  * on |rot_err| <= success_tolerance: a one-shot reach_goal_bonus, then the goal orientation
-    RESAMPLES (continuous in-hand reorientation -- the moving goalpost is what prevents camping
-    here, exactly as in the original).
-Dropping the cube terminates the episode.
+Action regularization is an L1 joint-velocity penalty, arm penalized ~10x the hand
+(the hand must stay free to manipulate). Episode ends on drop, lost grasp, or after
+`max_consecutive_successes` goals.
 """
 
 import isaaclab.sim as sim_utils
@@ -62,8 +54,10 @@ class PickReposeCubeEnvCfg(DirectRLEnvCfg):
     episode_length_s = 5.0
     action_space = 19  # full relative joint control: 7 arm + 12 hand
     # obs = joint_pos(19)+joint_vel(19)+ee_pos_b(5*3=15)+palm_center_b(3)
-    #       +object_pos_b(3)+object_quat(4)+target_pos_b(3)+target_quat(4)+actions(19) = 89
-    observation_space = 89
+    #       +object_pos_b(3)+object_quat(4)+target_pos_b(3)+target_quat(4)+actions(19)
+    #       +tip_contact_mag(5) = 94  (fingertip contact force is in the obs so the policy can
+    #       learn the "close fingers -> contact" causality; the real XHand exposes fingertip tactile)
+    observation_space = 94
     state_space = 0
 
     sim: SimulationCfg = SimulationCfg(
@@ -80,11 +74,17 @@ class PickReposeCubeEnvCfg(DirectRLEnvCfg):
 
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=2.5, replicate_physics=True)
 
-    # robot (no contact sensor needed -- the lift reward is height-gated)
-    robot_cfg: ArticulationCfg = FR3_XHAND_CFG.replace(prim_path="/World/envs/env_.*/Robot")
+    # robot -- contact sensors ENABLED on the fingertips (real XHand has fingertip tactile;
+    # we use net contact force to detect a real force-closure grasp, not a geometric "pose")
+    robot_cfg: ArticulationCfg = FR3_XHAND_CFG.replace(
+        prim_path="/World/envs/env_.*/Robot",
+        spawn=FR3_XHAND_CFG.spawn.replace(activate_contact_sensors=True),
+    )
     palm_body_name = "palm"
     # the 5 fingertips form the "end effector" (grasp assembly) for the reach reward
     ee_body_names = ["index_rota_link2", "mid_link2", "ring_link2", "pinky_link2", "thumb_rota_link2"]
+    thumb_tip_name = "thumb_rota_link2"
+    contact_force_threshold = 1.0  # N; per-fingertip net force above this counts as "in contact"
     # palm-center point in the PALM BODY frame (the XHand "palm" origin is at the wrist;
     # offset toward the fingers (+Z) and the palm side (-Y) to get the grasp center).
     palm_center_offset = (0.0, -0.02, 0.07)
@@ -139,37 +139,57 @@ class PickReposeCubeEnvCfg(DirectRLEnvCfg):
     target_rot_range_pitch = (-3.14159, 3.14159)
     target_rot_range_yaw = (-3.14159, 3.14159)
 
-    # ---- lift detection (mirror of franka `object_is_lifted`) ----
-    # the cube counts as "lifted" once its center rises this far above its table rest
-    lift_margin = 0.04
+    # ====================================================================================
+    # Reward: borrowed VERBATIM in structure from SimToolReal (arm+hand pick & reorient,
+    # sim2real-validated). All terms are progress(delta)/gated/one-shot -- NO persistent
+    # occupancy term, so there is no farming channel. Two phases, gated on `lifted`:
+    #   before lift:  dense lifting height + fingertip-distance PROGRESS (sum over 5 tips)
+    #   at lift:      one-shot lift bonus
+    #   after lift:   keypoint PROGRESS (4 cube corners -> goal corners; unifies pos+orient)
+    #   on success:   amortized goal bonus, resample a new goal (continuous reorientation)
+    # ====================================================================================
+    # joint groups for the (arm-heavy, hand-light) L1 velocity penalty
+    arm_joint_names = ["fr3_joint[1-7]"]
+    hand_joint_names = ["(thumb|index|middle|ring|pinky)_joint.*"]
 
-    # ---- in-hand REPOSE staging gate ----
-    # the orientation (in-hand manipulation) reward only switches on once the cube has
-    # been carried to within this radius of the target point -- i.e. the policy must
-    # PICK + CARRY first, then REPOSE in-hand. Kept loose enough to be reachable yet
-    # tight enough that reorientation happens AT the goal, not mid-flight.
-    inhand_pos_thresh = 0.08  # m
+    # -- lifting (dense before lift, shut off after; plus a one-shot bonus on crossing) --
+    lift_z_offset = 0.05            # SimToolReal offset so z_lift starts positive
+    lifting_bonus_threshold = 0.15  # z_lift above this -> "lifted" (i.e. ~0.10 m off the table)
+    lifting_bonus = 300.0           # SPARSE one-shot bonus at the instant of lift
+    lifting_rew_scale = 20.0        # dense clamp(z_lift,0,0.5) height reward (pre-lift only)
 
-    # ---- PICK + CARRY rewards (anti-camping: progress + latched events, no occupancy farming) ----
-    reach_std = 0.2          # grasp-approach tanh width (m); dense, DECAYS to 0 after lift
-    w_reach = 1.0            # dense grasp-approach (grasp bootstrap)
-    w_lift = 5.0             # ONE-SHOT bonus the first time the cube clears the table
-    w_carry = 50.0           # per metre of NEW closest-distance progress (carry ratchet, gated by lift)
+    # -- fingertip approach (progress, pre-lift): sum of per-tip closest-distance improvements --
+    distance_delta_rew_scale = 50.0
 
-    # ---- REPOSE: VERBATIM from xhand_repose / InHandManipulationEnv (the proven ShadowHand/OpenAI
-    # in-hand reorientation reward) -- dense hyperbolic orientation reward + instant success bonus +
-    # goal RESAMPLE on success (continuous reorientation), but STAGED so it only activates once the
-    # cube is lifted AND carried to the goal point (lifted & at_center). ----
-    rot_eps = 0.1            # softening in rot_rew = 1/(|rot_err| + rot_eps)
-    rot_reward_scale = 1.0   # dense orientation-reward weight
-    success_tolerance = 0.1  # orientation tolerance (rad) to count a success
-    reach_goal_bonus = 250.0 # one-shot bonus on hitting the goal orientation, then the goal resamples
-    w_action_rate = -1e-4
-    w_joint_vel = -1e-4
-    debug_ratchet_asserts = False  # set True to assert the carry-ratchet buffers reset correctly
+    # -- keypoint tracking (progress, post-lift): max over 4 cube corners -> goal corners --
+    keypoint_rew_scale = 200.0
+    keypoint_half_extent = 0.032    # cube half-edge (m) for the 4 corner keypoints (dex_cube x0.8)
 
-    # termination: cube fell this far below its rest height
+    # -- grasp quality (geometric, no contact sensor): palm-closeness x thumb-opposition.
+    # Caging (fingers cage the object center) leaves the palm far and the thumb un-opposed -> low
+    # quality; a force-closure palm grasp -> high. Used BOTH as a dense post-lift guide AND to GATE
+    # the keypoint (manipulation) reward, so the object must be properly held before reorientation
+    # pays -- which a cage cannot do. No contact sensor needed.
+    palm_std = 0.06                 # tanh width (m) for palm-center -> object closeness
+    w_grasp = 5.0                   # dense grasp-quality reward (active pre-lift too, to bootstrap)
+    # keypoint reward is gated by grasp quality, but with a FLOOR so caging still earns enough to
+    # keep "lift" valuable (a pure gate deadlocked: no grasp -> no keypoint -> never lifts). The
+    # 0.25..1.0 range still makes a real palm grasp pay 4x a cage, driving the transition.
+    grasp_gate_floor = 0.25
+
+    # -- success: keypoint max-corner error within tolerance for `success_steps` steps --
+    success_tolerance = 0.05        # keypoint max-corner distance tolerance (m)
+    success_steps = 10              # steps within tolerance to bank a success
+    reach_goal_bonus = 1000.0       # amortized per near-goal step (bonus / success_steps)
+    max_consecutive_successes = 50  # terminate after this many goals solved in one episode
+
+    # -- action regularization: L1 joint velocity, arm penalized 10x the hand --
+    kuka_actions_penalty_scale = 0.03
+    hand_actions_penalty_scale = 0.003
+
+    # termination: cube fell this far below its rest height, or hand lost the object
     drop_height = 0.10
+    hand_far_dist = 1.0             # max fingertip-to-object distance (m) before giving up
 
     # debug markers: palm-center (red sphere), fingertips (green spheres), palm-normal ray (blue).
     # only built when a GUI is present, so headless training pays nothing.

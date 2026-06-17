@@ -234,9 +234,10 @@ class InHandManipulationEnv(DirectRLEnv):
             return torch.acos(cos_angle)
         return rotation_distance(self.object_rot, self.goal_rot)
 
-    def _reset_idx(self, env_ids: Sequence[int] | None):
+    def _reset_idx(self, env_ids: Sequence[int] | torch.Tensor | None):
         if env_ids is None:
             env_ids = self.hand._ALL_INDICES
+        assert env_ids is not None
         # resets articulation and rigid body attributes
         super()._reset_idx(env_ids)
 
@@ -281,7 +282,7 @@ class InHandManipulationEnv(DirectRLEnv):
         self.successes[env_ids] = 0
         self._compute_intermediate_values()
 
-    def _reset_target_pose(self, env_ids):
+    def _reset_target_pose(self, env_ids: Sequence[int] | torch.Tensor):
         if self.goal_heading_only:
             # sample a target heading (azimuth about world Z) in [0, 2*pi)
             theta = sample_uniform(0.0, 2.0 * np.pi, (len(env_ids),), device=self.device)
