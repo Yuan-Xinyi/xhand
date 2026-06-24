@@ -220,7 +220,7 @@ class XHandReposeEnvCfg(DirectRLEnvCfg):
         prim_path="/World/envs/env_.*/object",
         spawn=sim_utils.UsdFileCfg(
             usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Blocks/DexCube/dex_cube_instanceable.usd",
-            scale=(1.0, 1.0, 1.0),  # TUNE: cube size relative to the hand
+            scale=(0.75, 0.75, 0.75),  # dex_cube 0.08 m -> 0.06 m edge
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 kinematic_enabled=False,
                 disable_gravity=False,
@@ -242,7 +242,7 @@ class XHandReposeEnvCfg(DirectRLEnvCfg):
         markers={
             "goal": sim_utils.UsdFileCfg(
                 usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Blocks/DexCube/dex_cube_instanceable.usd",
-                scale=(1.0, 1.0, 1.0),  # TUNE: match object scale
+                scale=(0.75, 0.75, 0.75),  # match object scale (0.06 m edge)
             )
         },
     )

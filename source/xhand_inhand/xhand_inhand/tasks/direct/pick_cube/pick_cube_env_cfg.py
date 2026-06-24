@@ -85,7 +85,7 @@ class PickCubeEnvCfg(DirectRLEnvCfg):
         prim_path="/World/envs/env_.*/Object",
         spawn=sim_utils.UsdFileCfg(
             usd_path=_CUBE_USD,
-            scale=(0.8, 0.8, 0.8),
+            scale=(0.75, 0.75, 0.75),  # dex_cube 0.08 m -> 0.06 m edge
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 solver_position_iteration_count=16,
                 solver_velocity_iteration_count=1,
@@ -148,5 +148,5 @@ class PickCubeEnvCfg(DirectRLEnvCfg):
     # floating goal-pose marker (a cube drawn at the target pose)
     goal_marker_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
         prim_path="/Visuals/goal_marker",
-        markers={"goal": sim_utils.UsdFileCfg(usd_path=_CUBE_USD, scale=(0.8, 0.8, 0.8))},
+        markers={"goal": sim_utils.UsdFileCfg(usd_path=_CUBE_USD, scale=(0.75, 0.75, 0.75))},
     )

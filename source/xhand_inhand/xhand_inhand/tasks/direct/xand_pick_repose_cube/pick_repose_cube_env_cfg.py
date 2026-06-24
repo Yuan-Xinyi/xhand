@@ -106,7 +106,7 @@ class PickReposeCubeEnvCfg(DirectRLEnvCfg):
         prim_path="/World/envs/env_.*/Object",
         spawn=sim_utils.UsdFileCfg(
             usd_path=_CUBE_USD,
-            scale=(0.8, 0.8, 0.8),
+            scale=(0.75, 0.75, 0.75),  # dex_cube 0.08 m -> 0.06 m edge
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 solver_position_iteration_count=16,
                 solver_velocity_iteration_count=1,
@@ -163,7 +163,7 @@ class PickReposeCubeEnvCfg(DirectRLEnvCfg):
 
     # -- keypoint tracking (progress, post-lift): max over 4 cube corners -> goal corners --
     keypoint_rew_scale = 200.0
-    keypoint_half_extent = 0.032    # cube half-edge (m) for the 4 corner keypoints (dex_cube x0.8)
+    keypoint_half_extent = 0.030    # cube half-edge (m) for the 4 corner keypoints (dex_cube x0.75 -> 0.06 m edge)
 
     # -- grasp quality (geometric, no contact sensor): palm-closeness x thumb-opposition.
     # Caging (fingers cage the object center) leaves the palm far and the thumb un-opposed -> low
@@ -198,5 +198,5 @@ class PickReposeCubeEnvCfg(DirectRLEnvCfg):
     # floating goal-pose marker (a cube drawn at the target pose)
     goal_marker_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
         prim_path="/Visuals/goal_marker",
-        markers={"goal": sim_utils.UsdFileCfg(usd_path=_CUBE_USD, scale=(0.8, 0.8, 0.8))},
+        markers={"goal": sim_utils.UsdFileCfg(usd_path=_CUBE_USD, scale=(0.75, 0.75, 0.75))},
     )

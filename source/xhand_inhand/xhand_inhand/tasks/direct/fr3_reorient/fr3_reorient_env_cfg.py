@@ -73,7 +73,7 @@ class Fr3ReorientEnvCfg(DirectRLEnvCfg):
         prim_path="/World/envs/env_.*/Object",
         spawn=sim_utils.UsdFileCfg(
             usd_path=_CUBE_USD,
-            scale=(1.0, 1.0, 1.0),
+            scale=(0.75, 0.75, 0.75),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 solver_position_iteration_count=16,
                 solver_velocity_iteration_count=1,
@@ -124,5 +124,5 @@ class Fr3ReorientEnvCfg(DirectRLEnvCfg):
     # floating goal-pose marker (a cube at the target pose)
     goal_marker_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
         prim_path="/Visuals/goal_marker",
-        markers={"goal": sim_utils.UsdFileCfg(usd_path=_CUBE_USD, scale=(1.0, 1.0, 1.0))},
+        markers={"goal": sim_utils.UsdFileCfg(usd_path=_CUBE_USD, scale=(0.75, 0.75, 0.75))},
     )
