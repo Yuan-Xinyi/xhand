@@ -5,19 +5,14 @@
 
 """Direct-workflow config: FR3 + XHand pick a cube up and reorient it to a target pose.
 
-This replicates IsaacLab's `Isaac-Lift-Cube-Franka-v0` (the manager-based lift task
-that actually trains), keeping the single design decision that makes it learnable --
-the lift / tracking rewards are gated on the object's HEIGHT, not on a contact
-sensor -- and ADDS a target ORIENTATION on top of the lift target:
+Reward follows the SimToolReal-style staged structure:
 
-  * lift the cube off the table (height-gated bootstrap, +w_lift)
-  * track a FIXED target point in the air (gated by lifted)
-  * track a per-episode RANDOM target orientation (gated by lifted)
+  * pre-lift fingertip distance progress toward the cube center
+  * sparse one-shot lift bonus once the cube clears the table
+  * post-lift keypoint progress from cube corners to goal-pose corners
 
-Height-gating is trivially discoverable (any upward nudge of the cube -> instant
-lift reward), and lifting a cube off a table is only possible by grasping it, so
-the height gate induces the grasp without ever detecting one.  Once the cube is
-held, the orientation term shapes it toward the shown target pose.
+The reward is progress-based instead of occupancy-based so the policy cannot farm
+reward by merely hovering near, holding still, or lifting without carrying/reorienting.
 """
 
 import isaaclab.sim as sim_utils
@@ -26,12 +21,12 @@ from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.markers import VisualizationMarkersCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import PhysxCfg, SimulationCfg
+from isaaclab.sim.spawners.materials.physics_materials_cfg import RigidBodyMaterialCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
+from xhand_inhand.foundationpose_cube import FOUNDATIONPOSE_CUBE_SCALE, FOUNDATIONPOSE_CUBE_USD
 from xhand_inhand.robots import FR3_XHAND_CFG
-
-_CUBE_USD = f"{ISAAC_NUCLEUS_DIR}/Props/Blocks/DexCube/dex_cube_instanceable.usd"
 
 
 @configclass
@@ -48,6 +43,10 @@ class PickCubeEnvCfg(DirectRLEnvCfg):
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 100,
         render_interval=decimation,
+        # scene default material -> table + object (no explicit material) get robot_friction (0.5),
+        # matching SimToolReal (table & object both run through the default 0.5 material). The
+        # robot's own shapes are overwritten per-shape after startup (see apply_fingertip_friction).
+        physics_material=RigidBodyMaterialCfg(static_friction=0.5, dynamic_friction=0.5),
         physx=PhysxCfg(
             bounce_threshold_velocity=0.2,
             gpu_found_lost_aggregate_pairs_capacity=1024 * 1024 * 4,
@@ -57,35 +56,38 @@ class PickCubeEnvCfg(DirectRLEnvCfg):
         ),
     )
 
+    # per-shape friction (SimToolReal defaults): all robot shapes 0.5, fingertip distal links
+    # 1.5 -> a 3x grip advantage at the fingerpads. Applied init-only via the physx view in
+    # the env __init__ (no DR; SimToolReal's friction scale ranges are (1.0, 1.0) by default).
+    robot_friction = 0.5
+    fingertip_friction = 1.5
+
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=2.5, replicate_physics=True)
 
     # robot (no contact sensor needed -- the lift reward is height-gated)
     robot_cfg: ArticulationCfg = FR3_XHAND_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     palm_body_name = "palm"
-    # the 5 fingertips form the "end effector" (grasp assembly) for the reach reward
+    # the 5 finger pads form the "end effector" (grasp assembly) for the reach reward
     ee_body_names = ["index_rota_link2", "mid_link2", "ring_link2", "pinky_link2", "thumb_rota_link2"]
     # palm-center point in the PALM BODY frame (the XHand "palm" origin is at the wrist;
     # offset toward the fingers (+Z) and the palm side (-Y) to get the grasp center).
     palm_center_offset = (0.0, -0.02, 0.07)
-    # per-fingertip TIP offset in EACH fingertip body's LOCAL frame, for visualization.
-    # The link2 body ORIGIN sits at the proximal joint; the actual tip is ~4cm out along the
-    # distal mesh axis -- +X for the thumb, +Z for the 4 fingers (measured from the xhand2R32
-    # link2 STL bounding boxes; same values as simtoolreal). Keyed by body name so it is robust
-    # to ee_body_names ordering / find_bodies reordering.
-    fingertip_tip_offsets = {
-        "thumb_rota_link2": (0.050, 0.000, -0.005),  # +X
-        "index_rota_link2": (0.000, 0.004, 0.040),   # +Z
-        "mid_link2": (0.000, 0.004, 0.040),          # +Z
-        "ring_link2": (0.000, 0.004, 0.040),         # +Z
-        "pinky_link2": (0.000, 0.004, 0.040),        # +Z
+    # Per-finger-pad offset in each distal link's local frame.
+    # These are link-local pad-center points calibrated interactively in Isaac Sim.
+    finger_pad_offsets = {
+        "thumb_rota_link2": (0.033409, 0.000346, 0.012429),
+        "index_rota_link2": (-0.002238, -0.011313, 0.026695),
+        "mid_link2": (0.000509, -0.014334, 0.023363),
+        "ring_link2": (0.000705, -0.013922, 0.025485),
+        "pinky_link2": (-0.000383, -0.011856, 0.028925),
     }
 
     # cube on the table
     object_cfg: RigidObjectCfg = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Object",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=_CUBE_USD,
-            scale=(0.75, 0.75, 0.75),  # dex_cube 0.08 m -> 0.06 m edge
+            usd_path=FOUNDATIONPOSE_CUBE_USD,
+            scale=FOUNDATIONPOSE_CUBE_SCALE,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 solver_position_iteration_count=16,
                 solver_velocity_iteration_count=1,
@@ -102,12 +104,14 @@ class PickCubeEnvCfg(DirectRLEnvCfg):
     table_pos = (0.5, 0.0, 0.0)
     table_rot = (0.707, 0.0, 0.0, 0.707)
 
-    # action: full RELATIVE joint position control (target += action_scale * action)
+    # action: full RELATIVE joint position control, smoothed by target moving average
     action_scale = 0.1
+    act_moving_average = 0.3
 
     # reset randomization of the cube on the table (x/y position + full yaw)
     reset_object_pos_noise = (0.10, 0.20)
     reset_object_yaw_range = (-3.14159, 3.14159)
+    reset_min_hand_object_dist = 0.060
 
     # ---- goal: lift the cube to a FIXED point + a target ORIENTATION ----
     # Orientation is specified as roll/pitch/yaw ranges, exactly like the reference
@@ -118,25 +122,22 @@ class PickCubeEnvCfg(DirectRLEnvCfg):
     target_rot_range_pitch = (-3.14159, 3.14159)
     target_rot_range_yaw = (-3.14159, 3.14159)
 
-    # ---- lift detection (mirror of franka `object_is_lifted`) ----
-    # the cube counts as "lifted" once its center rises this far above its table rest
-    lift_margin = 0.04
+    # ---- staged reward ----
+    lift_z_offset = 0.05  # SimToolReal offset: threshold 0.15 means ~0.10 m actual lift
+    lifting_bonus_threshold = 0.15
+    lifting_bonus = 300.0
+    distance_delta_rew_scale = 50.0
+    keypoint_rew_scale = 200.0
+    keypoint_half_extent = 0.030  # 6 cm cube half-edge
+    success_tolerance = 0.05
+    reach_goal_bonus = 1000.0
+    success_steps = 10
 
-    # ---- reward weights (franka lift weights + an orientation term) ----
-    reach_std = 0.2  # reaching tanh width (m)
-    goal_track_std = 0.3  # coarse position-tracking tanh width (m)
-    goal_track_fine_std = 0.05  # fine position-tracking tanh width (m)
-    orient_track_std = 0.3  # orientation-tracking tanh width (rad)
-    success_pos_std = 0.05
-    success_rot_std = 0.1
-    w_reach = 1.0
-    w_lift = 15.0
-    w_goal_track = 16.0
-    w_goal_track_fine = 5.0
-    w_orient_track = 8.0
-    w_success = 10.0
-    w_action_rate = -1e-4
-    w_joint_vel = -1e-4
+    # action regularization: L1 joint velocity, arm penalized 10x the hand
+    arm_joint_names = ["fr3_joint[1-7]"]
+    hand_joint_names = ["(thumb|index|middle|ring|pinky)_joint.*"]
+    kuka_actions_penalty_scale = 0.03
+    hand_actions_penalty_scale = 0.003
 
     # termination: cube fell this far below its rest height
     drop_height = 0.10
@@ -148,5 +149,10 @@ class PickCubeEnvCfg(DirectRLEnvCfg):
     # floating goal-pose marker (a cube drawn at the target pose)
     goal_marker_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
         prim_path="/Visuals/goal_marker",
-        markers={"goal": sim_utils.UsdFileCfg(usd_path=_CUBE_USD, scale=(0.75, 0.75, 0.75))},
+        markers={
+            "goal": sim_utils.UsdFileCfg(
+                usd_path=FOUNDATIONPOSE_CUBE_USD,
+                scale=FOUNDATIONPOSE_CUBE_SCALE,
+            )
+        },
     )

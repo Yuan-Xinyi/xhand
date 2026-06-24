@@ -11,7 +11,7 @@ from collections.abc import Sequence
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import DirectRLEnv
-from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+from isaaclab.markers import VisualizationMarkers
 from isaaclab.sensors import ContactSensor, ContactSensorCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.math import (
@@ -22,6 +22,8 @@ from isaaclab.utils.math import (
     quat_mul,
     sample_uniform,
 )
+
+from xhand_inhand.utils import apply_fingertip_friction
 
 from .pick_repose_cube_env_cfg import PickReposeCubeEnvCfg
 
@@ -38,11 +40,11 @@ class PickReposeCubeEnv(DirectRLEnv):
         self.palm_center_offset = torch.tensor(
             self.cfg.palm_center_offset, dtype=torch.float, device=self.device
         ).repeat((self.num_envs, 1))
-        # per-finger TIP offset, aligned to the ACTUAL resolved ee_ids order (find_bodies may
-        # reorder), so the green markers land on the real fingertips, not the proximal joints.
-        ee_names = [self.robot.body_names[i] for i in self.ee_ids]
-        self.fingertip_tip_offset = torch.tensor(
-            [self.cfg.fingertip_tip_offsets[n] for n in ee_names], dtype=torch.float, device=self.device
+        # per-finger pad offset, aligned to the ACTUAL resolved ee_ids order (find_bodies may
+        # reorder), so the green markers land on the pad surfaces, not the distal tips or joints.
+        self.ee_names = [self.robot.body_names[i] for i in self.ee_ids]
+        self.finger_pad_offset = torch.tensor(
+            [self.cfg.finger_pad_offsets[n] for n in self.ee_names], dtype=torch.float, device=self.device
         ).unsqueeze(0).repeat(self.num_envs, 1, 1)  # (N, 5, 3)
 
         # joint limits / defaults
@@ -50,6 +52,15 @@ class PickReposeCubeEnv(DirectRLEnv):
         self.dof_lower = limits[..., 0]
         self.dof_upper = limits[..., 1]
         self.default_joint_pos = self.robot.data.default_joint_pos.clone()
+
+        # per-shape friction (SimToolReal): all robot shapes low, the 5 fingertip distal
+        # links high, so non-fingerpad grasps (knuckle / finger-gap / palm scoop) are
+        # physically unprofitable and the policy converges to fingerpad grasping.
+        apply_fingertip_friction(
+            self.robot, self.cfg.ee_body_names,
+            robot_friction=self.cfg.robot_friction,
+            fingertip_friction=self.cfg.fingertip_friction,
+        )
 
         # action / target buffers (full relative joint control)
         self.actions = torch.zeros((self.num_envs, self.cfg.action_space), device=self.device)
@@ -72,8 +83,8 @@ class PickReposeCubeEnv(DirectRLEnv):
         self._keypoint_offsets = corners * self.cfg.keypoint_half_extent  # (4, 3)
 
         # thumb vs the other four fingertips, for the thumb-opposition grasp-quality metric
-        self._thumb_ee_idx = ee_names.index("thumb_rota_link2")
-        self._other_ee_idx = [i for i in range(len(ee_names)) if i != self._thumb_ee_idx]
+        self._thumb_ee_idx = self.ee_names.index("thumb_rota_link2")
+        self._other_ee_idx = [i for i in range(len(self.ee_names)) if i != self._thumb_ee_idx]
 
         # fingertip ids within the contact sensor + thumb position (for the contact grasp gate)
         self.tip_ids, tip_names = self._contact_sensor.find_bodies(self.cfg.ee_body_names)
@@ -101,25 +112,15 @@ class PickReposeCubeEnv(DirectRLEnv):
         self.goal_markers = VisualizationMarkers(self.cfg.goal_marker_cfg)
         self._resample_goal(self.robot._ALL_INDICES)
 
-        # debug markers: palm-center (red), fingertips (green), palm-normal ray (blue).
-        # only built with a GUI present -- headless training then pays nothing.
+        # Debug markers are authored as children of the robot links, not as world-space
+        # point-instancer entries. This keeps their local transform fixed to the link in the
+        # USD hierarchy, so the visible pad cannot lag behind the rendered hand.
         self.dbg_markers = None
-        if self.cfg.debug_markers and self.sim.has_gui():
-            def _sphere(name, color, r):
-                return VisualizationMarkers(
-                    VisualizationMarkersCfg(
-                        prim_path=f"/Visuals/dbg_{name}",
-                        markers={name: sim_utils.SphereCfg(
-                            radius=r,
-                            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color),
-                        )},
-                    )
-                )
-            self.dbg_markers = {
-                "palm": _sphere("palm", (1.0, 0.0, 0.0), 0.02),
-                "ft": _sphere("ft", (0.0, 1.0, 0.0), 0.012),
-                "normal": _sphere("normal", (0.0, 0.3, 1.0), 0.008),
-            }
+        self._debug_pad_prim_paths = {}
+        self._last_printed_debug_pad_offsets = None
+        self._enable_interactive_pad_calibration = bool(self.cfg.debug_markers and self.sim.has_gui())
+        if self._enable_interactive_pad_calibration:
+            self._create_link_attached_debug_markers()
 
     # ------------------------------------------------------------------ scene
     def _setup_scene(self):
@@ -179,20 +180,21 @@ class PickReposeCubeEnv(DirectRLEnv):
 
     # ------------------------------------------------------------------ mdp
     def _compute_intermediate_values(self):
+        self._sync_finger_pad_offsets_from_debug_markers()
         root = self.robot.data.root_pos_w
         self.object_pos_w = self.object.data.root_pos_w
         self.object_quat_w = self.object.data.root_quat_w
         self.object_pos_b = self.object_pos_w - root
-        # corrected fingertip TIPS: the link2 body ORIGIN sits at the proximal (mid) joint, so
-        # using it makes the hand grasp with its KNUCKLES. Add the per-finger tip offset (rotated
-        # into world) so the "end effector" is the real fingertips -- used in BOTH obs and reward.
+        # corrected finger pads: the link2 body ORIGIN sits at the proximal (mid) joint, while
+        # the geometric tip is too far distal. Add the per-finger pad offset (rotated into world)
+        # so the "end effector" is the pad surface used for grasping.
         ee_body_w = self.robot.data.body_pos_w[:, self.ee_ids]  # (N, 5, 3) proximal joints
         ft_quat = self.robot.data.body_quat_w[:, self.ee_ids]  # (N, 5, 4)
         ft_off = quat_apply(
-            ft_quat.reshape(-1, 4), self.fingertip_tip_offset.reshape(-1, 3)
+            ft_quat.reshape(-1, 4), self.finger_pad_offset.reshape(-1, 3)
         ).reshape(self.num_envs, -1, 3)
-        self.fingertip_tip_w = ee_body_w + ft_off  # (N, 5, 3) real tips
-        self.ee_pos_w = self.fingertip_tip_w  # grasp assembly = real fingertips
+        self.finger_pad_w = ee_body_w + ft_off  # (N, 5, 3) finger pads
+        self.ee_pos_w = self.finger_pad_w  # grasp assembly = finger pads
         self.ee_pos_b = (self.ee_pos_w - root.unsqueeze(1)).reshape(self.num_envs, -1)  # (N, 15)
         # grasp-center point = palm body pos + offset (in palm frame) toward the fingers
         palm_pos = self.robot.data.body_pos_w[:, self.palm_idx]
@@ -203,7 +205,7 @@ class PickReposeCubeEnv(DirectRLEnv):
         # ---- SimToolReal reward geometry (kept idempotent; this runs >once per step) ----
         # fingertip -> object-center distances (N, 5)
         self._curr_fingertip_distances = torch.norm(
-            self.fingertip_tip_w - self.object_pos_w.unsqueeze(1), dim=-1
+            self.finger_pad_w - self.object_pos_w.unsqueeze(1), dim=-1
         )
         # keypoint max-corner distance: object corners vs goal corners -> unifies pos + orient error
         kp = self._keypoint_offsets.unsqueeze(0).expand(self.num_envs, -1, -1)  # (N, 4, 3)
@@ -238,20 +240,101 @@ class PickReposeCubeEnv(DirectRLEnv):
         self.grasped = thumb_c & others.any(dim=1)  # (N,) bool
 
     def _update_dbg_markers(self):
-        org = self.scene.env_origins
-        # palm-center (red)
-        self.dbg_markers["palm"].visualize(self.palm_center_w)
-        # fingertips (green): corrected TIPS (joint-origin + tip offset), (N,5,3) -> (N*5,3)
-        self.dbg_markers["ft"].visualize(self.fingertip_tip_w.reshape(-1, 3))
-        # palm normal (blue ray): palm-local -Y (the grasp side the palm faces),
-        # drawn as a string of small spheres from the palm center outward.
-        n_dir = torch.tensor([0.0, -1.0, 0.0], device=self.device).expand(self.num_envs, 3)
-        palm_normal_w = quat_apply(self.palm_quat, n_dir)  # (N,3)
-        ks = torch.arange(1, 9, device=self.device).float() * 0.012  # 8 pts, ~0.1 m ray
-        ray = (
-            self.palm_center_w.unsqueeze(1) + palm_normal_w.unsqueeze(1) * ks.view(1, -1, 1)
-        ).reshape(-1, 3)
-        self.dbg_markers["normal"].visualize(ray)
+        # Link-attached debug markers are static local prims under each link, so they need no
+        # per-frame world-space updates.
+        return
+
+    def _create_link_attached_debug_markers(self):
+        stage = sim_utils.get_current_stage()
+
+        def _spawn_sphere(prim_path, color, radius, translation):
+            if stage.GetPrimAtPath(prim_path).IsValid():
+                return
+            cfg = sim_utils.SphereCfg(
+                radius=radius,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color),
+            )
+            cfg.func(prim_path, cfg, translation=translation)
+
+        env_id = 0
+        robot_path = f"/World/envs/env_{env_id}/Robot"
+
+        for body_name, offset in self.cfg.finger_pad_offsets.items():
+            parent_path = f"{robot_path}/{body_name}"
+            if not stage.GetPrimAtPath(parent_path).IsValid():
+                continue
+            marker_path = f"{parent_path}/dbg_finger_pad"
+            _spawn_sphere(
+                marker_path,
+                (0.0, 1.0, 0.0),
+                0.007,
+                tuple(float(v) for v in offset),
+            )
+            self._debug_pad_prim_paths[body_name] = marker_path
+
+        palm_path = f"{robot_path}/{self.cfg.palm_body_name}"
+        if not stage.GetPrimAtPath(palm_path).IsValid():
+            return
+
+        _spawn_sphere(
+            f"{palm_path}/dbg_palm_center",
+            (1.0, 0.0, 0.0),
+            0.02,
+            tuple(float(v) for v in self.cfg.palm_center_offset),
+        )
+        for i in range(8):
+            k = float(i + 1) * 0.012
+            pos = (
+                float(self.cfg.palm_center_offset[0]),
+                float(self.cfg.palm_center_offset[1]) - k,
+                float(self.cfg.palm_center_offset[2]),
+            )
+            _spawn_sphere(
+                f"{palm_path}/dbg_palm_normal_{i}",
+                (0.0, 0.3, 1.0),
+                0.008,
+                pos,
+            )
+
+    def _sync_finger_pad_offsets_from_debug_markers(self):
+        if not self._enable_interactive_pad_calibration:
+            return
+        if not self._debug_pad_prim_paths:
+            return
+
+        stage = sim_utils.get_current_stage()
+        offsets = []
+        for body_name in self.ee_names:
+            prim = stage.GetPrimAtPath(self._debug_pad_prim_paths.get(body_name, ""))
+            if not prim.IsValid():
+                return
+            value = prim.GetAttribute("xformOp:translate").Get()
+            if value is None:
+                return
+            offsets.append((float(value[0]), float(value[1]), float(value[2])))
+
+        offset_tensor = torch.tensor(offsets, dtype=torch.float, device=self.device).unsqueeze(0).repeat(
+            self.num_envs, 1, 1
+        )
+        if torch.max(torch.abs(offset_tensor - self.finger_pad_offset)) <= 1e-6:
+            return
+        self.finger_pad_offset.copy_(offset_tensor)
+
+        if self._last_printed_debug_pad_offsets is None:
+            should_print = True
+        else:
+            should_print = torch.max(torch.abs(offset_tensor[0] - self._last_printed_debug_pad_offsets)) > 1e-3
+        if not should_print:
+            return
+
+        self._last_printed_debug_pad_offsets = offset_tensor[0].clone()
+        offset_by_name = {name: offsets[i] for i, name in enumerate(self.ee_names)}
+        print("[finger-pad-calib] Updated finger_pad_offsets:")
+        print("    finger_pad_offsets = {")
+        for name in self.cfg.finger_pad_offsets:
+            x, y, z = offset_by_name[name]
+            print(f'        "{name}": ({x:.6f}, {y:.6f}, {z:.6f}),')
+        print("    }")
 
     def _get_observations(self) -> dict:
         self._compute_intermediate_values()
@@ -292,14 +375,19 @@ class PickReposeCubeEnv(DirectRLEnv):
         # ---- FINGERTIP approach (progress, pre-lift): sum of per-tip closest-distance gains ----
         ft_deltas = torch.clamp(self._closest_fingertip_dist - self._curr_fingertip_distances, 0.0, 10.0)
         self._closest_fingertip_dist = torch.minimum(self._closest_fingertip_dist, self._curr_fingertip_distances)
-        ft_rew = ft_deltas.sum(dim=-1) * (~lifted).float() * cfg.distance_delta_rew_scale
+        pre_lift = (~lifted).float()
+        thumb_ft_delta = ft_deltas[:, self._thumb_ee_idx]
+        other_ft_deltas = ft_deltas[:, self._other_ee_idx]
+        thumb_ft_rew = thumb_ft_delta * pre_lift * cfg.distance_delta_rew_scale
+        other_ft_rew = other_ft_deltas.sum(dim=-1) * pre_lift * cfg.distance_delta_rew_scale
+        ft_rew = thumb_ft_rew + other_ft_rew
 
         # ---- GRASP QUALITY (geometric, no contact sensor): palm-closeness x thumb-opposition.
         # Caging leaves the palm far and the thumb un-opposed -> ~0; a force-closure palm grasp -> ~1.
         # Used as a dense post-lift guide AND to GATE the keypoint reward (a cage can't reorient). ----
         obj = self.object_pos_w
         palm_close = 1.0 - torch.tanh(torch.norm(self.palm_center_w - obj, dim=-1) / cfg.palm_std)
-        tips = self.fingertip_tip_w  # (N, 5, 3)
+        tips = self.finger_pad_w  # (N, 5, 3)
         thumb_v = tips[:, self._thumb_ee_idx] - obj
         others_v = tips[:, self._other_ee_idx].mean(dim=1) - obj
         thumb_n = thumb_v / (thumb_v.norm(dim=-1, keepdim=True) + 1e-6)
@@ -337,6 +425,20 @@ class PickReposeCubeEnv(DirectRLEnv):
         self.extras["log"]["successes_mean"] = self.successes.float().mean()
         self.extras["log"]["keypoint_dist_mean"] = self._keypoints_max_dist.mean()
         self.extras["log"]["fingertip_dist_mean"] = self._curr_fingertip_distances.mean()
+        self.extras["log"]["thumb_dist_mean"] = self._curr_fingertip_distances[:, self._thumb_ee_idx].mean()
+        self.extras["log"]["other_fingers_dist_mean"] = self._curr_fingertip_distances[:, self._other_ee_idx].mean()
+        self.extras["log"]["thumb_ft_delta_mean"] = thumb_ft_delta.mean()
+        self.extras["log"]["other_fingers_ft_delta_mean"] = other_ft_deltas.mean()
+        self.extras["log"]["ft_rew_mean"] = ft_rew.mean()
+        self.extras["log"]["thumb_ft_rew_mean"] = thumb_ft_rew.mean()
+        self.extras["log"]["other_fingers_ft_rew_mean"] = other_ft_rew.mean()
+        self.extras["log"]["lift_rew_mean"] = lift_rew.mean()
+        self.extras["log"]["lift_bonus_mean"] = lift_bonus.mean()
+        self.extras["log"]["grasp_rew_mean"] = grasp_rew.mean()
+        self.extras["log"]["kp_rew_mean"] = kp_rew.mean()
+        self.extras["log"]["goal_bonus_mean"] = goal_bonus.mean()
+        self.extras["log"]["kuka_pen_mean"] = kuka_pen.mean()
+        self.extras["log"]["hand_pen_mean"] = hand_pen.mean()
         self.extras["log"]["grasp_quality_mean"] = grasp_quality.mean()
         self.extras["log"]["palm_close_mean"] = palm_close.mean()
         self.extras["log"]["oppose_mean"] = oppose.mean()
@@ -392,6 +494,7 @@ class PickReposeCubeEnv(DirectRLEnv):
         # robot to default pose
         joint_pos = self.default_joint_pos[env_ids]
         joint_vel = torch.zeros_like(joint_pos)
+        self.robot.set_joint_position_target(joint_pos, env_ids=env_ids)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
         self.dof_targets[env_ids] = joint_pos
 

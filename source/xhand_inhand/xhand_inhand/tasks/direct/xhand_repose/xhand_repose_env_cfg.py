@@ -25,9 +25,9 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import PhysxCfg, SimulationCfg
 from isaaclab.sim.spawners.materials.physics_materials_cfg import RigidBodyMaterialCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.noise import GaussianNoiseCfg, NoiseModelWithAdditiveBiasCfg
 
+from xhand_inhand.foundationpose_cube import FOUNDATIONPOSE_CUBE_SCALE, FOUNDATIONPOSE_CUBE_USD
 from xhand_inhand.robots import XHAND_RIGHT_CFG
 
 ##
@@ -214,13 +214,12 @@ class XHandReposeEnvCfg(DirectRLEnvCfg):
     fingertip_body_names = XHAND_FINGERTIPS
 
     # in-hand object ------------------------------------------------------ TUNE
-    # XHand is smaller than the Shadow Hand, so the dex cube is scaled down and
-    # placed above the palm. Tune `scale` and `pos` together with the hand pose.
+    # FoundationPose cube mesh is already 6 cm edge length and is placed above the palm.
     object_cfg: RigidObjectCfg = RigidObjectCfg(
         prim_path="/World/envs/env_.*/object",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Blocks/DexCube/dex_cube_instanceable.usd",
-            scale=(0.75, 0.75, 0.75),  # dex_cube 0.08 m -> 0.06 m edge
+            usd_path=FOUNDATIONPOSE_CUBE_USD,
+            scale=FOUNDATIONPOSE_CUBE_SCALE,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 kinematic_enabled=False,
                 disable_gravity=False,
@@ -241,8 +240,8 @@ class XHandReposeEnvCfg(DirectRLEnvCfg):
         prim_path="/Visuals/goal_marker",
         markers={
             "goal": sim_utils.UsdFileCfg(
-                usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Blocks/DexCube/dex_cube_instanceable.usd",
-                scale=(0.75, 0.75, 0.75),  # match object scale (0.06 m edge)
+                usd_path=FOUNDATIONPOSE_CUBE_USD,
+                scale=FOUNDATIONPOSE_CUBE_SCALE,
             )
         },
     )

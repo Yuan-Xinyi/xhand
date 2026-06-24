@@ -15,8 +15,6 @@ grasp baseline before moving to thin objects):
   * success reward on combined position + orientation error
 """
 
-import os  # noqa: F401
-
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, RigidObjectCfg
 from isaaclab.envs import DirectRLEnvCfg
@@ -26,9 +24,8 @@ from isaaclab.sim import PhysxCfg, SimulationCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
+from xhand_inhand.foundationpose_cube import FOUNDATIONPOSE_CUBE_SCALE, FOUNDATIONPOSE_CUBE_USD
 from xhand_inhand.robots import FR3_XHAND_CFG
-
-_CUBE_USD = f"{ISAAC_NUCLEUS_DIR}/Props/Blocks/DexCube/dex_cube_instanceable.usd"
 
 
 @configclass
@@ -72,8 +69,8 @@ class Fr3ReorientEnvCfg(DirectRLEnvCfg):
     object_cfg: RigidObjectCfg = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Object",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=_CUBE_USD,
-            scale=(0.75, 0.75, 0.75),
+            usd_path=FOUNDATIONPOSE_CUBE_USD,
+            scale=FOUNDATIONPOSE_CUBE_SCALE,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 solver_position_iteration_count=16,
                 solver_velocity_iteration_count=1,
@@ -124,5 +121,10 @@ class Fr3ReorientEnvCfg(DirectRLEnvCfg):
     # floating goal-pose marker (a cube at the target pose)
     goal_marker_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
         prim_path="/Visuals/goal_marker",
-        markers={"goal": sim_utils.UsdFileCfg(usd_path=_CUBE_USD, scale=(0.75, 0.75, 0.75))},
+        markers={
+            "goal": sim_utils.UsdFileCfg(
+                usd_path=FOUNDATIONPOSE_CUBE_USD,
+                scale=FOUNDATIONPOSE_CUBE_SCALE,
+            )
+        },
     )
