@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""FR3 + XHand pick-a-cube-and-reorient task (Direct workflow, lift-task-aligned)."""
+"""xArm7 + XHand pick-a-cube-and-reorient task (Direct workflow, lift-task-aligned)."""
 
 import gymnasium as gym
 

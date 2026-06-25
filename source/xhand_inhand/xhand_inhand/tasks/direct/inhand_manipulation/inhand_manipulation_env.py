@@ -7,27 +7,22 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, RigidObject
-from isaaclab.envs import DirectRLEnv
+from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
 from isaaclab.markers import VisualizationMarkers
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.math import quat_apply, quat_conjugate, quat_from_angle_axis, quat_mul, sample_uniform, saturate
 
 
-if TYPE_CHECKING:
-    from xhand_inhand.tasks.direct.xhand_repose.xhand_repose_env_cfg import XHandReposeEnvCfg
-
-
 class InHandManipulationEnv(DirectRLEnv):
-    cfg: XHandReposeEnvCfg
+    cfg: DirectRLEnvCfg
 
-    def __init__(self, cfg: XHandReposeEnvCfg, render_mode: str | None = None, **kwargs):
+    def __init__(self, cfg: DirectRLEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
 
         self.num_hand_dofs = self.hand.num_joints

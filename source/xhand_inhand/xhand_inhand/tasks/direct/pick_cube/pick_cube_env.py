@@ -75,21 +75,12 @@ class PickCubeEnv(DirectRLEnv):
         self._thumb_ee_idx = self.ee_names.index("thumb_rota_link2")
         self._other_ee_idx = [i for i in range(len(self.ee_names)) if i != self._thumb_ee_idx]
 
-        # tetrahedral subset of cube corners; max corner distance pins both position and orientation.
-        corners = torch.tensor(
-            [(1, 1, 1), (1, 1, -1), (-1, -1, 1), (-1, -1, -1)], dtype=torch.float, device=self.device
-        )
-        self._keypoint_offsets = corners * self.cfg.keypoint_half_extent
-
         # per-episode progress ratchets. -1 means "not armed yet"; first geometry update fills it.
         n_ft = len(self.ee_ids)
         self._lifted_object = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._highest_lift = torch.zeros(self.num_envs, device=self.device)
         self._closest_fingertip_dist = torch.full((self.num_envs, n_ft), -1.0, device=self.device)
-        self._closest_keypoint_max_dist = torch.full((self.num_envs,), -1.0, device=self.device)
         self._curr_fingertip_distances = torch.zeros((self.num_envs, n_ft), device=self.device)
-        self._keypoints_max_dist = torch.zeros(self.num_envs, device=self.device)
-        self._near_goal = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        self._near_goal_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._is_success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         # fixed goal point (env-local) + per-episode target orientation
@@ -192,30 +183,17 @@ class PickCubeEnv(DirectRLEnv):
         self.palm_quat = self.robot.data.body_quat_w[:, self.palm_idx]
         self.palm_center_w = palm_pos + quat_apply(self.palm_quat, self.palm_center_offset)
         self.palm_center_b = self.palm_center_w - root
+        palm_local_normal = torch.tensor([0.0, -1.0, 0.0], device=self.device).expand(self.num_envs, 3)
+        self.palm_normal_w = quat_apply(self.palm_quat, palm_local_normal)
 
         # fingertip -> object-center distances for pre-lift progress shaping
         self._curr_fingertip_distances = torch.norm(
             self.finger_pad_w - self.object_pos_w.unsqueeze(1), dim=-1
         )
 
-        # keypoint max-corner distance to the goal pose; this unifies post-lift position+orientation.
-        kp = self._keypoint_offsets.unsqueeze(0).expand(self.num_envs, -1, -1)
-        obj_kp = self.object_pos_w.unsqueeze(1) + quat_apply(
-            self.object_quat_w.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 4), kp.reshape(-1, 3)
-        ).reshape(self.num_envs, 4, 3)
-        goal_pos_w = self.target_pos + self.scene.env_origins
-        goal_kp = goal_pos_w.unsqueeze(1) + quat_apply(
-            self.target_quat.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 4), kp.reshape(-1, 3)
-        ).reshape(self.num_envs, 4, 3)
-        self._keypoints_max_dist = torch.norm(obj_kp - goal_kp, dim=-1).max(dim=-1).values
-
         ft_sent = self._closest_fingertip_dist < 0.0
         self._closest_fingertip_dist = torch.where(
             ft_sent, self._curr_fingertip_distances, self._closest_fingertip_dist
-        )
-        kp_sent = self._closest_keypoint_max_dist < 0.0
-        self._closest_keypoint_max_dist = torch.where(
-            kp_sent, self._keypoints_max_dist, self._closest_keypoint_max_dist
         )
 
     def _update_dbg_markers(self):
@@ -341,10 +319,23 @@ class PickCubeEnv(DirectRLEnv):
         # ---- lifting: sparse one-shot bonus when the object crosses the lift threshold ----
         object_z = self.object_pos_w[:, 2] - self.scene.env_origins[:, 2]
         z_lift = cfg.lift_z_offset + object_z - self.object_default_z
+        actual_lift = object_z - self.object_default_z
         lifted = (z_lift > cfg.lifting_bonus_threshold) | self._lifted_object
         just_crossed = lifted & ~self._lifted_object
         lift_bonus = just_crossed.float() * cfg.lifting_bonus
         self._lifted_object = lifted
+        self._is_success = actual_lift >= cfg.lift_success_height
+
+        # Dense lift progress is a per-episode ratchet: it only pays for new max lift height
+        # between the lift-bonus threshold and success height, so lowering and raising again
+        # cannot re-collect the same reward.
+        dense_lift_floor = torch.full_like(actual_lift, cfg.lifting_bonus_threshold)
+        dense_lift_ceiling = torch.full_like(actual_lift, cfg.lift_success_height)
+        prev_dense_lift = torch.maximum(self._highest_lift, dense_lift_floor)
+        curr_dense_lift = torch.minimum(actual_lift, dense_lift_ceiling)
+        dense_lift_delta = torch.clamp(curr_dense_lift - prev_dense_lift, min=0.0)
+        dense_lift_rew = dense_lift_delta * cfg.dense_lift_rew_scale
+        self._highest_lift = torch.maximum(self._highest_lift, actual_lift)
 
         # ---- pre-lift fingertip approach: progress in all 5 fingertip-to-object distances ----
         ft_deltas = torch.clamp(self._closest_fingertip_dist - self._curr_fingertip_distances, 0.0, 10.0)
@@ -355,14 +346,6 @@ class PickCubeEnv(DirectRLEnv):
         thumb_ft_rew = thumb_ft_delta * pre_lift * cfg.distance_delta_rew_scale
         other_ft_rew = other_ft_deltas.sum(dim=-1) * pre_lift * cfg.distance_delta_rew_scale
         ft_rew = thumb_ft_rew + other_ft_rew
-
-        # ---- post-lift keypoint progress: cube corners move toward target-pose corners ----
-        kp_delta = torch.clamp(self._closest_keypoint_max_dist - self._keypoints_max_dist, 0.0, 100.0)
-        self._closest_keypoint_max_dist = torch.minimum(self._closest_keypoint_max_dist, self._keypoints_max_dist)
-        kp_rew = kp_delta * lifted.float() * cfg.keypoint_rew_scale
-
-        # ---- success bonus: amortized over a short near-goal hold ----
-        goal_bonus = self._near_goal.float() * (cfg.reach_goal_bonus / cfg.success_steps)
 
         # ---- action penalty: L1 joint velocity, arm heavier than hand ----
         jv = self.robot.data.joint_vel
@@ -375,8 +358,8 @@ class PickCubeEnv(DirectRLEnv):
         self.extras["log"]["lifted_frac"] = lifted.float().mean()
         self.extras["log"]["z_lift_mean"] = z_lift.mean()
         self.extras["log"]["object_actual_lift_mean"] = (object_z - self.object_default_z).mean()
-        self.extras["log"]["near_goal_frac"] = self._near_goal.float().mean()
-        self.extras["log"]["keypoint_dist_mean"] = self._keypoints_max_dist.mean()
+        self.extras["log"]["highest_lift_mean"] = self._highest_lift.mean()
+        self.extras["log"]["success_frac"] = self._is_success.float().mean()
         self.extras["log"]["fingertip_dist_mean"] = self._curr_fingertip_distances.mean()
         self.extras["log"]["thumb_dist_mean"] = self._curr_fingertip_distances[:, self._thumb_ee_idx].mean()
         self.extras["log"]["other_fingers_dist_mean"] = self._curr_fingertip_distances[:, self._other_ee_idx].mean()
@@ -386,23 +369,25 @@ class PickCubeEnv(DirectRLEnv):
         self.extras["log"]["thumb_ft_rew_mean"] = thumb_ft_rew.mean()
         self.extras["log"]["other_fingers_ft_rew_mean"] = other_ft_rew.mean()
         self.extras["log"]["lift_bonus_mean"] = lift_bonus.mean()
-        self.extras["log"]["kp_rew_mean"] = kp_rew.mean()
-        self.extras["log"]["goal_bonus_mean"] = goal_bonus.mean()
+        self.extras["log"]["dense_lift_delta_mean"] = dense_lift_delta.mean()
+        self.extras["log"]["dense_lift_rew_mean"] = dense_lift_rew.mean()
         self.extras["log"]["kuka_pen_mean"] = kuka_pen.mean()
         self.extras["log"]["hand_pen_mean"] = hand_pen.mean()
 
-        return ft_rew + lift_bonus + kp_rew + goal_bonus + kuka_pen + hand_pen
+        return (
+            ft_rew
+            + lift_bonus
+            + dense_lift_rew
+            + kuka_pen
+            + hand_pen
+        )
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         self._compute_intermediate_values()
 
-        self._near_goal = self._keypoints_max_dist <= self.cfg.success_tolerance
-        self._near_goal_steps = torch.where(
-            self._near_goal,
-            self._near_goal_steps + 1,
-            torch.zeros_like(self._near_goal_steps),
-        )
-        self._is_success = self._near_goal_steps >= self.cfg.success_steps
+        object_z = self.object_pos_w[:, 2] - self.scene.env_origins[:, 2]
+        actual_lift = object_z - self.object_default_z
+        self._is_success = actual_lift >= self.cfg.lift_success_height
 
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         dropped = self.object_pos_w[:, 2] < (self.object_default_z - self.cfg.drop_height)
@@ -416,21 +401,31 @@ class PickCubeEnv(DirectRLEnv):
         super()._reset_idx(env_ids)
 
         self._lifted_object[env_ids] = False
+        self._highest_lift[env_ids] = 0.0
         self._closest_fingertip_dist[env_ids] = -1.0
-        self._closest_keypoint_max_dist[env_ids] = -1.0
-        self._near_goal[env_ids] = False
-        self._near_goal_steps[env_ids] = 0
         self._is_success[env_ids] = False
 
-        # robot to default pose
-        joint_pos = self.default_joint_pos[env_ids]
+        # robot to (optionally randomized) home pose: arm joints get a uniform offset around
+        # their home angle, clamped to the joint limits so randomization never leaves the URDF
+        # range. The bound (cfg.reset_arm_joint_noise) is kept small enough to keep the hand off
+        # the table -- no physics-based collision check is done.
+        joint_pos = self.default_joint_pos[env_ids].clone()
+        if self.cfg.reset_arm_joint_noise > 0.0:
+            arm_noise = sample_uniform(
+                -self.cfg.reset_arm_joint_noise,
+                self.cfg.reset_arm_joint_noise,
+                (len(env_ids), len(self._arm_joint_ids)),
+                device=self.device,
+            )
+            joint_pos[:, self._arm_joint_ids] += arm_noise
+            limits = self.robot.data.soft_joint_pos_limits[env_ids]
+            joint_pos = torch.clamp(joint_pos, limits[..., 0], limits[..., 1])
         joint_vel = torch.zeros_like(joint_pos)
         self.robot.set_joint_position_target(joint_pos, env_ids=env_ids)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
         self.dof_targets[env_ids] = joint_pos
         self._compute_intermediate_values()
         self._closest_fingertip_dist[env_ids] = -1.0
-        self._closest_keypoint_max_dist[env_ids] = -1.0
 
         # cube pose: default + xy noise + random yaw
         object_state = self.object.data.default_root_state[env_ids].clone()

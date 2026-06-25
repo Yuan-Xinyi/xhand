@@ -3,16 +3,16 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Direct-workflow config: FR3 + XHand pick a cube up and reorient it to a target pose.
+"""Direct-workflow config: xArm7 + XHand pick a cube up.
 
 Reward follows the SimToolReal-style staged structure:
 
   * pre-lift fingertip distance progress toward the cube center
-  * sparse one-shot lift bonus once the cube clears the table
-  * post-lift keypoint progress from cube corners to goal-pose corners
+  * sparse one-shot lift bonus once the cube is lifted 10 cm
+  * non-repeatable dense lift progress reward from 10 cm to 30 cm
 
 The reward is progress-based instead of occupancy-based so the policy cannot farm
-reward by merely hovering near, holding still, or lifting without carrying/reorienting.
+reward by merely hovering near or holding still.
 """
 
 import isaaclab.sim as sim_utils
@@ -26,7 +26,7 @@ from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
 from xhand_inhand.foundationpose_cube import FOUNDATIONPOSE_CUBE_SCALE, FOUNDATIONPOSE_CUBE_USD
-from xhand_inhand.robots import FR3_XHAND_CFG
+from xhand_inhand.robots import XARM7_XHAND_CFG
 
 
 @configclass
@@ -65,7 +65,7 @@ class PickCubeEnvCfg(DirectRLEnvCfg):
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=2.5, replicate_physics=True)
 
     # robot (no contact sensor needed -- the lift reward is height-gated)
-    robot_cfg: ArticulationCfg = FR3_XHAND_CFG.replace(prim_path="/World/envs/env_.*/Robot")
+    robot_cfg: ArticulationCfg = XARM7_XHAND_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     palm_body_name = "palm"
     # the 5 finger pads form the "end effector" (grasp assembly) for the reach reward
     ee_body_names = ["index_rota_link2", "mid_link2", "ring_link2", "pinky_link2", "thumb_rota_link2"]
@@ -113,28 +113,31 @@ class PickCubeEnvCfg(DirectRLEnvCfg):
     reset_object_yaw_range = (-3.14159, 3.14159)
     reset_min_hand_object_dist = 0.060
 
-    # ---- goal: lift the cube to a FIXED point + a target ORIENTATION ----
-    # Orientation is specified as roll/pitch/yaw ranges, exactly like the reference
-    # lift task's `UniformPoseCommandCfg.Ranges` (which fixes them to 0; here they
-    # are opened up so the policy must reorient the cube to the shown pose).
+    # reset randomization of the ARM start pose: a symmetric uniform offset (rad) added to
+    # each of the 7 arm joints' home angle, then clamped to the joint limits. Keep it small
+    # enough that the perturbed home pose keeps the hand clear of the table -- there is no
+    # physics-based collision check, so this bound is the only guard against table penetration.
+    # Set to 0.0 to disable (always start exactly at the home pose). The hand joints are not
+    # randomized (they stay at the open home pose).
+    reset_arm_joint_noise = 0.10
+
+    # Kept in the observation/marker path for compatibility with existing policies and scripts.
+    # The current task succeeds purely by lifting the cube 30 cm.
     target_pos = (0.5, 0.0, 0.35)
     target_rot_range_roll = (-3.14159, 3.14159)
     target_rot_range_pitch = (-3.14159, 3.14159)
     target_rot_range_yaw = (-3.14159, 3.14159)
 
     # ---- staged reward ----
-    lift_z_offset = 0.05  # SimToolReal offset: threshold 0.15 means ~0.10 m actual lift
-    lifting_bonus_threshold = 0.15
+    lift_z_offset = 0.0
+    lifting_bonus_threshold = 0.10
+    lift_success_height = 0.30
     lifting_bonus = 300.0
+    dense_lift_rew_scale = 1000.0
     distance_delta_rew_scale = 50.0
-    keypoint_rew_scale = 200.0
-    keypoint_half_extent = 0.030  # 6 cm cube half-edge
-    success_tolerance = 0.05
-    reach_goal_bonus = 1000.0
-    success_steps = 10
 
     # action regularization: L1 joint velocity, arm penalized 10x the hand
-    arm_joint_names = ["fr3_joint[1-7]"]
+    arm_joint_names = ["joint[1-7]"]
     hand_joint_names = ["(thumb|index|middle|ring|pinky)_joint.*"]
     kuka_actions_penalty_scale = 0.03
     hand_actions_penalty_scale = 0.003
