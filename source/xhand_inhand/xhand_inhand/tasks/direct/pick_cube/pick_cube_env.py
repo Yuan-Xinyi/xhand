@@ -406,6 +406,8 @@ class PickCubeEnv(DirectRLEnv):
 
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         dropped = self.object_pos_w[:, 2] < (self.object_default_z - self.cfg.drop_height)
+        if not self.cfg.terminate_on_drop:
+            dropped = torch.zeros_like(dropped)
         return dropped | self._is_success, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):

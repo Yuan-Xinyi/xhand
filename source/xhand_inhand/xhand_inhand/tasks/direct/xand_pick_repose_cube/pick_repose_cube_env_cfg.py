@@ -194,7 +194,8 @@ class PickReposeCubeEnvCfg(DirectRLEnvCfg):
     kuka_actions_penalty_scale = 0.03
     hand_actions_penalty_scale = 0.003
 
-    # termination: cube fell this far below its rest height, or hand lost the object
+    # termination: end the episode when the cube falls this far below its rest height, or hand lost the object
+    terminate_on_drop = True
     drop_height = 0.10
     hand_far_dist = 1.0             # max fingertip-to-object distance (m) before giving up
 

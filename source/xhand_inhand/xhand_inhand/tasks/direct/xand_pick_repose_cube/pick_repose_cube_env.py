@@ -467,6 +467,8 @@ class PickReposeCubeEnv(DirectRLEnv):
 
         # ---- terminations ----
         dropped = self.object_pos_w[:, 2] < (self.object_default_z - self.cfg.drop_height)
+        if not self.cfg.terminate_on_drop:
+            dropped = torch.zeros_like(dropped)
         hand_far = self._curr_fingertip_distances.max(dim=-1).values > self.cfg.hand_far_dist
         if self.cfg.max_consecutive_successes > 0:
             max_succ = self.successes >= self.cfg.max_consecutive_successes

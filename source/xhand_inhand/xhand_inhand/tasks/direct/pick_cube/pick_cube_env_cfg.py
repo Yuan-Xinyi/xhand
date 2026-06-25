@@ -139,7 +139,8 @@ class PickCubeEnvCfg(DirectRLEnvCfg):
     kuka_actions_penalty_scale = 0.03
     hand_actions_penalty_scale = 0.003
 
-    # termination: cube fell this far below its rest height
+    # termination: end the episode when the cube falls this far below its rest height
+    terminate_on_drop = True
     drop_height = 0.10
 
     # debug markers: palm-center (red sphere), fingertips (green spheres), palm-normal ray (blue).
