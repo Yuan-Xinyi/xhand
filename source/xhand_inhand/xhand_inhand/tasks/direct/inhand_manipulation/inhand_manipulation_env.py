@@ -68,6 +68,22 @@ class InHandManipulationEnv(DirectRLEnv):
         self.successes = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         self.consecutive_successes = torch.zeros(1, dtype=torch.float, device=self.device)
 
+        # success-tolerance curriculum: start at cfg.success_tolerance and shrink toward
+        # `target_success_tolerance` as the policy becomes competent. All fields are optional
+        # (read via getattr), so cfgs that don't set them keep a fixed tolerance.
+        #   interval <= 0                 -> curriculum OFF (fixed cfg.success_tolerance)
+        #   target == cfg.success_tolerance -> nothing to tighten (also effectively off)
+        self.success_tolerance = float(self.cfg.success_tolerance)
+        self.target_success_tolerance = float(
+            getattr(self.cfg, "target_success_tolerance", self.cfg.success_tolerance)
+        )
+        self.tolerance_curriculum_increment = float(getattr(self.cfg, "tolerance_curriculum_increment", 1.0))
+        self.tolerance_curriculum_interval = int(getattr(self.cfg, "tolerance_curriculum_interval", 0))
+        self.tolerance_curriculum_success_threshold = float(
+            getattr(self.cfg, "tolerance_curriculum_success_threshold", 1e9)
+        )
+        self._steps_since_tol_update = 0
+
         # unit tensors
         self.x_unit_tensor = torch.tensor([1, 0, 0], dtype=torch.float, device=self.device).repeat((self.num_envs, 1))
         self.y_unit_tensor = torch.tensor([0, 1, 0], dtype=torch.float, device=self.device).repeat((self.num_envs, 1))
@@ -165,16 +181,20 @@ class InHandManipulationEnv(DirectRLEnv):
             self.cfg.rot_eps,
             self.actions,
             self.cfg.action_penalty_scale,
-            self.cfg.success_tolerance,
+            self.success_tolerance,
             self.cfg.reach_goal_bonus,
             self.cfg.fall_dist,
             self.cfg.fall_penalty,
             self.cfg.av_factor,
         )
 
+        # tighten the success tolerance once the policy is competent at the current one
+        self._update_success_tolerance()
+
         if "log" not in self.extras:
             self.extras["log"] = dict()
         self.extras["log"]["consecutive_successes"] = self.consecutive_successes.mean()
+        self.extras["log"]["success_tolerance"] = self.success_tolerance
 
         # reset goals if the goal has been reached
         goal_env_ids = self.reset_goal_buf.nonzero(as_tuple=False).squeeze(-1)
@@ -182,6 +202,27 @@ class InHandManipulationEnv(DirectRLEnv):
             self._reset_target_pose(goal_env_ids)
 
         return total_reward
+
+    def _update_success_tolerance(self):
+        """Adaptive curriculum: tighten the success tolerance toward the target.
+
+        Every ``tolerance_curriculum_interval`` env steps, if the smoothed consecutive-success
+        metric shows the policy is competent at the current tolerance, shrink the tolerance by
+        ``tolerance_curriculum_increment`` (multiplicative), clamped at ``target_success_tolerance``.
+        It only ever tightens (monotonic). ``interval <= 0`` keeps the tolerance fixed.
+        """
+        if self.tolerance_curriculum_interval <= 0 or self.success_tolerance <= self.target_success_tolerance:
+            return
+        self._steps_since_tol_update += 1
+        if self._steps_since_tol_update < self.tolerance_curriculum_interval:
+            return
+        # enough steps elapsed; tighten only while the policy is clearing the current tolerance
+        if self.consecutive_successes.item() >= self.tolerance_curriculum_success_threshold:
+            self.success_tolerance = max(
+                self.target_success_tolerance,
+                self.success_tolerance * self.tolerance_curriculum_increment,
+            )
+            self._steps_since_tol_update = 0
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         self._compute_intermediate_values()
@@ -194,7 +235,7 @@ class InHandManipulationEnv(DirectRLEnv):
             # Reset progress (episode length buf) on goal envs if max_consecutive_success > 0
             rot_dist = self._orientation_distance()
             self.episode_length_buf = torch.where(
-                torch.abs(rot_dist) <= self.cfg.success_tolerance,
+                torch.abs(rot_dist) <= self.success_tolerance,
                 torch.zeros_like(self.episode_length_buf),
                 self.episode_length_buf,
             )

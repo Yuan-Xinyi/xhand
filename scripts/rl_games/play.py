@@ -37,6 +37,31 @@ parser.add_argument(
     help="When no checkpoint provided, use the last saved model. Otherwise use the best saved model.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument(
+    "--external_cube_pose_npy",
+    type=str,
+    default=None,
+    help="Path to a 4x4 robot_T_cube .npy pose. The pose is injected into env 0 after reset.",
+)
+parser.add_argument(
+    "--foundationpose_cube",
+    action="store_true",
+    help="Use D405 + FoundationPose to initialize env 0 cube pose.",
+)
+parser.add_argument(
+    "--camera_to_robot_tf",
+    type=str,
+    default=None,
+    help="Optional path to a 4x4 robot_T_camera .npy transform for FoundationPose. If omitted, camera_T_cube is used as robot_T_cube.",
+)
+parser.add_argument(
+    "--external_cube_track",
+    action="store_true",
+    help="Continuously overwrite the Isaac cube pose from the external provider. Debug only: this pins the cube.",
+)
+parser.add_argument("--foundationpose_width", type=int, default=640)
+parser.add_argument("--foundationpose_height", type=int, default=480)
+parser.add_argument("--foundationpose_fps", type=int, default=30)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -60,6 +85,7 @@ import random
 import time
 
 import gymnasium as gym
+import numpy as np
 import torch
 from rl_games.common import env_configurations, vecenv
 from rl_games.common.player import BasePlayer
@@ -86,6 +112,148 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 import xhand_inhand.tasks  # noqa: F401, E402
 
 # PLACEHOLDER: Extension template (do not remove this comment)
+
+
+def _rotmat_to_quat_wxyz(rotmat: np.ndarray) -> np.ndarray:
+    """3x3 rotation matrix to Isaac/torch quaternion order (w, x, y, z)."""
+    m = np.asarray(rotmat, dtype=np.float64)
+    tr = float(np.trace(m))
+    if tr > 0.0:
+        s = math.sqrt(tr + 1.0) * 2.0
+        qw = 0.25 * s
+        qx = (m[2, 1] - m[1, 2]) / s
+        qy = (m[0, 2] - m[2, 0]) / s
+        qz = (m[1, 0] - m[0, 1]) / s
+    else:
+        i = int(np.argmax(np.diag(m)))
+        if i == 0:
+            s = math.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
+            qw = (m[2, 1] - m[1, 2]) / s
+            qx = 0.25 * s
+            qy = (m[0, 1] + m[1, 0]) / s
+            qz = (m[0, 2] + m[2, 0]) / s
+        elif i == 1:
+            s = math.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
+            qw = (m[0, 2] - m[2, 0]) / s
+            qx = (m[0, 1] + m[1, 0]) / s
+            qy = 0.25 * s
+            qz = (m[1, 2] + m[2, 1]) / s
+        else:
+            s = math.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
+            qw = (m[1, 0] - m[0, 1]) / s
+            qx = (m[0, 2] + m[2, 0]) / s
+            qy = (m[1, 2] + m[2, 1]) / s
+            qz = 0.25 * s
+    q = np.array([qw, qx, qy, qz], dtype=np.float32)
+    return q / np.linalg.norm(q)
+
+
+class NpyCubePoseProvider:
+    def __init__(self, path: str):
+        pose = np.load(path).astype(np.float32)
+        if pose.shape != (4, 4):
+            raise ValueError(f"{path} must contain a 4x4 robot_T_cube matrix, got {pose.shape}")
+        self.pose = pose
+
+    def get_pose(self) -> np.ndarray:
+        return self.pose
+
+    def close(self):
+        pass
+
+
+class FoundationPoseCubeProvider:
+    def __init__(self, camera_to_robot_tf: str, width: int, height: int, fps: int):
+        if camera_to_robot_tf is None:
+            self.robot_T_camera = np.eye(4, dtype=np.float32)
+            print(
+                "[FoundationPose] --camera_to_robot_tf not provided; using camera_T_cube directly as robot_T_cube. "
+                "This follows live_demo.py pose extraction but is not hand-eye calibrated."
+            )
+        else:
+            self.robot_T_camera = np.load(camera_to_robot_tf).astype(np.float32)
+            if self.robot_T_camera.shape != (4, 4):
+                raise ValueError(f"{camera_to_robot_tf} must contain a 4x4 robot_T_camera matrix")
+
+        foundationpose_root = os.environ.get("FOUNDATIONPOSE_ROOT", "/home/lqin/disk2/FoundationPose")
+        cube_dir = os.path.join(foundationpose_root, "cube")
+        if cube_dir not in sys.path:
+            sys.path.insert(0, cube_dir)
+
+        from live_demo import build_estimator, select_mask
+        import pyrealsense2 as rs
+
+        self._rs = rs
+        self._select_mask = select_mask
+        mesh_file = os.path.join(cube_dir, "mesh", "textured.obj")
+        self._est, _, _, _, _ = build_estimator(mesh_file)
+        self._pipeline = rs.pipeline()
+        config = rs.config()
+        config.enable_stream(rs.stream.color, width, height, rs.format.rgb8, fps)
+        config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
+        profile = self._pipeline.start(config)
+        self._depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
+        self._align = rs.align(rs.stream.color)
+        for _ in range(15):
+            self._pipeline.wait_for_frames()
+        color, depth, K = self._grab()
+        mask = self._select_mask(color)
+        if mask is None:
+            raise RuntimeError("FoundationPose init mask was cancelled.")
+        self._est.register(K=K, rgb=color, depth=depth, ob_mask=mask, iteration=5)
+
+    def _grab(self):
+        fr = self._align.process(self._pipeline.wait_for_frames())
+        color_frame = fr.get_color_frame()
+        depth_frame = fr.get_depth_frame()
+        color = np.asarray(color_frame.get_data())
+        depth = np.asarray(depth_frame.get_data()).astype(np.float32) * self._depth_scale
+        intr = color_frame.profile.as_video_stream_profile().intrinsics
+        K = np.array([[intr.fx, 0, intr.ppx], [0, intr.fy, intr.ppy], [0, 0, 1]], float)
+        return color, depth, K
+
+    def get_pose(self) -> np.ndarray:
+        color, depth, K = self._grab()
+        camera_T_cube = self._est.track_one(rgb=color, depth=depth, K=K, iteration=2).astype(np.float32)
+        return self.robot_T_camera @ camera_T_cube
+
+    def close(self):
+        self._pipeline.stop()
+
+
+def _make_external_cube_provider():
+    if args_cli.external_cube_pose_npy is not None:
+        return NpyCubePoseProvider(args_cli.external_cube_pose_npy)
+    if args_cli.foundationpose_cube:
+        return FoundationPoseCubeProvider(
+            args_cli.camera_to_robot_tf,
+            args_cli.foundationpose_width,
+            args_cli.foundationpose_height,
+            args_cli.foundationpose_fps,
+        )
+    return None
+
+
+def _apply_robot_frame_cube_pose(base_env, robot_T_cube: np.ndarray):
+    """Write env-0 cube pose from robot-base frame into Isaac world frame."""
+    if base_env.num_envs != 1:
+        raise ValueError("External cube pose injection currently requires --num_envs 1")
+    device = base_env.device
+    root_pos = base_env.robot.data.root_pos_w[0]
+    pos_robot = torch.tensor(robot_T_cube[:3, 3], dtype=torch.float32, device=device)
+    pos_w = root_pos + pos_robot
+    quat_w = torch.tensor(_rotmat_to_quat_wxyz(robot_T_cube[:3, :3]), dtype=torch.float32, device=device)
+    pose = torch.cat([pos_w, quat_w], dim=0).unsqueeze(0)
+    env_ids = torch.tensor([0], dtype=torch.long, device=device)
+    base_env.object.write_root_pose_to_sim(pose, env_ids)
+    base_env.object.write_root_velocity_to_sim(torch.zeros((1, 6), dtype=torch.float32, device=device), env_ids)
+    base_env._compute_intermediate_values()
+
+
+def _refresh_obs_from_base(env_wrapper):
+    obs_dict = env_wrapper.unwrapped._get_observations()
+    processed = env_wrapper._process_obs(obs_dict)
+    return processed["obs"] if isinstance(processed, dict) else processed
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -201,6 +369,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # reset environment
     obs = env.reset()
+    cube_pose_provider = _make_external_cube_provider()
+    if cube_pose_provider is not None:
+        robot_T_cube = cube_pose_provider.get_pose()
+        _apply_robot_frame_cube_pose(env.unwrapped, robot_T_cube)
+        obs = _refresh_obs_from_base(env)
+        t = robot_T_cube[:3, 3]
+        print(f"[external-cube] initialized env-0 cube pose from robot frame: {t[0]:+.3f} {t[1]:+.3f} {t[2]:+.3f} m")
     if isinstance(obs, dict):
         obs = obs["obs"]
     timestep = 0
@@ -217,6 +392,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         start_time = time.time()
         # run everything in inference mode
         with torch.inference_mode():
+            if cube_pose_provider is not None and args_cli.external_cube_track:
+                robot_T_cube = cube_pose_provider.get_pose()
+                _apply_robot_frame_cube_pose(env.unwrapped, robot_T_cube)
+                obs = _refresh_obs_from_base(env)
+                if isinstance(obs, dict):
+                    obs = obs["obs"]
             # convert obs to agent format
             obs = agent.obs_to_torch(obs)
             # agent stepping
@@ -242,6 +423,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             time.sleep(sleep_time)
 
     # close the simulator
+    if cube_pose_provider is not None:
+        cube_pose_provider.close()
     env.close()
 
 
