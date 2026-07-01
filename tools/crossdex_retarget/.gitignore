@@ -1,0 +1,10 @@
+# licensed MANO model (download yourself from https://mano.is.tue.mpg.de/)
+mano-models/
+
+# regenerable / large artifacts
+dataset/
+CrossDex_ref/
+__pycache__/
+*.log
+
+# keep: models/*.pt + *_meta.pkl (runtime), assets/, configs/, *.py, README.md

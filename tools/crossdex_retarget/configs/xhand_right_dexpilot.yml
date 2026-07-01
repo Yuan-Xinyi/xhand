@@ -1,0 +1,32 @@
+retargeting:
+  type: DexPilot
+  # absolute path filled at runtime via set_default_urdf_dir + relative name,
+  # or replaced with an absolute path by the driver script.
+  urdf_path: xhand_right.urdf
+
+  # Robot (target) hand joints, in the SAME order as the Isaac Lab xhand actuator order:
+  # thumb[0:3], index[3:6], middle[6:8], ring[8:10], pinky[10:12]
+  target_joint_names: [
+    "thumb_joint0", "thumb_joint1", "thumb_joint2",
+    "index_joint0", "index_joint1", "index_joint2",
+    "middle_joint0", "middle_joint1",
+    "ring_joint0", "ring_joint1",
+    "pinky_joint0", "pinky_joint1",
+  ]
+
+  wrist_link_name: "palm"
+
+  # Order MUST be [thumb, index, middle, ring, pinky] so DexPilot maps them to
+  # MANO keypoint tips 4, 8, 12, 16, 20 respectively (human_indices = idx*4).
+  finger_tip_link_names: [
+    "thumb_rota_link2", "index_rota_link2", "mid_link2", "ring_link2", "pinky_link2",
+  ]
+
+  # Scales human (MANO) keypoint vectors to robot hand size.
+  # Swept over {1.0,1.5,2.0,2.5}; 1.5 maximizes per-joint token range and allows
+  # a more open pre-grasp hand. NOTE: DexPilot matches only fingertip positions,
+  # so the distal joints (index_joint2, middle_joint1, ring_joint1, pinky_joint1,
+  # thumb_joint2) stay regularized at their midpoint and are not driven by the token.
+  scaling_factor: 1.5
+
+  low_pass_alpha: 0.2

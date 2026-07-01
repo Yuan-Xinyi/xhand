@@ -28,6 +28,7 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CHECKPOINT = "logs/rl_games/pick_cube/0_2026-06-25_12-07-39/nn/pick_cube.pth"
+DEFAULT_CALIB_YAML = "/home/lqin/one/one/camera/RS435/calibration_result.yaml"
 
 ISAAC_JOINT_NAMES = [
     "joint1",
@@ -112,6 +113,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-print-every", type=int, default=10)
     parser.add_argument("--no_pose_capture", action="store_true", help="Use --pose_npy instead of running FoundationPose.")
     parser.add_argument("--pose_npy", default="/tmp/foundationpose_cube_pose.npy")
+    parser.add_argument(
+        "--calib_yaml",
+        default=DEFAULT_CALIB_YAML,
+        help="D435 eye-to-hand calibration (T_base_cam). Maps the FoundationPose camera_T_cube into the xArm base frame.",
+    )
+    parser.add_argument(
+        "--no_calib",
+        action="store_true",
+        help="Treat the cube pose as already expressed in the xArm base frame (skip the T_base_cam transform).",
+    )
 
     # FoundationPose args reused by capture_pose().
     parser.add_argument("--task", default="Pick-Cube-Direct-v0")
@@ -132,6 +143,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_play", action="store_true", default=True)
     parser.add_argument("play_args", nargs=argparse.REMAINDER)
     return parser.parse_args()
+
+
+def load_base_T_cam(calib_yaml: str) -> np.ndarray:
+    """Load the eye-to-hand extrinsic T_base_cam (pose of the D435 in the xArm base frame).
+
+    Convention from the calibration file: T_A_B maps points B->A, so
+    p_base = T_base_cam @ p_cam.
+    """
+    import yaml
+
+    path = Path(calib_yaml).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"D435 calibration not found: {path}")
+    with open(path) as f:
+        data = yaml.safe_load(f)
+    mat = np.array(data["T_base_cam"]["matrix"], dtype=np.float32)
+    if mat.shape != (4, 4):
+        raise RuntimeError(f"T_base_cam.matrix must be 4x4, got {mat.shape} from {path}")
+    return mat
 
 
 def _maybe_reexec_one_for_real(args: argparse.Namespace) -> None:
@@ -171,12 +201,16 @@ def _maybe_reexec_one_for_real(args: argparse.Namespace) -> None:
         str(args.max_hand_step),
         "--dry-print-every",
         str(args.dry_print_every),
+        "--calib_yaml",
+        args.calib_yaml,
         "--real",
     ]
     if args.execute:
         argv.append("--execute")
     if args.skip_start_sync:
         argv.append("--skip-start-sync")
+    if args.no_calib:
+        argv.append("--no_calib")
 
     env = os.environ.copy()
     pythonpath = env.get("PYTHONPATH", "")
@@ -480,14 +514,27 @@ def main() -> None:
         raise ValueError("--execute requires --real")
 
     if args.no_pose_capture:
-        robot_t_cube = np.load(args.pose_npy).astype(np.float32)
+        cam_t_cube = np.load(args.pose_npy).astype(np.float32)
     else:
         from foundationpose_then_play import capture_pose
 
-        robot_t_cube = capture_pose(args).astype(np.float32)
+        cam_t_cube = capture_pose(args).astype(np.float32)
         _maybe_reexec_one_for_real(args)
 
     _maybe_reexec_one_for_real(args)
+
+    # FoundationPose returns the cube pose in the D435 camera frame. Map it into the
+    # xArm base frame (the frame OneKinematics / the policy observation lives in) using
+    # the eye-to-hand calibration: base_T_cube = T_base_cam @ camera_T_cube.
+    if args.no_calib:
+        robot_t_cube = cam_t_cube
+    else:
+        base_T_cam = load_base_T_cam(args.calib_yaml)
+        robot_t_cube = (base_T_cam @ cam_t_cube).astype(np.float32)
+        c = cam_t_cube[:3, 3]
+        b = robot_t_cube[:3, 3]
+        print(f"[calib] camera_T_cube xyz(m): {c[0]:+.3f} {c[1]:+.3f} {c[2]:+.3f}")
+        print(f"[calib] base_T_cube   xyz(m): {b[0]:+.3f} {b[1]:+.3f} {b[2]:+.3f}")
 
     kin = OneKinematics()
     policy = RlGamesMlpPolicy(args.checkpoint, device="cpu")
