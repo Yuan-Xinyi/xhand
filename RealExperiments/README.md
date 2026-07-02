@@ -68,7 +68,7 @@ To connect hardware but not move it:
 ```bash
 /home/lqin/miniconda3/envs/env_isaaclab/bin/python RealExperiments/foundationpose_then_real.py \
   --real \
-  --xarm-ip 192.168.1.232 \
+  --xarm-ip 192.168.1.205 \
   --xhand-port /dev/ttyUSB0 \
   --steps 10
 ```
@@ -80,7 +80,7 @@ before moving to the RL start pose and before streaming policy commands:
 /home/lqin/miniconda3/envs/env_isaaclab/bin/python RealExperiments/foundationpose_then_real.py \
   --real \
   --execute \
-  --xarm-ip 192.168.1.232 \
+  --xarm-ip 192.168.1.205 \
   --xhand-port /dev/ttyUSB0
 ```
 

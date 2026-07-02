@@ -101,7 +101,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
     parser.add_argument("--steps", type=int, default=250, help="50 Hz control steps. 250 steps = 5 seconds.")
     parser.add_argument("--rate", type=float, default=50.0)
-    parser.add_argument("--xarm-ip", default="192.168.1.232")
+    parser.add_argument("--xarm-ip", default="192.168.1.205")
     parser.add_argument("--xhand-port", default="/dev/ttyUSB0")
     parser.add_argument("--real", action="store_true", help="Connect to xArm7 and XHand.")
     parser.add_argument("--execute", action="store_true", help="Actually stream commands. Requires --real.")

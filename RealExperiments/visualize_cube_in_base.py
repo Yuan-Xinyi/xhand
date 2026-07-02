@@ -223,7 +223,7 @@ def main() -> None:
     # camera toward the cube. A red sight line connects the camera to the cube. If the
     # camera ends up on the wrong side or +z points away from the cube, the extrinsic
     # axes are flipped — that is what makes detection look "reversed".
-    if not args.no_calib:
+    if base_T_cam is not None:
         cam_pos = base_T_cam[:3, 3]
         ossop.frame_from_tf(base_T_cam, length_scale=1.5).attach_to(base.scene)
         sight = np.stack([cam_pos, base_t_cube[:3, 3]]).reshape(1, 2, 3).astype(np.float32)
