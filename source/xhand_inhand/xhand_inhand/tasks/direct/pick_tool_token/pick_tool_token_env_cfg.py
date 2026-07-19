@@ -175,6 +175,15 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # hand actually closed on the handle -- a solid lift-off, achievable for this hammer.
     lift_success_height = 0.20
 
+    # ANTI-HACK: terminate the episode if the ARM presses on the table (the "press-up" hack levers the
+    # object up off the table's reaction force instead of a real arm lift). Detected GEOMETRICALLY (no
+    # contact sensor): any arm link's world z dropping to within arm_table_margin of the table plane
+    # (= the object's at-rest lowest corner) means the arm reached the table. The arm links never
+    # legitimately go that low -- only the fingertips reach down to the object -- so this is a clean signal.
+    terminate_on_arm_table_contact = True
+    arm_contact_bodies = ("link1", "link2", "link3", "link4", "link5", "link6", "link7", "link8")
+    arm_table_margin = 0.04    # m; an arm link center this close (or below) the table plane = pressing it
+
     # BIG lift pay (mvp20, user call): the mvp19 plateau (~324) was a "gentle-hold annuity" -- holding
     # pays a steady 5.0/step while lifting pays one-time ratchet increments with slip risk, so the
     # policy held without lifting (peak lift 8mm). 5x the dense scale: +50 per NEW cm of lift while
