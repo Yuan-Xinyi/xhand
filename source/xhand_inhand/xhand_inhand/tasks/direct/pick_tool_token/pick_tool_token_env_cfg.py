@@ -145,11 +145,19 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     grasp_bonus = 100.0
 
     # R_lift (mvp26): per-step NORMALIZED occupancy height (NOT a ratchet). r_lift = lift_step_max *
-    # clip(grasp_rel_lift/lift_success_height,0,1) * is_grasped. lift_step_max=20 => at 20cm it pays 20/step;
-    # holding there ~100 steps ~= 2000, so a STABLY HELD lift dominates. A crush-launch pays only while the
-    # object is airborne (then falls back to 0) -> can't be farmed like the mvp20 ratchet's transient peak.
-    lift_step_max = 20.0
+    # clip(grasp_rel_lift/lift_success_height,0,1) * is_grasped * clean_lift. lift_step_max=40 => at 20cm it
+    # pays 40/step; at 2cm clean clearance ~4/step (already > the grasp-hold floor, so lifting always beats
+    # just holding -> a positive lift gradient from mm 1). Occupancy on the TRUE clearance + clean_lift gate
+    # -> can't be farmed by tipping/wiggling.
+    lift_step_max = 40.0
     lift_success_bonus = 200.0
+
+    # R_hold: small per-step reward for MAINTAINING a stable grasp (is_grasped). MUST exceed reach_reward_scale
+    # (2.0) so "grasp and hold" strictly beats "hover near the object" -- otherwise the policy regresses to
+    # hovering (reach pays 2/step, a static grasp paid 0) and drops the grasp. Lift (up to 40/step) dwarfs it,
+    # so holding-without-lifting is never the optimum; this just welds the policy into the grasp so it can
+    # then discover the lift.
+    grasp_hold_scale = 3.0
 
     # R_reach: directional pre-grasp occupancy kernel (mvp20 kernel), gated to (~is_grasped) so it turns OFF
     # once grasped (no occupancy annuity after the grasp). coarse (reach_scale_far) pulls the arm in from

@@ -605,6 +605,10 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         lift_fraction = torch.clamp(grasp_rel_lift / cfg.lift_success_height, 0.0, 1.0)
         r_lift_height = cfg.lift_step_max * lift_fraction * is_grasped.float() * clean_lift
 
+        # ---- R_hold: per-step grasp-maintenance floor. Keeps the policy welded into a stable grasp (beats
+        # hovering) so it doesn't drop the grasp; dwarfed by R_lift so it never becomes the optimum. ----
+        r_hold = cfg.grasp_hold_scale * is_grasped.float()
+
         # one-shot pull to the finish line: paid once when the STRICT stable success first latches (held
         # success_hold_steps at >=20cm, cleared, nearly still). _is_success is set in _get_dones (runs
         # just before this each step).
@@ -657,8 +661,9 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         log["r_grasp_mean"] = r_grasp.mean()
         log["r_lift_height_mean"] = r_lift_height.mean()
         log["r_lift_success_mean"] = r_lift_success.mean()
+        log["r_hold_mean"] = r_hold.mean()
 
-        return r_reach + r_grasp + r_lift_height + r_lift_success
+        return r_reach + r_grasp + r_lift_height + r_lift_success + r_hold
 
     # ------------------------------------------------------------------ termination
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
