@@ -39,8 +39,8 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # PickCubeTokenEnv._pre_physics_step (arm: dof_target += action_scale*a; hand: token -> retarget NN).
     action_space = 16
 
-    observation_space = 89      # 86 base (19 joint_pos + 19 joint_vel + 15 ee + 3 palm + 3 obj_pos + 4
-    state_space = 89            # obj_quat + 3 tgt_pos + 4 tgt_quat + 16 action) + 3 phase (is_grasped etc.)
+    observation_space = 87      # 86 base (19 joint_pos + 19 joint_vel + 15 ee + 3 palm + 3 obj_pos + 4
+    state_space = 87            # obj_quat + 3 tgt_pos + 4 tgt_quat + 16 action) + 1 lift-progress feature
 
     # robot with CONTACT REPORTING enabled on its bodies (needed for the fingertip contact sensors /
     # R_contact). A fresh .replace() so the shared XARM7_XHAND_CFG is untouched.
@@ -157,6 +157,12 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # -> can't be farmed by tipping/wiggling.
     lift_step_max = 40.0
     lift_success_bonus = 200.0
+
+    # MINIMAL reward (2026-07-19): R_lift = lift_scale * clip(clearance / lift_success_height, 0, 1), per step.
+    # lift_scale=20 => at the 20cm success height it pays 20/step; at 10cm ~10/step. Dominates R_reach (max
+    # reach_reward_scale=2) once the object is a few cm up, so lifting is the objective and approaching is
+    # just the on-ramp.
+    lift_scale = 20.0
 
     # R_hold: small per-step reward for MAINTAINING a stable grasp (is_grasped). MUST exceed reach_reward_scale
     # (2.0) so "grasp and hold" strictly beats "hover near the object" -- otherwise the policy regresses to

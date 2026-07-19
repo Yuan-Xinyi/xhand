@@ -501,24 +501,13 @@ class PickToolTokenEnv(PickCubeTokenEnv):
 
     # ------------------------------------------------------------------ reward
     def _get_observations(self) -> dict:
-        # append 3 PHASE features so the policy KNOWS which stage it is in (the reward switches hard at
-        # is_grasped: before -> approach/close; after -> hold fingers + move up). Inferring the phase
-        # from noisy contact force alone is much harder. Added to BOTH policy obs and the symmetric
-        # "critic" group (the latter also feeds SAPG's states injection; plain PPO just uses the obs).
+        # minimal reward -> one extra feature: normalized off-table lift progress (clearance/success_height),
+        # so the policy knows how high the object currently is. (No is_grasped/grasp-age phase features.)
+        # Exposed as both "policy" and the symmetric "critic" group (+ cached for _get_states).
         d = super()._get_observations()
-        # clearance-based lift progress (matches the reward): how far the WHOLE object is off the table,
-        # relative to its off-table clearance at grasp formation.
         clearance = self._object_true_min_z() - self._table_surface_z
-        grasp_rel_lift = torch.clamp(clearance - self._grasp_baseline_clearance, min=0.0)
-        extra = torch.stack(
-            [
-                self._is_grasped.float(),                                                   # phase flag 0/1
-                torch.clamp(self._grasp_age.float() / float(self.max_episode_length), 0.0, 1.0),  # normalized grasp age
-                torch.clamp(grasp_rel_lift / self.cfg.lift_success_height, 0.0, 1.0),       # normalized lift progress
-            ],
-            dim=-1,
-        )
-        obs = torch.cat([d["policy"], extra], dim=-1)
+        lift_progress = torch.clamp(clearance / self.cfg.lift_success_height, 0.0, 1.0).unsqueeze(-1)
+        obs = torch.cat([d["policy"], lift_progress], dim=-1)
         self._policy_obs_cache = obs
         return {"policy": obs, "critic": obs}
 
@@ -529,150 +518,49 @@ class PickToolTokenEnv(PickCubeTokenEnv):
     # PickCubeTokenEnv._pre_physics_step (7 arm relative joint deltas + 9 hand eigengrasp token = 16).
 
     def _get_rewards(self) -> torch.Tensor:
-        # FOUR-TERM reward with a HYSTERESIS grasp state machine (mvp26, joint-space):
-        #   R_reach = reach_reward_scale * reach_val * (~is_grasped)  -- directional pre-grasp guidance
-        #             (mvp20 kernel: palm_facing x align x coarse+fine distance); switches OFF once grasped.
-        #   R_grasp = grasp_bonus * new_grasp_event                   -- ONE-SHOT on the first stable grasp
-        #             (latched by grasp_bonus_given for the WHOLE episode -> grasp/drop/regrasp can't re-farm it).
-        #   R_lift  = lift_step_max * clip(grasp_rel_lift/lift_success_height,0,1) * is_grasped -- per-step
-        #             NORMALIZED occupancy HEIGHT (NOT a ratchet -> a crush-launch pays only while airborne;
-        #             holding high pays continuously; no bounce-poisoned cliff).
-        #   R_bonus = lift_success_bonus * newly_successful           -- one-shot on the STRICT stable success.
-        # is_grasped is a STABLE latch (needs grasp_confirm_steps of valid contact to turn ON, grasp_release_steps
-        # of loss to turn OFF) so R_reach switches cleanly and the reward can't chatter with flickering contact.
+        # MINIMAL TWO-TERM reward (user request 2026-07-19: strip ALL contact / is_grasped / palm-facing /
+        # align / hold / clean-lift / grasp-bonus / success-bonus machinery; keep ONLY (1) fingertips APPROACH
+        # the object and (2) the object's off-table HEIGHT). reward = R_reach + R_lift.
         cfg = self.cfg
-        object_z = self.object_pos_w[:, 2] - self.scene.env_origins[:, 2]
-        actual_lift = object_z - self.object_default_z
 
-        # ---- hysteresis grasp state machine (valid_contact = thumb pad + >=1 other pad on the object) ----
-        thumb_contact, other_count = self._finger_contact_state()
-        # grasp QUALITY (computed EARLY so it gates the grasp state itself, not just pre-grasp reach):
-        # palm_facing = the palm (grasping side) faces the object; align = thumb + 2 nearest pads oppose the
-        # handle-keypoint normals. A back-of-hand / dorsal contact (palm faces AWAY, fingers press from the
-        # back) satisfied the old contact-only gate AND could NOT lift (forcelift: object slips out). Now such
-        # a contact does NOT count as a grasp -> is_grasped/hold/lift all require a real palm-side opposed grip.
+        # ---- R_reach: fingertips approach the handle. grasp_dist = mean distance of (thumb + 2 nearest other
+        # fingertips) to their nearest handle keypoint; shaped by a coarse (far) + fine (near) tanh kernel.
+        # Per-step occupancy: pays for being close every step (0 far -> reach_reward_scale at the keypoints). ----
         d = self._curr_fingertip_distances
-        a = self._finger_align  # (N,5) in [0,1], 1 = pad normal opposes its nearest keypoint normal
         other_d = d[:, self._other_ee_idx]
-        other_a = a[:, self._other_ee_idx]
-        near_val, near_idx = torch.topk(other_d, k=2, dim=1, largest=False)  # thumb + 2 nearest others
+        near_val, _ = torch.topk(other_d, k=2, dim=1, largest=False)  # 2 nearest non-thumb fingertips
         grasp_dist = (d[:, self._thumb_ee_idx] + near_val.sum(dim=-1)) / 3.0
-        align = (a[:, self._thumb_ee_idx] + torch.gather(other_a, 1, near_idx).sum(dim=-1)) / 3.0
-        to_obj = self.object_pos_w - self.palm_center_w
-        to_obj = to_obj / to_obj.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-        palm_facing = 0.5 * (1.0 + (self.palm_normal_w * to_obj).sum(dim=-1))  # [0,1]; >0.5 = palm faces object
-        valid_contact = (
-            thumb_contact
-            & (other_count >= 1)
-            & (palm_facing > cfg.grasp_palm_facing_min)
-            & (align > cfg.grasp_align_min)
-        )
-        self._contact_steps = torch.where(
-            valid_contact, self._contact_steps + 1, torch.zeros_like(self._contact_steps)
-        )
-        self._lost_contact_steps = torch.where(
-            valid_contact, torch.zeros_like(self._lost_contact_steps), self._lost_contact_steps + 1
-        )
-        confirm = self._contact_steps >= cfg.grasp_confirm_steps       # enough consecutive contact -> grasp ON
-        release = self._lost_contact_steps >= cfg.grasp_release_steps  # enough consecutive loss    -> grasp OFF
-        newly_grasped = (~self._is_grasped) & confirm
-        self._is_grasped = (self._is_grasped | confirm) & ~release
-        is_grasped = self._is_grasped
-        self._grasp_age = torch.where(is_grasped, self._grasp_age + 1, torch.zeros_like(self._grasp_age))
-
-        # P0-4: object AABB lowest corner above the table (env-local). This is the TRUE off-table height of
-        # the WHOLE object -- used both for clearance and as the lift measure (see below).
-        clearance = self._object_true_min_z() - self._table_surface_z
-        clearance_ok = clearance > cfg.clearance_margin
-
-        # FIRST stable grasp of the episode (happens exactly once). The lift baseline is LOCKED here and
-        # NEVER reset on a re-grasp -> a drop->lower->regrasp->relift loop cannot re-farm; and pre-grasp
-        # knock-ups aren't credited (P0-1). Baseline is on CLEARANCE (see below), not root height.
-        first_grasp = newly_grasped & (~self._grasp_bonus_given)
-        self._grasp_baseline_clearance = torch.where(first_grasp, clearance, self._grasp_baseline_clearance)
-        # lock the object POSE (xy + orientation) at grasp formation too, for the clean-lift gate below
-        fg2 = first_grasp.unsqueeze(-1)
-        self._grasp_baseline_xy = torch.where(fg2, self.object_pos_w[:, :2], self._grasp_baseline_xy)
-        self._grasp_baseline_quat = torch.where(fg2, self.object_quat_w, self._grasp_baseline_quat)
-
-        # LIFT is measured by CLEARANCE (how far the WHOLE object is off the table), NOT the object root
-        # height. The root-height measure was hackable: tipping the hammer toward VERTICAL raises the root
-        # ~half its length without lifting the object off the table (root +18cm while the bottom was only
-        # +8.5cm off the table). Clearance-based lift pays only for the object actually leaving the table,
-        # so "tip it vertical" earns only its true off-table height.
-        grasp_rel_lift = torch.clamp(clearance - self._grasp_baseline_clearance, min=0.0)
-
-        # ---- CLEAN-LIFT gate: only reward lifting the object STRAIGHT UP while KEEPING its grasp pose.
-        # orient_stay = cos(angle between current & grasp orientation) -> 1 aligned, 0 at >=90deg twist.
-        # xy_stay = 1 at no horizontal drift, ->0 as the object is dragged sideways. Their product gates
-        # r_lift, so the arm "wiggle" that tumbles/drags the object earns nothing; only a clean vertical
-        # lift (same orientation, straight up) pays. (User: penalize object pose/position change, reward
-        # only vertical up.)
-        qdot = (self.object_quat_w * self._grasp_baseline_quat).sum(dim=-1).abs()  # |cos(theta/2)|
-        orient_stay = torch.clamp(2.0 * qdot * qdot - 1.0, min=0.0)                # cos(theta), clamp>=0
-        xy_drift = (self.object_pos_w[:, :2] - self._grasp_baseline_xy).norm(dim=-1)
-        xy_stay = 1.0 - torch.tanh(xy_drift / cfg.lift_xy_drift_scale)
-        clean_lift = orient_stay * xy_stay
-
-        # ---- R_grasp: ONE-SHOT bonus for the FIRST stable grasp this episode (same event) ----
-        r_grasp = cfg.grasp_bonus * first_grasp.float()
-        self._grasp_bonus_given = self._grasp_bonus_given | is_grasped  # never re-paid, even after drop+regrasp
-
-        # ---- R_lift = per-step NORMALIZED off-table HEIGHT (occupancy) x clean-lift gate + one-shot success.
-        #      Per-step height pays for the CURRENT held clearance every step (no history/ratchet) -> gradient
-        #      from mm 1 ALWAYS; a crush-launch/tip pays only while the object is actually off the table;
-        #      holding the whole object high & STEADY (no twist/drift) pays continuously (aligned with success). ----
-        lift_fraction = torch.clamp(grasp_rel_lift / cfg.lift_success_height, 0.0, 1.0)
-        r_lift_height = cfg.lift_step_max * lift_fraction * is_grasped.float() * clean_lift
-
-        # ---- R_hold: per-step grasp-maintenance floor. Keeps the policy welded into a stable grasp (beats
-        # hovering) so it doesn't drop the grasp; dwarfed by R_lift so it never becomes the optimum. ----
-        r_hold = cfg.grasp_hold_scale * is_grasped.float()
-
-        # one-shot pull to the finish line: paid once when the STRICT stable success first latches (held
-        # success_hold_steps at >=20cm, cleared, nearly still). _is_success is set in _get_dones (runs
-        # just before this each step).
-        newly_successful = self._is_success & (~self._success_paid)
-        r_lift_success = cfg.lift_success_bonus * newly_successful.float()
-        self._success_paid = self._success_paid | self._is_success
-
-        # ---- R_reach: directional occupancy pre-grasp guidance, OFF once grasped (reuses grasp_dist /
-        # palm_facing / align computed above). coarse+fine distance x palm_facing x align. ----
         reach_far = 1.0 - torch.tanh(grasp_dist / cfg.reach_scale_far)
         reach_near = 1.0 - torch.tanh(grasp_dist / cfg.reach_scale)
-        reach_val = 0.5 * (reach_far + reach_near) * palm_facing * align
-        r_reach = cfg.reach_reward_scale * reach_val * (~is_grasped).float()
+        r_reach = cfg.reach_reward_scale * 0.5 * (reach_far + reach_near)
+
+        # ---- R_lift: how far the WHOLE object is off the table = TRUE lowest mesh point (hull) - table
+        # surface. Per-step occupancy, normalized by the success height, clamped to [0,1]. UNGATED (no
+        # contact / grasp required). Uses the true hull clearance so tipping the object doesn't count. ----
+        clearance = self._object_true_min_z() - self._table_surface_z
+        lift_fraction = torch.clamp(clearance / cfg.lift_success_height, 0.0, 1.0)
+        r_lift = cfg.lift_scale * lift_fraction
+
+        object_z = self.object_pos_w[:, 2] - self.scene.env_origins[:, 2]
+        actual_lift = object_z - self.object_default_z
 
         if "log" not in self.extras:
             self.extras["log"] = dict()
         log = self.extras["log"]
-        log["align_mean"] = align.mean()
-        log["palm_facing_mean"] = palm_facing.mean()
-        log["valid_contact_frac"] = valid_contact.float().mean()
-        log["is_grasped_frac"] = is_grasped.float().mean()
-        log["thumb_contact_frac"] = thumb_contact.float().mean()
-        log["other_contact_count_mean"] = other_count.float().mean()
-        log["clearance_ok_frac"] = clearance_ok.float().mean()
-        log["orient_stay_mean"] = orient_stay.mean()
-        log["xy_drift_mean"] = xy_drift.mean()
-        log["clean_lift_mean"] = clean_lift.mean()
-        log["grasp_rel_lift_mean"] = grasp_rel_lift.mean()
-        log["grasp_rel_lift_max"] = grasp_rel_lift.max()
-        log["actual_lift_mean"] = actual_lift.mean()
+        log["grasp_dist_mean"] = grasp_dist.mean()
         log["avg_ft_to_kp_mean"] = self._curr_fingertip_distances.mean()
+        log["clearance_mean"] = clearance.mean()
+        log["clearance_max"] = clearance.max()
+        log["actual_lift_mean"] = actual_lift.mean()
         log["success_frac"] = self._is_success.float().mean()
-        # height distribution: fraction of envs whose grasp-relative lift is currently at/above each mark
-        log["lift_ge_3cm_frac"] = (grasp_rel_lift >= 0.03).float().mean()
-        log["lift_ge_5cm_frac"] = (grasp_rel_lift >= 0.05).float().mean()
-        log["lift_ge_10cm_frac"] = (grasp_rel_lift >= 0.10).float().mean()
-        log["lift_ge_20cm_frac"] = (grasp_rel_lift >= 0.20).float().mean()
+        log["lift_ge_3cm_frac"] = (clearance >= 0.03).float().mean()
+        log["lift_ge_5cm_frac"] = (clearance >= 0.05).float().mean()
+        log["lift_ge_10cm_frac"] = (clearance >= 0.10).float().mean()
+        log["lift_ge_20cm_frac"] = (clearance >= 0.20).float().mean()
         log["r_reach_mean"] = r_reach.mean()
-        log["r_grasp_mean"] = r_grasp.mean()
-        log["r_lift_height_mean"] = r_lift_height.mean()
-        log["r_lift_success_mean"] = r_lift_success.mean()
-        log["r_hold_mean"] = r_hold.mean()
+        log["r_lift_mean"] = r_lift.mean()
 
-        return r_reach + r_grasp + r_lift_height + r_lift_success + r_hold
+        return r_reach + r_lift
 
     # ------------------------------------------------------------------ termination
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -681,24 +569,13 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         object_z = self.object_pos_w[:, 2] - self.scene.env_origins[:, 2]
         actual_lift = object_z - self.object_default_z
 
-        # success uses the SAME clearance-based lift as the reward (whole object off the table, relative to
-        # grasp-formation clearance), so a "tip to vertical" can't reach the success height.
+        # success = the WHOLE object lifted off the table above the success height (true hull clearance) and
+        # nearly still, held for success_hold_steps. No contact/grasp condition (minimal reward design).
         clearance = self._object_true_min_z() - self._table_surface_z
-        grasp_rel_lift = torch.clamp(clearance - self._grasp_baseline_clearance, min=0.0)
-        clearance_ok = clearance > cfg.clearance_margin
         obj_lin = self.object.data.root_lin_vel_w.norm(dim=-1)
         obj_ang = self.object.data.root_ang_vel_w.norm(dim=-1)
         slow = (obj_lin < cfg.success_max_obj_lin_speed) & (obj_ang < cfg.success_max_obj_ang_speed)
-
-        # P0-3: success = STABLE grasp (is_grasped, hysteresis) + clearance + rel-lift (relative to the
-        # grasp height), object nearly still, held for N steps, AND the object still at its grasp orientation
-        # (no tumble). is_grasped is updated in _get_rewards (runs right after this each step); a 1-step lag
-        # on the success gate is immaterial.
-        qdot = (self.object_quat_w * self._grasp_baseline_quat).sum(dim=-1).abs()
-        orient_ok = (2.0 * qdot * qdot - 1.0) >= cfg.success_orient_min   # cos(twist) above threshold
-        success_inst = (
-            self._is_grasped & clearance_ok & (grasp_rel_lift >= cfg.lift_success_height) & slow & orient_ok
-        )
+        success_inst = (clearance >= cfg.lift_success_height) & slow
         self._success_steps = torch.where(
             success_inst, self._success_steps + 1, torch.zeros_like(self._success_steps)
         )
@@ -710,15 +587,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         if not cfg.terminate_on_drop:
             dropped = torch.zeros_like(dropped)
 
-        # ANTI-HACK: arm pressed the table? any arm link center within arm_table_margin of the TRUE table
-        # surface (_table_surface_z; NOT the loose box _object_bottom_ref, which sits ~12cm below the table).
-        arm_z_local = self.robot.data.body_pos_w[:, self._arm_body_ids, 2] - self.scene.env_origins[:, 2:3]
-        arm_table_hit = (arm_z_local < (self._table_surface_z + cfg.arm_table_margin)).any(dim=1)
-        if not cfg.terminate_on_arm_table_contact:
-            arm_table_hit = torch.zeros_like(dropped)
-        self.extras.setdefault("log", dict())["arm_table_hit_frac"] = arm_table_hit.float().mean()
-
-        return dropped | self._is_success | arm_table_hit, time_out
+        return dropped | self._is_success, time_out
 
     # ------------------------------------------------------------------ reset
     def _reset_idx(self, env_ids: Sequence[int] | None):
