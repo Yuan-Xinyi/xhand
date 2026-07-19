@@ -189,7 +189,8 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # legitimately go that low -- only the fingertips reach down to the object -- so this is a clean signal.
     terminate_on_arm_table_contact = True
     arm_contact_bodies = ("link1", "link2", "link3", "link4", "link5", "link6", "link7", "link8")
-    arm_table_margin = 0.04    # m; an arm link center this close (or below) the table plane = pressing it
+    arm_table_margin = 0.03    # m; arm link center within this of the TRUE table surface = pressing it
+                               # (grasp keeps arm links >= ~+0.047 above origin; true table ~ -0.003 -> safe)
 
     # BIG lift pay (mvp20, user call): the mvp19 plateau (~324) was a "gentle-hold annuity" -- holding
     # pays a steady 5.0/step while lifting pays one-time ratchet increments with slip risk, so the

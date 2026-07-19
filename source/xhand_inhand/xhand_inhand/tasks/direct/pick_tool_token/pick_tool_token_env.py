@@ -64,7 +64,24 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         # yaw about world Z (applied at reset) leaves each corner's z unchanged, so the at-rest low
         # point is a single yaw-invariant constant.
         corner_z_rest = quat_apply(rest_quat.expand(8, 4), corners)[:, 2] + rest_z
-        self._object_bottom_ref = corner_z_rest.min()  # scalar; also = the table top plane (env-local z)
+        self._object_bottom_ref = corner_z_rest.min()  # scalar; LOOSE box bottom (kept for reference only)
+
+        # ---- TRUE object clearance via the mesh CONVEX HULL (the local AABB box is ~12cm looser than the
+        # mesh, so its rotated min-corner reads FAKE clearance when the object tips -> use real hull verts).
+        from .tool_asset import TOOL_OBJ, TOOL_SCALE
+        from scipy.spatial import ConvexHull
+        _v = []
+        for _ln in open(TOOL_OBJ):
+            if _ln.startswith("v "):
+                _p = _ln.split()
+                _v.append((float(_p[1]), float(_p[2]), float(_p[3])))
+        _v = torch.tensor(_v, dtype=torch.float, device=dev) * torch.tensor(TOOL_SCALE, device=dev)
+        _hull = ConvexHull(_v.cpu().numpy()).vertices
+        self._obj_hull_local = _v[torch.as_tensor(_hull, device=dev)]  # (M,3) hull verts, the min-z is always one
+        # true table surface = the object's real lowest mesh point at the rest pose (it sits on the table);
+        # yaw-invariant (reset only yaws), so a single constant.
+        _rest_world_z = quat_apply(rest_quat.expand(self._obj_hull_local.shape[0], 4), self._obj_hull_local)[:, 2]
+        self._table_surface_z = (_rest_world_z + rest_z).min()  # scalar, env-local
 
         # arm link body indices for the anti-hack "arm pressed the table" geometric termination
         arm_ids, _ = self.robot.find_bodies(list(cfg.arm_contact_bodies))
@@ -462,7 +479,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
 
     # ------------------------------------------------------------------ clearance
     def _object_min_corner_z(self) -> torch.Tensor:
-        """Env-local z of the object's lowest AABB corner (for the table-clearance test, P0-4)."""
+        """Env-local z of the object's lowest AABB corner (LOOSE box; kept for reference/logging only)."""
         N = self.num_envs
         cz = torch.stack(
             [
@@ -473,6 +490,15 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         )
         return (cz - self.scene.env_origins[:, 2:3]).min(dim=1).values
 
+    def _object_true_min_z(self) -> torch.Tensor:
+        """Env-local z of the object's TRUE lowest point (min over mesh convex-hull verts, rotation-correct).
+        Unlike the loose local-AABB box, this doesn't read fake clearance when the object tips."""
+        N, M = self.num_envs, self._obj_hull_local.shape[0]
+        q = self.object_quat_w.unsqueeze(1).expand(N, M, 4).reshape(-1, 4)
+        v = self._obj_hull_local.unsqueeze(0).expand(N, M, 3).reshape(-1, 3)
+        world = quat_apply(q, v).reshape(N, M, 3) + self.object_pos_w.unsqueeze(1)
+        return (world[:, :, 2] - self.scene.env_origins[:, 2:3]).min(dim=1).values
+
     # ------------------------------------------------------------------ reward
     def _get_observations(self) -> dict:
         # append 3 PHASE features so the policy KNOWS which stage it is in (the reward switches hard at
@@ -482,7 +508,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         d = super()._get_observations()
         # clearance-based lift progress (matches the reward): how far the WHOLE object is off the table,
         # relative to its off-table clearance at grasp formation.
-        clearance = self._object_min_corner_z() - self._object_bottom_ref
+        clearance = self._object_true_min_z() - self._table_surface_z
         grasp_rel_lift = torch.clamp(clearance - self._grasp_baseline_clearance, min=0.0)
         extra = torch.stack(
             [
@@ -536,7 +562,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
 
         # P0-4: object AABB lowest corner above the table (env-local). This is the TRUE off-table height of
         # the WHOLE object -- used both for clearance and as the lift measure (see below).
-        clearance = self._object_min_corner_z() - self._object_bottom_ref
+        clearance = self._object_true_min_z() - self._table_surface_z
         clearance_ok = clearance > cfg.clearance_margin
 
         # FIRST stable grasp of the episode (happens exactly once). The lift baseline is LOCKED here and
@@ -643,7 +669,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
 
         # success uses the SAME clearance-based lift as the reward (whole object off the table, relative to
         # grasp-formation clearance), so a "tip to vertical" can't reach the success height.
-        clearance = self._object_min_corner_z() - self._object_bottom_ref
+        clearance = self._object_true_min_z() - self._table_surface_z
         grasp_rel_lift = torch.clamp(clearance - self._grasp_baseline_clearance, min=0.0)
         clearance_ok = clearance > cfg.clearance_margin
         obj_lin = self.object.data.root_lin_vel_w.norm(dim=-1)
@@ -670,10 +696,10 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         if not cfg.terminate_on_drop:
             dropped = torch.zeros_like(dropped)
 
-        # ANTI-HACK: arm pressed the table? any arm link center within arm_table_margin of the table plane
-        # (env-local z = _object_bottom_ref). Ends the episode so the "press-up off the table" hack pays 0.
+        # ANTI-HACK: arm pressed the table? any arm link center within arm_table_margin of the TRUE table
+        # surface (_table_surface_z; NOT the loose box _object_bottom_ref, which sits ~12cm below the table).
         arm_z_local = self.robot.data.body_pos_w[:, self._arm_body_ids, 2] - self.scene.env_origins[:, 2:3]
-        arm_table_hit = (arm_z_local < (self._object_bottom_ref + cfg.arm_table_margin)).any(dim=1)
+        arm_table_hit = (arm_z_local < (self._table_surface_z + cfg.arm_table_margin)).any(dim=1)
         if not cfg.terminate_on_arm_table_contact:
             arm_table_hit = torch.zeros_like(dropped)
         self.extras.setdefault("log", dict())["arm_table_hit_frac"] = arm_table_hit.float().mean()
