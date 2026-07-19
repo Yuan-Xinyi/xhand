@@ -72,7 +72,7 @@ def main():
     def readout():
         palm_dz = (u.palm_center_w[0, 2] - origin_z).item() - palm0
         lift = (u.object_pos_w[0, 2] - origin_z - u.object_default_z[0]).item()
-        fN = u._contact_sensor.data.force_matrix_w.norm(dim=-1).sum(dim=-1)[0].sum().item()
+        fN = u._contact_sensor.data.net_forces_w.norm(dim=-1)[0].sum().item()
         tc, oc = u._finger_contact_state()
         cg = bool((tc[0] & (oc[0] >= 1)).item())
         return palm_dz, lift, cg, fN

@@ -138,6 +138,12 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
                                   # finger leaves the object, so an object squirting out of the grip isn't credited.
     grasp_confirm_steps = 4       # consecutive valid-contact steps to LATCH is_grasped True
     grasp_release_steps = 6       # consecutive lost-contact steps to release is_grasped (>confirm = hysteresis)
+    # a valid grasp must be PALM-SIDE and OPPOSED, not a back-of-hand press. palm_facing = 0.5(1+palm·to_obj)
+    # in [0,1]; >0.5 means the palm faces the object. align in [0,1] = thumb+2 nearest pads oppose the handle
+    # normals. Without these, a dorsal contact (palm_facing ~0.2-0.35, 460N press) satisfied is_grasped but
+    # could not lift (the object slipped out). Gating is_grasped on them forces a liftable palm-side grip.
+    grasp_palm_facing_min = 0.5   # palm must at least face toward the object (raw palm·to_obj > 0)
+    grasp_align_min = 0.3         # thumb+2 pads at least mildly opposed to the handle (a floor, not strict)
 
     # R_grasp (mvp26): ONE-SHOT bonus on the first stable grasp of the episode (latched by grasp_bonus_given,
     # never re-paid even after drop+regrasp). Kept MODEST (< the lift payout) so "grasp" matters but never

@@ -546,7 +546,27 @@ class PickToolTokenEnv(PickCubeTokenEnv):
 
         # ---- hysteresis grasp state machine (valid_contact = thumb pad + >=1 other pad on the object) ----
         thumb_contact, other_count = self._finger_contact_state()
-        valid_contact = thumb_contact & (other_count >= 1)
+        # grasp QUALITY (computed EARLY so it gates the grasp state itself, not just pre-grasp reach):
+        # palm_facing = the palm (grasping side) faces the object; align = thumb + 2 nearest pads oppose the
+        # handle-keypoint normals. A back-of-hand / dorsal contact (palm faces AWAY, fingers press from the
+        # back) satisfied the old contact-only gate AND could NOT lift (forcelift: object slips out). Now such
+        # a contact does NOT count as a grasp -> is_grasped/hold/lift all require a real palm-side opposed grip.
+        d = self._curr_fingertip_distances
+        a = self._finger_align  # (N,5) in [0,1], 1 = pad normal opposes its nearest keypoint normal
+        other_d = d[:, self._other_ee_idx]
+        other_a = a[:, self._other_ee_idx]
+        near_val, near_idx = torch.topk(other_d, k=2, dim=1, largest=False)  # thumb + 2 nearest others
+        grasp_dist = (d[:, self._thumb_ee_idx] + near_val.sum(dim=-1)) / 3.0
+        align = (a[:, self._thumb_ee_idx] + torch.gather(other_a, 1, near_idx).sum(dim=-1)) / 3.0
+        to_obj = self.object_pos_w - self.palm_center_w
+        to_obj = to_obj / to_obj.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        palm_facing = 0.5 * (1.0 + (self.palm_normal_w * to_obj).sum(dim=-1))  # [0,1]; >0.5 = palm faces object
+        valid_contact = (
+            thumb_contact
+            & (other_count >= 1)
+            & (palm_facing > cfg.grasp_palm_facing_min)
+            & (align > cfg.grasp_align_min)
+        )
         self._contact_steps = torch.where(
             valid_contact, self._contact_steps + 1, torch.zeros_like(self._contact_steps)
         )
@@ -616,21 +636,10 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         r_lift_success = cfg.lift_success_bonus * newly_successful.float()
         self._success_paid = self._success_paid | self._is_success
 
-        # ---- R_reach: directional occupancy pre-grasp guidance (mvp20 kernel), OFF once grasped ----
-        # coarse+fine distance kernel (far/near) x palm_facing (whole-hand orientation) x align (per-finger
-        # pad normals). palm_facing is load-bearing (mvp17: align alone lets a dorsal hover farm reach).
-        d = self._curr_fingertip_distances
-        a = self._finger_align  # (N,5) in [0,1], 1 = pad normal opposes its nearest keypoint normal
-        other_d = d[:, self._other_ee_idx]
-        other_a = a[:, self._other_ee_idx]
-        near_val, near_idx = torch.topk(other_d, k=2, dim=1, largest=False)  # thumb + 2 nearest others
-        grasp_dist = (d[:, self._thumb_ee_idx] + near_val.sum(dim=-1)) / 3.0
-        align = (a[:, self._thumb_ee_idx] + torch.gather(other_a, 1, near_idx).sum(dim=-1)) / 3.0
+        # ---- R_reach: directional occupancy pre-grasp guidance, OFF once grasped (reuses grasp_dist /
+        # palm_facing / align computed above). coarse+fine distance x palm_facing x align. ----
         reach_far = 1.0 - torch.tanh(grasp_dist / cfg.reach_scale_far)
         reach_near = 1.0 - torch.tanh(grasp_dist / cfg.reach_scale)
-        to_obj = self.object_pos_w - self.palm_center_w
-        to_obj = to_obj / to_obj.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-        palm_facing = 0.5 * (1.0 + (self.palm_normal_w * to_obj).sum(dim=-1))
         reach_val = 0.5 * (reach_far + reach_near) * palm_facing * align
         r_reach = cfg.reach_reward_scale * reach_val * (~is_grasped).float()
 
