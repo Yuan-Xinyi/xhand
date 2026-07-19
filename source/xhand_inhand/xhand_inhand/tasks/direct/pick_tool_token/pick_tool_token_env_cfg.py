@@ -136,8 +136,10 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
                                   # the dead filtered force_matrix_w (multi-env broken) AND the too-loose palm
                                   # gate (stayed True through a crush-launch); now contact drops the instant a
                                   # finger leaves the object, so an object squirting out of the grip isn't credited.
-    grasp_confirm_steps = 4       # consecutive valid-contact steps to LATCH is_grasped True
-    grasp_release_steps = 6       # consecutive lost-contact steps to release is_grasped (>confirm = hysteresis)
+    grasp_confirm_steps = 4       # consecutive STABLE-hold steps to LATCH is_grasped_phase True (+fire grasp bonus)
+    grasp_release_steps = 6       # consecutive lost-contact steps to release is_grasped_phase (>confirm = hysteresis)
+    grasp_hold_quality_min = 0.7  # a "stable hold" needs hold_quality above this (object moving WITH the hand),
+                                  # not just contact -> the grasp bonus/phase require a real, non-slipping grip.
     # a valid grasp must be PALM-SIDE and OPPOSED, not a back-of-hand press. palm_facing = 0.5(1+palm·to_obj)
     # in [0,1]; >0.5 means the palm faces the object. align in [0,1] = thumb+2 nearest pads oppose the handle
     # normals. Without these, a dorsal contact (palm_facing ~0.2-0.35, 460N press) satisfied is_grasped but
@@ -157,6 +159,11 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # -> can't be farmed by tipping/wiggling.
     lift_step_max = 40.0
     lift_success_bonus = 200.0
+    # R_success: ONE-SHOT bonus when the stable lift first succeeds. Needed because success ENDS the episode
+    # (occupancy lift would otherwise pay ~20/step forever at 19cm), so without it the policy is punished for
+    # crossing the 20cm line and stalls just below it. 500 ~= 25 steps of max lift reward (a rough
+    # continuation-value compensation for the truncated episode).
+    success_bonus = 500.0
 
     # R_lift = lift_scale * clip(clearance/lift_success_height,0,1) * valid_contact * hold_quality, per step.
     # lift_scale=20 => at 20cm success height ~20/step; at 10cm ~10/step. Dominates R_reach (max 2) once up.

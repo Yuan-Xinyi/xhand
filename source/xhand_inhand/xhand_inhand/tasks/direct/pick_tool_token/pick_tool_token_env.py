@@ -518,8 +518,13 @@ class PickToolTokenEnv(PickCubeTokenEnv):
     # PickCubeTokenEnv._pre_physics_step (7 arm relative joint deltas + 9 hand eigengrasp token = 16).
 
     def _get_rewards(self) -> torch.Tensor:
-        # TWO-TERM reward: R_reach (approach the handle with the correct hand orientation) + R_lift (hold the
-        # object and carry it off the table). R_lift is HELD-gated so a fling/throw earns nothing.
+        # FOUR-TERM phased reward (user redesign 2026-07-19): cross the hover->contact cliff with a one-shot
+        # grasp bonus + a hysteresis phase latch, pay height only while genuinely HELD (kinematically-correct
+        # slip), and pay a one-shot success bonus so the policy isn't punished for crossing the finish line.
+        #   R_reach  = reach_reward_scale * dist_kernel * palm_facing * align * (~is_grasped_phase)
+        #   R_grasp  = grasp_bonus * first_stable_grasp        (one-shot, latched per episode)
+        #   R_lift   = lift_scale * clip(clearance/H) * valid_contact * hold_quality
+        #   R_success= success_bonus * newly_successful        (one-shot)
         cfg = self.cfg
 
         # ---- grasp quality signals (all in [0,1]) ----
@@ -534,30 +539,52 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         to_obj = to_obj / to_obj.norm(dim=-1, keepdim=True).clamp_min(1e-6)
         palm_facing = 0.5 * (1.0 + (self.palm_normal_w * to_obj).sum(dim=-1))  # [0,1]; >0.5 = palm faces object
 
-        # ---- valid contact = thumb pad + >=1 other pad actually on the object (net force + per-finger
-        # proximity). Used ONLY to gate the lift (not the whole grasp state machine). ----
+        # ---- valid contact = thumb pad + >=1 other pad actually on the object (net force + per-finger proximity)
         thumb_contact, other_count = self._finger_contact_state()
         valid_contact = thumb_contact & (other_count >= 1)
 
-        # ---- R_reach: (coarse+fine distance) x palm_facing (whole-hand faces object) x align (pad normals
-        # oppose the handle) -- fingers must approach the RIGHT way. OFF once a contact grasp is present so it
-        # can't be farmed by hovering at the object. ----
-        reach_far = 1.0 - torch.tanh(grasp_dist / cfg.reach_scale_far)
-        reach_near = 1.0 - torch.tanh(grasp_dist / cfg.reach_scale)
-        r_reach = cfg.reach_reward_scale * 0.5 * (reach_far + reach_near) * palm_facing * align * (~valid_contact).float()
+        # ---- hold_quality: object motion RELATIVE TO THE PALM as a RIGID body. A rigidly held object has
+        # v_obj = v_palm + omega_palm x r (r = obj - palm), so we subtract that expected velocity -> a pure
+        # hand ROTATION while holding is NOT flagged as slip (important now that the arm can rotate). Only
+        # real slip / a fling makes slip_lin large. ----
+        palm_pos = self.robot.data.body_pos_w[:, self.palm_idx]
+        palm_lin = self.robot.data.body_lin_vel_w[:, self.palm_idx]
+        palm_ang = self.robot.data.body_ang_vel_w[:, self.palm_idx]
+        r_vec = self.object_pos_w - palm_pos
+        expected_obj_lin = palm_lin + torch.cross(palm_ang, r_vec, dim=-1)
+        slip_lin = (self.object.data.root_lin_vel_w - expected_obj_lin).norm(dim=-1)  # object slip vs the hand
+        slip_ang = (self.object.data.root_ang_vel_w - palm_ang).norm(dim=-1)          # object spin vs the hand
+        hold_quality = torch.exp(-slip_lin / cfg.hold_v_scale) * torch.exp(-slip_ang / cfg.hold_w_scale)
 
-        # ---- R_lift: off-table HEIGHT, but ONLY while the object is actually HELD -- gated by valid_contact
-        # AND a hold_quality that decays with the object's speed RELATIVE to the palm. A fling/throw breaks
-        # contact (valid_contact False) and sends the object flying (rel speed high) -> R_lift -> 0. Uses the
-        # TRUE hull clearance so tipping doesn't count either. ----
+        # ---- grasp phase (hysteresis latch) + one-shot stable-grasp bonus. A "stable hold" = valid_contact
+        # AND the object moving with the hand (hold_quality high). is_grasped_phase latches ON after
+        # grasp_confirm_steps of stable hold and OFF after grasp_release_steps of lost contact -> R_reach
+        # stays on through the confirmation window (no cliff), then the one-shot +grasp_bonus fires. ----
+        stable_hold = valid_contact & (hold_quality > cfg.grasp_hold_quality_min)
+        self._contact_steps = torch.where(stable_hold, self._contact_steps + 1, torch.zeros_like(self._contact_steps))
+        self._lost_contact_steps = torch.where(
+            valid_contact, torch.zeros_like(self._lost_contact_steps), self._lost_contact_steps + 1
+        )
+        confirmed = self._contact_steps >= cfg.grasp_confirm_steps
+        release = self._lost_contact_steps >= cfg.grasp_release_steps
+        self._is_grasped = (self._is_grasped | confirmed) & ~release
+        is_grasped_phase = self._is_grasped
+        first_stable_grasp = confirmed & (~self._grasp_bonus_given)
+        self._grasp_bonus_given = self._grasp_bonus_given | confirmed
+
+        # ---- clearance (TRUE off-table height via mesh hull) ----
         clearance = self._object_true_min_z() - self._table_surface_z
         lift_fraction = torch.clamp(clearance / cfg.lift_success_height, 0.0, 1.0)
-        palm_lin_vel = self.robot.data.body_lin_vel_w[:, self.palm_idx]
-        palm_ang_vel = self.robot.data.body_ang_vel_w[:, self.palm_idx]
-        rel_lin = (self.object.data.root_lin_vel_w - palm_lin_vel).norm(dim=-1)   # object vs hand linear speed
-        rel_ang = (self.object.data.root_ang_vel_w - palm_ang_vel).norm(dim=-1)   # object vs hand angular speed
-        hold_quality = torch.exp(-rel_lin / cfg.hold_v_scale) * torch.exp(-rel_ang / cfg.hold_w_scale)
+
+        # ---- the four reward terms ----
+        reach_far = 1.0 - torch.tanh(grasp_dist / cfg.reach_scale_far)
+        reach_near = 1.0 - torch.tanh(grasp_dist / cfg.reach_scale)
+        r_reach = cfg.reach_reward_scale * 0.5 * (reach_far + reach_near) * palm_facing * align * (~is_grasped_phase).float()
+        r_grasp = cfg.grasp_bonus * first_stable_grasp.float()
         r_lift = cfg.lift_scale * lift_fraction * valid_contact.float() * hold_quality
+        newly_successful = self._is_success & (~self._success_paid)
+        r_success = cfg.success_bonus * newly_successful.float()
+        self._success_paid = self._success_paid | self._is_success
 
         object_z = self.object_pos_w[:, 2] - self.scene.env_origins[:, 2]
         actual_lift = object_z - self.object_default_z
@@ -570,9 +597,10 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         log["palm_facing_mean"] = palm_facing.mean()
         log["valid_contact_frac"] = valid_contact.float().mean()
         log["thumb_contact_frac"] = thumb_contact.float().mean()
+        log["is_grasped_phase_frac"] = is_grasped_phase.float().mean()
         log["hold_quality_mean"] = hold_quality.mean()
-        log["rel_lin_speed_mean"] = rel_lin.mean()
-        log["rel_ang_speed_mean"] = rel_ang.mean()
+        log["slip_lin_mean"] = slip_lin.mean()
+        log["slip_ang_mean"] = slip_ang.mean()
         log["avg_ft_to_kp_mean"] = self._curr_fingertip_distances.mean()
         log["clearance_mean"] = clearance.mean()
         log["clearance_max"] = clearance.max()
@@ -583,9 +611,11 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         log["lift_ge_10cm_frac"] = (clearance >= 0.10).float().mean()
         log["lift_ge_20cm_frac"] = (clearance >= 0.20).float().mean()
         log["r_reach_mean"] = r_reach.mean()
+        log["r_grasp_mean"] = r_grasp.mean()
         log["r_lift_mean"] = r_lift.mean()
+        log["r_success_mean"] = r_success.mean()
 
-        return r_reach + r_lift
+        return r_reach + r_grasp + r_lift + r_success
 
     # ------------------------------------------------------------------ termination
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
