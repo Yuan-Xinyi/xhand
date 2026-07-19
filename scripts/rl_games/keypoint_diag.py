@@ -71,7 +71,7 @@ def main():
             obs, _, dones, _ = env.step(actions)
         fk = u._curr_fingertip_distances[0]           # (5,) min dist to nearest keypoint per finger
         lift = (u.object_pos_w[0, 2] - u.scene.env_origins[0, 2] - u.object_default_z[0]).item()
-        fmag = u._contact_sensor.data.force_matrix_w.norm(dim=-1).sum(dim=-1)[0]  # (B,) per-finger force
+        fmag = u._contact_sensor.data.net_forces_w.norm(dim=-1)[0]  # (B,) per-finger NET contact force
         maxforce = torch.maximum(maxforce, fmag)
         to_obj = u.object_pos_w[0] - u.palm_center_w[0]; to_obj = to_obj / (to_obj.norm() + 1e-6)
         pf = float((u.palm_normal_w[0] * to_obj).sum().item())  # raw palm-facing dot (unclamped)

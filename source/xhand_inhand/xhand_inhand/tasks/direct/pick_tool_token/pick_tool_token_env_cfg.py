@@ -34,13 +34,13 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # the bulky, irregular tool takes a little longer to line the grasp up than a small cube
     episode_length_s = 6.0
 
-    # ===== JOINT-SPACE ARM control (mvp20) =====
+    # ===== JOINT-SPACE ARM control (mvp26 reward, joint-space) =====
     # Action = 7 (arm relative joint deltas) + 9 (hand eigengrasp token) = 16, mapped by the inherited
     # PickCubeTokenEnv._pre_physics_step (arm: dof_target += action_scale*a; hand: token -> retarget NN).
     action_space = 16
 
-    observation_space = 86      # base only (19 joint_pos + 19 joint_vel + 15 ee + 3 palm + 3 obj_pos
-    state_space = 86            # + 4 obj_quat + 3 tgt_pos + 4 tgt_quat + 16 action echo). No phase features.
+    observation_space = 89      # 86 base (19 joint_pos + 19 joint_vel + 15 ee + 3 palm + 3 obj_pos + 4
+    state_space = 89            # obj_quat + 3 tgt_pos + 4 tgt_quat + 16 action) + 3 phase (is_grasped etc.)
 
     # robot with CONTACT REPORTING enabled on its bodies (needed for the fingertip contact sensors /
     # R_contact). A fresh .replace() so the shared XARM7_XHAND_CFG is untouched.
@@ -131,27 +131,29 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # This debounces flickering contact so R_reach switches off cleanly and success is stable.
     contact_force_thr = 0.2       # N; contact detected above this fingertip<->object force magnitude
                                   # (0.5 filtered out the tentative first grazes of a few tenths of a N).
-    contact_near_margin = 0.15    # m; gate: only count a fingertip NET contact force as OBJECT contact when
-                                  # the palm is within this of the object. net_forces_w is unfiltered (any
-                                  # contact) because filtered force_matrix_w is dead at multi-env in IsaacLab;
-                                  # this proximity gate rejects table/self contact during approach.
+    contact_near_margin = 0.09    # m; PER-FINGER gate: a fingertip's NET force counts as OBJECT contact only
+                                  # if THAT fingertip is within this of its nearest handle keypoint. Replaces
+                                  # the dead filtered force_matrix_w (multi-env broken) AND the too-loose palm
+                                  # gate (stayed True through a crush-launch); now contact drops the instant a
+                                  # finger leaves the object, so an object squirting out of the grip isn't credited.
     grasp_confirm_steps = 4       # consecutive valid-contact steps to LATCH is_grasped True
     grasp_release_steps = 6       # consecutive lost-contact steps to release is_grasped (>confirm = hysteresis)
 
-    # R_contact (mvp20): PER-STEP annuity while contact-grasping (thumb pad + >=1 other pad on the object).
-    # Bootstraps exploration toward a real grasp; the dense lift (1000 full) + bonus (300) dwarf it so it
-    # can't be farmed by holding-without-lifting alone.
-    contact_reward_scale = 3.0
+    # R_grasp (mvp26): ONE-SHOT bonus on the first stable grasp of the episode (latched by grasp_bonus_given,
+    # never re-paid even after drop+regrasp). Kept MODEST (< the lift payout) so "grasp" matters but never
+    # outweighs "actually lift". Ladder: grasp 100 < hold 10cm ~1000 < hold 20cm ~2000 (+200 success).
+    grasp_bonus = 100.0
 
-    # R_lift_bonus (mvp20): ONE-SHOT lift-off bonus, contact-gated + clearance-gated, paid once per episode
-    # when the grasp-relative lift first clears lift_bonus_height.
-    lifting_bonus = 300.0
-    lift_bonus_height = 0.10
+    # R_lift (mvp26): per-step NORMALIZED occupancy height (NOT a ratchet). r_lift = lift_step_max *
+    # clip(grasp_rel_lift/lift_success_height,0,1) * is_grasped. lift_step_max=20 => at 20cm it pays 20/step;
+    # holding there ~100 steps ~= 2000, so a STABLY HELD lift dominates. A crush-launch pays only while the
+    # object is airborne (then falls back to 0) -> can't be farmed like the mvp20 ratchet's transient peak.
+    lift_step_max = 20.0
+    lift_success_bonus = 200.0
 
-    # R_reach: directional pre-grasp occupancy kernel (mvp20). Always on, but LOCKED at full while contact-
-    # grasping (touching jiggles the object; without the lock PPO books the touch as negative advantage and
-    # never closes). coarse (reach_scale_far) pulls the arm in from ~15cm,
-    # fine (reach_scale) sharpens the final placement; both x palm_facing (whole-hand orientation) x align.
+    # R_reach: directional pre-grasp occupancy kernel (mvp20 kernel), gated to (~is_grasped) so it turns OFF
+    # once grasped (no occupancy annuity after the grasp). coarse (reach_scale_far) pulls the arm in from
+    # ~15cm, fine (reach_scale) sharpens the final placement; both x palm_facing (whole-hand orient) x align.
     reach_reward_scale = 2.0
     reach_scale = 0.08        # fine kernel (last ~8cm placement)
     reach_scale_far = 0.25    # coarse kernel (approach slope from the ~15cm reset distance)
