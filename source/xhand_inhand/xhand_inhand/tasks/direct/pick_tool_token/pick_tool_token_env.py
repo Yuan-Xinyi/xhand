@@ -523,16 +523,21 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         # the object and (2) the object's off-table HEIGHT). reward = R_reach + R_lift.
         cfg = self.cfg
 
-        # ---- R_reach: fingertips approach the handle. grasp_dist = mean distance of (thumb + 2 nearest other
-        # fingertips) to their nearest handle keypoint; shaped by a coarse (far) + fine (near) tanh kernel.
-        # Per-step occupancy: pays for being close every step (0 far -> reach_reward_scale at the keypoints). ----
+        # ---- R_reach: fingertips approach the handle WITH THE CORRECT DIRECTION. grasp_dist = mean distance
+        # of (thumb + 2 nearest other fingertips) to their nearest handle keypoint; shaped by a coarse (far)
+        # + fine (near) tanh kernel. MULTIPLIED by `align` = how well those pads' normals OPPOSE the handle
+        # keypoint's outward normal (the directional keypoints -> the pad must press INTO the handle, not
+        # graze it from the back). Per-step occupancy. ----
         d = self._curr_fingertip_distances
+        a = self._finger_align  # (N,5) in [0,1], 1 = pad normal directly opposes its nearest keypoint normal
         other_d = d[:, self._other_ee_idx]
-        near_val, _ = torch.topk(other_d, k=2, dim=1, largest=False)  # 2 nearest non-thumb fingertips
+        other_a = a[:, self._other_ee_idx]
+        near_val, near_idx = torch.topk(other_d, k=2, dim=1, largest=False)  # thumb + 2 nearest others
         grasp_dist = (d[:, self._thumb_ee_idx] + near_val.sum(dim=-1)) / 3.0
+        align = (a[:, self._thumb_ee_idx] + torch.gather(other_a, 1, near_idx).sum(dim=-1)) / 3.0
         reach_far = 1.0 - torch.tanh(grasp_dist / cfg.reach_scale_far)
         reach_near = 1.0 - torch.tanh(grasp_dist / cfg.reach_scale)
-        r_reach = cfg.reach_reward_scale * 0.5 * (reach_far + reach_near)
+        r_reach = cfg.reach_reward_scale * 0.5 * (reach_far + reach_near) * align
 
         # ---- R_lift: how far the WHOLE object is off the table = TRUE lowest mesh point (hull) - table
         # surface. Per-step occupancy, normalized by the success height, clamped to [0,1]. UNGATED (no
@@ -548,6 +553,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             self.extras["log"] = dict()
         log = self.extras["log"]
         log["grasp_dist_mean"] = grasp_dist.mean()
+        log["align_mean"] = align.mean()
         log["avg_ft_to_kp_mean"] = self._curr_fingertip_distances.mean()
         log["clearance_mean"] = clearance.mean()
         log["clearance_max"] = clearance.max()
