@@ -59,6 +59,9 @@ def main():
     _ = agent.get_batch_size(obs, 1)
     if agent.is_rnn: agent.init_rnn()
 
+    print(f"[SENSOR] contact body order = {u._contact_sensor.body_names}")
+    print(f"[SENSOR] thumb_idx={u._contact_thumb_idx}  other_ids={u._contact_other_ids}  thr={u.cfg.contact_force_thr}N")
+    maxforce = torch.zeros(len(u._contact_sensor.body_names), device=u.device)
     print("step  meanFKdist  minFKdist  lift   (FK=fingertip->nearest keypoint, m)")
     rows = []
     for t in range(args_cli.steps):
@@ -68,11 +71,26 @@ def main():
             obs, _, dones, _ = env.step(actions)
         fk = u._curr_fingertip_distances[0]           # (5,) min dist to nearest keypoint per finger
         lift = (u.object_pos_w[0, 2] - u.scene.env_origins[0, 2] - u.object_default_z[0]).item()
-        rows.append((fk.mean().item(), fk.min().item(), lift))
+        fmag = u._contact_sensor.data.force_matrix_w.norm(dim=-1).sum(dim=-1)[0]  # (B,) per-finger force
+        maxforce = torch.maximum(maxforce, fmag)
+        to_obj = u.object_pos_w[0] - u.palm_center_w[0]; to_obj = to_obj / (to_obj.norm() + 1e-6)
+        pf = float((u.palm_normal_w[0] * to_obj).sum().item())  # raw palm-facing dot (unclamped)
+        if t == 0 or t == 60 or t == 120:
+            print(f"    [palm_facing raw @step{t}] = {pf:+.3f}  (+ = palm faces object, - = hand-back)")
+        tc, oc = u._finger_contact_state()
+        cg = bool((tc[0] & (oc[0] >= 1)).item())
+        rows.append((fk.mean().item(), fk.min().item(), lift, cg, int(oc[0].item()), bool(tc[0].item())))
         if t % 15 == 0:
-            print(f"{t:4d}  {fk.mean().item():.4f}     {fk.min().item():.4f}    {lift:+.3f}")
+            print(f"{t:4d}  {fk.mean().item():.4f}     {fk.min().item():.4f}    {lift:+.3f}   "
+                  f"contact_grasp={cg} thumb={bool(tc[0].item())} n_other={int(oc[0].item())}")
     import statistics as st
     meanFK = [r[0] for r in rows]; minFK = [r[1] for r in rows]; lifts = [r[2] for r in rows]
+    contact_frac = sum(1 for r in rows if r[3]) / len(rows)
+    any_thumb = any(r[5] for r in rows); max_other = max(r[4] for r in rows)
+    print(f"[CONTACT] contact_grasp steps = {contact_frac*100:.0f}%  thumb ever touched = {any_thumb}  "
+          f"max simultaneous other-finger contacts = {max_other}")
+    mf = {u._contact_sensor.body_names[i]: round(maxforce[i].item(), 3) for i in range(len(maxforce))}
+    print(f"[CONTACT] max contact force per finger (N) over rollout: {mf}")
     print("---- summary ----")
     print(f"mean-finger->keypoint dist: overall mean={st.mean(meanFK):.4f}  best(min over episode)={min(meanFK):.4f}")
     print(f"closest any-finger->keypoint ever: {min(minFK):.4f} m")

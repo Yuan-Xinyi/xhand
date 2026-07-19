@@ -13,6 +13,10 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--task", type=str, default="Pick-Tool-Token-Direct-v0")
 parser.add_argument("--drop_z", type=float, default=0.35)
 parser.add_argument("--drop_x", type=float, default=0.9)
+parser.add_argument("--quat", type=float, nargs=4, default=[1.0, 0.0, 0.0, 0.0])
+parser.add_argument("--long_axis", type=float, nargs=3, default=[0.863, -0.13, -0.488])
+parser.add_argument("--eye", type=float, nargs=3, default=[1.3, -0.9, 0.5])
+parser.add_argument("--lookat", type=float, nargs=3, default=[0.5, 0.0, 0.05])
 parser.add_argument("--steps", type=int, default=200)
 parser.add_argument("--record", action="store_true")
 AppLauncher.add_app_launcher_args(parser)
@@ -32,7 +36,7 @@ import xhand_inhand.tasks  # noqa: F401
 def main():
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1)
     env_cfg.object_cfg.init_state.pos = (args_cli.drop_x, 0.0, args_cli.drop_z)
-    env_cfg.object_cfg.init_state.rot = (1.0, 0.0, 0.0, 0.0)
+    env_cfg.object_cfg.init_state.rot = tuple(args_cli.quat)
     env_cfg.reset_object_pos_noise = (0.0, 0.0)
     env_cfg.reset_object_yaw_range = (0.0, 0.0)
     # make sure a drop-termination or success doesn't cut the rollout short
@@ -42,8 +46,8 @@ def main():
     if args_cli.record:
         env_cfg.viewer.origin_type = "env"
         env_cfg.viewer.env_index = 0
-        env_cfg.viewer.eye = (1.3, -0.9, 0.5)
-        env_cfg.viewer.lookat = (0.5, 0.0, 0.05)
+        env_cfg.viewer.eye = tuple(args_cli.eye)
+        env_cfg.viewer.lookat = tuple(args_cli.lookat)
 
     render_mode = "rgb_array" if args_cli.record else None
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode=render_mode)
@@ -82,6 +86,11 @@ def main():
     q = u.object.data.root_quat_w[0]
     print(f"[DROP] SETTLED pose: z={settle:.5f}  quat_wxyz=({q[0]:.5f}, {q[1]:.5f}, {q[2]:.5f}, {q[3]:.5f})")
     print(f"[DROP] final |lin_vel|={u.object.data.root_lin_vel_w[0].norm():.4f}  |ang_vel|={u.object.data.root_ang_vel_w[0].norm():.4f}")
+    # long-axis tilt: |world-z of the rotated long axis| -> 1.0 = vertical (standing), 0 = horizontal (tipped)
+    from isaaclab.utils.math import quat_apply
+    la = torch.tensor(args_cli.long_axis, device=u.device).unsqueeze(0)
+    la_w = quat_apply(u.object_quat_w[:1], la)[0]
+    print(f"[DROP] long-axis |world_z| = {abs(la_w[2].item()):.3f}  ({'STANDING' if abs(la_w[2].item())>0.8 else 'TIPPED/LEANING'})")
     env.close()
 
 

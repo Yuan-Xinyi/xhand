@@ -23,7 +23,7 @@ params:
         sigma_init:
           name: const_initializer
           val: 0
-        fixed_sigma: 'fixed'  # SAPG-fork expects a STRING ('fixed'|'coef_cond'|'obs_cond'); bool True -> builds sigma as a Linear and crashes
+        fixed_sigma: 'fixed'  # plain PPO for this run (SAPG's coef_cond is only for the mixed_expl run)
     mlp:
       units: [256, 128, 64]
       activation: elu
@@ -47,20 +47,26 @@ params:
     normalize_input: True
     normalize_value: True
     num_actors: -1
-    # the rl_games backend here is the SAPG fork (/disk2/simtoolreal/rl_games); it reads these
-    # exploration keys unconditionally. expl_type='none' = plain PPO (no SAPG mixed-exploration).
-    expl_type: 'none'  # 'none' | 'mixed_expl' | 'mixed_expl_disjoint'
-    expl_reward_type: rnd
+    # ===== SAPG structured exploration (mixed_expl) — 8192 actors split into 2 blocks of 4096: one
+    # gets an entropy intrinsic-reward coef (explores hard), one exploits; sigma is coef-conditioned
+    # (fixed_sigma: coef_cond) and the exploit block learns from the explore block (use_others_experience:
+    # lf). Symmetric critic state provided by the env (state_space=86). expl_reward_type MUST be
+    # 'entropy'|'none' ('rnd' -> NotImplementedError). =====
+    expl_type: 'none'   # plain PPO for THIS run (the SAPG mixed_expl run mvp23c is already running with
+                        # its own loaded config; these SAPG keys below are ignored when expl_type=none)
+    expl_reward_type: entropy
     expl_reward_coef_embd_size: 32
-    expl_reward_coef_scale: 1.0
+    expl_reward_coef_scale: 0.002
     expl_coef_block_size: 4096
+    use_others_experience: lf
+    off_policy_ratio: 1.0
     reward_shaper:
       scale_value: 0.01
     normalize_advantage: True
     gamma: 0.99
     tau: 0.95
     learning_rate: 5e-4
-    lr_schedule: adaptive
+    lr_schedule: adaptive    # clean baseline: KL-adaptive LR (original). No entropy schedule this round.
     schedule_type: standard
     kl_threshold: 0.008
     score_to_win: 100000
@@ -69,7 +75,8 @@ params:
     save_frequency: 200
     print_stats: True
     grad_norm: 1.0
-    entropy_coef: 0.0
+    entropy_coef: 0.0    # cleanest baseline: PPO's Gaussian still SAMPLES actions (not deterministic),
+                         # this just adds no pressure to widen sigma. 0.01 was shown to wreck fine contact.
     truncate_grads: True
     e_clip: 0.2
     horizon_length: 32

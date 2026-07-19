@@ -42,7 +42,7 @@ TOOL_USD = sim_utils.MeshConverter(
     sim_utils.MeshConverterCfg(
         asset_path=TOOL_OBJ,
         usd_dir="/tmp/xhand_inhand/pick_tool_token",
-        usd_file_name="tool_pentagon.usd",
+        usd_file_name="tool_hammer.usd",
         rigid_props=sim_utils.RigidBodyPropertiesCfg(),
         collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
         # convex decomposition: many convex hulls approximating the concave tool so the
