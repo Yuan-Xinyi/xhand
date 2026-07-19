@@ -158,11 +158,16 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     lift_step_max = 40.0
     lift_success_bonus = 200.0
 
-    # MINIMAL reward (2026-07-19): R_lift = lift_scale * clip(clearance / lift_success_height, 0, 1), per step.
-    # lift_scale=20 => at the 20cm success height it pays 20/step; at 10cm ~10/step. Dominates R_reach (max
-    # reach_reward_scale=2) once the object is a few cm up, so lifting is the objective and approaching is
-    # just the on-ramp.
+    # R_lift = lift_scale * clip(clearance/lift_success_height,0,1) * valid_contact * hold_quality, per step.
+    # lift_scale=20 => at 20cm success height ~20/step; at 10cm ~10/step. Dominates R_reach (max 2) once up.
     lift_scale = 20.0
+
+    # HELD-gate on R_lift: hold_quality = exp(-rel_lin/hold_v_scale) * exp(-rel_ang/hold_w_scale), where
+    # rel_lin/rel_ang are the object's linear/angular speed RELATIVE to the palm. A HELD object moves with
+    # the hand (rel ~0 -> hold_quality ~1); a FLUNG object flies off (rel large -> hold_quality -> 0), and it
+    # also breaks valid_contact. Together: a throw/fling earns ZERO lift reward.
+    hold_v_scale = 0.3    # m/s; relative linear speed that drops hold_quality to ~0.72 (0.1 m/s) / e^-1 (0.3)
+    hold_w_scale = 3.0    # rad/s; relative angular speed scale
 
     # R_hold: small per-step reward for MAINTAINING a stable grasp (is_grasped). MUST exceed reach_reward_scale
     # (2.0) so "grasp and hold" strictly beats "hover near the object" -- otherwise the policy regresses to

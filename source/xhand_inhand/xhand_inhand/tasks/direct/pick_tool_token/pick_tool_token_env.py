@@ -518,33 +518,46 @@ class PickToolTokenEnv(PickCubeTokenEnv):
     # PickCubeTokenEnv._pre_physics_step (7 arm relative joint deltas + 9 hand eigengrasp token = 16).
 
     def _get_rewards(self) -> torch.Tensor:
-        # MINIMAL TWO-TERM reward (user request 2026-07-19: strip ALL contact / is_grasped / palm-facing /
-        # align / hold / clean-lift / grasp-bonus / success-bonus machinery; keep ONLY (1) fingertips APPROACH
-        # the object and (2) the object's off-table HEIGHT). reward = R_reach + R_lift.
+        # TWO-TERM reward: R_reach (approach the handle with the correct hand orientation) + R_lift (hold the
+        # object and carry it off the table). R_lift is HELD-gated so a fling/throw earns nothing.
         cfg = self.cfg
 
-        # ---- R_reach: fingertips approach the handle WITH THE CORRECT DIRECTION. grasp_dist = mean distance
-        # of (thumb + 2 nearest other fingertips) to their nearest handle keypoint; shaped by a coarse (far)
-        # + fine (near) tanh kernel. MULTIPLIED by `align` = how well those pads' normals OPPOSE the handle
-        # keypoint's outward normal (the directional keypoints -> the pad must press INTO the handle, not
-        # graze it from the back). Per-step occupancy. ----
+        # ---- grasp quality signals (all in [0,1]) ----
         d = self._curr_fingertip_distances
-        a = self._finger_align  # (N,5) in [0,1], 1 = pad normal directly opposes its nearest keypoint normal
+        a = self._finger_align  # (N,5) in [0,1], 1 = pad normal directly OPPOSES its nearest keypoint normal
         other_d = d[:, self._other_ee_idx]
         other_a = a[:, self._other_ee_idx]
         near_val, near_idx = torch.topk(other_d, k=2, dim=1, largest=False)  # thumb + 2 nearest others
         grasp_dist = (d[:, self._thumb_ee_idx] + near_val.sum(dim=-1)) / 3.0
         align = (a[:, self._thumb_ee_idx] + torch.gather(other_a, 1, near_idx).sum(dim=-1)) / 3.0
+        to_obj = self.object_pos_w - self.palm_center_w
+        to_obj = to_obj / to_obj.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        palm_facing = 0.5 * (1.0 + (self.palm_normal_w * to_obj).sum(dim=-1))  # [0,1]; >0.5 = palm faces object
+
+        # ---- valid contact = thumb pad + >=1 other pad actually on the object (net force + per-finger
+        # proximity). Used ONLY to gate the lift (not the whole grasp state machine). ----
+        thumb_contact, other_count = self._finger_contact_state()
+        valid_contact = thumb_contact & (other_count >= 1)
+
+        # ---- R_reach: (coarse+fine distance) x palm_facing (whole-hand faces object) x align (pad normals
+        # oppose the handle) -- fingers must approach the RIGHT way. OFF once a contact grasp is present so it
+        # can't be farmed by hovering at the object. ----
         reach_far = 1.0 - torch.tanh(grasp_dist / cfg.reach_scale_far)
         reach_near = 1.0 - torch.tanh(grasp_dist / cfg.reach_scale)
-        r_reach = cfg.reach_reward_scale * 0.5 * (reach_far + reach_near) * align
+        r_reach = cfg.reach_reward_scale * 0.5 * (reach_far + reach_near) * palm_facing * align * (~valid_contact).float()
 
-        # ---- R_lift: how far the WHOLE object is off the table = TRUE lowest mesh point (hull) - table
-        # surface. Per-step occupancy, normalized by the success height, clamped to [0,1]. UNGATED (no
-        # contact / grasp required). Uses the true hull clearance so tipping the object doesn't count. ----
+        # ---- R_lift: off-table HEIGHT, but ONLY while the object is actually HELD -- gated by valid_contact
+        # AND a hold_quality that decays with the object's speed RELATIVE to the palm. A fling/throw breaks
+        # contact (valid_contact False) and sends the object flying (rel speed high) -> R_lift -> 0. Uses the
+        # TRUE hull clearance so tipping doesn't count either. ----
         clearance = self._object_true_min_z() - self._table_surface_z
         lift_fraction = torch.clamp(clearance / cfg.lift_success_height, 0.0, 1.0)
-        r_lift = cfg.lift_scale * lift_fraction
+        palm_lin_vel = self.robot.data.body_lin_vel_w[:, self.palm_idx]
+        palm_ang_vel = self.robot.data.body_ang_vel_w[:, self.palm_idx]
+        rel_lin = (self.object.data.root_lin_vel_w - palm_lin_vel).norm(dim=-1)   # object vs hand linear speed
+        rel_ang = (self.object.data.root_ang_vel_w - palm_ang_vel).norm(dim=-1)   # object vs hand angular speed
+        hold_quality = torch.exp(-rel_lin / cfg.hold_v_scale) * torch.exp(-rel_ang / cfg.hold_w_scale)
+        r_lift = cfg.lift_scale * lift_fraction * valid_contact.float() * hold_quality
 
         object_z = self.object_pos_w[:, 2] - self.scene.env_origins[:, 2]
         actual_lift = object_z - self.object_default_z
@@ -554,6 +567,12 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         log = self.extras["log"]
         log["grasp_dist_mean"] = grasp_dist.mean()
         log["align_mean"] = align.mean()
+        log["palm_facing_mean"] = palm_facing.mean()
+        log["valid_contact_frac"] = valid_contact.float().mean()
+        log["thumb_contact_frac"] = thumb_contact.float().mean()
+        log["hold_quality_mean"] = hold_quality.mean()
+        log["rel_lin_speed_mean"] = rel_lin.mean()
+        log["rel_ang_speed_mean"] = rel_ang.mean()
         log["avg_ft_to_kp_mean"] = self._curr_fingertip_distances.mean()
         log["clearance_mean"] = clearance.mean()
         log["clearance_max"] = clearance.max()
@@ -575,13 +594,16 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         object_z = self.object_pos_w[:, 2] - self.scene.env_origins[:, 2]
         actual_lift = object_z - self.object_default_z
 
-        # success = the WHOLE object lifted off the table above the success height (true hull clearance) and
-        # nearly still, held for success_hold_steps. No contact/grasp condition (minimal reward design).
+        # success = the WHOLE object HELD (thumb + >=1 pad in contact) off the table above the success height
+        # (true hull clearance), nearly still, held for success_hold_steps. valid_contact rules out a flung
+        # object that momentarily passes 20cm airborne.
         clearance = self._object_true_min_z() - self._table_surface_z
+        thumb_contact, other_count = self._finger_contact_state()
+        valid_contact = thumb_contact & (other_count >= 1)
         obj_lin = self.object.data.root_lin_vel_w.norm(dim=-1)
         obj_ang = self.object.data.root_ang_vel_w.norm(dim=-1)
         slow = (obj_lin < cfg.success_max_obj_lin_speed) & (obj_ang < cfg.success_max_obj_ang_speed)
-        success_inst = (clearance >= cfg.lift_success_height) & slow
+        success_inst = (clearance >= cfg.lift_success_height) & slow & valid_contact
         self._success_steps = torch.where(
             success_inst, self._success_steps + 1, torch.zeros_like(self._success_steps)
         )
