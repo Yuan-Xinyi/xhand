@@ -76,6 +76,11 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._grasp_baseline_lift = torch.full((N,), 1.0e6, device=dev)  # root lift at grasp (logging only now)
         self._grasp_baseline_clearance = torch.full((N,), 1.0e6, device=dev)  # object off-table clearance at grasp (P0-1)
         self._highest_rel_lift = torch.zeros(N, device=dev)              # (unused; old mvp20 ratchet)
+        # object POSE at grasp formation -- the lift reward is gated on keeping this pose (no twisting, no
+        # horizontal drift) so only a CLEAN vertical lift pays (arm "wiggle" that tumbles/drags the object -> 0).
+        self._grasp_baseline_xy = torch.zeros((N, 2), device=dev)        # object xy at grasp (world; diff cancels origin)
+        self._grasp_baseline_quat = torch.zeros((N, 4), device=dev)      # object orientation at grasp
+        self._grasp_baseline_quat[:, 0] = 1.0                            # identity until first grasp locks it
         self._success_steps = torch.zeros(N, dtype=torch.long, device=dev)  # success hold counter (P0-3)
         # --- hysteresis grasp state machine: is_grasped is a STABLE latch, not raw flickering contact ---
         self._contact_steps = torch.zeros(N, dtype=torch.long, device=dev)       # consecutive valid-contact steps
@@ -539,6 +544,10 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         # knock-ups aren't credited (P0-1). Baseline is on CLEARANCE (see below), not root height.
         first_grasp = newly_grasped & (~self._grasp_bonus_given)
         self._grasp_baseline_clearance = torch.where(first_grasp, clearance, self._grasp_baseline_clearance)
+        # lock the object POSE (xy + orientation) at grasp formation too, for the clean-lift gate below
+        fg2 = first_grasp.unsqueeze(-1)
+        self._grasp_baseline_xy = torch.where(fg2, self.object_pos_w[:, :2], self._grasp_baseline_xy)
+        self._grasp_baseline_quat = torch.where(fg2, self.object_quat_w, self._grasp_baseline_quat)
 
         # LIFT is measured by CLEARANCE (how far the WHOLE object is off the table), NOT the object root
         # height. The root-height measure was hackable: tipping the hammer toward VERTICAL raises the root
@@ -547,16 +556,28 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         # so "tip it vertical" earns only its true off-table height.
         grasp_rel_lift = torch.clamp(clearance - self._grasp_baseline_clearance, min=0.0)
 
+        # ---- CLEAN-LIFT gate: only reward lifting the object STRAIGHT UP while KEEPING its grasp pose.
+        # orient_stay = cos(angle between current & grasp orientation) -> 1 aligned, 0 at >=90deg twist.
+        # xy_stay = 1 at no horizontal drift, ->0 as the object is dragged sideways. Their product gates
+        # r_lift, so the arm "wiggle" that tumbles/drags the object earns nothing; only a clean vertical
+        # lift (same orientation, straight up) pays. (User: penalize object pose/position change, reward
+        # only vertical up.)
+        qdot = (self.object_quat_w * self._grasp_baseline_quat).sum(dim=-1).abs()  # |cos(theta/2)|
+        orient_stay = torch.clamp(2.0 * qdot * qdot - 1.0, min=0.0)                # cos(theta), clamp>=0
+        xy_drift = (self.object_pos_w[:, :2] - self._grasp_baseline_xy).norm(dim=-1)
+        xy_stay = 1.0 - torch.tanh(xy_drift / cfg.lift_xy_drift_scale)
+        clean_lift = orient_stay * xy_stay
+
         # ---- R_grasp: ONE-SHOT bonus for the FIRST stable grasp this episode (same event) ----
         r_grasp = cfg.grasp_bonus * first_grasp.float()
         self._grasp_bonus_given = self._grasp_bonus_given | is_grasped  # never re-paid, even after drop+regrasp
 
-        # ---- R_lift = per-step NORMALIZED off-table HEIGHT (occupancy) + one-shot stable-success bonus.
+        # ---- R_lift = per-step NORMALIZED off-table HEIGHT (occupancy) x clean-lift gate + one-shot success.
         #      Per-step height pays for the CURRENT held clearance every step (no history/ratchet) -> gradient
         #      from mm 1 ALWAYS; a crush-launch/tip pays only while the object is actually off the table;
-        #      holding the whole object high pays continuously (aligned with success). ----
+        #      holding the whole object high & STEADY (no twist/drift) pays continuously (aligned with success). ----
         lift_fraction = torch.clamp(grasp_rel_lift / cfg.lift_success_height, 0.0, 1.0)
-        r_lift_height = cfg.lift_step_max * lift_fraction * is_grasped.float()
+        r_lift_height = cfg.lift_step_max * lift_fraction * is_grasped.float() * clean_lift
 
         # one-shot pull to the finish line: paid once when the STRICT stable success first latches (held
         # success_hold_steps at >=20cm, cleared, nearly still). _is_success is set in _get_dones (runs
@@ -593,6 +614,9 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         log["thumb_contact_frac"] = thumb_contact.float().mean()
         log["other_contact_count_mean"] = other_count.float().mean()
         log["clearance_ok_frac"] = clearance_ok.float().mean()
+        log["orient_stay_mean"] = orient_stay.mean()
+        log["xy_drift_mean"] = xy_drift.mean()
+        log["clean_lift_mean"] = clean_lift.mean()
         log["grasp_rel_lift_mean"] = grasp_rel_lift.mean()
         log["grasp_rel_lift_max"] = grasp_rel_lift.max()
         log["actual_lift_mean"] = actual_lift.mean()
@@ -627,9 +651,14 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         slow = (obj_lin < cfg.success_max_obj_lin_speed) & (obj_ang < cfg.success_max_obj_ang_speed)
 
         # P0-3: success = STABLE grasp (is_grasped, hysteresis) + clearance + rel-lift (relative to the
-        # grasp height), object nearly still, held for N steps. is_grasped is updated in _get_rewards
-        # (runs right after this each step); a 1-step lag on the success gate is immaterial.
-        success_inst = self._is_grasped & clearance_ok & (grasp_rel_lift >= cfg.lift_success_height) & slow
+        # grasp height), object nearly still, held for N steps, AND the object still at its grasp orientation
+        # (no tumble). is_grasped is updated in _get_rewards (runs right after this each step); a 1-step lag
+        # on the success gate is immaterial.
+        qdot = (self.object_quat_w * self._grasp_baseline_quat).sum(dim=-1).abs()
+        orient_ok = (2.0 * qdot * qdot - 1.0) >= cfg.success_orient_min   # cos(twist) above threshold
+        success_inst = (
+            self._is_grasped & clearance_ok & (grasp_rel_lift >= cfg.lift_success_height) & slow & orient_ok
+        )
         self._success_steps = torch.where(
             success_inst, self._success_steps + 1, torch.zeros_like(self._success_steps)
         )
@@ -660,6 +689,9 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._grasp_baseline_lift[env_ids] = 1.0e6
         self._grasp_baseline_clearance[env_ids] = 1.0e6
         self._highest_rel_lift[env_ids] = 0.0
+        self._grasp_baseline_xy[env_ids] = 0.0
+        self._grasp_baseline_quat[env_ids] = 0.0
+        self._grasp_baseline_quat[env_ids, 0] = 1.0
         self._success_steps[env_ids] = 0
         self._contact_steps[env_ids] = 0
         self._lost_contact_steps[env_ids] = 0

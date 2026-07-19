@@ -175,6 +175,13 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # hand actually closed on the handle -- a solid lift-off, achievable for this hammer.
     lift_success_height = 0.20
 
+    # CLEAN-LIFT gate (user: reward only a straight-up lift that keeps the grasp pose; penalize the arm
+    # "wiggle" that tumbles/drags the object). r_lift is multiplied by orient_stay (cos of the twist from
+    # the grasp orientation) x xy_stay (1 - tanh(horizontal_drift/scale)). Success also requires the twist
+    # to stay small.
+    lift_xy_drift_scale = 0.05     # m; horizontal drift at which xy_stay ~ 0.76 (5cm) -> lift reward decays
+    success_orient_min = 0.85      # cos(twist) required for success (~0.85 = <=31 deg from grasp orientation)
+
     # ANTI-HACK: terminate the episode if the ARM presses on the table (the "press-up" hack levers the
     # object up off the table's reaction force instead of a real arm lift). Detected GEOMETRICALLY (no
     # contact sensor): any arm link's world z dropping to within arm_table_margin of the table plane
