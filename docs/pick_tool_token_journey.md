@@ -99,3 +99,31 @@ R_success = 500 × newly_successful          # 一次性(成功会结束回合)
 
 ## 附:诊断工具(scripts/rl_games/)
 `isgrasped_diag.py`(接触规模验证)、`keypoint_diag.py`(指尖-keypoint+palm_facing)、`forcelift_diag.py`(冻结抓握强制抬,测握能否举)、`truelift_diag.py`(凸包真实clearance vs 假包围盒)、`press_diag.py`(各body vs桌面z)、`fling_real.py`/`fling_test.py`(投掷→lift归零)、`cond_action_diag.py`(抓握后是否命令上举)。
+
+---
+
+## 七、探索桥接实施结果（2026-07-20）
+
+这轮不再继续放大奖励，而是把「接近→合拢→稳定持握→持续上举」先变成可验证的控制闭环，再用示范启动探索：
+
+- 动作扩为 21 维：`arm7 + token9 + distal residual5`。残差直接覆盖五个指尖远端屈曲关节的完整非对称可动范围，且不累积。
+- 观测扩为 115 维，加入逐指接触/包裹、抓握 latch、刚体 slip、历史动作与阶段量；旧 87 维保持逐元素前缀兼容。
+- grasp 判据改成方向门控的 thumb + 两个对侧指腹包裹，并用 Schmitt latch 消除接触抖动；close/contact/wrap progress 填补擦边到力闭合之间的奖励空洞。
+- 加入 25 N 去预载、30 N 主动卸载、单步手目标限速与未 latch 禁止上举；持续超过 30 N 10 帧或超过 60 N 2 帧终止。
+- episode horizon 从 6 s 增至 20 s；严格成功轨迹的中位完成时刻约为第 630 个控制步，短 horizon 会系统性截断成功。
+- 支持从物理轨迹边界做 reverse curriculum，并同时恢复机器人关节速度、物体线/角速度和上一动作，避免中途状态注入造成虚假 slip 冲击。
+- 新增脚本 oracle、状态反馈示范采集、数据合并、BC/DAgger、checkpoint 迁移与分离 actor/critic 转换工具。示范教师由可观测的上一执行动作恢复握持目标，不依赖跨步隐藏积分器。
+
+### 严格结果
+
+| 控制器 | 评估 | 真实 20 cm 成功 | 结论 |
+|---|---:|---:|---|
+| 脚本闭环 oracle | 8 env | 8/8 | 任务在当前动力学、动作空间和安全阈值下可行；最终真实 clearance 22.2–23.4 cm |
+| 最佳学习 actor，seed 99 | 256 env × 1000 step | 42/256 | 49 个 env 到过 20 cm，42 个满足稳定成功 |
+| 最佳学习 actor，seed 100 | 256 env × 1000 step | 41/256 | 44 个 env 到过 20 cm，41 个满足稳定成功 |
+| 两 seed 合计 | 512 env | **83/512（16.2%）** | 已打穿探索墙，但远未达到稳健部署标准 |
+
+端到端继续 BC、95% learner DAgger、option FSM 和直接 PPO fine-tune 都未超过该基线；其中最新状态反馈 DAgger actor 在 seed 99 上降到 0/256，因此已拒绝。结果说明现在的主要问题已从「从未探索到抓举」转成「全网络蒸馏/更新造成闭环分布漂移」。下一步应冻结当前 actor，只训练有界残差适配器或门控 option，并以两 seed 的严格物理成功率作为唯一晋级条件，不能再以离线 action MSE 选模。
+
+本轮可复现交付位于忽略版本控制的
+`logs/rl_games/pick_tool_token/0_bootstrap_handoff_20260720/`：包含最佳 actor、8-env oracle 数据和两组严格评估 JSON。

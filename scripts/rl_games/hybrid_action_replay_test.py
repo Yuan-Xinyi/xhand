@@ -11,8 +11,8 @@ from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Hybrid action decoder/physics regression.")
 parser.add_argument("--input", default="/tmp/pick_tool_hand_space_seed0.json")
-parser.add_argument("--close_steps", type=int, default=24)
-parser.add_argument("--eval_steps", type=int, default=8)
+parser.add_argument("--close_steps", type=int, default=48)
+parser.add_argument("--eval_steps", type=int, default=12)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 app_launcher = AppLauncher(args_cli)
@@ -24,6 +24,7 @@ from isaaclab_tasks.utils import parse_env_cfg
 
 import xhand_inhand.tasks  # noqa: F401
 from xhand_inhand.tasks.direct.pick_cube.pick_cube_env import PickCubeEnv
+from xhand_inhand.tasks.direct.pick_tool_token.hybrid_action import apply_asymmetric_joint_residual
 
 
 @torch.inference_mode()
@@ -58,10 +59,22 @@ def main() -> None:
     residual_probe = torch.zeros((num_envs, u._n_tokens + u._n_distal_residuals), device=dev)
     residual_probe[0, u._n_tokens :] = -1.0
     residual_probe[2, u._n_tokens :] = 1.0
-    probe_target = u._decode_hand_action(residual_probe)
     hand_lower = u.dof_lower[:, u._hand_ids_t]
     hand_upper = u.dof_upper[:, u._hand_ids_t]
-    probe_zero = u._decode_hand_action(torch.zeros_like(residual_probe))
+
+    def raw_decode(value: torch.Tensor) -> torch.Tensor:
+        token_target = u.retarget.retarget_from_unit_action(value[:, : u._n_tokens])[:, u._retarget2isaac]
+        target, _ = apply_asymmetric_joint_residual(
+            token_target,
+            hand_lower,
+            hand_upper,
+            value[:, u._n_tokens :],
+            u._distal_hand_ids,
+        )
+        return target
+
+    probe_target = raw_decode(residual_probe)
+    probe_zero = raw_decode(torch.zeros_like(residual_probe))
     if not torch.allclose(probe_target[0, u._distal_hand_ids], hand_lower[0, u._distal_hand_ids]):
         raise AssertionError("-1 residual did not reach every distal lower limit")
     if not torch.allclose(probe_target[1], probe_zero[1]):
@@ -106,7 +119,7 @@ def main() -> None:
     hand_action = torch.tensor(result["latent"], device=dev).unsqueeze(0).repeat(num_envs, 1)
     action = torch.zeros((num_envs, cfg.action_space), device=dev)
     action[:, u._n_arm :] = hand_action
-    decoded = u._decode_hand_action(action[:, u._n_arm :])
+    decoded = raw_decode(hand_action)
     expected = torch.tensor(result["target"], device=dev).unsqueeze(0).repeat(num_envs, 1)
     max_decode_error = float((decoded - expected).abs().max())
     if max_decode_error >= 1.0e-6:

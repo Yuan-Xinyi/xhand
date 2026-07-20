@@ -56,3 +56,28 @@ def apply_asymmetric_joint_residual(
     target = base.clone()
     target.index_copy_(1, joint_indices, selected_base + delta)
     return target, delta
+
+
+def invert_asymmetric_joint_residual(
+    target: torch.Tensor,
+    base_target: torch.Tensor,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    joint_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Encode selected absolute joint targets back into normalized residual actions."""
+
+    if target.shape != base_target.shape or lower.shape != base_target.shape or upper.shape != base_target.shape:
+        raise ValueError("target, base_target, lower and upper must have the same (N, J) shape")
+    selected_target = target.index_select(1, joint_indices)
+    selected_base = torch.maximum(
+        torch.minimum(base_target.index_select(1, joint_indices), upper.index_select(1, joint_indices)),
+        lower.index_select(1, joint_indices),
+    )
+    delta = selected_target - selected_base
+    span = torch.where(
+        delta >= 0.0,
+        upper.index_select(1, joint_indices) - selected_base,
+        selected_base - lower.index_select(1, joint_indices),
+    ).clamp_min(1.0e-8)
+    return (delta / span).clamp(-1.0, 1.0)

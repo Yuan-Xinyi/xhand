@@ -24,8 +24,18 @@ from .tool_asset import TOOL_MASS, TOOL_REST_QUAT, TOOL_REST_Z, TOOL_SCALE, TOOL
 
 @configclass
 class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
-    # the bulky, irregular tool takes a little longer to line the grasp up than a small cube
-    episode_length_s = 6.0
+    # End-to-end DAgger rollouts reach strict 20 cm success at a median of ~630 control steps
+    # (observed range extends past step 900).  A 10 s / 500-step horizon therefore censored most
+    # successful trajectories before PPO could observe the terminal reward.
+    episode_length_s = 20.0
+
+    # Reverse-curriculum reset.  Defaults preserve ordinary random reset exactly.  Training phases
+    # opt into a physically captured episode boundary (settle_start -> mid_lift -> micro_end ->
+    # close_start), then reduce curriculum_reset_probability until all resets are task-randomized.
+    curriculum_dataset: str = ""
+    curriculum_boundary = "close_start"
+    curriculum_reset_probability = 0.0
+    curriculum_joint_noise = 0.0
 
     # Action = 7 arm relative deltas + 9 CrossDex tokens + 5 absolute distal residuals.  A residual
     # of -1/0/+1 reaches the runtime lower/token/upper target respectively, before the existing EMA.
@@ -38,6 +48,21 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
         "pinky_joint1",
     )
     action_space = 21
+
+    # Action shields enforce the task ordering in the controller as well as in reward.  The tactile
+    # limiter follows the validated oracle servo: remove stored hand preload at 25N and actively
+    # unload above 30N.  Ten persistent >30N frames terminate a jammed grasp; two >60N frames are
+    # the faster emergency cutoff.
+    # While touching without a strict latch (or after losing a
+    # previously latched grasp), remove only the palm-up component of the arm delta.
+    enable_grasp_action_shield = True
+    tactile_soft_force_limit = 25.0
+    tactile_hard_force_limit = 30.0
+    tactile_release_step = 0.02
+    hand_target_max_step = 0.02
+    tactile_hard_terminate_steps = 10
+    tactile_terminate_force_limit = 60.0
+    tactile_terminate_steps = 2
 
     # The old 87 features remain an exact prefix: core70 + arm/token16 + lift1. New features are
     # residual5 plus 23 bounded close/contact/phase/counter/transport features.  In particular,

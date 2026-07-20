@@ -216,6 +216,9 @@ def test_asymmetric_joint_residual() -> None:
     check(torch.equal(target[:, untouched], base[:, untouched]), "advanced indexing changed other joints")
     check(torch.all(target >= lower).item() and torch.all(target <= upper).item(), "target escaped limits")
     check(torch.allclose(delta[2], expected_row2 - base[2, joint_ids]), "reported delta is wrong")
+    encoded = hybrid_action.invert_asymmetric_joint_residual(target, base, lower, upper, joint_ids)
+    roundtrip, _ = hybrid_action.apply_asymmetric_joint_residual(base, lower, upper, encoded, joint_ids)
+    check(torch.allclose(roundtrip, target), "absolute distal target failed residual round trip")
     print("PASS hybrid action: full asymmetric range, zero identity, shuffled joints and rows")
 
 

@@ -16,6 +16,8 @@ terms improve credit assignment without weakening contact, transport or true-cle
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 from collections.abc import Sequence
 
@@ -60,6 +62,25 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._last_token_hand_target = torch.zeros((N, len(hand_joint_names)), device=dev)
         self._last_distal_delta = torch.zeros((N, len(distal_names)), device=dev)
         self._last_raw_hand_target = torch.zeros((N, len(hand_joint_names)), device=dev)
+        distal_by_fingertip = {
+            "thumb_rota_link2": "thumb_joint2",
+            "index_rota_link2": "index_joint2",
+            "mid_link2": "middle_joint1",
+            "ring_link2": "ring_joint1",
+            "pinky_link2": "pinky_joint1",
+        }
+        self._force_to_distal_index = torch.tensor(
+            [distal_names.index(distal_by_fingertip[name]) for name in self.ee_names],
+            dtype=torch.long,
+            device=dev,
+        )
+        self._arm_up_shield_fraction = torch.zeros((), device=dev)
+        self._tactile_soft_shield_fraction = torch.zeros((), device=dev)
+        self._tactile_hard_shield_fraction = torch.zeros((), device=dev)
+        self._hand_slew_shield_fraction = torch.zeros((), device=dev)
+        self._tactile_terminate_fraction = torch.zeros((), device=dev)
+        self._hard_force_steps = torch.zeros(N, dtype=torch.long, device=dev)
+        self._overforce_steps = torch.zeros(N, dtype=torch.long, device=dev)
 
         # handle grasp keypoints in the object's local frame -- (K, 3)
         self.grasp_keypoints_local = torch.tensor(cfg.grasp_keypoints, dtype=torch.float, device=dev)
@@ -237,6 +258,15 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._finger_dir_bead_paths = {}   # ee_name -> [trail beads] under the link
         self._last_printed_dirs = None
 
+        # Optional reverse-curriculum snapshots are loaded once onto the simulation device.  The
+        # ordinary task leaves curriculum_dataset=None, so its reset distribution is unchanged.
+        self._curriculum_states: dict[str, torch.Tensor] | None = None
+        self._curriculum_reset_mask = torch.zeros(N, dtype=torch.bool, device=dev)
+        if cfg.curriculum_dataset:
+            self._curriculum_states = self._load_curriculum_boundary(
+                Path(cfg.curriculum_dataset), cfg.curriculum_boundary
+            )
+
         # compute once (fills valid poses + finalizes the thumb normal from the rest pose) BEFORE
         # creating markers, so the bead trails render the finalized directions.
         self._compute_intermediate_values()
@@ -249,6 +279,88 @@ class PickToolTokenEnv(PickCubeTokenEnv):
     @staticmethod
     def _normalize(v: torch.Tensor) -> torch.Tensor:
         return v / (v.norm(dim=-1, keepdim=True) + 1e-9)
+
+    def _load_curriculum_boundary(self, dataset_path: Path, boundary_name: str) -> dict[str, torch.Tensor]:
+        if not dataset_path.is_file():
+            raise FileNotFoundError(f"Curriculum dataset does not exist: {dataset_path}")
+        dataset = torch.load(dataset_path, map_location="cpu", weights_only=False)
+        if not isinstance(dataset, dict) or not isinstance(dataset.get("boundaries"), dict):
+            raise TypeError("Curriculum dataset must contain a boundaries dictionary")
+        boundaries = dataset["boundaries"]
+        if boundary_name not in boundaries or not isinstance(boundaries[boundary_name], dict):
+            raise KeyError(
+                f"Curriculum boundary {boundary_name!r} is absent; available={sorted(boundaries)}"
+            )
+        source = boundaries[boundary_name]
+        required = {
+            "joint_pos": self.robot.num_joints,
+            "joint_vel": self.robot.num_joints,
+            "dof_targets": self.robot.num_joints,
+            "object_local_pos": 3,
+            "object_quat": 4,
+            "object_velocity": 6,
+            "last_action": self.cfg.action_space,
+        }
+        states: dict[str, torch.Tensor] = {}
+        state_count = None
+        for key, width in required.items():
+            value = source.get(key)
+            if not isinstance(value, torch.Tensor) or value.ndim != 2 or value.shape[1] != width:
+                shape = tuple(value.shape) if isinstance(value, torch.Tensor) else None
+                raise ValueError(f"Curriculum {boundary_name}.{key} expected [K,{width}], got {shape}")
+            if state_count is None:
+                state_count = value.shape[0]
+            elif value.shape[0] != state_count:
+                raise ValueError(f"Curriculum {boundary_name} tensors have inconsistent episode counts")
+            states[key] = value.to(device=self.device, dtype=torch.float32)
+        if not state_count:
+            raise ValueError(f"Curriculum boundary {boundary_name!r} is empty")
+        print(
+            f"[PickToolTokenEnv] loaded {state_count} curriculum states "
+            f"from {dataset_path} boundary={boundary_name}",
+            flush=True,
+        )
+        return states
+
+    def _apply_curriculum_resets(self, env_ids: torch.Tensor) -> None:
+        self._curriculum_reset_mask[env_ids] = False
+        states = self._curriculum_states
+        probability = float(self.cfg.curriculum_reset_probability)
+        if states is None or probability <= 0.0 or env_ids.numel() == 0:
+            return
+        use_mask = torch.rand(env_ids.numel(), device=self.device) < min(probability, 1.0)
+        selected_envs = env_ids[use_mask]
+        if selected_envs.numel() == 0:
+            return
+        state_ids = torch.randint(states["joint_pos"].shape[0], (selected_envs.numel(),), device=self.device)
+        joint_pos = states["joint_pos"][state_ids].clone()
+        dof_targets = states["dof_targets"][state_ids].clone()
+        noise_scale = float(self.cfg.curriculum_joint_noise)
+        if noise_scale > 0.0:
+            noise = sample_uniform(
+                -noise_scale, noise_scale, joint_pos.shape, device=self.device
+            )
+            joint_pos += noise
+            dof_targets += noise
+        limits = self.robot.data.soft_joint_pos_limits[selected_envs]
+        joint_pos = torch.clamp(joint_pos, limits[..., 0], limits[..., 1])
+        dof_targets = torch.clamp(dof_targets, limits[..., 0], limits[..., 1])
+        joint_vel = states["joint_vel"][state_ids]
+        self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=selected_envs)
+        self.robot.set_joint_position_target(dof_targets, env_ids=selected_envs)
+        self.dof_targets[selected_envs] = dof_targets
+
+        object_pose = torch.empty((selected_envs.numel(), 7), device=self.device)
+        object_pose[:, :3] = states["object_local_pos"][state_ids] + self.scene.env_origins[selected_envs]
+        object_pose[:, 3:] = states["object_quat"][state_ids]
+        self.object.write_root_pose_to_sim(object_pose, env_ids=selected_envs)
+        # Restore both sides of the captured hand-object motion.  Zeroing only the object while the
+        # arm retained a mid-lift joint velocity created an artificial first-frame slip impulse.
+        self.object.write_root_velocity_to_sim(states["object_velocity"][state_ids], env_ids=selected_envs)
+        self.actions[selected_envs] = states["last_action"][state_ids]
+        self.prev_actions[selected_envs] = states["last_action"][state_ids]
+        self._curriculum_reset_mask[selected_envs] = True
+        self._compute_intermediate_values()
 
     # ------------------------------------------------------------------ scene (+ contact sensors)
     def _setup_scene(self):
@@ -761,6 +873,62 @@ class PickToolTokenEnv(PickCubeTokenEnv):
     def _get_states(self) -> torch.Tensor:
         return getattr(self, "_policy_obs_cache", None)
 
+    def _pre_physics_step(self, actions: torch.Tensor) -> None:
+        """Apply a grasp-phase arm shield before the shared relative-action controller."""
+
+        shielded = actions.clone()
+        self._arm_up_shield_fraction.zero_()
+        object_force = None
+        soft = None
+        hard = None
+        if self.cfg.enable_grasp_action_shield:
+            object_force = self._finger_object_force_magnitudes()
+            soft = object_force >= self.cfg.tactile_soft_force_limit
+            hard = object_force >= self.cfg.tactile_hard_force_limit
+            touching = object_force.max(dim=-1).values >= self.cfg.contact_force_thr
+            block_up = (~self._is_grasped) & (touching | self._grasp_bonus_given)
+            if bool(block_up.any()):
+                jacobian = self.robot.root_physx_view.get_jacobians()
+                palm_jacobian = jacobian[:, self._palm_jac_idx, :, :][:, :, self._arm_ids_t]
+                jz = palm_jacobian[:, 2, :]
+                arm = shielded[:, : self._n_arm]
+                predicted_up = (jz * arm).sum(dim=-1)
+                active = block_up & (predicted_up > 0.0)
+                correction = predicted_up / jz.square().sum(dim=-1).clamp_min(1.0e-8)
+                projected = arm - correction.unsqueeze(-1) * jz
+                shielded[:, : self._n_arm] = torch.where(active.unsqueeze(-1), projected, arm)
+                self._arm_up_shield_fraction.copy_(active.float().mean())
+        super()._pre_physics_step(shielded)
+        if self.cfg.enable_grasp_action_shield:
+            # `_decode_hand_action` shapes the raw command, but the parent's EMA and joint-limit
+            # clamp can otherwise leave a large position-target preload after contact.  Enforce the
+            # tactile shield on the *final* targets as well: a soft event removes all stored hand
+            # preload, while a hard event also arrests the arm and unloads the whole hand.  Releasing
+            # every joint is important because proximal token joints can retain squeeze even after
+            # a distal residual has opened.
+            assert object_force is not None and soft is not None and hard is not None
+            soft_env = soft.any(dim=-1)
+            hard_env = hard.any(dim=-1)
+            actual = self.robot.data.joint_pos
+            if bool(soft_env.any()):
+                current_hand = self.dof_targets[:, self._hand_ids_t]
+                current_hand[soft_env] = actual[soft_env][:, self._hand_ids_t]
+                self.dof_targets[:, self._hand_ids_t] = current_hand
+            if bool(hard_env.any()):
+                current_arm = self.dof_targets[:, self._arm_ids_t]
+                current_arm[hard_env] = actual[hard_env][:, self._arm_ids_t]
+                self.dof_targets[:, self._arm_ids_t] = current_arm
+                hand_target = self.dof_targets[:, self._hand_ids_t]
+                actual_hand = actual[:, self._hand_ids_t]
+                open_hand = self.default_joint_pos[:, self._hand_ids_t]
+                release_delta = torch.clamp(
+                    open_hand - actual_hand,
+                    -self.cfg.tactile_release_step,
+                    self.cfg.tactile_release_step,
+                )
+                hand_target[hard_env] = (actual_hand + release_delta)[hard_env]
+                self.dof_targets[:, self._hand_ids_t] = hand_target
+
     def _decode_hand_action(self, hand_action: torch.Tensor) -> torch.Tensor:
         """Decode token9 plus five full-range, non-accumulating distal residuals."""
 
@@ -785,6 +953,55 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             residual,
             self._distal_hand_ids,
             validate_indices=False,
+        )
+        self._tactile_soft_shield_fraction.zero_()
+        self._tactile_hard_shield_fraction.zero_()
+        self._hand_slew_shield_fraction.zero_()
+        current_hand_target = self.dof_targets[:, self._hand_ids_t]
+        actual_hand = self.robot.data.joint_pos[:, self._hand_ids_t]
+        alpha = max(self.cfg.act_moving_average, 1.0e-6)
+        any_soft = torch.zeros((target.shape[0], 1), dtype=torch.bool, device=self.device)
+        if self.cfg.enable_grasp_action_shield:
+            force = self._finger_object_force_magnitudes()
+            soft = force >= self.cfg.tactile_soft_force_limit
+            hard = force >= self.cfg.tactile_hard_force_limit
+            # A proximal token can keep squeezing even if its distal residual is frozen. Once any
+            # fingertip reaches the soft limit, command the next EMA target back to the measured
+            # hand pose, removing stored actuator preload. The per-finger hard branch actively opens.
+            any_soft = soft.any(dim=-1, keepdim=True)
+            unload_raw = (actual_hand - (1.0 - alpha) * current_hand_target) / alpha
+            target = torch.where(any_soft, unload_raw, target)
+            distal_target = target.index_select(1, self._distal_hand_ids)
+            current_distal = current_hand_target.index_select(1, self._distal_hand_ids)
+            actual_distal = actual_hand.index_select(1, self._distal_hand_ids)
+            # Sensor and residual orders differ; scatter each fingertip's force decision into the
+            # corresponding distal flexion column. Positive motion is closure for all five joints.
+            hard_by_distal = torch.zeros_like(distal_target, dtype=torch.bool)
+            hard_by_distal.index_copy_(1, self._force_to_distal_index, hard)
+            released_next = actual_distal - self.cfg.tactile_release_step
+            released_raw = (released_next - (1.0 - alpha) * current_distal) / alpha
+            distal_target = torch.where(hard_by_distal, released_raw, distal_target)
+            distal_lower = hand_lower.index_select(1, self._distal_hand_ids)
+            distal_upper = hand_upper.index_select(1, self._distal_hand_ids)
+            distal_target = torch.maximum(torch.minimum(distal_target, distal_upper), distal_lower)
+            target.index_copy_(1, self._distal_hand_ids, distal_target)
+            self._tactile_soft_shield_fraction.copy_(soft.float().mean())
+            self._tactile_hard_shield_fraction.copy_(hard.float().mean())
+        # The parent applies ``new = alpha*raw + (1-alpha)*current``. Limit the raw target around
+        # current so the resulting per-control-step hand target motion cannot impact the tool before
+        # the one-step-delayed tactile feedback has a chance to react.
+        raw_step = self.cfg.hand_target_max_step / alpha
+        slew_limited = torch.maximum(
+            torch.minimum(target, current_hand_target + raw_step), current_hand_target - raw_step
+        )
+        # Opening a force-limited hand is a safety response and must not itself be rate-limited.
+        slew_limited = torch.where(any_soft, target, slew_limited)
+        slew_limited = torch.maximum(torch.minimum(slew_limited, hand_upper), hand_lower)
+        self._hand_slew_shield_fraction.copy_((slew_limited != target).float().mean())
+        target = slew_limited
+        clamped_token = torch.maximum(torch.minimum(token_target, hand_upper), hand_lower)
+        delta = target.index_select(1, self._distal_hand_ids) - clamped_token.index_select(
+            1, self._distal_hand_ids
         )
         self._last_token_hand_target.copy_(
             torch.maximum(torch.minimum(token_target, hand_upper), hand_lower)
@@ -942,6 +1159,12 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         log["force_excess_mean"] = force_excess.mean()
         log["r_force_penalty_mean"] = r_force_penalty.mean()
         log["r_residual_penalty_mean"] = r_residual_penalty.mean()
+        log["arm_up_shield_fraction"] = self._arm_up_shield_fraction
+        log["tactile_soft_shield_fraction"] = self._tactile_soft_shield_fraction
+        log["tactile_hard_shield_fraction"] = self._tactile_hard_shield_fraction
+        log["tactile_terminate_fraction"] = self._tactile_terminate_fraction
+        log["hand_slew_shield_fraction"] = self._hand_slew_shield_fraction
+        log["curriculum_reset_fraction"] = self._curriculum_reset_mask.float().mean()
         if residual_action.shape[1] > 0:
             log["residual_action_abs_mean"] = residual_action.abs().mean()
             log["residual_action_sat_frac"] = (residual_action.abs() > 0.99).float().mean()
@@ -990,7 +1213,22 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         if not cfg.terminate_on_drop:
             dropped = torch.zeros_like(dropped)
 
-        return dropped | self._is_success, time_out
+        max_force = signals["force_magnitude"].max(dim=-1).values
+        hard_force = max_force > cfg.tactile_hard_force_limit
+        self._hard_force_steps = torch.where(
+            hard_force, self._hard_force_steps + 1, torch.zeros_like(self._hard_force_steps)
+        )
+        overforce = max_force > cfg.tactile_terminate_force_limit
+        self._overforce_steps = torch.where(
+            overforce, self._overforce_steps + 1, torch.zeros_like(self._overforce_steps)
+        )
+        unsafe_force = (
+            (self._hard_force_steps >= cfg.tactile_hard_terminate_steps)
+            | (self._overforce_steps >= cfg.tactile_terminate_steps)
+        )
+        self._tactile_terminate_fraction.copy_(unsafe_force.float().mean())
+
+        return dropped | unsafe_force | self._is_success, time_out
 
     # ------------------------------------------------------------------ reset
     def _reset_idx(self, env_ids: Sequence[int] | None):
@@ -1012,11 +1250,14 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._safe_grasp_steps[env_ids] = 0
         self._grasp_age[env_ids] = 0
         self._success_paid[env_ids] = False
+        self._hard_force_steps[env_ids] = 0
+        self._overforce_steps[env_ids] = 0
         self._lift_bonus_given[env_ids] = False
         self._prev_close_quality[env_ids] = 0.0
         self._prev_wrap_quality[env_ids] = 0.0
         self._prev_lift_potential[env_ids] = 0.0
         self._potential_initialized[env_ids] = False
+        self._apply_curriculum_resets(env_ids)
 
     # ------------------------------------------------------------------ reset object placement (P1-8)
     def _sample_non_overlapping_object_xy(self, env_ids, default_xy):

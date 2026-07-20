@@ -28,6 +28,15 @@ parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint.")
+parser.add_argument(
+    "--checkpoint_load_mode",
+    choices=("auto", "resume", "weights"),
+    default="auto",
+    help=(
+        "Auto-detect full versus model-only checkpoints, resume all training state, or initialize "
+        "only model weights with a fresh optimizer/epoch."
+    ),
+)
 parser.add_argument("--sigma", type=str, default=None, help="The policy's initial standard deviation.")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument("--wandb-project-name", type=str, default=None, help="the wandb's project name")
@@ -70,6 +79,7 @@ import time
 from datetime import datetime
 
 import gymnasium as gym
+import torch
 from rl_games.common import env_configurations, vecenv
 from rl_games.common.algo_observer import IsaacAlgoObserver
 from rl_games.torch_runner import Runner
@@ -99,6 +109,29 @@ logger = logging.getLogger(__name__)
 # PLACEHOLDER: Extension template (do not remove this comment)
 
 
+def _resolve_checkpoint_load_mode(checkpoint_path: str, requested_mode: str) -> str:
+    """Use weights mode for BC/migration artifacts that have no optimizer/epoch state."""
+
+    if requested_mode != "auto":
+        return requested_mode
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    payload = checkpoint
+    if isinstance(checkpoint, dict):
+        for rank_key in (0, "0"):
+            if isinstance(checkpoint.get(rank_key), dict):
+                payload = checkpoint[rank_key]
+                break
+    is_full_checkpoint = (
+        isinstance(payload, dict)
+        and isinstance(payload.get("optimizer"), dict)
+        and "epoch" in payload
+    )
+    return "resume" if is_full_checkpoint else "weights"
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: dict):
     """Train with RL-Games agent."""
@@ -122,9 +155,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     )
     if args_cli.checkpoint is not None:
         resume_path = retrieve_file_path(args_cli.checkpoint)
+        checkpoint_load_mode = _resolve_checkpoint_load_mode(
+            resume_path, args_cli.checkpoint_load_mode
+        )
         agent_cfg["params"]["load_checkpoint"] = True
         agent_cfg["params"]["load_path"] = resume_path
-        print(f"[INFO]: Loading model checkpoint from: {agent_cfg['params']['load_path']}")
+        print(
+            f"[INFO]: Loading model checkpoint from: {agent_cfg['params']['load_path']} "
+            f"(mode={checkpoint_load_mode})"
+        )
     train_sigma = float(args_cli.sigma) if args_cli.sigma is not None else None
 
     # multi-gpu training config
@@ -255,7 +294,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             wandb.config.update({"agent_cfg": agent_cfg})
 
     if args_cli.checkpoint is not None:
-        runner.run({"train": True, "play": False, "sigma": train_sigma, "checkpoint": resume_path})
+        runner.run(
+            {
+                "train": True,
+                "play": False,
+                "sigma": train_sigma,
+                "checkpoint": resume_path,
+                "checkpoint_load_mode": checkpoint_load_mode,
+            }
+        )
     else:
         runner.run({"train": True, "play": False, "sigma": train_sigma})
 

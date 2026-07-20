@@ -13,6 +13,9 @@ params:
 
   network:
     name: actor_critic
+    # Preserve compatibility with historical task checkpoints.  Critic warm-up / anchored BC-PPO
+    # runs explicitly override this to True after converting the checkpoint with
+    # separate_actor_critic_checkpoint.py.
     separate: False
     space:
       continuous:
@@ -60,6 +63,17 @@ params:
     expl_coef_block_size: 4096
     use_others_experience: lf
     off_policy_ratio: 1.0
+    # Optional frozen-reference actor regularizer implemented by the SAPG fork.  Leave disabled
+    # for training from scratch; BC/PPO fine-tuning supplies the converted separate checkpoint and
+    # overrides network.separate=True.  freeze_actor requires that separate network.
+    behavior_anchor_coef: 0.0
+    behavior_anchor_checkpoint: ''
+    behavior_anchor_demo_coef: 0.0
+    behavior_anchor_demo_batch_size: 0
+    behavior_anchor_dataset: ''
+    positive_advantage_only: False
+    freeze_actor: False
+    freeze_input_normalization: False
     reward_shaper:
       scale_value: 0.01
     normalize_advantage: True
