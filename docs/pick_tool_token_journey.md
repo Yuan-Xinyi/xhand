@@ -183,3 +183,73 @@ latch 波动或 +1 success。
 后恢复成功的环境槽；评估器现已另报不排除最终成功的
 `ever_unlatched_clearance_ge_5cm_count`。安全 reset 后同一环境槽会开始新尝试，而漏斗继续累计，
 因此表中是 1000-step campaign 的 ever-event，不是严格逐 episode 条件概率。
+
+---
+
+## 九、在线分层 close + lift option（2026-07-21）
+
+继续给端到端 PPO 加奖励没有解决长时序探索。这一轮改为冻结原策略，并把真实 rollout 拆成
+三个连续、无状态恢复的控制段：
+
+1. `SEARCH`：冻结基策略至少运行到第 400 步；`pregrasp_score >= 0.30`、
+   `proximity >= 0.02` 连续 4 帧后才允许接管，基策略在接管前仍可直接成功。
+2. `CLOSE`：独立 115→21 actor 最多运行 240 步。成功必须连续 15 帧满足 latch、
+   `grasp_quality >= 0.35`、`hold_quality >= 0.5`、最大指尖力不超过 30 N；未 latch 抬高
+   1.5 cm、COM 横漂 3 cm、丢失 pregrasp 窗口或过力均失败。
+3. `LIFT`：另一个 115→21 actor 控制 arm7，同时固定 close 成功瞬间真实执行的 hand14，
+   避免 lift actor 改坏已形成的握型。训练教师以 close 成功时的当前 palm pose 为 anchor，
+   用 DLS 在 240 步内升高 24 cm 后继续 settle；learner 到真实 clearance 22 cm 后停止继续
+   累加 arm target。最终成功仍要求真实网格 clearance 至少 20 cm、latch/质量/力/速度全部
+   合格并连续保持 15 帧。
+
+整个 `SEARCH -> CLOSE -> LIFT` 在同一条物理轨迹中异步切换，不做 snapshot restore。数据保存前
+断言第一条 option observation 中的历史动作与切换边界逐元素一致，并拒绝任何 NaN/Inf。举升中
+一旦未 latch 且真实 clearance 达 5 cm，立即作为 fling 失败，绝不计入成功。
+
+### 示范与模型
+
+| 项目 | 规模 | 产物 |
+|---|---:|---|
+| late-handoff close 数据 | 87 episode / 5,362 transition | `fallback400_train_s144_s147_dagger.pt` |
+| settle-complete lift 数据 | 119 episode / 30,343 transition | `fallback400_lift_settle_train_s154_s156.pt` |
+| close actor | 全 actor BC，phase 1 | `close_actor_fallback400_bc_s149.pth` |
+| lift actor | 全 actor BC，phase 3 | `lift_actor_fallback400_settle_bc_s157.pth` |
+
+两类数据都只保留最终通过物理合同的 episode。lift 数据的边界连续性最大误差为 0；s157 的验证集
+objective 从 0.2851 降到 0.00436，arm/token/residual RMSE 分别为 0.0364/0.0153/0.0107，
+observation RMS、critic/value 和 sigma 位级不变。
+选中的 hybrid14 握型已固化为
+`scripts/rl_games/artifacts/pick_tool_hybrid14_seed1_refine.json`，不再依赖易失的 `/tmp` 文件。
+
+### 最终严格评估：每环境一次尝试
+
+以下结果不允许 auto-reset 后重试；因此不能与第七节的 256 env × 1000 step campaign
+`83/512` 直接比较。
+
+| seed | 独立 base strict20 | 分层总 strict20 | 其中 base-only | close-assisted | close 成功 | close→lift | fling 失败 | option unsafe/drop |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 142 | 16 | 49 | 17 | 32 | 60 | 53.3% | 4 | 0 |
+| 143 | 27 | 65 | 29 | 36 | 72 | 50.0% | 8 | 1 |
+| 158 | 20 | 54 | 20 | 34 | 56 | 60.7% | 4 | 0 |
+| **合计** | **63/3072（2.05%）** | **168/3072（5.47%）** | **66** | **102** | **188** | **54.3%** | **16** | **1** |
+
+所有 168 个成功都满足真实网格 20 cm + latch + 低 slip + 低速连续 15 帧。16 个释放后上窜案例
+均被判失败；其中 1 个在单个仿真步内从 5 cm 以下越过 20 cm，但 latch 为假，没有污染成功数。
+另有 1 个 close 阶段 unsafe/drop 失败，三个 seed 的 lift 阶段 unsafe 与环境硬终止均为 0。
+GPU PhysX 接触 rollout 存在小幅非确定性，因此表中保留完整 seed 与 JSON，而不把单次差值当成
+确定性回归。
+
+### 当前判断
+
+这条结果支持的修改方向不是继续放大奖励，而是：冻结可用 reach、用真实策略状态上的成功示范
+训练独立 close 和 lift、用测量门控做层间切换，并让 hand 在 lift 阶段保持已验证握型。它已经把
+「握住后不会抬」从 0 打通到 54.3% 的条件成功率，但 **5.47% 仍不够部署**。剩余漏斗主要是：
+
+- 只有 893/3072（29.1%）进入 late pregrasp handoff；
+- 只有 188/893（21.1%）通过稳定 close；
+- close 后 learned lift 已完成 102/188（54.3%）。
+
+所以下一轮应把预算集中到 recoverability gate 与 close option：收集更多「冻结 base 的真实 late
+state -> 完整 scripted close -> load-bearing 验证」成功轨迹，按整段 option 接管而不是逐 action
+随机 DAgger 混合；先把 handoff→close 提到稳定的高成功率，再训练一个小型 selector 或高层 PPO。
+在此之前不应解冻三个低层 actor 做端到端联合更新。
