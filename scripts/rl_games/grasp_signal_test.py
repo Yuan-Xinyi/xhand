@@ -90,6 +90,19 @@ def test_wrap_quality() -> None:
         "a strong wrong-side collision hid two legal opposed contacts",
     )
 
+    # Force, alignment and opposition are independent min-gates.  The aligned/opposed product may
+    # rank candidate fingers, but must not be multiplied into force coverage and then gated twice.
+    moderate = make_wrap_case()
+    moderate["force"][:, :3] = 5.0
+    moderate["alignment"][:, :3] = 0.65  # normalized alignment score = 0.5
+    moderate["palm_facing"][:] = 0.75    # normalized palm score = 0.5
+    moderate["normal"][:, 1:3] = torch.tensor((-0.5, 0.8660254, 0.0))  # opposition score = 0.5
+    moderate_quality = evaluate_wrap(moderate)["quality"].item()
+    check(
+        abs(moderate_quality - 0.5) < 1.0e-5,
+        f"independent wrap gates were multiplied/double-counted: q={moderate_quality}",
+    )
+
     cases = {}
     cases["thumb-only"] = make_wrap_case()
     cases["thumb-only"]["force"][:, 1:] = 0.0

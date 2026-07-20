@@ -85,9 +85,13 @@ def wrap_quality(
     # Rank non-thumb fingers by whether each one is simultaneously in contact, pad-aligned and
     # opposite the thumb. A strong wrong-side collision must not hide two weaker legal contacts.
     other_candidate = other_strength * other_align_score * opposition_each_score
-    selected_candidate, selected_local_idx = torch.topk(other_candidate, k=2, dim=1)
+    _, selected_local_idx = torch.topk(other_candidate, k=2, dim=1)
     selected_finger_idx = other_indices[selected_local_idx]
-    other_coverage = selected_candidate[:, 1]
+    # The product above is only a ranking key.  Coverage itself is the weaker selected contact
+    # strength; alignment and opposition are separate minimum gates below.  Reusing the product as
+    # coverage applies both geometric factors twice and makes a perfectly valid moderate grasp fail.
+    selected_strength = torch.gather(other_strength, 1, selected_local_idx)
+    other_coverage = selected_strength.min(dim=1).values
 
     selected_align = torch.gather(finger_alignment, 1, selected_finger_idx)
     alignment_raw = torch.minimum(thumb_align, selected_align.min(dim=1).values)
@@ -114,6 +118,8 @@ def wrap_quality(
         "quality": quality,
         "contact": contact,
         "contact_strength": contact_strength,
+        "thumb_strength": thumb_strength,
+        "other_coverage": other_coverage,
         "thumb_contact": thumb_contact,
         "other_contact_count": other_count,
         "palm_score": palm_score,

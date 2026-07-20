@@ -92,9 +92,9 @@ def main() -> None:
     check(float(log["r_grasp_mean"]) == 0.0, "grasp bonus cannot be farmed")
 
     # The latch survives the Schmitt dead-band, but weak quality must not retain the full hold annuity.
-    scenario.update(q_wrap=0.30, hold=1.0, thumb=True, others=3, palm=1.0)
+    scenario.update(q_wrap=0.25, hold=1.0, thumb=True, others=3, palm=1.0)
     _, log = reward()
-    expected_strength = (0.30 - u.cfg.grasp_quality_low) / (
+    expected_strength = (0.25 - u.cfg.grasp_quality_low) / (
         u.cfg.grasp_quality_high - u.cfg.grasp_quality_low
     )
     check(bool(u._is_grasped[0]), "dead-band quality preserves the confirmed latch")

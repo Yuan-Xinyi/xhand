@@ -155,7 +155,10 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     grasp_palm_facing_min = 0.5   # palm must at least face toward the object (raw palm·to_obj > 0)
     grasp_align_min = 0.3         # thumb+2 pads at least mildly opposed to the handle (a floor, not strict)
     grasp_opposition_min = 0.5    # thumb and the two strongest other contacts must lie on opposing handle sides
-    grasp_quality_high = 0.45     # confirm only above this shared wrap*transport quality
+    # Calibrated with the scripted gravity-bearing oracle: real fingertip grasps that transport
+    # the 0.15kg hammer through 20cm settle at q=0.37--0.44.  The old 0.45 rejected those physical
+    # holds even though all topology/orientation/transport components were present.
+    grasp_quality_high = 0.35     # confirm only above this shared wrap*transport quality
     grasp_quality_low = 0.20      # release below this threshold (Schmitt dead-band in between)
 
     # R_grasp: one-shot bonus on the first stable grasp (never re-paid after drop/regrasp).
