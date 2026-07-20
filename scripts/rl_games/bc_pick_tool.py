@@ -29,6 +29,7 @@ ACTION_BLOCKS = {
     "residual": slice(16, 21),
 }
 ACTOR_PREFIXES = ("a2c_network.actor_mlp.", "a2c_network.mu.")
+MU_KEYS = {"a2c_network.mu.weight", "a2c_network.mu.bias"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,6 +58,11 @@ def parse_args() -> argparse.Namespace:
         choices=range(5),
         default=None,
         help="train only one option/phase id; useful for a non-interfering option expert",
+    )
+    parser.add_argument(
+        "--mu-head-only",
+        action="store_true",
+        help="freeze actor trunk, sigma, critic/value and RMS; optimize only the separate actor mu head",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=10)
@@ -422,14 +428,14 @@ def main() -> None:
     raw_checkpoint = load_torch(checkpoint_path)
     if not isinstance(raw_checkpoint, dict):
         raise TypeError("checkpoint root must be a dictionary")
-    root_key: int | str
-    if 0 in raw_checkpoint:
-        root_key = 0
+    if isinstance(raw_checkpoint.get("model"), dict):
+        payload = raw_checkpoint
+    elif 0 in raw_checkpoint:
+        payload = raw_checkpoint[0]
     elif "0" in raw_checkpoint:
-        root_key = "0"
+        payload = raw_checkpoint["0"]
     else:
-        raise KeyError("checkpoint must have a root 0 payload")
-    payload = raw_checkpoint[root_key]
+        raise KeyError("checkpoint must contain model directly or below root key 0")
     if not isinstance(payload, dict) or "model" not in payload:
         raise KeyError("checkpoint root 0 must contain model")
     if not isinstance(payload["model"], dict):
@@ -443,6 +449,10 @@ def main() -> None:
             f"BC is defined for a migrated 115-or-120/21 policy, got "
             f"{actor.observation_dim}/{actor.action_dim}"
         )
+    if args.mu_head_only and not any(
+        key.startswith("a2c_network.critic_mlp.") for key in initial_model
+    ):
+        raise RuntimeError("--mu-head-only requires a separate actor/critic checkpoint")
 
     raw_dataset = load_torch(dataset_path)
     data = validate_dataset(raw_dataset, actor.observation_dim, actor.action_dim)
@@ -488,8 +498,16 @@ def main() -> None:
     )
     print_split_metrics("validation before BC", initial_val_metrics)
 
+    if args.mu_head_only:
+        for parameter in actor.parameters():
+            parameter.requires_grad_(False)
+        for parameter in actor.mu.parameters():
+            parameter.requires_grad_(True)
+        trainable_parameters = list(actor.mu.parameters())
+    else:
+        trainable_parameters = list(actor.parameters())
     optimizer = torch.optim.Adam(
-        actor.parameters(),
+        trainable_parameters,
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
@@ -514,7 +532,7 @@ def main() -> None:
                 prediction, target, args.smooth_l1_beta, args.bounds_weight
             )
             loss.backward()
-            nn.utils.clip_grad_norm_(actor.parameters(), args.grad_clip)
+            nn.utils.clip_grad_norm_(trainable_parameters, args.grad_clip)
             optimizer.step()
             epoch_loss += float(loss.detach())
             epoch_batches += 1
@@ -554,6 +572,28 @@ def main() -> None:
     actor.load_state_dict(best_state)
     actor.write_actor_into(output_model)
 
+    changed_model_keys = {
+        key for key in initial_model if not torch.equal(initial_model[key], output_model[key])
+    }
+    allowed_changed_keys = MU_KEYS if args.mu_head_only else {
+        key for key in initial_model if key.startswith(ACTOR_PREFIXES)
+    }
+    unexpected_changed_keys = changed_model_keys - allowed_changed_keys
+    if unexpected_changed_keys:
+        raise RuntimeError(
+            "serialized tensors changed outside the requested trainable boundary: "
+            f"{sorted(unexpected_changed_keys)}"
+        )
+    if args.mu_head_only and not (changed_model_keys & MU_KEYS):
+        raise RuntimeError("--mu-head-only training did not change either mu tensor")
+    frozen_tensors_bit_exact = all(
+        torch.equal(initial_model[key], output_model[key])
+        for key in initial_model
+        if key not in allowed_changed_keys
+    )
+    if not frozen_tensors_bit_exact:
+        raise RuntimeError("a frozen model tensor is not bit-exact")
+
     # Assert the requested freeze boundary at the serialized-state level, not merely optimizer setup.
     non_actor_diff = max_group_difference(
         initial_model, output_model, lambda key: not key.startswith(ACTOR_PREFIXES)
@@ -580,6 +620,10 @@ def main() -> None:
         "frozen_rms_max_abs": rms_diff,
         "frozen_value_max_abs": value_diff,
         "frozen_sigma_max_abs": sigma_diff,
+        "mu_head_only": args.mu_head_only,
+        "changed_model_keys": sorted(changed_model_keys),
+        "trainable_model_keys": sorted(MU_KEYS) if args.mu_head_only else sorted(allowed_changed_keys),
+        "all_frozen_tensors_bit_exact": frozen_tensors_bit_exact,
     }
     print(
         "migration preservation (new obs zeroed): "
@@ -626,6 +670,7 @@ def main() -> None:
         "dataset": str(dataset_path.resolve()),
         "dataset_sha256": sha256(dataset_path),
         "only_phase": args.only_phase,
+        "mu_head_only": args.mu_head_only,
         "seed": args.seed,
         "device": str(device),
         "transitions": int(data["obs"].shape[0]),
@@ -656,11 +701,27 @@ def main() -> None:
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({0: {"model": output_model, "bc_meta": merged_meta}}, output_path)
+    output_payload = {"model": output_model, "bc_meta": merged_meta}
+    separate_meta = payload.get("separate_actor_critic_meta")
+    if isinstance(separate_meta, dict):
+        output_payload["separate_actor_critic_meta"] = copy.deepcopy(separate_meta)
+    elif any(key.startswith("a2c_network.critic_mlp.") for key in output_model):
+        output_payload["separate_actor_critic_meta"] = {
+            "format_version": 1,
+            "source_checkpoint": str(checkpoint_path.resolve()),
+            "source_checkpoint_sha256": sha256(checkpoint_path),
+            "actor_layer_indices": actor.layer_indices,
+            "requires_network_separate": True,
+            "self_check": {
+                "all_frozen_tensors_bit_exact": frozen_tensors_bit_exact,
+                "changed_model_keys": sorted(changed_model_keys),
+            },
+        }
+    torch.save({0: output_payload}, output_path)
     print(f"wrote BC checkpoint without optimizer: {output_path.resolve()}", flush=True)
     print(
         "payload keys="
-        + json.dumps({"root": [0], "entry": ["model", "bc_meta"]}, separators=(",", ":")),
+        + json.dumps({"root": [0], "entry": sorted(output_payload)}, separators=(",", ":")),
         flush=True,
     )
 

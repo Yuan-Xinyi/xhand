@@ -37,6 +37,21 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     curriculum_reset_probability = 0.0
     curriculum_joint_noise = 0.0
 
+    # Short-horizon reverse-curriculum task used to train a coupled arm+hand close option.  The
+    # default end-to-end task is unchanged.  Option mode deliberately has no height reward: it must
+    # hold a safe strict latch for 0.30s, while lifting before latch or pushing the object sideways
+    # terminates as a failure.  Deployment then switches to a separately validated lift option.
+    close_option_mode = False
+    close_option_success_bonus = 100.0
+    close_option_confirm_steps = 15
+    close_option_min_hold_quality = 0.5
+    close_option_unlatched_lift_limit = 0.015
+    close_option_horizontal_drift_limit = 0.03
+    close_option_min_proximity = 0.01
+    close_option_lost_window_steps = 12
+    close_option_failure_penalty = 100.0
+    close_option_timeout_penalty = 20.0
+
     # Action = 7 arm relative deltas + 9 CrossDex tokens + 5 absolute distal residuals.  A residual
     # of -1/0/+1 reaches the runtime lower/token/upper target respectively, before the existing EMA.
     enable_distal_residual = True

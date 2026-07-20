@@ -196,6 +196,81 @@ def test_schmitt_latch() -> None:
     print("PASS Schmitt latch: one confirmation, dead-band hold, quality-driven release")
 
 
+def test_close_option_state() -> None:
+    n = 5
+    stable = torch.zeros(n, dtype=torch.long)
+    lost = torch.zeros(n, dtype=torch.long)
+
+    def update(
+        *,
+        quality: torch.Tensor | None = None,
+        hold: torch.Tensor | None = None,
+        force: torch.Tensor | None = None,
+        grasped: torch.Tensor | None = None,
+        clearance: torch.Tensor | None = None,
+        drift: torch.Tensor | None = None,
+        proximity: torch.Tensor | None = None,
+        unsafe: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        nonlocal stable, lost
+        result = signals.update_close_option_state(
+            torch.full((n,), 0.5) if quality is None else quality,
+            torch.full((n,), 0.8) if hold is None else hold,
+            torch.full((n,), 10.0) if force is None else force,
+            torch.ones(n, dtype=torch.bool) if grasped is None else grasped,
+            stable,
+            torch.zeros(n) if clearance is None else clearance,
+            torch.zeros(n) if drift is None else drift,
+            torch.full((n,), 0.5) if proximity is None else proximity,
+            lost,
+            torch.zeros(n, dtype=torch.bool) if unsafe is None else unsafe,
+            grasp_quality_threshold=0.35,
+            hold_quality_threshold=0.5,
+            safe_force_limit=30.0,
+            confirm_steps=15,
+            unlatched_lift_limit=0.015,
+            horizontal_drift_limit=0.03,
+            min_proximity=0.01,
+            lost_window_steps=12,
+        )
+        stable, lost = result["stable_count"], result["lost_window_count"]
+        return result
+
+    result = None
+    for _ in range(14):
+        result = update()
+    assert result is not None
+    check(not result["success"].any().item(), "close option succeeded before 15 stable frames")
+    result = update()
+    check(result["success"].all().item(), "close option did not succeed on frame 15")
+
+    # One low-hold frame clears the independent option streak even though the four-frame phase
+    # latch can remain set in its Schmitt dead band.
+    result = update(hold=torch.full((n,), 0.49))
+    check((result["stable_count"] == 0).all().item(), "bad hold did not clear stable close streak")
+
+    # The ordinary four-frame latch authorizes rigid transport; the independent 15-frame streak
+    # verifies that this remains a safe hold rather than requiring the tool to stay table-fixed.
+    result = update(clearance=torch.full((n,), 0.016), drift=torch.full((n,), 0.031))
+    check(not result["unlatched_lift"].any().item(), "latched rigid lift was rejected")
+    check(not result["horizontal_escape"].any().item(), "latched rigid transport was rejected")
+
+    not_grasped = torch.zeros(n, dtype=torch.bool)
+    result = update(grasped=not_grasped, clearance=torch.full((n,), 0.016))
+    check(result["unlatched_lift"].all().item(), "unlatched 1.6cm lift was not rejected")
+    result = update(grasped=not_grasped, drift=torch.full((n,), 0.031))
+    check(result["horizontal_escape"].all().item(), "unlatched 3.1cm shove was not rejected")
+
+    for _ in range(11):
+        result = update(grasped=not_grasped, proximity=torch.zeros(n))
+    check(not result["lost_window"].any().item(), "close window ended before 12 frames")
+    result = update(grasped=not_grasped, proximity=torch.zeros(n))
+    check(result["lost_window"].all().item(), "lost close window did not terminate on frame 12")
+    result = update(unsafe=torch.ones(n, dtype=torch.bool))
+    check(result["failure"].all().item(), "unsafe force did not fail the close option")
+    print("PASS close option: 15-frame stable success; lift/shove/lost-window/unsafe rejected")
+
+
 def test_asymmetric_joint_residual() -> None:
     base = torch.tensor(
         [[0.1, 0.4, -0.2, 0.7, 0.6, 0.0], [0.2, 0.5, -0.1, 0.8, 0.7, 0.1],
@@ -227,5 +302,6 @@ if __name__ == "__main__":
     test_wrap_quality()
     test_staged_close_quality()
     test_schmitt_latch()
+    test_close_option_state()
     test_asymmetric_joint_residual()
     print("ALL GRASP SIGNAL TESTS PASSED")

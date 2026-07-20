@@ -28,7 +28,13 @@ from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.math import quat_apply, quat_conjugate, sample_uniform
 
 from ..pick_cube_token.pick_cube_token_env import PickCubeTokenEnv
-from .grasp_signals import rigid_hold_quality, staged_close_quality, update_grasp_latch, wrap_quality
+from .grasp_signals import (
+    rigid_hold_quality,
+    staged_close_quality,
+    update_close_option_state,
+    update_grasp_latch,
+    wrap_quality,
+)
 from .hybrid_action import apply_asymmetric_joint_residual
 from .pick_tool_token_env_cfg import PickToolTokenEnvCfg
 
@@ -203,6 +209,22 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._safe_grasp_steps = torch.zeros(N, dtype=torch.long, device=dev)    # consecutive low-impact latch steps
         self._grasp_age = torch.zeros(N, dtype=torch.long, device=dev)           # steps since is_grasped became True (unused mvp20)
         self._success_paid = torch.zeros(N, dtype=torch.bool, device=dev)        # one-shot stable-success bonus latch (unused mvp20)
+        self._close_option_success = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._close_option_failure = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._close_option_timeout = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._close_option_unlatched_lift = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._close_option_horizontal_escape = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._close_option_lost_window = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._close_option_stable_steps = torch.zeros(N, dtype=torch.long, device=dev)
+        self._close_option_lost_window_steps = torch.zeros(N, dtype=torch.long, device=dev)
+        self._close_option_start_xy = torch.zeros((N, 2), device=dev)
+        self._close_option_episode_total = torch.zeros((), dtype=torch.long, device=dev)
+        self._close_option_success_total = torch.zeros((), dtype=torch.long, device=dev)
+        self._close_option_failure_total = torch.zeros((), dtype=torch.long, device=dev)
+        self._close_option_timeout_total = torch.zeros((), dtype=torch.long, device=dev)
+        self._close_option_unlatched_lift_total = torch.zeros((), dtype=torch.long, device=dev)
+        self._close_option_horizontal_escape_total = torch.zeros((), dtype=torch.long, device=dev)
+        self._close_option_lost_window_total = torch.zeros((), dtype=torch.long, device=dev)
         self._lift_bonus_given = torch.zeros(N, dtype=torch.bool, device=dev)    # mvp20: one-shot lift-off bonus latch (per episode)
         self._prev_close_quality = torch.zeros(N, device=dev)
         self._prev_wrap_quality = torch.zeros(N, device=dev)
@@ -279,6 +301,14 @@ class PickToolTokenEnv(PickCubeTokenEnv):
     @staticmethod
     def _normalize(v: torch.Tensor) -> torch.Tensor:
         return v / (v.norm(dim=-1, keepdim=True) + 1e-9)
+
+    def _object_com_position_w(self) -> torch.Tensor:
+        """Compute COM position from the authoritative link pose, including just-written resets."""
+
+        return self.object.data.root_link_pos_w + quat_apply(
+            self.object.data.root_link_quat_w,
+            self.object.data.body_com_pos_b[:, 0],
+        )
 
     def _load_curriculum_boundary(self, dataset_path: Path, boundary_name: str) -> dict[str, torch.Tensor]:
         if not dataset_path.is_file():
@@ -1095,6 +1125,21 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         newly_successful = self._is_success & (~self._success_paid)
         r_success = cfg.success_bonus * newly_successful.float()
         self._success_paid = self._success_paid | self._is_success
+        r_close_option_success = (
+            cfg.close_option_success_bonus * self._close_option_success.float()
+            if cfg.close_option_mode
+            else torch.zeros_like(r_success)
+        )
+        r_close_option_failure = (
+            -cfg.close_option_failure_penalty * self._close_option_failure.float()
+            if cfg.close_option_mode
+            else torch.zeros_like(r_success)
+        )
+        r_close_option_timeout = (
+            -cfg.close_option_timeout_penalty * self._close_option_timeout.float()
+            if cfg.close_option_mode
+            else torch.zeros_like(r_success)
+        )
 
         force_excess = torch.clamp(
             (max_force - cfg.safe_contact_force) / cfg.contact_force_penalty_width, 0.0, 1.0
@@ -1156,6 +1201,30 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         log["lift_quality_mean"] = transport_gate.mean()
         log["lift_potential_mean"] = lift_potential.mean()
         log["r_success_mean"] = r_success.mean()
+        log["close_option_success_frac"] = self._close_option_success.float().mean()
+        log["r_close_option_success_mean"] = r_close_option_success.mean()
+        log["close_option_failure_frac"] = self._close_option_failure.float().mean()
+        log["close_option_timeout_frac"] = self._close_option_timeout.float().mean()
+        log["close_option_unlatched_lift_frac"] = self._close_option_unlatched_lift.float().mean()
+        log["close_option_horizontal_escape_frac"] = self._close_option_horizontal_escape.float().mean()
+        log["close_option_lost_window_frac"] = self._close_option_lost_window.float().mean()
+        log["close_option_stable_steps_mean"] = self._close_option_stable_steps.float().mean()
+        completed = self._close_option_episode_total.clamp_min(1).float()
+        log["close_option_episode_total"] = self._close_option_episode_total.float()
+        log["close_option_success_rate_total"] = self._close_option_success_total.float() / completed
+        log["close_option_failure_rate_total"] = self._close_option_failure_total.float() / completed
+        log["close_option_timeout_rate_total"] = self._close_option_timeout_total.float() / completed
+        log["close_option_unlatched_lift_rate_total"] = (
+            self._close_option_unlatched_lift_total.float() / completed
+        )
+        log["close_option_horizontal_escape_rate_total"] = (
+            self._close_option_horizontal_escape_total.float() / completed
+        )
+        log["close_option_lost_window_rate_total"] = (
+            self._close_option_lost_window_total.float() / completed
+        )
+        log["r_close_option_failure_mean"] = r_close_option_failure.mean()
+        log["r_close_option_timeout_mean"] = r_close_option_timeout.mean()
         log["force_excess_mean"] = force_excess.mean()
         log["r_force_penalty_mean"] = r_force_penalty.mean()
         log["r_residual_penalty_mean"] = r_residual_penalty.mean()
@@ -1171,6 +1240,19 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             log["distal_delta_abs_mean"] = self._last_distal_delta.abs().mean()
             log["distal_delta_abs_max"] = self._last_distal_delta.abs().max()
 
+        if cfg.close_option_mode:
+            # The option is only a bridge from pregrasp to a stable latch.  In particular, neither
+            # true-clearance progress nor the full-task 20cm success can pay during this phase.
+            return (
+                r_close_progress
+                + r_wrap_progress
+                + r_grasp
+                + r_close_option_success
+                + r_close_option_failure
+                + r_close_option_timeout
+                + r_force_penalty
+                + r_residual_penalty
+            )
         return (
             r_close_progress
             + r_wrap_progress
@@ -1228,6 +1310,49 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         )
         self._tactile_terminate_fraction.copy_(unsafe_force.float().mean())
 
+        if cfg.close_option_mode:
+            horizontal_drift = (
+                self._object_com_position_w()[:, :2] - self._close_option_start_xy
+            ).norm(dim=-1)
+            option = update_close_option_state(
+                signals["grasp_quality"],
+                signals["hold_quality"],
+                max_force,
+                self._is_grasped,
+                self._close_option_stable_steps,
+                clearance,
+                horizontal_drift,
+                signals["proximity_quality"],
+                self._close_option_lost_window_steps,
+                unsafe_force | dropped,
+                grasp_quality_threshold=cfg.grasp_quality_high,
+                hold_quality_threshold=cfg.close_option_min_hold_quality,
+                safe_force_limit=cfg.grasp_bonus_max_force,
+                confirm_steps=cfg.close_option_confirm_steps,
+                unlatched_lift_limit=cfg.close_option_unlatched_lift_limit,
+                horizontal_drift_limit=cfg.close_option_horizontal_drift_limit,
+                min_proximity=cfg.close_option_min_proximity,
+                lost_window_steps=cfg.close_option_lost_window_steps,
+            )
+            self._close_option_stable_steps.copy_(option["stable_count"])
+            self._close_option_lost_window_steps.copy_(option["lost_window_count"])
+            self._close_option_success.copy_(option["success"])
+            self._close_option_failure.copy_(option["failure"])
+            self._close_option_unlatched_lift.copy_(option["unlatched_lift"])
+            self._close_option_horizontal_escape.copy_(option["horizontal_escape"])
+            self._close_option_lost_window.copy_(option["lost_window"])
+            terminated = self._close_option_success | self._close_option_failure
+            time_out = time_out & ~terminated
+            self._close_option_timeout.copy_(time_out)
+            self._close_option_episode_total.add_((terminated | time_out).sum())
+            self._close_option_success_total.add_(self._close_option_success.sum())
+            self._close_option_failure_total.add_(self._close_option_failure.sum())
+            self._close_option_timeout_total.add_(self._close_option_timeout.sum())
+            self._close_option_unlatched_lift_total.add_(self._close_option_unlatched_lift.sum())
+            self._close_option_horizontal_escape_total.add_(self._close_option_horizontal_escape.sum())
+            self._close_option_lost_window_total.add_(self._close_option_lost_window.sum())
+            return terminated, time_out
+
         return dropped | unsafe_force | self._is_success, time_out
 
     # ------------------------------------------------------------------ reset
@@ -1250,6 +1375,14 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._safe_grasp_steps[env_ids] = 0
         self._grasp_age[env_ids] = 0
         self._success_paid[env_ids] = False
+        self._close_option_success[env_ids] = False
+        self._close_option_failure[env_ids] = False
+        self._close_option_timeout[env_ids] = False
+        self._close_option_unlatched_lift[env_ids] = False
+        self._close_option_horizontal_escape[env_ids] = False
+        self._close_option_lost_window[env_ids] = False
+        self._close_option_stable_steps[env_ids] = 0
+        self._close_option_lost_window_steps[env_ids] = 0
         self._hard_force_steps[env_ids] = 0
         self._overforce_steps[env_ids] = 0
         self._lift_bonus_given[env_ids] = False
@@ -1258,6 +1391,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._prev_lift_potential[env_ids] = 0.0
         self._potential_initialized[env_ids] = False
         self._apply_curriculum_resets(env_ids)
+        self._close_option_start_xy[env_ids] = self._object_com_position_w()[env_ids, :2]
 
     # ------------------------------------------------------------------ reset object placement (P1-8)
     def _sample_non_overlapping_object_xy(self, env_ids, default_xy):

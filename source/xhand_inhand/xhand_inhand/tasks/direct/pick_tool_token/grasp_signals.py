@@ -229,3 +229,67 @@ def update_grasp_latch(
     next_is_grasped = (is_grasped | confirmed) & ~released
     newly_confirmed = next_is_grasped & ~is_grasped
     return next_is_grasped, confirm_count, release_count, newly_confirmed, released
+
+
+def update_close_option_state(
+    grasp_quality: torch.Tensor,
+    hold_quality: torch.Tensor,
+    max_force: torch.Tensor,
+    is_grasped: torch.Tensor,
+    stable_count: torch.Tensor,
+    clearance: torch.Tensor,
+    horizontal_drift: torch.Tensor,
+    proximity_quality: torch.Tensor,
+    lost_window_count: torch.Tensor,
+    unsafe_force: torch.Tensor,
+    *,
+    grasp_quality_threshold: float,
+    hold_quality_threshold: float,
+    safe_force_limit: float,
+    confirm_steps: int,
+    unlatched_lift_limit: float,
+    horizontal_drift_limit: float,
+    min_proximity: float,
+    lost_window_steps: int,
+) -> dict[str, torch.Tensor]:
+    """Update the terminal state for the isolated close option.
+
+    This state machine is intentionally stricter than the four-frame phase latch.  A close policy
+    only succeeds after continuously carrying a safe, low-slip latch for ``confirm_steps``.  Before
+    that point it may neither lift the object nor shove it across the table.  Losing the pregrasp
+    window for several frames also ends the short-horizon option instead of letting it farm a
+    state-only potential until timeout.
+    """
+
+    stable_now = (
+        is_grasped
+        & (grasp_quality >= grasp_quality_threshold)
+        & (hold_quality >= hold_quality_threshold)
+        & (max_force <= safe_force_limit)
+    )
+    next_stable_count = torch.where(
+        stable_now, stable_count + 1, torch.zeros_like(stable_count)
+    )
+    success = next_stable_count >= confirm_steps
+
+    outside_window = (~is_grasped) & (proximity_quality < min_proximity)
+    next_lost_window_count = torch.where(
+        outside_window, lost_window_count + 1, torch.zeros_like(lost_window_count)
+    )
+    lost_window = next_lost_window_count >= lost_window_steps
+    # Once the ordinary Schmitt latch has confirmed, rigid palm/object motion is legitimate.  The
+    # independent 15-frame streak below verifies that it remains a safe, low-slip hold.
+    unlatched_lift = (~is_grasped) & (clearance > unlatched_lift_limit)
+    horizontal_escape = (~is_grasped) & (horizontal_drift > horizontal_drift_limit)
+    failure = (unsafe_force | unlatched_lift | horizontal_escape | lost_window) & ~success
+
+    return {
+        "stable_now": stable_now,
+        "stable_count": next_stable_count,
+        "success": success,
+        "lost_window_count": next_lost_window_count,
+        "lost_window": lost_window,
+        "unlatched_lift": unlatched_lift,
+        "horizontal_escape": horizontal_escape,
+        "failure": failure,
+    }

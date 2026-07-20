@@ -19,6 +19,10 @@ parser.add_argument(
 )
 parser.add_argument("--switch_score", type=float, default=0.20)
 parser.add_argument("--switch_hold_steps", type=int, default=1)
+parser.add_argument("--close_contract_score", type=float, default=0.25)
+parser.add_argument("--close_contract_hold_steps", type=int, default=4)
+parser.add_argument("--close_contract_min_step", type=int, default=0)
+parser.add_argument("--close_contract_min_proximity", type=float, default=0.02)
 parser.add_argument("--tactile_close_servo", action="store_true")
 parser.add_argument("--close_servo_arm_zero", action="store_true")
 parser.add_argument("--close_servo_token_hold", action="store_true")
@@ -52,10 +56,22 @@ parser.add_argument("--feasibility_json", default=None)
 parser.add_argument("--num_envs", type=int, default=8)
 parser.add_argument("--steps", type=int, default=500)
 parser.add_argument("--stable_steps", type=int, default=15)
+parser.add_argument(
+    "--zero_arm_actions",
+    action="store_true",
+    help="diagnostic ablation: hold the seven arm targets while evaluating the actor's hand action",
+)
 parser.add_argument("--curriculum_dataset", default=None)
 parser.add_argument(
     "--curriculum_boundary",
-    choices=("close_start", "lift_start", "micro_end", "mid_lift", "settle_start"),
+    choices=(
+        "close_start",
+        "micro_start",
+        "lift_start",
+        "micro_end",
+        "mid_lift",
+        "settle_start",
+    ),
     default="close_start",
 )
 parser.add_argument("--curriculum_reset_probability", type=float, default=1.0)
@@ -71,10 +87,17 @@ if (
     or args_cli.steps < 1
     or args_cli.stable_steps < 1
     or args_cli.switch_hold_steps < 1
+    or args_cli.close_contract_hold_steps < 1
 ):
-    parser.error("--num_envs, --steps, --stable_steps and --switch_hold_steps must be positive")
+    parser.error("environment and debounce step counts must be positive")
 if not 0.0 <= args_cli.switch_score <= 1.0:
     parser.error("--switch_score must be in [0, 1]")
+if not 0.0 <= args_cli.close_contract_score <= 1.0:
+    parser.error("--close_contract_score must be in [0, 1]")
+if not 0.0 <= args_cli.close_contract_min_proximity <= 1.0:
+    parser.error("--close_contract_min_proximity must be in [0, 1]")
+if not 0 <= args_cli.close_contract_min_step < args_cli.steps:
+    parser.error("--close_contract_min_step must be in [0, steps)")
 if args_cli.option_fsm and not args_cli.feasibility_json:
     parser.error("--feasibility_json is required with --option_fsm for palm/object calibration")
 if args_cli.option_fsm and args_cli.reach_checkpoint:
@@ -98,12 +121,18 @@ simulation_app = app_launcher.app
 import gymnasium as gym
 import torch
 from isaaclab_tasks.utils import parse_env_cfg
-from isaaclab.utils.math import combine_frame_transforms, compute_pose_error, subtract_frame_transforms
+from isaaclab.utils.math import (
+    combine_frame_transforms,
+    compute_pose_error,
+    quat_apply,
+    subtract_frame_transforms,
+)
 
 import xhand_inhand.tasks  # noqa: F401
 from bc_pick_tool import MigratedActor, clone_state, load_torch
 from distal_residual_adapter import StatefulCloseGate, load_adapter as load_distal_adapter
 from tactile_close_controller import TactileCloseController
+from xhand_inhand.tasks.direct.pick_tool_token.grasp_signals import update_close_option_state
 
 
 OPTION_NAMES = ("HOVER", "DESCEND", "CLOSE", "MICRO", "LIFT_HOLD")
@@ -128,6 +157,15 @@ def _summary(value: torch.Tensor) -> dict[str, float]:
 def _masked_summary(value: torch.Tensor, mask: torch.Tensor) -> dict[str, float] | None:
     selected = value[mask]
     return None if selected.numel() == 0 else _summary(selected)
+
+
+def _object_com_position_w(u) -> torch.Tensor:
+    """Compute COM position from the link pose so a just-written reset cannot leave a stale cache."""
+
+    return u.object.data.root_link_pos_w + quat_apply(
+        u.object.data.root_link_quat_w,
+        u.object.data.body_com_pos_b[:, 0],
+    )
 
 
 def _checkpoint_model(path: Path) -> dict[str, torch.Tensor]:
@@ -439,6 +477,9 @@ def main() -> None:
     success_step = torch.full((n,), -1, dtype=torch.long, device=dev)
     max_clearance = torch.full((n,), -float("inf"), device=dev)
     max_unlatched_clearance = torch.full((n,), -float("inf"), device=dev)
+    # COM displacement is invariant to rotation about an off-center asset root.
+    initial_object_xy = _object_com_position_w(u)[:, :2].clone()
+    max_unlatched_horizontal_drift = torch.zeros(n, device=dev)
     max_grasp_quality = torch.zeros(n, device=dev)
     force_peak = torch.zeros((n, len(u.ee_names)), device=dev)
     force_peak_env = torch.zeros(n, device=dev)
@@ -469,8 +510,25 @@ def main() -> None:
     max_pregrasp_score = torch.zeros(n, device=dev)
     ever_touch = torch.zeros(n, dtype=torch.bool, device=dev)
     ever_latch = torch.zeros(n, dtype=torch.bool, device=dev)
+    stable_grasp_steps = torch.zeros(n, dtype=torch.long, device=dev)
+    max_stable_grasp_steps = torch.zeros(n, dtype=torch.long, device=dev)
+    ever_stable_grasp = torch.zeros(n, dtype=torch.bool, device=dev)
     ever_latched_5cm = torch.zeros(n, dtype=torch.bool, device=dev)
     ever_20cm = torch.zeros(n, dtype=torch.bool, device=dev)
+    close_contract_active = torch.zeros(n, dtype=torch.bool, device=dev)
+    close_contract_finished = torch.zeros(n, dtype=torch.bool, device=dev)
+    close_contract_entered = torch.zeros(n, dtype=torch.bool, device=dev)
+    close_contract_ready_steps = torch.zeros(n, dtype=torch.long, device=dev)
+    close_contract_start_xy = torch.zeros((n, 2), device=dev)
+    close_contract_success = torch.zeros(n, dtype=torch.bool, device=dev)
+    close_contract_failure = torch.zeros(n, dtype=torch.bool, device=dev)
+    close_contract_success_step = torch.full((n,), -1, dtype=torch.long, device=dev)
+    close_contract_stable_steps = torch.zeros(n, dtype=torch.long, device=dev)
+    close_contract_lost_steps = torch.zeros(n, dtype=torch.long, device=dev)
+    close_contract_unlatched_lift = torch.zeros(n, dtype=torch.bool, device=dev)
+    close_contract_horizontal_escape = torch.zeros(n, dtype=torch.bool, device=dev)
+    close_contract_lost_window = torch.zeros(n, dtype=torch.bool, device=dev)
+    close_contract_unsafe = torch.zeros(n, dtype=torch.bool, device=dev)
     option_state = torch.full((n,), HOVER, dtype=torch.long, device=dev)
     option_guard_steps = torch.zeros(n, dtype=torch.long, device=dev)
     option_occupancy_steps = torch.zeros((n, len(OPTION_NAMES)), dtype=torch.long, device=dev)
@@ -517,6 +575,36 @@ def main() -> None:
                     action[selected] = expert(actor_obs[selected]).clamp(-1.0, 1.0)
         score = _pregrasp_score(u)
         max_pregrasp_score = torch.maximum(max_pregrasp_score, score)
+        contract_gate_signals = u._compute_grasp_signals()
+        contract_gate_force = contract_gate_signals["force_magnitude"].max(dim=-1).values
+        contract_ready = (
+            ~close_contract_active
+            & ~close_contract_finished
+            & (step >= args_cli.close_contract_min_step)
+            & ~u._is_grasped
+            & (score >= args_cli.close_contract_score)
+            & (
+                contract_gate_signals["proximity_quality"]
+                >= args_cli.close_contract_min_proximity
+            )
+            & (contract_gate_force <= cfg.grasp_bonus_max_force)
+        )
+        close_contract_ready_steps = torch.where(
+            contract_ready,
+            close_contract_ready_steps + 1,
+            torch.zeros_like(close_contract_ready_steps),
+        )
+        contract_enter_now = (
+            ~close_contract_active
+            & ~close_contract_finished
+            & (close_contract_ready_steps >= args_cli.close_contract_hold_steps)
+        )
+        if bool(contract_enter_now.any()):
+            close_contract_start_xy[contract_enter_now] = _object_com_position_w(u)[
+                contract_enter_now, :2
+            ]
+            close_contract_entered |= contract_enter_now
+            close_contract_active |= contract_enter_now
         if reach_actor is not None:
             ready = (~option_switched) & (score >= args_cli.switch_score)
             option_ready_steps = torch.where(
@@ -532,7 +620,7 @@ def main() -> None:
             action = torch.where(option_switched.unsqueeze(-1), action, reach_action)
         if close_controller is not None:
             assert close_servo_gate_steps is not None and close_servo_delta_abs_sum is not None
-            control_signals = u._compute_grasp_signals()
+            control_signals = contract_gate_signals
             force_by_distal = torch.zeros_like(control_signals["force_magnitude"])
             force_by_distal.index_copy_(
                 1, u._force_to_distal_index, control_signals["force_magnitude"]
@@ -578,6 +666,8 @@ def main() -> None:
             distal_adapter_delta_abs_max = torch.maximum(
                 distal_adapter_delta_abs_max, adapter_delta.abs().max(dim=-1).values
             )
+        if args_cli.zero_arm_actions:
+            action[:, :7] = 0.0
         action_abs_sum[:, 0] += action[:, :7].abs().mean(dim=-1)
         action_abs_sum[:, 1] += action[:, 7:16].abs().mean(dim=-1)
         action_abs_sum[:, 2] += action[:, 16:].abs().mean(dim=-1)
@@ -719,6 +809,63 @@ def main() -> None:
             max_unlatched_clearance,
             torch.where(u._is_grasped, torch.full_like(clearance, -float("inf")), clearance),
         )
+        current_object_xy = _object_com_position_w(u)[:, :2]
+        horizontal_drift = (current_object_xy - initial_object_xy).norm(dim=-1)
+        horizontal_drift = torch.where(done, torch.zeros_like(horizontal_drift), horizontal_drift)
+        initial_object_xy[done] = current_object_xy[done]
+        close_contract_horizontal_drift = (
+            current_object_xy - close_contract_start_xy
+        ).norm(dim=-1)
+        contract = update_close_option_state(
+            signals["grasp_quality"],
+            signals["hold_quality"],
+            force_max,
+            u._is_grasped,
+            close_contract_stable_steps,
+            clearance,
+            close_contract_horizontal_drift,
+            signals["proximity_quality"],
+            close_contract_lost_steps,
+            done,
+            grasp_quality_threshold=cfg.grasp_quality_high,
+            hold_quality_threshold=cfg.close_option_min_hold_quality,
+            safe_force_limit=cfg.grasp_bonus_max_force,
+            confirm_steps=cfg.close_option_confirm_steps,
+            unlatched_lift_limit=cfg.close_option_unlatched_lift_limit,
+            horizontal_drift_limit=cfg.close_option_horizontal_drift_limit,
+            min_proximity=cfg.close_option_min_proximity,
+            lost_window_steps=cfg.close_option_lost_window_steps,
+        )
+        contract_success_now = close_contract_active & contract["success"]
+        contract_failure_now = close_contract_active & contract["failure"]
+        close_contract_stable_steps = torch.where(
+            close_contract_active,
+            contract["stable_count"],
+            close_contract_stable_steps,
+        )
+        close_contract_lost_steps = torch.where(
+            close_contract_active,
+            contract["lost_window_count"],
+            close_contract_lost_steps,
+        )
+        close_contract_success_step[contract_success_now] = step
+        close_contract_success |= contract_success_now
+        close_contract_failure |= contract_failure_now
+        close_contract_unlatched_lift |= contract_failure_now & contract["unlatched_lift"]
+        close_contract_horizontal_escape |= contract_failure_now & contract["horizontal_escape"]
+        close_contract_lost_window |= contract_failure_now & contract["lost_window"]
+        close_contract_unsafe |= contract_failure_now & terminated
+        close_contract_finished |= contract_success_now | contract_failure_now
+        close_contract_active &= ~(contract_success_now | contract_failure_now)
+        close_contract_ready_steps[done & ~close_contract_active] = 0
+        max_unlatched_horizontal_drift = torch.maximum(
+            max_unlatched_horizontal_drift,
+            torch.where(
+                u._is_grasped,
+                torch.zeros_like(horizontal_drift),
+                horizontal_drift,
+            ),
+        )
         max_grasp_quality = torch.maximum(max_grasp_quality, signals["grasp_quality"])
         force_peak = torch.maximum(force_peak, force)
         force_peak_env = torch.maximum(force_peak_env, force_max)
@@ -728,6 +875,17 @@ def main() -> None:
         latch_steps += u._is_grasped.long()
         ever_touch |= force_max >= cfg.contact_force_thr
         ever_latch |= u._is_grasped
+        safe_latch = (
+            u._is_grasped
+            & (signals["grasp_quality"] >= cfg.grasp_quality_high)
+            & (signals["hold_quality"] >= cfg.close_option_min_hold_quality)
+            & (force_max <= cfg.grasp_bonus_max_force)
+        )
+        stable_grasp_steps = torch.where(
+            safe_latch, stable_grasp_steps + 1, torch.zeros_like(stable_grasp_steps)
+        )
+        max_stable_grasp_steps = torch.maximum(max_stable_grasp_steps, stable_grasp_steps)
+        ever_stable_grasp |= stable_grasp_steps >= cfg.close_option_confirm_steps
         ever_latched_5cm |= u._is_grasped & (clearance >= 0.05)
         ever_20cm |= clearance >= cfg.lift_success_height
 
@@ -739,17 +897,23 @@ def main() -> None:
         "num_envs": n,
         "steps": args_cli.steps,
         "stable_steps": args_cli.stable_steps,
+        "zero_arm_actions": args_cli.zero_arm_actions,
         "success_count": int(success.sum()),
         "success_rate": float(success.float().mean()),
         "success_step": success_step.cpu().tolist(),
         "max_true_clearance": _summary(max_clearance),
         "max_unlatched_clearance": _summary(max_unlatched_clearance),
+        "max_unlatched_horizontal_drift": _summary(max_unlatched_horizontal_drift),
+        "ever_unlatched_horizontal_drift_ge_3cm_count": int(
+            (max_unlatched_horizontal_drift >= 0.03).sum()
+        ),
         "ever_unlatched_clearance_ge_5cm_count": int(
             (max_unlatched_clearance >= 0.05).sum()
         ),
         "false_lift_or_fling_count": int(fling.sum()),
         "max_grasp_quality": _summary(max_grasp_quality),
         "latch_occupancy": _summary(latch_steps.float() / args_cli.steps),
+        "max_stable_grasp_steps": _summary(max_stable_grasp_steps.float()),
         "force_order": list(u.ee_names),
         "force_peak_per_finger": force_peak.max(dim=0).values.cpu().tolist(),
         "mean_action_abs_arm_token_residual": (action_abs_sum / args_cli.steps).mean(dim=0).cpu().tolist(),
@@ -758,6 +922,7 @@ def main() -> None:
             "pregrasp_score_ge_0.25": int((max_pregrasp_score >= 0.25).sum()),
             "touch": int(ever_touch.sum()),
             "grasp_latch": int(ever_latch.sum()),
+            "stable_grasp_latch": int(ever_stable_grasp.sum()),
             "latched_lift_ge_5cm": int(ever_latched_5cm.sum()),
             "true_clearance_ge_20cm": int(ever_20cm.sum()),
             "strict_success": int(success.sum()),
@@ -771,6 +936,31 @@ def main() -> None:
             "force_time_integral_Ns": _summary(force_impulse),
             "unsafe_termination_events": int(unsafe_force_terminations.sum()),
             "unsafe_terminated_envs": int((unsafe_force_terminations > 0).sum()),
+        },
+        "close_option_contract": {
+            "entry_count": int(close_contract_entered.sum()),
+            "entry_rate": float(close_contract_entered.float().mean()),
+            "success_count": int(close_contract_success.sum()),
+            "success_rate_per_env": float(close_contract_success.float().mean()),
+            "success_rate_given_entry": (
+                float(close_contract_success.sum() / close_contract_entered.sum())
+                if bool(close_contract_entered.any())
+                else 0.0
+            ),
+            "failure_count": int(close_contract_failure.sum()),
+            "timeout_count": int(close_contract_active.sum()),
+            "not_entered_count": int((~close_contract_entered).sum()),
+            "success_step": close_contract_success_step.cpu().tolist(),
+            "gate": {
+                "score": args_cli.close_contract_score,
+                "hold_steps": args_cli.close_contract_hold_steps,
+                "min_step": args_cli.close_contract_min_step,
+                "min_proximity": args_cli.close_contract_min_proximity,
+            },
+            "unlatched_lift_failure_count": int(close_contract_unlatched_lift.sum()),
+            "horizontal_escape_failure_count": int(close_contract_horizontal_escape.sum()),
+            "lost_window_failure_count": int(close_contract_lost_window.sum()),
+            "unsafe_failure_count": int(close_contract_unsafe.sum()),
         },
     }
     if curriculum_initial is not None:

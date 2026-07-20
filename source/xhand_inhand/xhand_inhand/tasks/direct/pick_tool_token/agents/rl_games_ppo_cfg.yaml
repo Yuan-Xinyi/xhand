@@ -73,6 +73,7 @@ params:
     behavior_anchor_dataset: ''
     positive_advantage_only: False
     freeze_actor: False
+    train_mu_head_only: False
     freeze_input_normalization: False
     reward_shaper:
       scale_value: 0.01
