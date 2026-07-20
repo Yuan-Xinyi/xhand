@@ -3,16 +3,12 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Direct-workflow config: xArm7 + XHand pick-a-tool with CrossDex action tokenization.
+"""Direct-workflow config for robust xArm7 + XHand hammer pickup.
 
-Same task / reward / scene / action pipeline as ``pick_cube_token`` (7 arm joint deltas +
-a 9-dim eigengrasp token retargeted to 12 absolute xhand joint targets, then the staged
-SimToolReal lift reward). The ONLY change is the grasped object: the FoundationPose cube is
-swapped for the concave pentagon "tool" mesh (see ``tool_asset.py``).
-
-Action layout (16 = 7 + 9), observation layout (86) and the reward are all inherited
-verbatim from ``pick_cube_token`` -- the policy just has to grasp and lift a bulkier,
-irregular object instead of a cube.
+The policy controls seven arm deltas, nine CrossDex tokens and five independent distal-joint
+residuals.  The latter restore hand degrees of freedom that the DexPilot retargeter fixes near
+their midpoints.  Reward and observations expose a staged close-to-wrap bridge, while grasp,
+lift and success remain gated by real object contact and true mesh clearance.
 """
 
 import isaaclab.sim as sim_utils
@@ -28,19 +24,27 @@ from .tool_asset import TOOL_MASS, TOOL_REST_QUAT, TOOL_REST_Z, TOOL_SCALE, TOOL
 
 @configclass
 class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
-    # action (16 = 7 arm deltas + 9 hand eigengrasp token) and observation (86) are inherited
-    # unchanged from pick_cube_token.
-
     # the bulky, irregular tool takes a little longer to line the grasp up than a small cube
     episode_length_s = 6.0
 
-    # ===== JOINT-SPACE ARM control (mvp26 reward, joint-space) =====
-    # Action = 7 (arm relative joint deltas) + 9 (hand eigengrasp token) = 16, mapped by the inherited
-    # PickCubeTokenEnv._pre_physics_step (arm: dof_target += action_scale*a; hand: token -> retarget NN).
-    action_space = 16
+    # Action = 7 arm relative deltas + 9 CrossDex tokens + 5 absolute distal residuals.  A residual
+    # of -1/0/+1 reaches the runtime lower/token/upper target respectively, before the existing EMA.
+    enable_distal_residual = True
+    distal_residual_joint_names = (
+        "thumb_joint2",
+        "index_joint2",
+        "middle_joint1",
+        "ring_joint1",
+        "pinky_joint1",
+    )
+    action_space = 21
 
-    observation_space = 87      # 86 base (19 joint_pos + 19 joint_vel + 15 ee + 3 palm + 3 obj_pos + 4
-    state_space = 87            # obj_quat + 3 tgt_pos + 4 tgt_quat + 16 action) + 1 lift-progress feature
+    # The old 87 features remain an exact prefix: core70 + arm/token16 + lift1. New features are
+    # residual5 plus 23 bounded close/contact/phase/counter/transport features.  In particular,
+    # palm-frame linear and angular slip make held-versus-flung transport observable to the actor.
+    enable_grasp_observations = True
+    observation_space = 115
+    state_space = 115
 
     # robot with CONTACT REPORTING enabled on its bodies (needed for the fingertip contact sensors /
     # R_contact). A fresh .replace() so the shared XARM7_XHAND_CFG is untouched.
@@ -163,77 +167,56 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
 
     # R_grasp: one-shot bonus on the first stable grasp (never re-paid after drop/regrasp).
     grasp_bonus = 100.0
+    grasp_bonus_max_force = 30.0  # N; oracle peaks near 21N, while crush-launch spikes are 285--460N
 
-    # R_success: ONE-SHOT bonus when the stable lift first succeeds. Needed because success ENDS the episode
-    # (occupancy lift would otherwise pay ~20/step forever at 19cm), so without it the policy is punished for
-    # crossing the 20cm line and stalls just below it. 500 ~= 25 steps of max lift reward (a rough
-    # continuation-value compensation for the truncated episode).
+    # R_success is paid once when the stable 20cm true-clearance termination is reached.
     success_bonus = 500.0
 
-    # R_lift = lift_scale * clip(clearance/lift_success_height,0,1) * valid_contact * hold_quality, per step.
-    # lift_scale=20 => at 20cm success height ~20/step; at 10cm ~10/step. Dominates R_reach (max 2) once up.
-    lift_scale = 20.0
-
-    # HELD-gate on R_lift: hold_quality = exp(-rel_lin/hold_v_scale) * exp(-rel_ang/hold_w_scale), where
+    # HELD gate: hold_quality = exp(-rel_lin/hold_v_scale) * exp(-rel_ang/hold_w_scale), where
     # rel_lin/rel_ang are the object's linear/angular speed RELATIVE to the palm. A HELD object moves with
     # the hand (rel ~0 -> hold_quality ~1); a FLUNG object flies off (rel large -> hold_quality -> 0), and it
     # also breaks valid_contact. Together: a throw/fling earns ZERO lift reward.
     hold_v_scale = 0.3    # m/s; relative linear speed that drops hold_quality to ~0.72 (0.1 m/s) / e^-1 (0.3)
     hold_w_scale = 3.0    # rad/s; relative angular speed scale
 
-    # R_hold: quality-weighted floor for a confirmed grasp.  It reaches 3 only at/above the confirmation
-    # threshold (so a legal hold beats max reach=2), and fades to zero across the latch dead-band so a weak
-    # or slipping latched grasp cannot farm the full reward.
-    grasp_hold_scale = 3.0
+    # Stage-4 exploration bridge.  Its potential has explicit near -> thumb -> thumb+one ->
+    # thumb+two tiers. None of these terms can enable the grasp latch, lift or success.
+    close_proximity_scale_far = 0.08
+    close_proximity_scale_near = 0.02
+    shaping_discount = 0.99
+    close_progress_scale = 40.0
+    wrap_progress_scale = 80.0
 
-    # R_reach: directional pre-grasp occupancy kernel (mvp20 kernel), gated to (~is_grasped) so it turns OFF
-    # once grasped (no occupancy annuity after the grasp). coarse (reach_scale_far) pulls the arm in from
-    # ~15cm, fine (reach_scale) sharpens the final placement; both x palm_facing (whole-hand orient) x align.
-    reach_reward_scale = 2.0
-    reach_scale = 0.08        # fine kernel (last ~8cm placement)
-    reach_scale_far = 0.25    # coarse kernel (approach slope from the ~15cm reset distance)
+    # Once latched, signed true-clearance progress makes sustained upward arm motion discoverable;
+    # there is deliberately no held-height occupancy annuity.
+    lift_progress_scale = 400.0
 
-    # P0-4: table-clearance. The object's AABB lowest corner must rise this far above its at-rest
-    # low point before the lift counts -- blocks "tip the hammer up on one end" (root Z rises while
-    # the object still rests on the table). AABB from the mesh bbox (tool_asset geometry).
-    clearance_margin = 0.03
+    # A real oracle carry peaks around 21N.  Penalize only excess fingertip-object force so normal
+    # closure is free while the historical 285--460N crush/launch solutions are uneconomic.
+    safe_contact_force = 20.0
+    contact_force_penalty_width = 20.0
+    force_excess_penalty_scale = 5.0
+    distal_residual_penalty_scale = 0.02
+
+    # The AABB remains only for reset collision bounds and diagnostic comparison. Reward/success use
+    # the real mesh convex-hull minimum, never this loose box.
     object_aabb_min = (-0.0986, -0.0878, 0.0034)
     object_aabb_max = (0.0955, 0.0884, 0.1667)
 
-    # P0-3: success must be a stable grasp held this many steps, with the object nearly still (not
-    # flung/tossed through the 30 cm plane for a single frame).
+    # Success must remain a slow, safe, strict grasp for this many steps.
     success_hold_steps = 15
     success_max_obj_lin_speed = 0.20   # m/s
     success_max_obj_ang_speed = 3.0    # rad/s
 
-    # lift success height is now measured RELATIVE to the grasp height (P0-1): 20 cm above where the
-    # hand actually closed on the handle -- a solid lift-off, achievable for this hammer.
+    # True minimum-mesh-point clearance above the measured table surface.
     lift_success_height = 0.20
 
-    # CLEAN-LIFT gate (user: reward only a straight-up lift that keeps the grasp pose; penalize the arm
-    # "wiggle" that tumbles/drags the object). r_lift is multiplied by orient_stay (cos of the twist from
-    # the grasp orientation) x xy_stay (1 - tanh(horizontal_drift/scale)). Success also requires the twist
-    # to stay small.
-    lift_xy_drift_scale = 0.05     # m; horizontal drift at which xy_stay ~ 0.76 (5cm) -> lift reward decays
-    success_orient_min = 0.85      # cos(twist) required for success (~0.85 = <=31 deg from grasp orientation)
-
-    # ANTI-HACK: terminate the episode if the ARM presses on the table (the "press-up" hack levers the
-    # object up off the table's reaction force instead of a real arm lift). Detected GEOMETRICALLY (no
-    # contact sensor): any arm link's world z dropping to within arm_table_margin of the table plane
-    # (= the object's at-rest lowest corner) means the arm reached the table. The arm links never
-    # legitimately go that low -- only the fingertips reach down to the object -- so this is a clean signal.
-    terminate_on_arm_table_contact = True
+    # Retained only for press_diag/armhit_diag geometry reports. Arm-table contact is not a task
+    # termination; robust object contact and transport gates make table-reaction hacks unprofitable.
+    terminate_on_arm_table_contact = False
     arm_contact_bodies = ("link1", "link2", "link3", "link4", "link5", "link6", "link7", "link8")
     arm_table_margin = 0.03    # m; arm link center within this of the TRUE table surface = pressing it
                                # (grasp keeps arm links >= ~+0.047 above origin; true table ~ -0.003 -> safe)
-
-    # BIG lift pay (mvp20, user call): the mvp19 plateau (~324) was a "gentle-hold annuity" -- holding
-    # pays a steady 5.0/step while lifting pays one-time ratchet increments with slip risk, so the
-    # policy held without lifting (peak lift 8mm). 5x the dense scale: +50 per NEW cm of lift while
-    # contact-grasping (full 20cm = 1000 + 300 bonus, dwarfing the ~600 hold annuity). STILL strictly
-    # contact-gated (x contact_grasp; no contact -> no lift pay, regression T1) and ratcheted (only new
-    # highs pay -- jiggling can't farm it).
-    dense_lift_rew_scale = 5000.0
 
     # draggable grasp-keypoint markers (yellow spheres on the object) -- GUI-only, for visually
     # checking / repositioning the handle keypoints. Costs nothing headless (gated on has_gui()).

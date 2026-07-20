@@ -34,7 +34,7 @@ act=torch.zeros((1,u.cfg.action_space),device=dev)
 print("phase           clr    slip_lin hold_q grasp_q latched R_lift  ungated")
 # settle
 for _ in range(10): env.step(act)
-lift_scale=u.cfg.lift_scale; H=u.cfg.lift_success_height
+lift_scale=u.cfg.lift_progress_scale; H=u.cfg.lift_success_height
 def report(tag):
     clr=logval("clearance_mean"); rl=logval("slip_lin_mean"); hq=logval("hold_quality_mean"); rlift=logval("r_lift_mean")
     ungated=lift_scale*min(max(clr,0)/H,1.0)

@@ -11,9 +11,8 @@ Transport quality is evaluated entirely in center-of-mass frames.  Lift height i
 world-Z of the real mesh convex hull relative to the table, so tipping or flinging the hammer
 cannot masquerade as a successful lift.
 
-The stage-1 reward here is intentionally a correctness scaffold.  Later stages add continuous
-close/wrap shaping, an oracle demonstration path and reverse curriculum without weakening these
-contact, transport or true-clearance invariants.
+Exploration uses signed near/close/wrap/lift potentials and five distal residual controls.  These
+terms improve credit assignment without weakening contact, transport or true-clearance invariants.
 """
 from __future__ import annotations
 
@@ -27,7 +26,8 @@ from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.math import quat_apply, quat_conjugate, sample_uniform
 
 from ..pick_cube_token.pick_cube_token_env import PickCubeTokenEnv
-from .grasp_signals import rigid_hold_quality, update_grasp_latch, wrap_quality
+from .grasp_signals import rigid_hold_quality, staged_close_quality, update_grasp_latch, wrap_quality
+from .hybrid_action import apply_asymmetric_joint_residual
 from .pick_tool_token_env_cfg import PickToolTokenEnvCfg
 
 
@@ -37,6 +37,29 @@ class PickToolTokenEnv(PickCubeTokenEnv):
     def __init__(self, cfg: PickToolTokenEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
         dev, N = self.device, self.num_envs
+
+        # CrossDex leaves these five distal flexion joints nearly fixed.  Resolve them by name in
+        # articulation-hand order; ee_names has a different order and must never be used here.
+        _, hand_joint_names = self.robot.find_joints(self.cfg.hand_joint_names)
+        distal_names = tuple(cfg.distal_residual_joint_names)
+        if len(set(distal_names)) != len(distal_names):
+            raise ValueError("distal_residual_joint_names contains duplicates")
+        missing = [name for name in distal_names if name not in hand_joint_names]
+        if missing:
+            raise ValueError(f"Distal residual joints are absent from the XHand articulation: {missing}")
+        self._distal_hand_ids = torch.tensor(
+            [hand_joint_names.index(name) for name in distal_names], dtype=torch.long, device=dev
+        )
+        self._n_distal_residuals = len(distal_names) if cfg.enable_distal_residual else 0
+        expected_actions = self._n_arm + self._n_tokens + self._n_distal_residuals
+        if cfg.action_space != expected_actions:
+            raise ValueError(
+                f"PickTool action_space={cfg.action_space}, expected {expected_actions} "
+                f"({self._n_arm} arm + {self._n_tokens} token + {self._n_distal_residuals} residual)."
+            )
+        self._last_token_hand_target = torch.zeros((N, len(hand_joint_names)), device=dev)
+        self._last_distal_delta = torch.zeros((N, len(distal_names)), device=dev)
+        self._last_raw_hand_target = torch.zeros((N, len(hand_joint_names)), device=dev)
 
         # handle grasp keypoints in the object's local frame -- (K, 3)
         self.grasp_keypoints_local = torch.tensor(cfg.grasp_keypoints, dtype=torch.float, device=dev)
@@ -155,10 +178,15 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._contact_steps = torch.zeros(N, dtype=torch.long, device=dev)       # consecutive valid-contact steps
         self._lost_contact_steps = torch.zeros(N, dtype=torch.long, device=dev)  # consecutive lost-contact steps
         self._is_grasped = torch.zeros(N, dtype=torch.bool, device=dev)          # confirmed stable grasp state
-        self._grasp_bonus_given = torch.zeros(N, dtype=torch.bool, device=dev)   # mvp20: "ever contacted" latch (baseline lock)
+        self._grasp_bonus_given = torch.zeros(N, dtype=torch.bool, device=dev)   # safe stable-grasp bonus latch
+        self._safe_grasp_steps = torch.zeros(N, dtype=torch.long, device=dev)    # consecutive low-impact latch steps
         self._grasp_age = torch.zeros(N, dtype=torch.long, device=dev)           # steps since is_grasped became True (unused mvp20)
         self._success_paid = torch.zeros(N, dtype=torch.bool, device=dev)        # one-shot stable-success bonus latch (unused mvp20)
         self._lift_bonus_given = torch.zeros(N, dtype=torch.bool, device=dev)    # mvp20: one-shot lift-off bonus latch (per episode)
+        self._prev_close_quality = torch.zeros(N, device=dev)
+        self._prev_wrap_quality = torch.zeros(N, device=dev)
+        self._prev_lift_potential = torch.zeros(N, device=dev)
+        self._potential_initialized = torch.zeros(N, dtype=torch.bool, device=dev)
         # task-space arm control (mvp27): palm EEF Jacobian row index (fixed base -> body_idx - 1) and a
         # cached 6x6 identity for the damped-least-squares pseudo-inverse.
         self._palm_jac_idx = self.palm_idx - 1
@@ -632,6 +660,23 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             alignment_min=self.cfg.grasp_align_min,
             opposition_min=self.cfg.grasp_opposition_min,
         )
+        wrap.update(
+            staged_close_quality(
+                force_magnitude,
+                self._handle_surface_distances,
+                self._handle_contact_region,
+                self._handle_surface_normal_w,
+                self._finger_align,
+                wrap["palm_score"],
+                self._contact_thumb_idx,
+                self._contact_other_ids,
+                alignment_min=self.cfg.grasp_align_min,
+                opposition_min=self.cfg.grasp_opposition_min,
+                proximity_scale_far=self.cfg.close_proximity_scale_far,
+                proximity_scale_near=self.cfg.close_proximity_scale_near,
+                force_saturation=self.cfg.contact_force_saturation,
+            )
+        )
 
         hold, slip_lin, slip_ang = rigid_hold_quality(
             self.robot.data.body_com_pos_w[:, self.palm_idx],
@@ -648,6 +693,17 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         wrap["hold_quality"] = hold
         wrap["slip_lin"] = slip_lin
         wrap["slip_ang"] = slip_ang
+        palm_com_pos = self.robot.data.body_com_pos_w[:, self.palm_idx]
+        palm_com_lin = self.robot.data.body_com_lin_vel_w[:, self.palm_idx]
+        palm_com_ang = self.robot.data.body_com_ang_vel_w[:, self.palm_idx]
+        palm_to_object = self.object.data.root_com_pos_w - palm_com_pos
+        slip_lin_w = self.object.data.root_com_lin_vel_w - (
+            palm_com_lin + torch.cross(palm_com_ang, palm_to_object, dim=-1)
+        )
+        slip_ang_w = self.object.data.root_com_ang_vel_w - palm_com_ang
+        palm_inv = quat_conjugate(self.palm_quat)
+        wrap["slip_lin_palm"] = quat_apply(palm_inv, slip_lin_w)
+        wrap["slip_ang_palm"] = quat_apply(palm_inv, slip_ang_w)
         wrap["grasp_quality"] = torch.minimum(wrap["quality"], hold)
         wrap["force_magnitude"] = force_magnitude
         wrap["palm_facing"] = palm_facing
@@ -655,27 +711,91 @@ class PickToolTokenEnv(PickCubeTokenEnv):
 
     # ------------------------------------------------------------------ reward
     def _get_observations(self) -> dict:
-        # minimal reward -> one extra feature: normalized off-table lift progress (clearance/success_height),
-        # so the policy knows how high the object currently is. (No is_grasped/grasp-age phase features.)
-        # Exposed as both "policy" and the symmetric "critic" group (+ cached for _get_states).
+        # Preserve the old 87-dimensional observation as an exact prefix.  This permits an explicit
+        # old-checkpoint migration without shifting its learned lift-feature column:
+        # core70 | arm+token16 | lift1 | residual5 | close/contact/phase/transport23.
         d = super()._get_observations()
         clearance = self._object_true_min_z() - self._table_surface_z
         lift_progress = torch.clamp(clearance / self.cfg.lift_success_height, 0.0, 1.0).unsqueeze(-1)
-        obs = torch.cat([d["policy"], lift_progress], dim=-1)
+        if not self.cfg.enable_grasp_observations:
+            obs = torch.cat([d["policy"], lift_progress], dim=-1)
+        else:
+            base = d["policy"]
+            core = base[:, : -self.cfg.action_space]
+            old_action = self.actions[:, : self._n_arm + self._n_tokens]
+            residual_action = self.actions[:, self._n_arm + self._n_tokens :]
+            signals = self._compute_grasp_signals()
+            latch = self._is_grasped.float().unsqueeze(-1)
+            confirm_progress = torch.clamp(
+                self._contact_steps.float() / self.cfg.grasp_confirm_steps, 0.0, 1.0
+            ).unsqueeze(-1)
+            release_progress = torch.clamp(
+                self._lost_contact_steps.float() / self.cfg.grasp_release_steps, 0.0, 1.0
+            ).unsqueeze(-1)
+            phase = torch.cat(
+                (
+                    signals["legal_finger_proximity"],
+                    signals["finger_force_strength"],
+                    signals["close_quality"].unsqueeze(-1),
+                    signals["quality"].unsqueeze(-1),
+                    signals["hold_quality"].unsqueeze(-1),
+                    1.0 - latch,
+                    latch,
+                    confirm_progress,
+                    release_progress,
+                    torch.clamp(signals["slip_lin_palm"] / self.cfg.hold_v_scale, -2.0, 2.0),
+                    torch.clamp(signals["slip_ang_palm"] / self.cfg.hold_w_scale, -2.0, 2.0),
+                ),
+                dim=-1,
+            )
+            obs = torch.cat(
+                (core, old_action, lift_progress, residual_action, phase), dim=-1
+            )
+        if obs.shape[1] != self.cfg.observation_space:
+            raise RuntimeError(
+                f"Built {obs.shape[1]} observations, cfg declares {self.cfg.observation_space}."
+            )
         self._policy_obs_cache = obs
         return {"policy": obs, "critic": obs}
 
     def _get_states(self) -> torch.Tensor:
         return getattr(self, "_policy_obs_cache", None)
 
-    # NOTE: joint-space arm control (mvp20) -- no _pre_physics_step override; inherits
-    # PickCubeTokenEnv._pre_physics_step (7 arm relative joint deltas + 9 hand eigengrasp token = 16).
+    def _decode_hand_action(self, hand_action: torch.Tensor) -> torch.Tensor:
+        """Decode token9 plus five full-range, non-accumulating distal residuals."""
+
+        if not self.cfg.enable_distal_residual:
+            self._last_distal_delta.zero_()
+            target = super()._decode_hand_action(hand_action)
+            self._last_token_hand_target.copy_(target)
+            self._last_raw_hand_target.copy_(target)
+            return target
+        expected_width = self._n_tokens + self._n_distal_residuals
+        if hand_action.shape[1] != expected_width:
+            raise ValueError(f"Expected {expected_width} hand actions, got {hand_action.shape[1]}.")
+        token = hand_action[:, : self._n_tokens]
+        residual = hand_action[:, self._n_tokens :]
+        token_target = super()._decode_hand_action(token)
+        hand_lower = self.dof_lower[:, self._hand_ids_t]
+        hand_upper = self.dof_upper[:, self._hand_ids_t]
+        target, delta = apply_asymmetric_joint_residual(
+            token_target,
+            hand_lower,
+            hand_upper,
+            residual,
+            self._distal_hand_ids,
+            validate_indices=False,
+        )
+        self._last_token_hand_target.copy_(
+            torch.maximum(torch.minimum(token_target, hand_upper), hand_lower)
+        )
+        self._last_distal_delta.copy_(delta)
+        self._last_raw_hand_target.copy_(target)
+        return target
 
     def _get_rewards(self) -> torch.Tensor:
-        # Stage-1 correctness reward. Grasp/lift/success all consume the SAME robust quality:
-        # real handle contact topology x palm-facing x pad/surface alignment x opposing sides x
-        # COM-frame transport quality. A continuous close/progress reward replaces this scaffold in
-        # stage 4, after the action-space and scripted-oracle feasibility gates have passed.
+        # Staged close/wrap potentials bridge approach to force closure, while the strict shared
+        # quality remains the only authority for latch, transport potential and success.
         cfg = self.cfg
 
         # Reach still targets the four calibrated cross-section points. Its alignment now comes from
@@ -696,9 +816,11 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         slip_lin = signals["slip_lin"]
         slip_ang = signals["slip_ang"]
         q_wrap = signals["quality"]
+        q_close = signals["close_quality"]
+        q_contact = signals["contact_quality"]
         grasp_quality = signals["grasp_quality"]
 
-        self._is_grasped, self._contact_steps, self._lost_contact_steps, newly_confirmed, _ = update_grasp_latch(
+        self._is_grasped, self._contact_steps, self._lost_contact_steps, _, _ = update_grasp_latch(
             grasp_quality,
             self._is_grasped,
             self._contact_steps,
@@ -709,37 +831,66 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             release_steps=cfg.grasp_release_steps,
         )
         is_grasped_phase = self._is_grasped
-        first_stable_grasp = newly_confirmed & (~self._grasp_bonus_given)
-        self._grasp_bonus_given = self._grasp_bonus_given | newly_confirmed
+        max_force = signals["force_magnitude"].max(dim=-1).values
+        safe_grasp = (
+            (grasp_quality >= cfg.grasp_quality_high)
+            & (max_force <= cfg.grasp_bonus_max_force)
+        )
+        self._safe_grasp_steps = torch.where(
+            safe_grasp, self._safe_grasp_steps + 1, torch.zeros_like(self._safe_grasp_steps)
+        )
+        first_stable_grasp = (
+            is_grasped_phase
+            & (self._safe_grasp_steps >= cfg.grasp_confirm_steps)
+            & (~self._grasp_bonus_given)
+        )
+        self._grasp_bonus_given = self._grasp_bonus_given | first_stable_grasp
 
         clearance = self._object_true_min_z() - self._table_surface_z
         lift_fraction = torch.clamp(clearance / cfg.lift_success_height, 0.0, 1.0)
 
-        reach_far = 1.0 - torch.tanh(grasp_dist / cfg.reach_scale_far)
-        reach_near = 1.0 - torch.tanh(grasp_dist / cfg.reach_scale)
-        r_reach = cfg.reach_reward_scale * 0.5 * (reach_far + reach_near) * palm_facing * align * (~is_grasped_phase).float()
+        # Gamma-correct potential shaping cannot be farmed by repeatedly approaching and retreating.
+        # The first post-reset sample only initializes the potential and pays no state-only reset bonus.
+        potential_ready = self._potential_initialized.float()
+        close_delta = cfg.shaping_discount * q_close - self._prev_close_quality
+        wrap_delta = cfg.shaping_discount * q_wrap - self._prev_wrap_quality
+        r_close_progress = cfg.close_progress_scale * close_delta * potential_ready
+        r_wrap_progress = cfg.wrap_progress_scale * wrap_delta * potential_ready
+        # Keep the one-shot strict-latch event as the end of the close sequence.  Unlike the removed
+        # contact/hold occupancies it cannot be farmed by waiting or by drop/regrasp cycles.
         r_grasp = cfg.grasp_bonus * first_stable_grasp.float()
-        # Only a high-quality confirmed grasp gets the full hold floor.  A Schmitt latch deliberately
-        # survives the quality dead-band for control stability, but paying the full floor there lets a
-        # weak/slipping hold farm reward indefinitely.  Fade the floor from zero at the release threshold
-        # to full value at the confirm threshold; a legal stable grasp still strictly beats max reach.
-        hold_strength = torch.clamp(
+        transport_x = torch.clamp(
             (grasp_quality - cfg.grasp_quality_low)
             / max(cfg.grasp_quality_high - cfg.grasp_quality_low, 1.0e-6),
             0.0,
             1.0,
         )
-        r_hold = cfg.grasp_hold_scale * is_grasped_phase.float() * hold_strength
-        # During the release debounce window a fling can leave the latch true for a few frames.  The
-        # instantaneous transport quality must therefore clear the release threshold as well; otherwise
-        # the exponential tail pays a tiny but non-zero reward to a fast airborne object.
-        lift_quality = torch.where(
-            grasp_quality >= cfg.grasp_quality_low, grasp_quality, torch.zeros_like(grasp_quality)
+        force_safe = (max_force <= cfg.grasp_bonus_max_force).float()
+        transport_gate = (
+            is_grasped_phase.float()
+            * transport_x.square()
+            * (3.0 - 2.0 * transport_x)
+            * force_safe
         )
-        r_lift = cfg.lift_scale * lift_fraction * is_grasped_phase.float() * lift_quality
+        lift_potential = lift_fraction * transport_gate
+        lift_delta = cfg.shaping_discount * lift_potential - self._prev_lift_potential
+        r_lift_progress = cfg.lift_progress_scale * lift_delta * potential_ready
         newly_successful = self._is_success & (~self._success_paid)
         r_success = cfg.success_bonus * newly_successful.float()
         self._success_paid = self._success_paid | self._is_success
+
+        force_excess = torch.clamp(
+            (max_force - cfg.safe_contact_force) / cfg.contact_force_penalty_width, 0.0, 1.0
+        )
+        force_excess = force_excess.square() * (3.0 - 2.0 * force_excess)
+        r_force_penalty = -cfg.force_excess_penalty_scale * force_excess
+        residual_action = self.actions[:, self._n_arm + self._n_tokens :]
+        r_residual_penalty = -cfg.distal_residual_penalty_scale * residual_action.square().sum(dim=-1)
+
+        self._prev_close_quality.copy_(q_close)
+        self._prev_wrap_quality.copy_(q_wrap)
+        self._prev_lift_potential.copy_(lift_potential)
+        self._potential_initialized.fill_(True)
 
         object_z = self.object_pos_w[:, 2] - self.scene.env_origins[:, 2]
         actual_lift = object_z - self.object_default_z
@@ -754,6 +905,9 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         log["thumb_contact_frac"] = thumb_contact.float().mean()
         log["is_grasped_phase_frac"] = is_grasped_phase.float().mean()
         log["q_wrap_mean"] = q_wrap.mean()
+        log["q_close_mean"] = q_close.mean()
+        log["q_contact_mean"] = q_contact.mean()
+        log["q_proximity_mean"] = signals["proximity_quality"].mean()
         log["grasp_quality_mean"] = grasp_quality.mean()
         log["palm_gate_mean"] = signals["palm_score"].mean()
         log["align_gate_mean"] = signals["alignment_score"].mean()
@@ -773,15 +927,36 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         log["lift_ge_5cm_frac"] = (clearance >= 0.05).float().mean()
         log["lift_ge_10cm_frac"] = (clearance >= 0.10).float().mean()
         log["lift_ge_20cm_frac"] = (clearance >= 0.20).float().mean()
-        log["r_reach_mean"] = r_reach.mean()
+        log["r_reach_mean"] = torch.zeros((), device=self.device)
+        log["r_close_progress_mean"] = r_close_progress.mean()
+        log["r_contact_mean"] = torch.zeros((), device=self.device)
+        log["r_wrap_mean"] = r_wrap_progress.mean()
         log["r_grasp_mean"] = r_grasp.mean()
-        log["r_hold_mean"] = r_hold.mean()
-        log["hold_strength_mean"] = hold_strength.mean()
-        log["r_lift_mean"] = r_lift.mean()
-        log["lift_quality_mean"] = lift_quality.mean()
+        log["r_hold_mean"] = torch.zeros((), device=self.device)
+        log["hold_strength_mean"] = transport_x.mean()
+        log["r_lift_mean"] = r_lift_progress.mean()
+        log["r_lift_progress_mean"] = r_lift_progress.mean()
+        log["lift_quality_mean"] = transport_gate.mean()
+        log["lift_potential_mean"] = lift_potential.mean()
         log["r_success_mean"] = r_success.mean()
+        log["force_excess_mean"] = force_excess.mean()
+        log["r_force_penalty_mean"] = r_force_penalty.mean()
+        log["r_residual_penalty_mean"] = r_residual_penalty.mean()
+        if residual_action.shape[1] > 0:
+            log["residual_action_abs_mean"] = residual_action.abs().mean()
+            log["residual_action_sat_frac"] = (residual_action.abs() > 0.99).float().mean()
+            log["distal_delta_abs_mean"] = self._last_distal_delta.abs().mean()
+            log["distal_delta_abs_max"] = self._last_distal_delta.abs().max()
 
-        return r_reach + r_grasp + r_hold + r_lift + r_success
+        return (
+            r_close_progress
+            + r_wrap_progress
+            + r_grasp
+            + r_lift_progress
+            + r_success
+            + r_force_penalty
+            + r_residual_penalty
+        )
 
     # ------------------------------------------------------------------ termination
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -802,6 +977,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             & slow
             & self._is_grasped
             & (signals["grasp_quality"] >= cfg.grasp_quality_high)
+            & (signals["force_magnitude"].max(dim=-1).values <= cfg.grasp_bonus_max_force)
         )
         self._success_steps = torch.where(
             success_inst, self._success_steps + 1, torch.zeros_like(self._success_steps)
@@ -832,10 +1008,15 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._contact_steps[env_ids] = 0
         self._lost_contact_steps[env_ids] = 0
         self._is_grasped[env_ids] = False
-        self._grasp_bonus_given[env_ids] = False  # "ever contacted" latch clears ONLY on episode reset
+        self._grasp_bonus_given[env_ids] = False
+        self._safe_grasp_steps[env_ids] = 0
         self._grasp_age[env_ids] = 0
         self._success_paid[env_ids] = False
         self._lift_bonus_given[env_ids] = False
+        self._prev_close_quality[env_ids] = 0.0
+        self._prev_wrap_quality[env_ids] = 0.0
+        self._prev_lift_potential[env_ids] = 0.0
+        self._potential_initialized[env_ids] = False
 
     # ------------------------------------------------------------------ reset object placement (P1-8)
     def _sample_non_overlapping_object_xy(self, env_ids, default_xy):

@@ -149,6 +149,7 @@ def main() -> None:
         u._lost_contact_steps.zero_()
         u._is_grasped.zero_()
         u._grasp_bonus_given.zero_()
+        u._safe_grasp_steps.zero_()
         u._success_paid.zero_()
         u._success_steps.zero_()
         u._is_success.zero_()

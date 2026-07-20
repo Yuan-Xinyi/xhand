@@ -24,6 +24,15 @@ signals = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(signals)
 
+ACTION_MODULE_PATH = (
+    REPO_ROOT
+    / "source/xhand_inhand/xhand_inhand/tasks/direct/pick_tool_token/hybrid_action.py"
+)
+ACTION_SPEC = importlib.util.spec_from_file_location("pick_tool_hybrid_action", ACTION_MODULE_PATH)
+hybrid_action = importlib.util.module_from_spec(ACTION_SPEC)
+assert ACTION_SPEC.loader is not None
+ACTION_SPEC.loader.exec_module(hybrid_action)
+
 
 def check(condition: bool, message: str) -> None:
     if not condition:
@@ -123,6 +132,38 @@ def test_wrap_quality() -> None:
     print("PASS wrap truth table: thumb+2 opposed pads required; back/misaligned/off-handle rejected")
 
 
+def test_staged_close_quality() -> None:
+    def close(case: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        palm_score = torch.clamp((case["palm_facing"] - 0.5) / 0.5, 0.0, 1.0)
+        return signals.staged_close_quality(
+            case["force"], case["distance"], case["distance"] < 0.008,
+            case["normal"], case["alignment"], palm_score, 0, torch.tensor((1, 2, 3, 4)),
+            alignment_min=0.3, opposition_min=0.5, proximity_scale_far=0.08,
+            proximity_scale_near=0.02, force_saturation=5.0,
+        )
+
+    values = []
+    for contacts in (0, 1, 2, 3):
+        case = make_wrap_case()
+        case["force"].zero_()
+        if contacts:
+            case["force"][:, :contacts] = 10.0
+        values.append(close(case)["close_quality"].item())
+    check(values[0] > 0.0, "near-handle shaping disappeared before contact")
+    check(values[0] < values[1] < values[2] < values[3], f"close stages are not monotonic: {values}")
+
+    back = make_wrap_case()
+    back["palm_facing"][:] = 0.2
+    check(close(back)["close_quality"].item() == 0.0, "back-of-hand close shaping is nonzero")
+    wrong = make_wrap_case()
+    wrong["normal"][:, 1:3] = torch.tensor((1.0, 0.0, 0.0))
+    check(
+        close(wrong)["close_quality"].item() < close(make_wrap_case())["close_quality"].item() / 2.0,
+        "same-side contacts receive nearly as much close shaping as opposed contacts",
+    )
+    print("PASS staged close: near -> thumb -> thumb+1 -> thumb+2 is monotonic and direction-gated")
+
+
 def test_schmitt_latch() -> None:
     grasped = torch.tensor([False])
     confirm = torch.zeros(1, dtype=torch.long)
@@ -155,8 +196,33 @@ def test_schmitt_latch() -> None:
     print("PASS Schmitt latch: one confirmation, dead-band hold, quality-driven release")
 
 
+def test_asymmetric_joint_residual() -> None:
+    base = torch.tensor(
+        [[0.1, 0.4, -0.2, 0.7, 0.6, 0.0], [0.2, 0.5, -0.1, 0.8, 0.7, 0.1],
+         [0.3, 0.6, 0.0, 0.9, 0.8, 0.2]]
+    )
+    lower = base - torch.tensor((0.5, 0.4, 0.3, 0.2, 0.6, 0.1))
+    upper = base + torch.tensor((0.4, 0.8, 0.2, 0.5, 0.3, 0.7))
+    joint_ids = torch.tensor((4, 1))  # deliberately not articulation order
+    residual = torch.tensor(((-1.0, 1.0), (0.0, 0.0), (0.5, -0.25)))
+    target, delta = hybrid_action.apply_asymmetric_joint_residual(
+        base, lower, upper, residual, joint_ids
+    )
+    check(torch.equal(target[0, joint_ids], torch.tensor((0.0, 1.2))), "-1/+1 missed limits")
+    check(torch.equal(target[1], base[1]), "zero residual changed the token target")
+    expected_row2 = torch.tensor((0.95, 0.5))
+    check(torch.allclose(target[2, joint_ids], expected_row2), "asymmetric residual scale changed")
+    untouched = torch.tensor((0, 2, 3, 5))
+    check(torch.equal(target[:, untouched], base[:, untouched]), "advanced indexing changed other joints")
+    check(torch.all(target >= lower).item() and torch.all(target <= upper).item(), "target escaped limits")
+    check(torch.allclose(delta[2], expected_row2 - base[2, joint_ids]), "reported delta is wrong")
+    print("PASS hybrid action: full asymmetric range, zero identity, shuffled joints and rows")
+
+
 if __name__ == "__main__":
     test_rigid_hold_quality()
     test_wrap_quality()
+    test_staged_close_quality()
     test_schmitt_latch()
+    test_asymmetric_joint_residual()
     print("ALL GRASP SIGNAL TESTS PASSED")

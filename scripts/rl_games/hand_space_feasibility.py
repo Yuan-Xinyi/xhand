@@ -87,6 +87,14 @@ def main() -> None:
     env_cfg.episode_length_s = 120.0
     env_cfg.terminate_on_drop = False
     env_cfg.success_hold_steps = 100000
+    # This benchmark intentionally mines its fixed pregrasp with the historical 16-action/87-observation
+    # checkpoint.  New training uses 21/115; legacy mode is explicit so incompatible checkpoints never
+    # get silently padded or assigned shifted observation columns.
+    env_cfg.enable_distal_residual = False
+    env_cfg.enable_grasp_observations = False
+    env_cfg.action_space = 16
+    env_cfg.observation_space = 87
+    env_cfg.state_space = 87
 
     agent_cfg = load_cfg_from_registry(args_cli.task, "rl_games_cfg_entry_point")
     agent_cfg["params"]["seed"] = args_cli.seed
@@ -200,7 +208,7 @@ def main() -> None:
                     u.object.data.root_pos_w[i] - u.scene.env_origins[i]
                 ).detach().clone(),
                 "object_quat": u.object.data.root_quat_w[i].detach().clone(),
-                "token": actions[i, u._n_arm :].detach().clone().clamp(-1.0, 1.0),
+                "token": actions[i, u._n_arm : u._n_arm + u._n_tokens].detach().clone().clamp(-1.0, 1.0),
             }
         if step % 30 == 0 or step == args_cli.approach_steps - 1:
             print(
@@ -257,6 +265,7 @@ def main() -> None:
         u._lost_contact_steps.zero_()
         u._is_grasped.zero_()
         u._grasp_bonus_given.zero_()
+        u._safe_grasp_steps.zero_()
         u._success_paid.zero_()
         u._success_steps.zero_()
         u._is_success.zero_()
@@ -278,8 +287,8 @@ def main() -> None:
             base_distal = target[:, distal_local]
             lo_distal = lower[:, distal_local]
             hi_distal = upper[:, distal_local]
-            # Feasibility mapping: -1/0/+1 exactly reach lower/base/upper without an arbitrary
-            # symmetric scale.  The later PPO action can use a narrower regularized residual.
+            # Feasibility and PPO share this exact map: -1/0/+1 reaches lower/base/upper. A small
+            # policy-side residual penalty regularizes usage without deleting feasible grasps.
             delta = torch.where(
                 residual >= 0.0,
                 residual * (hi_distal - base_distal),

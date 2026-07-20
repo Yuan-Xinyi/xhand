@@ -56,12 +56,25 @@ class PickCubeTokenEnv(PickCubeEnv):
         self._n_tokens = cfg.n_hand_tokens
 
     # ------------------------------------------------------------------ step
+    def _decode_hand_action(self, hand_action: torch.Tensor) -> torch.Tensor:
+        """Decode a hand action into absolute targets in articulation hand-joint order.
+
+        Subclasses may extend the hand action while keeping the arm update, limit clamp and
+        moving-average path below identical.  The base cube task remains exactly token-only.
+        """
+        if hand_action.shape[1] != self._n_tokens:
+            raise ValueError(
+                f"Expected {self._n_tokens} hand-token actions, got {hand_action.shape[1]}."
+            )
+        hand_nn = self.retarget.retarget_from_unit_action(hand_action)
+        return hand_nn[:, self._retarget2isaac]
+
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         a = actions.clone().clamp(-1.0, 1.0)
         self.actions = a
 
         arm_a = a[:, : self._n_arm]            # (N, 7) relative arm deltas
-        hand_token = a[:, self._n_arm :]       # (N, 9) eigengrasp token in [-1, 1]
+        hand_action = a[:, self._n_arm :]       # token, optionally extended by a subclass
 
         # arm: relative joint position control (same scheme as pick_cube)
         raw_targets = self.dof_targets.clone()
@@ -69,9 +82,8 @@ class PickCubeTokenEnv(PickCubeEnv):
             self.dof_targets[:, self._arm_ids_t] + self.cfg.action_scale * arm_a
         )
 
-        # hand: token -> eigengrasp coords -> MANO pose -> retarget NN -> absolute joint targets
-        hand_nn = self.retarget.retarget_from_unit_action(hand_token)  # (N, 12) in NN order
-        hand_abs = hand_nn[:, self._retarget2isaac]                    # -> articulation hand order
+        # hand: subclass hook -> absolute targets in articulation hand-joint order
+        hand_abs = self._decode_hand_action(hand_action)
         raw_targets[:, self._hand_ids_t] = hand_abs
 
         # clamp, then smooth with the moving average (CrossDex smooths the hand the same way)

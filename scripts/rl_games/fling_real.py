@@ -16,7 +16,7 @@ for _ in range(10): env.step(act)
 print("REAL contact (no monkeypatch). Object flung; hand at home (never grips).")
 print("phase        clr    obj_contact q_wrap hold_q  slip_lin  latched R_lift  ungated")
 def rep(tag):
-    ungated = u.cfg.lift_scale * min(max(lv("clearance_mean"), 0) / u.cfg.lift_success_height, 1)
+    ungated = u.cfg.lift_progress_scale * min(max(lv("clearance_mean"), 0) / u.cfg.lift_success_height, 1)
     print(
         f"{tag:12s} {lv('clearance_mean'):+.3f}  {lv('valid_contact_frac'):.2f}       "
         f"{lv('q_wrap_mean'):.3f}  {lv('hold_quality_mean'):.3f}   {lv('slip_lin_mean'):6.2f}   "

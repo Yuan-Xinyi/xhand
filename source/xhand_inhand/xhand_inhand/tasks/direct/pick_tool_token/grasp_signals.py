@@ -130,6 +130,79 @@ def wrap_quality(
     }
 
 
+def staged_close_quality(
+    force_magnitude: torch.Tensor,
+    handle_surface_distance: torch.Tensor,
+    handle_contact_region: torch.Tensor,
+    handle_surface_normal_w: torch.Tensor,
+    finger_alignment: torch.Tensor,
+    palm_score: torch.Tensor,
+    thumb_index: int,
+    other_indices: torch.Tensor,
+    *,
+    alignment_min: float,
+    opposition_min: float,
+    proximity_scale_far: float,
+    proximity_scale_near: float,
+    force_saturation: float,
+) -> dict[str, torch.Tensor]:
+    """Return a staged near -> thumb -> thumb+one -> thumb+two closure potential.
+
+    Unlike strict :func:`wrap_quality`, this signal must remain informative before force closure.
+    Its four additive tiers are 0.15/0.20/0.25/0.40, so reaching the handle, touching with the
+    thumb, adding one opposed pad and finally adding a second opposed pad each create a distinct
+    improvement.  It is a potential only: latch, lift and success still use strict wrap quality.
+    """
+
+    alignment_score = torch.clamp(
+        (finger_alignment - alignment_min) / max(1.0 - alignment_min, 1.0e-6), 0.0, 1.0
+    )
+    thumb_normal = handle_surface_normal_w[:, thumb_index].unsqueeze(1)
+    other_normals = handle_surface_normal_w[:, other_indices]
+    opposition_raw = 0.5 * (1.0 - (thumb_normal * other_normals).sum(dim=-1))
+    opposition_score = torch.clamp(
+        (opposition_raw - opposition_min) / max(1.0 - opposition_min, 1.0e-6), 0.0, 1.0
+    )
+
+    proximity = 0.5 * torch.exp(-handle_surface_distance / proximity_scale_far)
+    proximity = proximity + 0.5 * torch.exp(-handle_surface_distance / proximity_scale_near)
+    proximity = proximity * handle_contact_region.float()
+    force_strength = torch.tanh(force_magnitude / force_saturation)
+
+    legal_near = proximity * alignment_score
+    legal_other_near = legal_near[:, other_indices] * opposition_score
+    legal_finger_proximity = legal_near.clone()
+    legal_finger_proximity.index_copy_(1, other_indices, legal_other_near)
+    best_other_near = torch.topk(legal_other_near, k=2, dim=1).values
+    thumb_near = legal_near[:, thumb_index]
+    proximity_quality = (thumb_near + best_other_near.sum(dim=-1)) / 3.0
+
+    thumb_contact = thumb_near * force_strength[:, thumb_index]
+    other_contact = legal_other_near * force_strength[:, other_indices]
+    best_other_contact = torch.topk(other_contact, k=2, dim=1).values
+    one_opposed = torch.minimum(thumb_contact, best_other_contact[:, 0])
+    two_opposed = torch.minimum(one_opposed, best_other_contact[:, 1])
+    quality = palm_score * (
+        0.15 * proximity_quality
+        + 0.20 * thumb_contact
+        + 0.25 * one_opposed
+        + 0.40 * two_opposed
+    )
+    contact_quality = palm_score * (
+        0.20 * thumb_contact + 0.25 * one_opposed + 0.40 * two_opposed
+    )
+    return {
+        "close_quality": quality,
+        "contact_quality": contact_quality,
+        "proximity_quality": proximity_quality,
+        "finger_proximity": proximity,
+        "legal_finger_proximity": legal_finger_proximity,
+        "finger_force_strength": force_strength,
+        "finger_alignment_score": alignment_score,
+        "finger_opposition_score": opposition_score,
+    }
+
+
 def update_grasp_latch(
     quality: torch.Tensor,
     is_grasped: torch.Tensor,
