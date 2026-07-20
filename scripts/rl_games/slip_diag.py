@@ -4,8 +4,8 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """Slip vs no-lift diagnostic for pick_tool_token. Runs the policy in 1 env and logs, per step:
-the HAND height (palm_center z, delta from step 0), the OBJECT height (lift), the contact grasp
-state and total normal force. Distinguishes the two reasons a correct-looking grasp fails to lift:
+the hand rise, TRUE mesh clearance, robust grasp latch, shared grasp qualities, and object-filtered
+force. Distinguishes the two reasons a robust grasp fails to lift:
   * SLIP   : hand rises but object does NOT follow (palm_dz grows, lift lags, contact drops)
   * NO-LIFT: hand never rises (palm_dz ~0) -> the policy isn't commanding an upward move."""
 
@@ -58,8 +58,11 @@ def main():
     if agent.is_rnn: agent.init_rnn()
 
     palm0 = None
+    clearance0 = None
     rows = []
-    print("step  palm_dz  obj_lift  gap    contact  fN   (palm_dz=hand rise, gap=palm_dz-lift, m)")
+    max_object_force = torch.zeros(len(u.ee_names), device=u.device)
+    max_net_force = torch.zeros(len(u.ee_names), device=u.device)
+    print("step  palm_dz  true_clear  clear_d  gap    latch  q_wrap  q_grasp  q_hold  objF")
     for t in range(args_cli.steps):
         with torch.inference_mode():
             obs = agent.obs_to_torch(obs)
@@ -70,25 +73,54 @@ def main():
         if palm0 is None:
             palm0 = palm_z
         palm_dz = palm_z - palm0
-        lift = (u.object_pos_w[0, 2] - origin_z - u.object_default_z[0]).item()
-        fmag = u._contact_sensor.data.force_matrix_w.norm(dim=-1).sum(dim=-1)[0]
-        fN = fmag.sum().item()
-        tc, oc = u._finger_contact_state()
-        cg = bool((tc[0] & (oc[0] >= 1)).item())
-        rows.append((palm_dz, lift, cg, fN))
+        clearance = float((u._object_true_min_z()[0] - u._table_surface_z).item())
+        if clearance0 is None:
+            clearance0 = clearance
+        clearance_delta = clearance - clearance0
+        object_force = u._finger_object_force_magnitudes()[0]
+        net_force = u._finger_net_force_magnitudes()[0]
+        max_object_force = torch.maximum(max_object_force, object_force)
+        max_net_force = torch.maximum(max_net_force, net_force)
+        signals = u._compute_grasp_signals()
+        latch = bool(u._is_grasped[0].item())
+        q_wrap = float(signals["quality"][0].item())
+        q_grasp = float(signals["grasp_quality"][0].item())
+        q_hold = float(signals["hold_quality"][0].item())
+        fN = object_force.sum().item()
+        rows.append((palm_dz, clearance, clearance_delta, latch, fN, q_wrap, q_grasp, q_hold))
         if t % 15 == 0:
-            print(f"{t:4d}  {palm_dz:+.3f}   {lift:+.3f}   {palm_dz-lift:+.3f}  {int(cg)}       {fN:5.1f}")
+            print(
+                f"{t:4d}  {palm_dz:+.3f}   {clearance:+.4f}    {clearance_delta:+.3f}  "
+                f"{palm_dz-clearance_delta:+.3f}  {int(latch)}      {q_wrap:.3f}   "
+                f"{q_grasp:.3f}   {q_hold:.3f}  {fN:5.1f}"
+            )
 
-    palm_dz = [r[0] for r in rows]; lifts = [r[1] for r in rows]
+    palm_dz = [r[0] for r in rows]
+    clearances = [r[1] for r in rows]
+    clearance_delta = [r[2] for r in rows]
     hi = max(range(len(rows)), key=lambda i: palm_dz[i])
     print("\n---- summary ----")
     print(f"peak hand rise (palm_dz): {max(palm_dz):+.3f} m")
-    print(f"peak object lift        : {max(lifts):+.3f} m")
-    print(f"at max hand-rise (step {hi}): palm_dz={palm_dz[hi]:+.3f}  obj_lift={lifts[hi]:+.3f}  "
-          f"contact={int(rows[hi][2])}  fN={rows[hi][3]:.1f}")
-    if max(palm_dz) < 0.05:
+    print(f"peak TRUE mesh clearance: {max(clearances):+.4f} m")
+    print(f"peak clearance gain     : {max(clearance_delta):+.3f} m")
+    print(
+        f"robust latch fraction={sum(1 for r in rows if r[3]) / len(rows):.3f}; "
+        f"peak q_wrap={max(r[5] for r in rows):.3f}, q_grasp={max(r[6] for r in rows):.3f}"
+    )
+    print(
+        f"at max hand-rise (step {hi}): palm_dz={palm_dz[hi]:+.3f}  "
+        f"true_clear={clearances[hi]:+.4f}  clear_d={clearance_delta[hi]:+.3f}  "
+        f"latch={int(rows[hi][3])}  objF={rows[hi][4]:.1f}"
+    )
+    object_mf = {u.ee_names[i]: round(max_object_force[i].item(), 3) for i in range(len(u.ee_names))}
+    net_mf = {u.ee_names[i]: round(max_net_force[i].item(), 3) for i in range(len(u.ee_names))}
+    print(f"max OBJECT-filtered force per finger (N): {object_mf}")
+    print(f"max unfiltered NET force per finger (N), audit only: {net_mf}")
+    if not any(r[3] for r in rows):
+        v = "NO ROBUST GRASP: the shared grasp latch never formed; slip/no-lift is not yet diagnosable."
+    elif max(palm_dz) < 0.05:
         v = "NO-LIFT: hand never rose >5cm -> the policy is NOT commanding an upward arm move."
-    elif palm_dz[hi] - lifts[hi] > 0.03:
+    elif palm_dz[hi] - clearance_delta[hi] > 0.03:
         v = "SLIP: hand rose but object lagged >3cm -> the grip slips (friction/contact geometry)."
     else:
         v = "OBJECT FOLLOWS: hand & object rise together -> lift mechanically works (just needs more)."

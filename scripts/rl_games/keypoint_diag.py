@@ -3,11 +3,10 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Diagnose whether the trained policy actually drives fingertips to the handle keypoints.
+"""Diagnose approach, object contact, robust wrap, and true hammer clearance.
 
-Loads a checkpoint, runs 1 env, and logs per-step: mean/min fingertip-to-nearest-keypoint
-distance (u._curr_fingertip_distances) and object lift. Reveals whether the fingers reach the
-keypoints, and whether the object is lifted WITHOUT the fingers ever getting close (a knock).
+The grasp verdict comes only from the environment's shared robust latch.  Raw fingertip force
+and thumb/non-thumb contacts are reported as evidence, but are never promoted to a grasp.
 """
 
 import argparse
@@ -23,7 +22,6 @@ args_cli = parser.parse_args()
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
-import math
 import gymnasium as gym
 import torch
 from rl_games.common import env_configurations, vecenv
@@ -59,50 +57,76 @@ def main():
     _ = agent.get_batch_size(obs, 1)
     if agent.is_rnn: agent.init_rnn()
 
-    print(f"[SENSOR] contact body order = {u._contact_sensor.body_names}")
-    print(f"[SENSOR] thumb_idx={u._contact_thumb_idx}  other_ids={u._contact_other_ids}  thr={u.cfg.contact_force_thr}N")
-    maxforce = torch.zeros(len(u._contact_sensor.body_names), device=u.device)
-    print("step  meanFKdist  minFKdist  lift   (FK=fingertip->nearest keypoint, m)")
+    print(f"[SENSOR] singleton object-filtered order = {u.ee_names}")
+    print(
+        f"[SENSOR] thumb_idx={u._contact_thumb_idx}  other_ids={u._contact_other_ids.tolist()}  "
+        f"thr={u.cfg.contact_force_thr}N"
+    )
+    max_object_force = torch.zeros(len(u.ee_names), device=u.device)
+    max_net_force = torch.zeros(len(u.ee_names), device=u.device)
+    print("step  meanFK   minFK   true_clear  latch  thumb+other  q_wrap  q_grasp  q_hold  objF")
     rows = []
     for t in range(args_cli.steps):
         with torch.inference_mode():
             obs = agent.obs_to_torch(obs)
             actions = agent.get_action(obs, is_deterministic=agent.is_deterministic)
             obs, _, dones, _ = env.step(actions)
-        fk = u._curr_fingertip_distances[0]           # (5,) min dist to nearest keypoint per finger
-        lift = (u.object_pos_w[0, 2] - u.scene.env_origins[0, 2] - u.object_default_z[0]).item()
-        fmag = u._contact_sensor.data.net_forces_w.norm(dim=-1)[0]  # (B,) per-finger NET contact force
-        maxforce = torch.maximum(maxforce, fmag)
-        to_obj = u.object_pos_w[0] - u.palm_center_w[0]; to_obj = to_obj / (to_obj.norm() + 1e-6)
-        pf = float((u.palm_normal_w[0] * to_obj).sum().item())  # raw palm-facing dot (unclamped)
+        fk = u._curr_fingertip_distances[0]
+        clearance = float((u._object_true_min_z()[0] - u._table_surface_z).item())
+        object_force = u._finger_object_force_magnitudes()[0]
+        net_force = u._finger_net_force_magnitudes()[0]
+        max_object_force = torch.maximum(max_object_force, object_force)
+        max_net_force = torch.maximum(max_net_force, net_force)
+        signals = u._compute_grasp_signals()
+        thumb = bool(signals["thumb_contact"][0].item())
+        other = int(signals["other_contact_count"][0].item())
+        q_wrap = float(signals["quality"][0].item())
+        q_grasp = float(signals["grasp_quality"][0].item())
+        q_hold = float(signals["hold_quality"][0].item())
+        latch = bool(u._is_grasped[0].item())
+        to_handle = u.handle_center_w[0] - u.palm_center_w[0]
+        to_handle = to_handle / (to_handle.norm() + 1e-6)
+        pf = float((u.palm_normal_w[0] * to_handle).sum().item())
         if t == 0 or t == 60 or t == 120:
-            print(f"    [palm_facing raw @step{t}] = {pf:+.3f}  (+ = palm faces object, - = hand-back)")
-        tc, oc = u._finger_contact_state()
-        cg = bool((tc[0] & (oc[0] >= 1)).item())
-        rows.append((fk.mean().item(), fk.min().item(), lift, cg, int(oc[0].item()), bool(tc[0].item())))
+            print(f"    [palm_facing raw @step{t}] = {pf:+.3f}  (+ = palm faces handle, - = hand-back)")
+        rows.append(
+            (fk.mean().item(), fk.min().item(), clearance, latch, other, thumb, q_wrap, q_grasp, q_hold)
+        )
         if t % 15 == 0:
-            print(f"{t:4d}  {fk.mean().item():.4f}     {fk.min().item():.4f}    {lift:+.3f}   "
-                  f"contact_grasp={cg} thumb={bool(tc[0].item())} n_other={int(oc[0].item())}")
+            print(
+                f"{t:4d}  {fk.mean().item():.4f}  {fk.min().item():.4f}  {clearance:+.4f}   "
+                f"{int(latch)}       {int(thumb)}+{other}       {q_wrap:.3f}   {q_grasp:.3f}   "
+                f"{q_hold:.3f}  {object_force.sum().item():5.1f}"
+            )
     import statistics as st
-    meanFK = [r[0] for r in rows]; minFK = [r[1] for r in rows]; lifts = [r[2] for r in rows]
-    contact_frac = sum(1 for r in rows if r[3]) / len(rows)
+    meanFK = [r[0] for r in rows]; minFK = [r[1] for r in rows]; clearances = [r[2] for r in rows]
+    grasp_frac = sum(1 for r in rows if r[3]) / len(rows)
     any_thumb = any(r[5] for r in rows); max_other = max(r[4] for r in rows)
-    print(f"[CONTACT] contact_grasp steps = {contact_frac*100:.0f}%  thumb ever touched = {any_thumb}  "
-          f"max simultaneous other-finger contacts = {max_other}")
-    mf = {u._contact_sensor.body_names[i]: round(maxforce[i].item(), 3) for i in range(len(maxforce))}
-    print(f"[CONTACT] max contact force per finger (N) over rollout: {mf}")
+    print(
+        f"[GRASP] robust latch steps={grasp_frac*100:.1f}%  ever={any(r[3] for r in rows)}; "
+        f"raw topology audit: thumb ever={any_thumb}, max simultaneous others={max_other}"
+    )
+    object_mf = {u.ee_names[i]: round(max_object_force[i].item(), 3) for i in range(len(u.ee_names))}
+    net_mf = {u.ee_names[i]: round(max_net_force[i].item(), 3) for i in range(len(u.ee_names))}
+    print(f"[CONTACT] max OBJECT-filtered force per finger (N): {object_mf}")
+    print(f"[CONTACT] max unfiltered NET force per finger (N), audit only: {net_mf}")
     print("---- summary ----")
     print(f"mean-finger->keypoint dist: overall mean={st.mean(meanFK):.4f}  best(min over episode)={min(meanFK):.4f}")
     print(f"closest any-finger->keypoint ever: {min(minFK):.4f} m")
-    print(f"peak lift: {max(lifts):.3f} m")
-    # was it lifted while fingers were still far? (knock detection)
-    lifted_idx = [i for i, l in enumerate(lifts) if l > 0.10]
+    print(f"peak TRUE mesh clearance: {max(clearances):.4f} m")
+    print(
+        f"peak qualities: q_wrap={max(r[6] for r in rows):.3f}  "
+        f"q_grasp={max(r[7] for r in rows):.3f}  q_hold={max(r[8] for r in rows):.3f}"
+    )
+    lifted_idx = [i for i, clearance in enumerate(clearances) if clearance > 0.10]
     if lifted_idx:
         i0 = lifted_idx[0]
-        print(f"first crossed 10cm lift at step {i0}; mean FK dist at that step = {meanFK[i0]:.4f} m "
-              f"(small=>grasped, large=>knocked)")
+        print(
+            f"first crossed 10cm true clearance at step {i0}; robust_latch={int(rows[i0][3])}, "
+            f"q_grasp={rows[i0][7]:.3f}, mean FK dist={meanFK[i0]:.4f} m"
+        )
     else:
-        print("never crossed 10cm lift in this episode")
+        print("never crossed 10cm true mesh clearance in this episode")
     env.close()
 
 

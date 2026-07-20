@@ -33,7 +33,8 @@ restq=torch.tensor(TOOL_REST_QUAT,device=dev).view(1,4).expand(Vt.shape[0],4)
 rest_world=quat_apply(restq,Vt); table_top=(rest_world[:,2]+TOOL_REST_Z).min().item()
 print(f"TRUE table surface (env-local z, from rest mesh) = {table_top:.4f}")
 print(f"box _object_bottom_ref = {float(u._object_bottom_ref):.4f}  (diff = box is this far BELOW true table)")
-print("step rootRise tilt°  BOXclr  TRUEclr")
+print("step rootRise tilt°  BOXclr  TRUEclr  ENVclr  |error|")
+max_clearance_error = 0.0
 for t in range(a.steps):
     with torch.inference_mode():
         obs=pl.obs_to_torch(obs); act=pl.get_action(obs,is_deterministic=pl.is_deterministic); obs,_,d,_=env.step(act)
@@ -41,9 +42,20 @@ for t in range(a.steps):
     world=quat_apply(q.view(1,4).expand(Vt.shape[0],4),Vt)+pos.view(1,3)   # (M,3) world
     true_minz=(world[:,2]-u.scene.env_origins[0,2]).min().item()
     true_clr=true_minz-table_top
+    env_clr=(u._object_true_min_z()[0]-u._table_surface_z).item()
+    clearance_error=abs(true_clr-env_clr)
+    max_clearance_error=max(max_clearance_error,clearance_error)
     root_rise=(pos[2]-u.scene.env_origins[0,2]-u.object_default_z[0]).item()
     box_clr=(u._object_min_corner_z()[0]-u._object_bottom_ref).item()
     qdot=abs(float((q*torch.tensor(TOOL_REST_QUAT,device=dev)).sum()))
     tilt=np.degrees(np.arccos(np.clip(2*qdot*qdot-1,-1,1)))
-    if t%15==0: print(f"{t:4d}  {root_rise:+.3f}  {tilt:5.1f}  {box_clr:+.3f}  {true_clr:+.3f}")
+    if t%15==0:
+        print(
+            f"{t:4d}  {root_rise:+.3f}  {tilt:5.1f}  {box_clr:+.3f}  "
+            f"{true_clr:+.3f}  {env_clr:+.3f}  {clearance_error:.2e}"
+        )
+print(f"max independent-mesh vs env clearance error = {max_clearance_error:.3e} m")
+if max_clearance_error > 1.0e-5:
+    raise AssertionError("environment true-clearance calculation disagrees with independent mesh vertices")
 env.close()
+app.close()

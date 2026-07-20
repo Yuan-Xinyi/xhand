@@ -3,14 +3,13 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Force-lift test: does the policy's GRIP actually hold the object against gravity?
+"""Force-lift test: does a ROBUST policy grasp hold the object against gravity?
 
-Phase 1 (grip): run the policy until it forms a contact grasp (freeze the hand token it was
+Phase 1 (grip): run the policy until the shared robust grasp latch confirms (freeze the token it was
 commanding at that moment). Phase 2 (forced lift): keep the frozen hand token (hold the grip) and
 drive the ARM joints back toward their home/reset pose (the high configuration the arm descended
-from), a bounded delta per step. Log palm rise vs object rise. If the object follows the hand up ->
-the grasp holds and the failure is purely "policy won't lift"; if the hand rises but the object
-stays -> the grip slips and the grasp itself is too weak."""
+from), a bounded delta per step. Log palm rise vs TRUE mesh clearance. If phase 1 never forms the
+robust latch, phase 2 is not run: freezing an arbitrary last token is not a valid lift oracle."""
 
 import argparse
 from isaaclab.app import AppLauncher
@@ -39,6 +38,11 @@ import xhand_inhand.tasks  # noqa: F401
 def main():
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1)
     env_cfg.seed = args_cli.seed
+    # Keep the diagnostic episode alive through the complete two-phase maneuver.  Success and drop
+    # are still measured below, but must not auto-reset the state before the readout is captured.
+    env_cfg.episode_length_s = max(float(env_cfg.episode_length_s), 30.0)
+    env_cfg.terminate_on_drop = False
+    env_cfg.success_hold_steps = args_cli.grip_steps + args_cli.lift_steps + 1
     agent_cfg = load_cfg_from_registry(args_cli.task, "rl_games_cfg_entry_point")
     agent_cfg["params"]["seed"] = args_cli.seed
     agent_cfg["params"]["config"]["full_experiment_name"] = "0_forcelift"
@@ -67,36 +71,70 @@ def main():
 
     origin_z = u.scene.env_origins[0, 2]
     home_arm = u.dof_targets[0, arm_ids].clone()  # arm joint targets at reset (high pose)
-    palm0 = (u.palm_center_w[0, 2] - origin_z).item()
-
     def readout():
-        palm_dz = (u.palm_center_w[0, 2] - origin_z).item() - palm0
-        lift = (u.object_pos_w[0, 2] - origin_z - u.object_default_z[0]).item()
-        fN = u._contact_sensor.data.net_forces_w.norm(dim=-1)[0].sum().item()
-        tc, oc = u._finger_contact_state()
-        cg = bool((tc[0] & (oc[0] >= 1)).item())
-        return palm_dz, lift, cg, fN
+        object_force = u._finger_object_force_magnitudes()[0]
+        net_force = u._finger_net_force_magnitudes()[0]
+        signals = u._compute_grasp_signals()
+        return {
+            "palm_z": float((u.palm_center_w[0, 2] - origin_z).item()),
+            "clearance": float((u._object_true_min_z()[0] - u._table_surface_z).item()),
+            "latch": bool(u._is_grasped[0].item()),
+            "object_force": float(object_force.sum().item()),
+            "net_force": float(net_force.sum().item()),
+            "q_wrap": float(signals["quality"][0].item()),
+            "q_grasp": float(signals["grasp_quality"][0].item()),
+            "q_hold": float(signals["hold_quality"][0].item()),
+        }
 
     # ---- phase 1: let the policy grip; freeze the hand token once a grasp forms ----
     frozen_hand = None
+    latch_step = None
     for t in range(args_cli.grip_steps):
         with torch.inference_mode():
             ob = agent.obs_to_torch(obs)
             act = agent.get_action(ob, is_deterministic=agent.is_deterministic)
             obs, _, dones, _ = env.step(act)
-        _, _, cg, _ = readout()
-        if cg and frozen_hand is None:
-            frozen_hand = act[0, n_arm:].clone()  # hand token at first grasp
+        state = readout()
+        if state["latch"] and frozen_hand is None:
+            frozen_hand = act[0, n_arm:].clone()
+            latch_step = t
+            print(
+                f"[robust latch @ grip step {t}] q_wrap={state['q_wrap']:.3f} "
+                f"q_grasp={state['q_grasp']:.3f} q_hold={state['q_hold']:.3f} "
+                f"object_force={state['object_force']:.1f}N"
+            )
     if frozen_hand is None:
-        frozen_hand = act[0, n_arm:].clone()
-        print("[warn] no contact grasp formed in phase 1; freezing last hand token anyway")
-    pd, lf, cg, fN = readout()
-    print(f"\n[grip end] palm_dz={pd:+.3f} obj_lift={lf:+.3f} contact={int(cg)} fN={fN:.1f}")
+        state = readout()
+        print(
+            f"\n[grip end] true_clearance={state['clearance']:+.4f} latch=0 "
+            f"q_wrap={state['q_wrap']:.3f} q_grasp={state['q_grasp']:.3f} "
+            f"q_hold={state['q_hold']:.3f} object_force={state['object_force']:.1f}N "
+            f"net_force(audit)={state['net_force']:.1f}N"
+        )
+        print(
+            "VERDICT: ORACLE PRECONDITION FAILED -> policy never formed the robust grasp latch; "
+            "forced lift was NOT run and no arbitrary token was frozen."
+        )
+        env.close()
+        return
+
+    state = readout()
+    palm_start = state["palm_z"]
+    clearance_start = state["clearance"]
+    print(
+        f"\n[grip end; latch first seen at step {latch_step}] true_clearance={clearance_start:+.4f} "
+        f"latch={int(state['latch'])} q_wrap={state['q_wrap']:.3f} "
+        f"q_grasp={state['q_grasp']:.3f} q_hold={state['q_hold']:.3f} "
+        f"object_force={state['object_force']:.1f}N"
+    )
 
     # ---- phase 2: hold the frozen grip, drive arm joints toward home (up) ----
     print("\n---- FORCED LIFT (hand grip frozen, arm driven to home pose) ----")
-    print("step  palm_dz  obj_lift  gap    contact  fN")
-    peak_lift = lf
+    print("step  hand_rise  true_clear  clear_gain  gap    latch  q_wrap  q_grasp  q_hold  objF")
+    peak_clearance = clearance_start
+    peak_clearance_gain = 0.0
+    peak_hand_rise = 0.0
+    latch_steps = 0
     for t in range(args_cli.lift_steps):
         cur_arm = u.dof_targets[0, arm_ids]
         arm_delta = torch.clamp((home_arm - cur_arm) / action_scale, -1.0, 1.0)
@@ -106,20 +144,44 @@ def main():
         with torch.inference_mode():
             obs, _, dones, _ = env.step(act)
         if isinstance(obs, dict): obs = obs["obs"]
-        pd, lf, cg, fN = readout()
-        peak_lift = max(peak_lift, lf)
+        state = readout()
+        hand_rise = state["palm_z"] - palm_start
+        clearance_gain = state["clearance"] - clearance_start
+        peak_clearance = max(peak_clearance, state["clearance"])
+        peak_clearance_gain = max(peak_clearance_gain, clearance_gain)
+        peak_hand_rise = max(peak_hand_rise, hand_rise)
+        latch_steps += int(state["latch"])
         if t % 10 == 0:
-            print(f"{t:4d}  {pd:+.3f}   {lf:+.3f}   {pd-lf:+.3f}  {int(cg)}       {fN:5.1f}")
+            print(
+                f"{t:4d}  {hand_rise:+.3f}      {state['clearance']:+.4f}    "
+                f"{clearance_gain:+.3f}     {hand_rise-clearance_gain:+.3f}  "
+                f"{int(state['latch'])}      {state['q_wrap']:.3f}   {state['q_grasp']:.3f}   "
+                f"{state['q_hold']:.3f}  {state['object_force']:5.1f}"
+            )
         if bool(dones[0]) if not torch.is_tensor(dones) else bool(dones.flatten()[0]):
-            print(f"  [episode terminated at lift step {t} -> object likely dropped]")
+            print(f"  [unexpected episode termination at lift step {t}]")
             break
 
     print("\n---- verdict ----")
-    print(f"peak object lift during forced lift: {peak_lift:+.3f} m   (hand target rose ~{-palm0+ (u.dof_targets[0,arm_ids]-home_arm).abs().mean().item()*0:.2f})")
-    print(f"final: palm_dz={pd:+.3f} obj_lift={lf:+.3f} gap={pd-lf:+.3f} contact={int(cg)}")
-    if pd > 0.05 and lf > 0.05 and (pd - lf) < 0.05:
-        print("VERDICT: GRIP HOLDS -> object follows the hand up. Failure is 'policy won't lift' (reward/explore).")
-    elif pd > 0.05 and lf < 0.03:
+    print(
+        f"peak hand rise={peak_hand_rise:+.3f} m; peak TRUE clearance={peak_clearance:+.4f} m; "
+        f"peak clearance gain={peak_clearance_gain:+.3f} m; "
+        f"robust latch fraction during lift={latch_steps / max(args_cli.lift_steps, 1):.3f}"
+    )
+    hand_rise = state["palm_z"] - palm_start
+    clearance_gain = state["clearance"] - clearance_start
+    print(
+        f"final: hand_rise={hand_rise:+.3f} true_clearance={state['clearance']:+.4f} "
+        f"clearance_gain={clearance_gain:+.3f} gap={hand_rise-clearance_gain:+.3f} "
+        f"latch={int(state['latch'])} q_grasp={state['q_grasp']:.3f}"
+    )
+    if peak_clearance >= 0.20:
+        print("TARGET: reached 20cm TRUE mesh clearance.")
+    else:
+        print("TARGET: did not reach 20cm TRUE mesh clearance.")
+    if peak_hand_rise > 0.05 and peak_clearance_gain > 0.05 and (peak_hand_rise - peak_clearance_gain) < 0.05:
+        print("VERDICT: GRIP HOLDS -> true clearance follows the hand. Policy exploration/control is the lift blocker.")
+    elif peak_hand_rise > 0.05 and peak_clearance_gain < 0.03:
         print("VERDICT: GRIP SLIPS -> hand rose, object stayed. The grasp is too weak to hold the weight.")
     else:
         print("VERDICT: inconclusive (hand didn't rise enough) -- raise lift_steps or check home pose.")

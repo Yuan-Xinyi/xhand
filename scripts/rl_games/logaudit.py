@@ -1,7 +1,6 @@
 # Copyright (c) 2022-2026, The Isaac Lab Project Developers.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Log-audit: FORCE is_grasped=True (monkeypatch contact) and trace is_grasped_frac through the exact
-training wrapper stack, to find where the nonzero value becomes 0 in the wandb 'Episode/' logging."""
+"""Force robust grasp signals and trace the current latch log through the RL-Games wrapper."""
 import argparse
 from isaaclab.app import AppLauncher
 parser = argparse.ArgumentParser()
@@ -28,21 +27,35 @@ def main():
     u = base_env.unwrapped
     wrapped = RlGamesVecEnvWrapper(base_env, agent_cfg["params"]["config"]["device"], clip_obs, clip_actions, None, True)
 
-    # FORCE a valid contact grasp every step so is_grasped latches True after grasp_confirm_steps
-    u._finger_contact_state = lambda: (
-        torch.ones(u.num_envs, dtype=torch.bool, device=u.device),
-        torch.full((u.num_envs,), 2, dtype=torch.long, device=u.device),
-    )
+    # Force the shared robust quality (not a stale raw-contact helper) above the confirm threshold.
+    real_signals = u._compute_grasp_signals
+    def forced_grasp_signals():
+        signals = real_signals()
+        quality = torch.full((u.num_envs,), 0.8, device=u.device)
+        signals["quality"] = quality
+        signals["grasp_quality"] = quality
+        signals["hold_quality"] = torch.ones_like(quality)
+        signals["thumb_contact"] = torch.ones(u.num_envs, dtype=torch.bool, device=u.device)
+        signals["other_contact_count"] = torch.full(
+            (u.num_envs,), 3, dtype=torch.long, device=u.device
+        )
+        signals["palm_facing"] = torch.ones_like(quality)
+        signals["palm_score"] = torch.ones_like(quality)
+        signals["alignment_score"] = torch.ones_like(quality)
+        signals["opposition_raw"] = torch.ones_like(quality)
+        return signals
+    u._compute_grasp_signals = forced_grasp_signals
     wrapped.reset()
     n_act = u.cfg.action_space
-    print("\nstep | env-truth u._is_grasped.mean | wrapper extras['episode']['is_grasped_frac'] | key present?")
+    key = "is_grasped_phase_frac"
+    print(f"\nstep | env-truth u._is_grasped.mean | wrapper log[{key!r}] | key present?")
     for t in range(10):
         act = torch.zeros((u.num_envs, n_act), device=u.device)
         obs, rew, dones, extras = wrapped.step(act)
         env_truth = u._is_grasped.float().mean().item()
         ep = extras.get("episode", extras.get("log", {}))
-        has = "is_grasped_frac" in ep
-        logged = ep.get("is_grasped_frac", None)
+        has = key in ep
+        logged = ep.get(key, None)
         logged_v = (logged.item() if hasattr(logged, "item") else logged) if logged is not None else "MISSING"
         print(f"{t:4d} | {env_truth:.3f}                         | {logged_v}                    | {has}  "
               f"(extras keys: {list(extras.keys())})")

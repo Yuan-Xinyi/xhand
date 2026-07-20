@@ -3,28 +3,17 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""xArm7 + XHand pick-a-tool (hammer) with CrossDex action tokenization (Direct workflow).
+"""xArm7 + XHand hammer pickup with CrossDex token actions (Direct workflow).
 
-Subclass of :class:`PickCubeTokenEnv`: inherits the CrossDex token action pipeline and the
-scene/observations, and uses a CUBE-ALIGNED grasp+lift reward.
+The environment uses object-filtered singleton fingertip sensors, a calibrated real-handle
+surface, and one shared robust grasp quality for phase confirmation, hold, lift and success.
+Transport quality is evaluated entirely in center-of-mass frames.  Lift height is the minimum
+world-Z of the real mesh convex hull relative to the table, so tipping or flinging the hammer
+cannot masquerade as a successful lift.
 
-The earlier reward plateaued at ~308 with success/contact/lift all 0: its CONTINUOUS reach term
-was farmable by hovering ~3.6 cm from the handle, while the lift was gated on a contact grasp the
-policy never discovered -> no lift gradient. The reward is now rebuilt term-for-term from the
-working ``pick_cube``:
-
-  * approach: a bounded PROGRESS RATCHET (only a new-closest fingertip->keypoint distance pays), so
-    hovering earns nothing and the only way to keep earning is to LIFT. Fingertips are driven to a
-    set of HANDLE keypoints (``cfg.grasp_keypoints``; draggable yellow markers for GUI calibration).
-  * lift: rewarded DIRECTLY (dense ratchet + one-shot bonus), UNGATED by contact, so the lift
-    gradient is immediate -- gated only on table clearance (P0-4) as a cheap anti-tip.
-  * KEPT (our proven success experience): the palm-facing directional gate on the approach reward,
-    so the policy is never guided into a back-of-hand / dorsal press pose.
-  * one-shot contact nudge steers toward a real (thumb + >=1 other) grasp rather than a scoop.
-
-Success/termination stays a REAL grasp (contact + clearance + lifted to success height + object
-nearly still, held ``success_hold_steps``); reset uses a bounding-sphere clearance vs all hand
-points + a safe fallback pose.
+The stage-1 reward here is intentionally a correctness scaffold.  Later stages add continuous
+close/wrap shaping, an oracle demonstration path and reverse curriculum without weakening these
+contact, transport or true-clearance invariants.
 """
 from __future__ import annotations
 
@@ -38,6 +27,7 @@ from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.math import quat_apply, quat_conjugate, sample_uniform
 
 from ..pick_cube_token.pick_cube_token_env import PickCubeTokenEnv
+from .grasp_signals import rigid_hold_quality, update_grasp_latch, wrap_quality
 from .pick_tool_token_env_cfg import PickToolTokenEnvCfg
 
 
@@ -83,6 +73,68 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         _rest_world_z = quat_apply(rest_quat.expand(self._obj_hull_local.shape[0], 4), self._obj_hull_local)[:, 2]
         self._table_surface_z = (_rest_world_z + rest_z).min()  # scalar, env-local
 
+        # ---- dense analytic handle surface ----
+        # The calibrated points form a cross-section of the handle. Build a convex polygon from a
+        # thin slice of the real mesh, then use point-to-segment distance and edge normals at runtime.
+        # This is both more accurate and much cheaper than a nearest search over all 44k mesh vertices.
+        self._handle_center_local = torch.tensor(cfg.handle_center, dtype=torch.float, device=dev)
+        self._handle_axis_local = self._normalize(torch.tensor(cfg.handle_axis, dtype=torch.float, device=dev))
+        reference = torch.tensor((0.0, 0.0, 1.0), dtype=torch.float, device=dev)
+        if torch.abs(torch.dot(self._handle_axis_local, reference)) > 0.9:
+            reference = torch.tensor((0.0, 1.0, 0.0), dtype=torch.float, device=dev)
+        self._handle_u_local = self._normalize(torch.cross(self._handle_axis_local, reference, dim=-1))
+        self._handle_v_local = self._normalize(
+            torch.cross(self._handle_axis_local, self._handle_u_local, dim=-1)
+        )
+        mesh_rel = _v - self._handle_center_local
+        mesh_axial = mesh_rel @ self._handle_axis_local
+        section_mask = mesh_axial.abs() <= cfg.handle_section_half_width
+        section_rel = mesh_rel[section_mask]
+        if section_rel.shape[0] < 3:
+            raise RuntimeError("Handle mesh slice has fewer than three vertices; check handle frame calibration.")
+        section_xy = torch.stack(
+            (section_rel @ self._handle_u_local, section_rel @ self._handle_v_local), dim=-1
+        )
+        section_hull = ConvexHull(section_xy.cpu().numpy())
+        polygon = section_xy[torch.as_tensor(section_hull.vertices, dtype=torch.long, device=dev)]
+        self._handle_edge_start = polygon
+        self._handle_edge_vector = torch.roll(polygon, shifts=-1, dims=0) - polygon
+        edge_len = self._handle_edge_vector.norm(dim=-1, keepdim=True).clamp_min(1.0e-9)
+        signed_twice_area = (
+            polygon[:, 0] * torch.roll(polygon[:, 1], shifts=-1)
+            - polygon[:, 1] * torch.roll(polygon[:, 0], shifts=-1)
+        ).sum()
+        polygon_radius = polygon.norm(dim=-1)
+        if (
+            signed_twice_area <= 2.0e-4
+            or polygon_radius.min() < 0.005
+            or polygon_radius.max() > 0.05
+            or edge_len.min() < 1.0e-6
+        ):
+            raise RuntimeError(
+                "Invalid handle cross-section polygon: "
+                f"area={0.5 * signed_twice_area.item():.6g}, "
+                f"radius=[{polygon_radius.min().item():.6g}, {polygon_radius.max().item():.6g}], "
+                f"min_edge={edge_len.min().item():.6g}."
+            )
+        # scipy ConvexHull vertices are counter-clockwise: (dy, -dx) is the outward normal.
+        self._handle_edge_normal_2d = torch.stack(
+            (self._handle_edge_vector[:, 1], -self._handle_edge_vector[:, 0]), dim=-1
+        ) / edge_len
+
+        # Runtime truth, not the config or a cached default: fail early if mass authoring was ignored.
+        self._runtime_object_masses = self.object.root_physx_view.get_masses().reshape(N, -1)
+        expected_mass = torch.full_like(self._runtime_object_masses, cfg.expected_object_mass)
+        if not torch.allclose(
+            self._runtime_object_masses, expected_mass, atol=cfg.object_mass_tolerance, rtol=0.0
+        ):
+            mass_min = self._runtime_object_masses.min().item()
+            mass_max = self._runtime_object_masses.max().item()
+            raise RuntimeError(
+                f"Runtime hammer mass is [{mass_min:.6f}, {mass_max:.6f}] kg; "
+                f"expected {cfg.expected_object_mass:.6f} kg. Mass authoring did not reach PhysX."
+            )
+
         # arm link body indices for the anti-hack "arm pressed the table" geometric termination
         arm_ids, _ = self.robot.find_bodies(list(cfg.arm_contact_bodies))
         self._arm_body_ids = torch.tensor(arm_ids, dtype=torch.long, device=dev)
@@ -112,18 +164,13 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._palm_jac_idx = self.palm_idx - 1
         self._eye6 = torch.eye(6, device=dev)
 
-        # contact-sensor body indices for the R_contact grasp condition (thumb + >=1 other)
-        self._contact_thumb_idx = self._contact_sensor.find_bodies("thumb_rota_link2")[0][0]
-        self._contact_other_ids = [
-            self._contact_sensor.find_bodies(link)[0][0]
-            for link in self.cfg.ee_body_names
-            if link != "thumb_rota_link2"
-        ]
-        # map each contact-sensor body -> its index in ee_names, so we can gate each fingertip's NET
-        # contact force by THAT fingertip's distance to the object (per-finger proximity = the multi-env
-        # -safe stand-in for the dead filtered fingertip<->object force_matrix_w).
-        self._contact2ee = torch.tensor(
-            [self.ee_names.index(n) for n in self._contact_sensor.body_names], dtype=torch.long, device=dev
+        # Contact tensors are ordered exactly like ee_names. Each fingertip has its own singleton
+        # object-filtered sensor; Isaac Lab does not support filtering one sensor that matches many bodies.
+        self._contact_thumb_idx = self.ee_names.index("thumb_rota_link2")
+        self._contact_other_ids = torch.tensor(
+            [i for i, name in enumerate(self.ee_names) if name != "thumb_rota_link2"],
+            dtype=torch.long,
+            device=dev,
         )
 
         # ---- DIRECTIONAL keypoints (calibration): a unit direction per object keypoint (object-local)
@@ -180,18 +227,20 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self.robot = Articulation(self.cfg.robot_cfg)
         self.object = RigidObject(self.cfg.object_cfg)
 
-        # one contact sensor over the 5 fingertip links, filtered for the Object -> per-finger
-        # fingertip<->object contact force (paper R_contact uses real contact, not distance proxy).
-        tips = "|".join(self.cfg.ee_body_names)
-        # NOTE: no filter_prim_paths_expr. The filtered force_matrix_w is broken at multi-env in IsaacLab
-        # (PhysX 'filter did not match' -> reads 0 for num_envs>1). We read the unfiltered net_forces_w and
-        # gate it on palm-object proximity instead (see _finger_contact_state).
-        self._contact_sensor = ContactSensor(
-            ContactSensorCfg(
-                prim_path=f"/World/envs/env_.*/Robot/({tips})",
+        # Object-specific contact requires ONE sensor body per filtered ContactSensor. The previous
+        # single regex sensor matched all five fingertips, an unsupported many-to-many configuration
+        # that happened to work with one env and returned zero at training scale. Keep five singleton
+        # sensors in ee_names order and filter each one against the object.
+        self._object_contact_sensors: dict[str, ContactSensor] = {}
+        for name in self.cfg.ee_body_names:
+            sensor = ContactSensor(
+                ContactSensorCfg(
+                    prim_path=f"/World/envs/env_.*/Robot/{name}",
+                    filter_prim_paths_expr=["/World/envs/env_.*/Object"],
+                )
             )
-        )
-        self.scene.sensors["fingertip_contact"] = self._contact_sensor
+            self._object_contact_sensors[name] = sensor
+            self.scene.sensors[f"object_contact_{name}"] = sensor
 
         table_spawn = sim_utils.UsdFileCfg(usd_path=self.cfg.table_usd)
         table_spawn.func(
@@ -208,27 +257,39 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         light_cfg = sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
-    def _finger_contact_state(self):
-        """(thumb_contact, other_contact_count) from real fingertip contact forces.
+    def _finger_object_force_magnitudes(self) -> torch.Tensor:
+        """Object-filtered normal-force magnitudes in ``ee_names`` order, shape ``(N, 5)``."""
 
-        Uses NET contact force (net_forces_w), NOT the filtered force_matrix_w: the latter is broken at
-        multi-env scale in IsaacLab (PhysX 'filter did not match' -> reads 0 for num_envs>1, worked only
-        at num_envs=1). net_forces_w is unfiltered (any contact) but works at any scale; we gate it on the
-        HAND being at the object (palm within contact_near_margin of the object) so a fingertip net force
-        is object contact, not table/self contact.
-        """
-        net = self._contact_sensor.data.net_forces_w                 # (N, B, 3) net contact force per body
-        mag = net.norm(dim=-1)                                        # (N, B)
-        thr = self.cfg.contact_force_thr
-        # PER-FINGER proximity gate: a fingertip's net force counts as OBJECT contact only if THAT fingertip
-        # is within contact_near_margin of the object (its nearest handle keypoint). This tracks each finger
-        # leaving the object -- so a crush-LAUNCH (object squirts out of the grip) drops contact the instant
-        # the fingers separate, instead of the old loose palm-proximity gate that stayed True through it.
-        finger_dist = self._curr_fingertip_distances[:, self._contact2ee]  # (N, B) in contact-body order
-        contact = (mag > thr) & (finger_dist < self.cfg.contact_near_margin)  # (N, B)
-        thumb_contact = contact[:, self._contact_thumb_idx]
-        other_count = contact[:, self._contact_other_ids].sum(dim=1)
-        return thumb_contact, other_count
+        magnitudes = []
+        for name in self.ee_names:
+            matrix = self._object_contact_sensors[name].data.force_matrix_w
+            if matrix is None:
+                raise RuntimeError(f"Filtered contact matrix is unavailable for singleton sensor {name!r}.")
+            # (N, one sensor body, one-or-more filtered collision shapes, xyz)
+            magnitudes.append(matrix.norm(dim=-1).sum(dim=(1, 2)))
+        return torch.stack(magnitudes, dim=1)
+
+    def _finger_net_force_magnitudes(self) -> torch.Tensor:
+        """Unfiltered fingertip net forces, used only to audit filtered-contact coverage."""
+
+        return torch.stack(
+            [
+                self._object_contact_sensors[name].data.net_forces_w[:, 0].norm(dim=-1)
+                for name in self.ee_names
+            ],
+            dim=1,
+        )
+
+    def _finger_contact_state(self):
+        """Return robust ``(thumb_contact, nonthumb_count)`` on the actual handle."""
+
+        forces = self._finger_object_force_magnitudes()
+        contact = (
+            (forces > self.cfg.contact_force_thr)
+            & self._handle_contact_region
+            & (self._handle_side_distances < self.cfg.handle_contact_margin)
+        )
+        return contact[:, self._contact_thumb_idx], contact[:, self._contact_other_ids].sum(dim=1)
 
     # ------------------------------------------------------------------ keypoint markers (GUI)
     def _create_object_grasp_markers(self):
@@ -468,13 +529,59 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             dim=1,
         )  # (N, 5, 3)
 
-        # ---- opposing-normal ALIGNMENT (replaces the palm-facing gate) ----
-        # each finger pad should press INTO the handle surface, i.e. its normal points OPPOSITE the
-        # nearest object keypoint's OUTWARD normal. align in [0,1]: 1 = perfectly opposed, 0 = same dir.
-        nearest_kp_dir = torch.gather(
-            self.grasp_keypoints_dir_w, 1, self._nearest_kp_idx.unsqueeze(-1).expand(-1, -1, 3)
-        )  # (N, 5, 3) outward normal of each finger's nearest keypoint
-        dot = (self.finger_pad_normal_w * nearest_kp_dir).sum(dim=-1)  # (N,5) in [-1,1]
+        # ---- real handle surface distance + outward normal ----
+        # Transform pad centers to object local coordinates, project into the calibrated handle
+        # cross-section, and find the nearest segment of the polygon cut from the true mesh.
+        object_q_inv = quat_conjugate(self.object_quat_w)
+        pad_rel_w = self.finger_pad_w - self.object_pos_w.unsqueeze(1)
+        pad_local = quat_apply(
+            object_q_inv.unsqueeze(1).expand(-1, len(self.ee_ids), -1).reshape(-1, 4),
+            pad_rel_w.reshape(-1, 3),
+        ).reshape(self.num_envs, len(self.ee_ids), 3)
+        handle_rel = pad_local - self._handle_center_local
+        handle_axial = (handle_rel * self._handle_axis_local).sum(dim=-1)
+        handle_xy = torch.stack(
+            (
+                (handle_rel * self._handle_u_local).sum(dim=-1),
+                (handle_rel * self._handle_v_local).sum(dim=-1),
+            ),
+            dim=-1,
+        )
+        edge_start = self._handle_edge_start.view(1, 1, -1, 2)
+        edge_vector = self._handle_edge_vector.view(1, 1, -1, 2)
+        point_delta = handle_xy.unsqueeze(2) - edge_start
+        edge_len_sq = (edge_vector * edge_vector).sum(dim=-1).clamp_min(1.0e-12)
+        edge_t = torch.clamp((point_delta * edge_vector).sum(dim=-1) / edge_len_sq, 0.0, 1.0)
+        closest_xy = edge_start + edge_t.unsqueeze(-1) * edge_vector
+        side_dist_sq = ((handle_xy.unsqueeze(2) - closest_xy) ** 2).sum(dim=-1)
+        side_dist_sq, nearest_edge = side_dist_sq.min(dim=2)
+        self._handle_side_distances = torch.sqrt(side_dist_sq)
+        self._handle_contact_region = (
+            (handle_axial >= self.cfg.handle_axial_min - self.cfg.handle_axial_margin)
+            & (handle_axial <= self.cfg.handle_axial_max + self.cfg.handle_axial_margin)
+        )
+        axial_excess = torch.clamp(self.cfg.handle_axial_min - handle_axial, min=0.0) + torch.clamp(
+            handle_axial - self.cfg.handle_axial_max, min=0.0
+        )
+        self._handle_surface_distances = torch.sqrt(side_dist_sq + axial_excess.square())
+        self._handle_axial = handle_axial
+
+        normal_2d = self._handle_edge_normal_2d[nearest_edge]
+        handle_normal_local = (
+            normal_2d[..., 0:1] * self._handle_u_local
+            + normal_2d[..., 1:2] * self._handle_v_local
+        )
+        self._handle_surface_normal_w = quat_apply(
+            self.object_quat_w.unsqueeze(1).expand(-1, len(self.ee_ids), -1).reshape(-1, 4),
+            handle_normal_local.reshape(-1, 3),
+        ).reshape(self.num_envs, len(self.ee_ids), 3)
+        self.handle_center_w = self.object_pos_w + quat_apply(
+            self.object_quat_w, self._handle_center_local.expand(self.num_envs, 3)
+        )
+
+        # Each pad should press into the nearest real handle surface. Unlike the old centroid-to-
+        # keypoint directions, these normals have no spurious component along the handle axis.
+        dot = (self.finger_pad_normal_w * self._handle_surface_normal_w).sum(dim=-1)
         self._finger_align = (1.0 - dot) * 0.5  # (N,5) in [0,1]
 
     # ------------------------------------------------------------------ clearance
@@ -499,6 +606,53 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         world = quat_apply(q, v).reshape(N, M, 3) + self.object_pos_w.unsqueeze(1)
         return (world[:, :, 2] - self.scene.env_origins[:, 2:3]).min(dim=1).values
 
+    def _compute_grasp_signals(self) -> dict[str, torch.Tensor]:
+        """Compute the single source of truth used by grasp, lift, release and success."""
+
+        force_magnitude = self._finger_object_force_magnitudes()
+        to_handle = self.handle_center_w - self.palm_center_w
+        to_handle = to_handle / to_handle.norm(dim=-1, keepdim=True).clamp_min(1.0e-6)
+        palm_facing = 0.5 * (1.0 + (self.palm_normal_w * to_handle).sum(dim=-1))
+        wrap = wrap_quality(
+            force_magnitude,
+            torch.where(
+                self._handle_contact_region,
+                self._handle_side_distances,
+                torch.full_like(self._handle_side_distances, torch.inf),
+            ),
+            self._handle_surface_normal_w,
+            self._finger_align,
+            palm_facing,
+            self._contact_thumb_idx,
+            self._contact_other_ids,
+            force_threshold=self.cfg.contact_force_thr,
+            force_saturation=self.cfg.contact_force_saturation,
+            surface_margin=self.cfg.handle_contact_margin,
+            palm_facing_min=self.cfg.grasp_palm_facing_min,
+            alignment_min=self.cfg.grasp_align_min,
+            opposition_min=self.cfg.grasp_opposition_min,
+        )
+
+        hold, slip_lin, slip_ang = rigid_hold_quality(
+            self.robot.data.body_com_pos_w[:, self.palm_idx],
+            self.robot.data.body_com_lin_vel_w[:, self.palm_idx],
+            self.robot.data.body_com_ang_vel_w[:, self.palm_idx],
+            self.object.data.root_com_pos_w,
+            self.object.data.root_com_lin_vel_w,
+            self.object.data.root_com_ang_vel_w,
+            self.cfg.hold_v_scale,
+            self.cfg.hold_w_scale,
+        )
+        # Wrap proves force-closure topology; hold quality proves transport. On the table a static
+        # shallow touch can have hold=1, but cannot raise this minimum because wrap remains zero.
+        wrap["hold_quality"] = hold
+        wrap["slip_lin"] = slip_lin
+        wrap["slip_ang"] = slip_ang
+        wrap["grasp_quality"] = torch.minimum(wrap["quality"], hold)
+        wrap["force_magnitude"] = force_magnitude
+        wrap["palm_facing"] = palm_facing
+        return wrap
+
     # ------------------------------------------------------------------ reward
     def _get_observations(self) -> dict:
         # minimal reward -> one extra feature: normalized off-table lift progress (clearance/success_height),
@@ -518,70 +672,71 @@ class PickToolTokenEnv(PickCubeTokenEnv):
     # PickCubeTokenEnv._pre_physics_step (7 arm relative joint deltas + 9 hand eigengrasp token = 16).
 
     def _get_rewards(self) -> torch.Tensor:
-        # FOUR-TERM phased reward (user redesign 2026-07-19): cross the hover->contact cliff with a one-shot
-        # grasp bonus + a hysteresis phase latch, pay height only while genuinely HELD (kinematically-correct
-        # slip), and pay a one-shot success bonus so the policy isn't punished for crossing the finish line.
-        #   R_reach  = reach_reward_scale * dist_kernel * palm_facing * align * (~is_grasped_phase)
-        #   R_grasp  = grasp_bonus * first_stable_grasp        (one-shot, latched per episode)
-        #   R_lift   = lift_scale * clip(clearance/H) * valid_contact * hold_quality
-        #   R_success= success_bonus * newly_successful        (one-shot)
+        # Stage-1 correctness reward. Grasp/lift/success all consume the SAME robust quality:
+        # real handle contact topology x palm-facing x pad/surface alignment x opposing sides x
+        # COM-frame transport quality. A continuous close/progress reward replaces this scaffold in
+        # stage 4, after the action-space and scripted-oracle feasibility gates have passed.
         cfg = self.cfg
 
-        # ---- grasp quality signals (all in [0,1]) ----
+        # Reach still targets the four calibrated cross-section points. Its alignment now comes from
+        # the nearest true handle surface rather than fake centroid-radial keypoint directions.
         d = self._curr_fingertip_distances
-        a = self._finger_align  # (N,5) in [0,1], 1 = pad normal directly OPPOSES its nearest keypoint normal
+        a = self._finger_align
         other_d = d[:, self._other_ee_idx]
         other_a = a[:, self._other_ee_idx]
         near_val, near_idx = torch.topk(other_d, k=2, dim=1, largest=False)  # thumb + 2 nearest others
         grasp_dist = (d[:, self._thumb_ee_idx] + near_val.sum(dim=-1)) / 3.0
         align = (a[:, self._thumb_ee_idx] + torch.gather(other_a, 1, near_idx).sum(dim=-1)) / 3.0
-        to_obj = self.object_pos_w - self.palm_center_w
-        to_obj = to_obj / to_obj.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-        palm_facing = 0.5 * (1.0 + (self.palm_normal_w * to_obj).sum(dim=-1))  # [0,1]; >0.5 = palm faces object
+        signals = self._compute_grasp_signals()
+        thumb_contact = signals["thumb_contact"]
+        other_count = signals["other_contact_count"]
+        valid_contact = thumb_contact & (other_count >= 2)
+        palm_facing = signals["palm_facing"]
+        hold_quality = signals["hold_quality"]
+        slip_lin = signals["slip_lin"]
+        slip_ang = signals["slip_ang"]
+        q_wrap = signals["quality"]
+        grasp_quality = signals["grasp_quality"]
 
-        # ---- valid contact = thumb pad + >=1 other pad actually on the object (net force + per-finger proximity)
-        thumb_contact, other_count = self._finger_contact_state()
-        valid_contact = thumb_contact & (other_count >= 1)
-
-        # ---- hold_quality: object motion RELATIVE TO THE PALM as a RIGID body. A rigidly held object has
-        # v_obj = v_palm + omega_palm x r (r = obj - palm), so we subtract that expected velocity -> a pure
-        # hand ROTATION while holding is NOT flagged as slip (important now that the arm can rotate). Only
-        # real slip / a fling makes slip_lin large. ----
-        palm_pos = self.robot.data.body_pos_w[:, self.palm_idx]
-        palm_lin = self.robot.data.body_lin_vel_w[:, self.palm_idx]
-        palm_ang = self.robot.data.body_ang_vel_w[:, self.palm_idx]
-        r_vec = self.object_pos_w - palm_pos
-        expected_obj_lin = palm_lin + torch.cross(palm_ang, r_vec, dim=-1)
-        slip_lin = (self.object.data.root_lin_vel_w - expected_obj_lin).norm(dim=-1)  # object slip vs the hand
-        slip_ang = (self.object.data.root_ang_vel_w - palm_ang).norm(dim=-1)          # object spin vs the hand
-        hold_quality = torch.exp(-slip_lin / cfg.hold_v_scale) * torch.exp(-slip_ang / cfg.hold_w_scale)
-
-        # ---- grasp phase (hysteresis latch) + one-shot stable-grasp bonus. A "stable hold" = valid_contact
-        # AND the object moving with the hand (hold_quality high). is_grasped_phase latches ON after
-        # grasp_confirm_steps of stable hold and OFF after grasp_release_steps of lost contact -> R_reach
-        # stays on through the confirmation window (no cliff), then the one-shot +grasp_bonus fires. ----
-        stable_hold = valid_contact & (hold_quality > cfg.grasp_hold_quality_min)
-        self._contact_steps = torch.where(stable_hold, self._contact_steps + 1, torch.zeros_like(self._contact_steps))
-        self._lost_contact_steps = torch.where(
-            valid_contact, torch.zeros_like(self._lost_contact_steps), self._lost_contact_steps + 1
+        self._is_grasped, self._contact_steps, self._lost_contact_steps, newly_confirmed, _ = update_grasp_latch(
+            grasp_quality,
+            self._is_grasped,
+            self._contact_steps,
+            self._lost_contact_steps,
+            high_threshold=cfg.grasp_quality_high,
+            low_threshold=cfg.grasp_quality_low,
+            confirm_steps=cfg.grasp_confirm_steps,
+            release_steps=cfg.grasp_release_steps,
         )
-        confirmed = self._contact_steps >= cfg.grasp_confirm_steps
-        release = self._lost_contact_steps >= cfg.grasp_release_steps
-        self._is_grasped = (self._is_grasped | confirmed) & ~release
         is_grasped_phase = self._is_grasped
-        first_stable_grasp = confirmed & (~self._grasp_bonus_given)
-        self._grasp_bonus_given = self._grasp_bonus_given | confirmed
+        first_stable_grasp = newly_confirmed & (~self._grasp_bonus_given)
+        self._grasp_bonus_given = self._grasp_bonus_given | newly_confirmed
 
-        # ---- clearance (TRUE off-table height via mesh hull) ----
         clearance = self._object_true_min_z() - self._table_surface_z
         lift_fraction = torch.clamp(clearance / cfg.lift_success_height, 0.0, 1.0)
 
-        # ---- the four reward terms ----
         reach_far = 1.0 - torch.tanh(grasp_dist / cfg.reach_scale_far)
         reach_near = 1.0 - torch.tanh(grasp_dist / cfg.reach_scale)
         r_reach = cfg.reach_reward_scale * 0.5 * (reach_far + reach_near) * palm_facing * align * (~is_grasped_phase).float()
         r_grasp = cfg.grasp_bonus * first_stable_grasp.float()
-        r_lift = cfg.lift_scale * lift_fraction * valid_contact.float() * hold_quality
+        # Only a high-quality confirmed grasp gets the full hold floor.  A Schmitt latch deliberately
+        # survives the quality dead-band for control stability, but paying the full floor there lets a
+        # weak/slipping hold farm reward indefinitely.  Fade the floor from zero at the release threshold
+        # to full value at the confirm threshold; a legal stable grasp still strictly beats max reach.
+        hold_strength = torch.clamp(
+            (grasp_quality - cfg.grasp_quality_low)
+            / max(cfg.grasp_quality_high - cfg.grasp_quality_low, 1.0e-6),
+            0.0,
+            1.0,
+        )
+        r_hold = cfg.grasp_hold_scale * is_grasped_phase.float() * hold_strength
+        # During the release debounce window a fling can leave the latch true for a few frames.  The
+        # instantaneous transport quality must therefore clear the release threshold as well; otherwise
+        # the exponential tail pays a tiny but non-zero reward to a fast airborne object.
+        lift_quality = torch.where(
+            grasp_quality >= cfg.grasp_quality_low, grasp_quality, torch.zeros_like(grasp_quality)
+        )
+        r_lift = cfg.lift_scale * lift_fraction * is_grasped_phase.float() * lift_quality
         newly_successful = self._is_success & (~self._success_paid)
         r_success = cfg.success_bonus * newly_successful.float()
         self._success_paid = self._success_paid | self._is_success
@@ -598,9 +753,17 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         log["valid_contact_frac"] = valid_contact.float().mean()
         log["thumb_contact_frac"] = thumb_contact.float().mean()
         log["is_grasped_phase_frac"] = is_grasped_phase.float().mean()
+        log["q_wrap_mean"] = q_wrap.mean()
+        log["grasp_quality_mean"] = grasp_quality.mean()
+        log["palm_gate_mean"] = signals["palm_score"].mean()
+        log["align_gate_mean"] = signals["alignment_score"].mean()
+        log["opposition_mean"] = signals["opposition_raw"].mean()
         log["hold_quality_mean"] = hold_quality.mean()
         log["slip_lin_mean"] = slip_lin.mean()
         log["slip_ang_mean"] = slip_ang.mean()
+        log["object_contact_force_mean"] = signals["force_magnitude"].mean()
+        log["object_contact_force_max"] = signals["force_magnitude"].max()
+        log["handle_surface_dist_mean"] = self._handle_surface_distances.mean()
         log["avg_ft_to_kp_mean"] = self._curr_fingertip_distances.mean()
         log["clearance_mean"] = clearance.mean()
         log["clearance_max"] = clearance.max()
@@ -612,10 +775,13 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         log["lift_ge_20cm_frac"] = (clearance >= 0.20).float().mean()
         log["r_reach_mean"] = r_reach.mean()
         log["r_grasp_mean"] = r_grasp.mean()
+        log["r_hold_mean"] = r_hold.mean()
+        log["hold_strength_mean"] = hold_strength.mean()
         log["r_lift_mean"] = r_lift.mean()
+        log["lift_quality_mean"] = lift_quality.mean()
         log["r_success_mean"] = r_success.mean()
 
-        return r_reach + r_grasp + r_lift + r_success
+        return r_reach + r_grasp + r_hold + r_lift + r_success
 
     # ------------------------------------------------------------------ termination
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -624,16 +790,19 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         object_z = self.object_pos_w[:, 2] - self.scene.env_origins[:, 2]
         actual_lift = object_z - self.object_default_z
 
-        # success = the WHOLE object HELD (thumb + >=1 pad in contact) off the table above the success height
-        # (true hull clearance), nearly still, held for success_hold_steps. valid_contact rules out a flung
-        # object that momentarily passes 20cm airborne.
+        # Success uses the same robust grasp quality as the phase latch and lift reward. A separate
+        # thumb+one-contact condition here previously allowed back-of-hand and weak two-point presses.
         clearance = self._object_true_min_z() - self._table_surface_z
-        thumb_contact, other_count = self._finger_contact_state()
-        valid_contact = thumb_contact & (other_count >= 1)
-        obj_lin = self.object.data.root_lin_vel_w.norm(dim=-1)
-        obj_ang = self.object.data.root_ang_vel_w.norm(dim=-1)
+        signals = self._compute_grasp_signals()
+        obj_lin = self.object.data.root_com_lin_vel_w.norm(dim=-1)
+        obj_ang = self.object.data.root_com_ang_vel_w.norm(dim=-1)
         slow = (obj_lin < cfg.success_max_obj_lin_speed) & (obj_ang < cfg.success_max_obj_ang_speed)
-        success_inst = (clearance >= cfg.lift_success_height) & slow & valid_contact
+        success_inst = (
+            (clearance >= cfg.lift_success_height)
+            & slow
+            & self._is_grasped
+            & (signals["grasp_quality"] >= cfg.grasp_quality_high)
+        )
         self._success_steps = torch.where(
             success_inst, self._success_steps + 1, torch.zeros_like(self._success_steps)
         )

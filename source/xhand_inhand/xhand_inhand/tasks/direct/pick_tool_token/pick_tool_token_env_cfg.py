@@ -23,7 +23,7 @@ from isaaclab.utils import configclass
 from xhand_inhand.robots import XARM7_XHAND_CFG
 
 from ..pick_cube_token.pick_cube_token_env_cfg import PickCubeTokenEnvCfg
-from .tool_asset import TOOL_REST_QUAT, TOOL_REST_Z, TOOL_SCALE, TOOL_USD
+from .tool_asset import TOOL_MASS, TOOL_REST_QUAT, TOOL_REST_Z, TOOL_SCALE, TOOL_USD
 
 
 @configclass
@@ -58,9 +58,8 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
             # this it silently reads 0 at multi-env scale (worked at num_envs=1, dead at >1) -> is_grasped
             # was always False in training -> the grasp/lift reward NEVER fired (the whole "won't lift" bug).
             activate_contact_sensors=True,
-            # explicit mass so the weak XHand fingers can hold it and the dynamics stay damped
-            # (auto-computed density-based mass on a ~10 cm shell can come out heavy/uneven).
-            mass_props=sim_utils.MassPropertiesCfg(mass=0.15),
+            # Mass is authored by MeshConverter on the rigid root before instancing. Applying it
+            # here would target an instanceable geometry child and may be ignored by USD/PhysX.
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 solver_position_iteration_count=16,
                 solver_velocity_iteration_count=1,
@@ -89,11 +88,25 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # tune them by dragging the yellow markers in the GUI (see pick_tool_token_env.py).
     # hand-tuned in the GUI (dragged the yellow markers onto the handle grasp region)
     grasp_keypoints = (
-        (-0.0083, 0.0393, 0.0977),
-        (-0.0201, 0.0160, 0.0921),
-        (-0.0132, 0.0581, 0.0788),
-        (-0.0264, 0.0264, 0.0750),
+        # Projected from the hand-calibrated points to the real central handle cross-section.
+        # The old points were 1.0--3.7mm inside the mesh and rewarded impossible penetration.
+        (-0.006245, 0.040144, 0.100644),
+        (-0.020187, 0.015094, 0.092488),
+        (-0.012841, 0.059730, 0.078441),
+        (-0.027973, 0.024908, 0.073244),
     )
+
+    # Analytic handle frame. The four calibrated keypoints lie on one handle cross-section; its
+    # centroid is the center and the plane normal is the handle axis. At startup the environment
+    # takes a thin mesh slice in this frame and builds its convex 2-D surface polygon, yielding a
+    # dense handle distance and a real outward normal without a 44k-vertex per-step nearest search.
+    handle_center = (-0.017000, 0.034950, 0.085900)
+    handle_axis = (0.821886, -0.288917, -0.490949)
+    handle_axial_min = -0.020        # m; negative side reaches the hammer head beyond roughly -25mm
+    handle_axial_max = 0.025         # m; central 4.5cm graspable band around the calibrated section
+    handle_axial_margin = 0.002      # m; contact ROI tolerance, kept separate from radial surface margin
+    handle_section_half_width = 0.002  # m; mesh slice used to construct the cross-section polygon
+    handle_contact_margin = 0.008    # m; sanity gate in addition to object-filtered contact force
 
     # ===================== DIRECTIONAL keypoints (calibration step) =====================
     # Each object keypoint and each finger pad gets a DIRECTION (unit vector). A later reward will
@@ -124,41 +137,30 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     dir_viz_len = 0.05
     dir_viz_beads = 6
 
-    # ================= reward params (mvp25: hysteresis grasp state machine) =================
-    # A "valid contact" = thumb pad contacts the object AND >=1 other fingertip pad contacts it (real
-    # contact sensors, force > contact_force_thr). is_grasped is a HYSTERESIS latch over valid_contact:
-    # ON after grasp_confirm_steps of consecutive valid contact, OFF after grasp_release_steps of loss.
-    # This debounces flickering contact so R_reach switches off cleanly and success is stable.
+    # ================= reward params (stage-1 robust grasp state machine) =================
+    # One grasp quality is shared by confirmation, hold, lift and success.  It requires filtered
+    # object contact at the handle from thumb + two non-thumb pads, opposed contact sides, palm/pad
+    # orientation and low palm/object rigid-body slip.  A Schmitt latch debounces this same quality.
+    expected_object_mass = TOOL_MASS
+    object_mass_tolerance = 1.0e-4
     contact_force_thr = 0.2       # N; contact detected above this fingertip<->object force magnitude
                                   # (0.5 filtered out the tentative first grazes of a few tenths of a N).
-    contact_near_margin = 0.09    # m; PER-FINGER gate: a fingertip's NET force counts as OBJECT contact only
-                                  # if THAT fingertip is within this of its nearest handle keypoint. Replaces
-                                  # the dead filtered force_matrix_w (multi-env broken) AND the too-loose palm
-                                  # gate (stayed True through a crush-launch); now contact drops the instant a
-                                  # finger leaves the object, so an object squirting out of the grip isn't credited.
-    grasp_confirm_steps = 4       # consecutive STABLE-hold steps to LATCH is_grasped_phase True (+fire grasp bonus)
-    grasp_release_steps = 6       # consecutive lost-contact steps to release is_grasped_phase (>confirm = hysteresis)
-    grasp_hold_quality_min = 0.7  # a "stable hold" needs hold_quality above this (object moving WITH the hand),
-                                  # not just contact -> the grasp bonus/phase require a real, non-slipping grip.
+    contact_force_saturation = 5.0  # N; force contribution is tanh(F/F_sat), preventing crush farming
+    grasp_confirm_steps = 4       # consecutive high-quality steps to latch (+fire one-shot grasp bonus)
+    grasp_release_steps = 6       # consecutive below-low-quality steps to release (>confirm = hysteresis)
     # a valid grasp must be PALM-SIDE and OPPOSED, not a back-of-hand press. palm_facing = 0.5(1+palm·to_obj)
     # in [0,1]; >0.5 means the palm faces the object. align in [0,1] = thumb+2 nearest pads oppose the handle
     # normals. Without these, a dorsal contact (palm_facing ~0.2-0.35, 460N press) satisfied is_grasped but
     # could not lift (the object slipped out). Gating is_grasped on them forces a liftable palm-side grip.
     grasp_palm_facing_min = 0.5   # palm must at least face toward the object (raw palm·to_obj > 0)
     grasp_align_min = 0.3         # thumb+2 pads at least mildly opposed to the handle (a floor, not strict)
+    grasp_opposition_min = 0.5    # thumb and the two strongest other contacts must lie on opposing handle sides
+    grasp_quality_high = 0.45     # confirm only above this shared wrap*transport quality
+    grasp_quality_low = 0.20      # release below this threshold (Schmitt dead-band in between)
 
-    # R_grasp (mvp26): ONE-SHOT bonus on the first stable grasp of the episode (latched by grasp_bonus_given,
-    # never re-paid even after drop+regrasp). Kept MODEST (< the lift payout) so "grasp" matters but never
-    # outweighs "actually lift". Ladder: grasp 100 < hold 10cm ~1000 < hold 20cm ~2000 (+200 success).
+    # R_grasp: one-shot bonus on the first stable grasp (never re-paid after drop/regrasp).
     grasp_bonus = 100.0
 
-    # R_lift (mvp26): per-step NORMALIZED occupancy height (NOT a ratchet). r_lift = lift_step_max *
-    # clip(grasp_rel_lift/lift_success_height,0,1) * is_grasped * clean_lift. lift_step_max=40 => at 20cm it
-    # pays 40/step; at 2cm clean clearance ~4/step (already > the grasp-hold floor, so lifting always beats
-    # just holding -> a positive lift gradient from mm 1). Occupancy on the TRUE clearance + clean_lift gate
-    # -> can't be farmed by tipping/wiggling.
-    lift_step_max = 40.0
-    lift_success_bonus = 200.0
     # R_success: ONE-SHOT bonus when the stable lift first succeeds. Needed because success ENDS the episode
     # (occupancy lift would otherwise pay ~20/step forever at 19cm), so without it the policy is punished for
     # crossing the 20cm line and stalls just below it. 500 ~= 25 steps of max lift reward (a rough
@@ -176,11 +178,9 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     hold_v_scale = 0.3    # m/s; relative linear speed that drops hold_quality to ~0.72 (0.1 m/s) / e^-1 (0.3)
     hold_w_scale = 3.0    # rad/s; relative angular speed scale
 
-    # R_hold: small per-step reward for MAINTAINING a stable grasp (is_grasped). MUST exceed reach_reward_scale
-    # (2.0) so "grasp and hold" strictly beats "hover near the object" -- otherwise the policy regresses to
-    # hovering (reach pays 2/step, a static grasp paid 0) and drops the grasp. Lift (up to 40/step) dwarfs it,
-    # so holding-without-lifting is never the optimum; this just welds the policy into the grasp so it can
-    # then discover the lift.
+    # R_hold: quality-weighted floor for a confirmed grasp.  It reaches 3 only at/above the confirmation
+    # threshold (so a legal hold beats max reach=2), and fades to zero across the latch dead-band so a weak
+    # or slipping latched grasp cannot farm the full reward.
     grasp_hold_scale = 3.0
 
     # R_reach: directional pre-grasp occupancy kernel (mvp20 kernel), gated to (~is_grasped) so it turns OFF

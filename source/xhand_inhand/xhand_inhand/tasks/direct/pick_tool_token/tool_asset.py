@@ -27,6 +27,9 @@ TOOL_OBJ = os.path.join(_THIS_DIR, "textured_mesh.obj")
 TOOL_SCALE = (1.0, 1.0, 1.0)
 """Mesh is authored in meters at its true size -- no rescale."""
 
+TOOL_MASS = 0.15
+"""Hammer mass in kilograms, authored into the converted USD before it is instanced."""
+
 # TRUE stable resting pose, measured in-sim by DROPPING the hammer from height (0.35 & 0.50 m,
 # away from the arm) and letting it fully tumble+settle -- both drops converge to z=-0.0468,
 # quat below, with ~0 rebound. NOTE: the authored identity pose (old z=0.0735) is only a
@@ -43,6 +46,10 @@ TOOL_USD = sim_utils.MeshConverter(
         asset_path=TOOL_OBJ,
         usd_dir="/tmp/xhand_inhand/pick_tool_token",
         usd_file_name="tool_hammer.usd",
+        # Author mass on the converter's rigid root. Applying MassAPI later through UsdFileCfg
+        # attempts to edit the instanceable geometry child and can silently leave the runtime mass
+        # unchanged ("Could not perform modify_mass_properties on an instanced prim").
+        mass_props=sim_utils.MassPropertiesCfg(mass=TOOL_MASS),
         rigid_props=sim_utils.RigidBodyPropertiesCfg(),
         collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
         # convex decomposition: many convex hulls approximating the concave tool so the
