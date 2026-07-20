@@ -165,13 +165,18 @@ class MigratedActor(nn.Module):
     def action_dim(self) -> int:
         return self.mu.out_features
 
-    def forward(self, observation: torch.Tensor) -> torch.Tensor:
+    def encode(self, observation: torch.Tensor) -> torch.Tensor:
+        """Return the frozen actor latent before the mean head."""
+
         x = observation.clamp(-5.0, 5.0)
         x = (x - self.obs_mean) / torch.sqrt(self.obs_var + 1.0e-5)
         x = x.clamp(-5.0, 5.0)
         for layer in self.layers:
             x = F.elu(layer(x))
-        return self.mu(x)
+        return x
+
+    def forward(self, observation: torch.Tensor) -> torch.Tensor:
+        return self.mu(self.encode(observation))
 
     @torch.no_grad()
     def write_actor_into(self, model_state: dict[str, torch.Tensor]) -> None:

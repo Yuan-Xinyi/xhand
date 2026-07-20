@@ -19,6 +19,22 @@ parser.add_argument(
 )
 parser.add_argument("--switch_score", type=float, default=0.20)
 parser.add_argument("--switch_hold_steps", type=int, default=1)
+parser.add_argument("--tactile_close_servo", action="store_true")
+parser.add_argument("--close_servo_arm_zero", action="store_true")
+parser.add_argument("--close_servo_token_hold", action="store_true")
+parser.add_argument("--close_servo_entry_proximity", type=float, default=0.02)
+parser.add_argument("--close_servo_exit_proximity", type=float, default=0.01)
+parser.add_argument("--close_servo_pregrasp_score", type=float, default=0.25)
+parser.add_argument("--close_servo_require_touch", action="store_true")
+parser.add_argument("--close_servo_low_force", type=float, default=3.0)
+parser.add_argument("--close_servo_high_force", type=float, default=20.0)
+parser.add_argument("--close_servo_step", type=float, default=0.005)
+parser.add_argument("--close_servo_max_travel", type=float, default=0.10)
+parser.add_argument("--close_servo_timeout", type=int, default=120)
+parser.add_argument("--distal_adapter", default=None)
+parser.add_argument("--distal_adapter_scale", type=float, default=1.0)
+parser.add_argument("--distal_adapter_pregrasp_score", type=float, default=0.25)
+parser.add_argument("--distal_adapter_timeout", type=int, default=120)
 parser.add_argument(
     "--option_fsm",
     action="store_true",
@@ -65,6 +81,16 @@ if args_cli.option_fsm and args_cli.reach_checkpoint:
     parser.error("--option_fsm and --reach_checkpoint are mutually exclusive")
 if args_cli.option_checkpoints and not args_cli.option_fsm:
     parser.error("--option_checkpoints requires --option_fsm")
+if (args_cli.close_servo_arm_zero or args_cli.close_servo_token_hold) and not args_cli.tactile_close_servo:
+    parser.error("close-servo ablations require --tactile_close_servo")
+if args_cli.tactile_close_servo and args_cli.option_fsm:
+    parser.error("--tactile_close_servo currently supports only a single 115-observation actor")
+if args_cli.distal_adapter and args_cli.option_fsm:
+    parser.error("--distal_adapter currently supports only a single 115-observation actor")
+if args_cli.distal_adapter and args_cli.tactile_close_servo:
+    parser.error("--distal_adapter and --tactile_close_servo are separate ablations")
+if not 0.0 <= args_cli.distal_adapter_scale <= 1.0 or args_cli.distal_adapter_timeout < 1:
+    parser.error("distal adapter scale must be in [0,1] and timeout positive")
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -76,6 +102,8 @@ from isaaclab.utils.math import combine_frame_transforms, compute_pose_error, su
 
 import xhand_inhand.tasks  # noqa: F401
 from bc_pick_tool import MigratedActor, clone_state, load_torch
+from distal_residual_adapter import StatefulCloseGate, load_adapter as load_distal_adapter
+from tactile_close_controller import TactileCloseController
 
 
 OPTION_NAMES = ("HOVER", "DESCEND", "CLOSE", "MICRO", "LIFT_HOLD")
@@ -320,6 +348,12 @@ def main() -> None:
                 f"expected an 87/16 legacy reach actor, got "
                 f"{reach_actor.observation_dim}/{reach_actor.action_dim}"
             )
+    distal_adapter = None
+    distal_adapter_payload = None
+    if args_cli.distal_adapter:
+        distal_adapter, distal_adapter_payload = load_distal_adapter(
+            Path(args_cli.distal_adapter), checkpoint_path, args_cli.device
+        )
 
     cfg = parse_env_cfg("Pick-Tool-Token-Direct-v0", device=args_cli.device, num_envs=args_cli.num_envs)
     cfg.seed = args_cli.seed
@@ -336,6 +370,35 @@ def main() -> None:
     obs, _ = env.reset()
     dev = u.device
     n = u.num_envs
+    close_controller = None
+    if args_cli.tactile_close_servo:
+        close_controller = TactileCloseController(
+            n,
+            dev,
+            entry_proximity=args_cli.close_servo_entry_proximity,
+            exit_proximity=args_cli.close_servo_exit_proximity,
+            low_force=args_cli.close_servo_low_force,
+            high_force=args_cli.close_servo_high_force,
+            step=args_cli.close_servo_step,
+            max_travel=args_cli.close_servo_max_travel,
+            timeout_steps=args_cli.close_servo_timeout,
+            arm_zero=args_cli.close_servo_arm_zero,
+            token_hold=args_cli.close_servo_token_hold,
+        )
+    distal_close_gate = None
+    if distal_adapter is not None:
+        assert distal_adapter_payload is not None
+        distal_close_gate = StatefulCloseGate(
+            n,
+            dev,
+            timeout_steps=args_cli.distal_adapter_timeout,
+            entry_proximity=distal_adapter.proximity_threshold,
+            exit_proximity=float(
+                distal_adapter_payload.get(
+                    "gate_exit_proximity", 0.5 * distal_adapter.proximity_threshold
+                )
+            ),
+        )
     curriculum_initial = None
     if args_cli.curriculum_dataset:
         u._compute_intermediate_values()
@@ -385,6 +448,21 @@ def main() -> None:
     unsafe_force_terminations = torch.zeros(n, dtype=torch.long, device=dev)
     latch_steps = torch.zeros(n, dtype=torch.long, device=dev)
     action_abs_sum = torch.zeros((n, 3), device=dev)
+    close_servo_gate_steps = (
+        torch.zeros(n, dtype=torch.long, device=dev) if close_controller is not None else None
+    )
+    close_servo_delta_abs_sum = (
+        torch.zeros((n, 3), device=dev) if close_controller is not None else None
+    )
+    distal_adapter_gate_steps = (
+        torch.zeros(n, dtype=torch.long, device=dev) if distal_adapter is not None else None
+    )
+    distal_adapter_delta_abs_sum = (
+        torch.zeros(n, device=dev) if distal_adapter is not None else None
+    )
+    distal_adapter_delta_abs_max = (
+        torch.zeros(n, device=dev) if distal_adapter is not None else None
+    )
     option_switched = torch.zeros(n, dtype=torch.bool, device=dev)
     option_ready_steps = torch.zeros(n, dtype=torch.long, device=dev)
     option_switch_step = torch.full((n,), -1, dtype=torch.long, device=dev)
@@ -452,14 +530,67 @@ def main() -> None:
             reach_action = torch.zeros_like(action)
             reach_action[:, :16] = reach_actor(obs["policy"][:, :87]).clamp(-1.0, 1.0)
             action = torch.where(option_switched.unsqueeze(-1), action, reach_action)
+        if close_controller is not None:
+            assert close_servo_gate_steps is not None and close_servo_delta_abs_sum is not None
+            control_signals = u._compute_grasp_signals()
+            force_by_distal = torch.zeros_like(control_signals["force_magnitude"])
+            force_by_distal.index_copy_(
+                1, u._force_to_distal_index, control_signals["force_magnitude"]
+            )
+            external_gate = option_switched if reach_actor is not None else None
+            entry_gate = score >= args_cli.close_servo_pregrasp_score
+            if args_cli.close_servo_require_touch:
+                entry_gate &= control_signals["force_magnitude"].max(dim=-1).values >= cfg.contact_force_thr
+            if external_gate is not None:
+                entry_gate &= external_gate
+            action, servo_gate, servo_delta = close_controller.apply(
+                action,
+                policy_obs,
+                force_by_distal,
+                external_gate=external_gate,
+                entry_gate=entry_gate,
+            )
+            close_servo_gate_steps += servo_gate.long()
+            close_servo_delta_abs_sum[:, 0] += servo_delta[:, :7].abs().mean(dim=-1)
+            close_servo_delta_abs_sum[:, 1] += servo_delta[:, 7:16].abs().mean(dim=-1)
+            close_servo_delta_abs_sum[:, 2] += servo_delta[:, 16:21].abs().mean(dim=-1)
+        if distal_adapter is not None:
+            assert distal_close_gate is not None
+            assert distal_adapter_gate_steps is not None
+            assert distal_adapter_delta_abs_sum is not None
+            assert distal_adapter_delta_abs_max is not None
+            allowed = option_switched if reach_actor is not None else None
+            close_gate = distal_close_gate.update(
+                policy_obs,
+                score >= args_cli.distal_adapter_pregrasp_score,
+                allowed=allowed,
+            )
+            actor_latent = actor.encode(policy_obs)
+            action, adapter_gate, adapter_delta = distal_adapter.apply(
+                action,
+                policy_obs,
+                actor_latent,
+                scale=args_cli.distal_adapter_scale,
+                external_gate=close_gate,
+            )
+            distal_adapter_gate_steps += adapter_gate.long()
+            distal_adapter_delta_abs_sum += adapter_delta.abs().mean(dim=-1)
+            distal_adapter_delta_abs_max = torch.maximum(
+                distal_adapter_delta_abs_max, adapter_delta.abs().max(dim=-1).values
+            )
         action_abs_sum[:, 0] += action[:, :7].abs().mean(dim=-1)
         action_abs_sum[:, 1] += action[:, 7:16].abs().mean(dim=-1)
         action_abs_sum[:, 2] += action[:, 16:].abs().mean(dim=-1)
-        obs, _, terminated, _, _ = env.step(action)
+        obs, _, terminated, truncated, _ = env.step(action)
+        done = terminated | truncated
         # Evaluation disables drop and built-in success termination, so every termination here is
         # the sustained-force safety cutoff.  Keep per-env event counts because auto-reset permits
         # a fresh attempt during a long diagnostic rollout.
         unsafe_force_terminations += terminated.long()
+        if close_controller is not None:
+            close_controller.reset(done)
+        if distal_close_gate is not None:
+            distal_close_gate.reset(done)
         signals = u._compute_grasp_signals()
         clearance = u._object_true_min_z() - u._table_surface_z
         force = signals["force_magnitude"]
@@ -467,7 +598,7 @@ def main() -> None:
         if args_cli.option_fsm:
             assert palm_in_object_pos is not None and palm_in_object_quat is not None
             pose_state = _option_pose_state(u, palm_in_object_pos, palm_in_object_quat)
-            active = ~terminated
+            active = ~done
             previous_option = option_state.clone()
             next_option = previous_option.clone()
             thumb_and_other_contact = signals["thumb_contact"] & (
@@ -562,9 +693,9 @@ def main() -> None:
 
             # Auto-reset follows sustained-force termination.  Restart the controller state but
             # keep accumulated evaluation/funnel statistics for the fresh attempt.
-            option_reset_counts += terminated.long()
-            next_option[terminated] = HOVER
-            option_guard_steps[terminated] = 0
+            option_reset_counts += done.long()
+            next_option[done] = HOVER
+            option_guard_steps[done] = 0
             option_state = next_option
         slow = (
             (u.object.data.root_com_lin_vel_w.norm(dim=-1) < cfg.success_max_obj_lin_speed)
@@ -613,6 +744,9 @@ def main() -> None:
         "success_step": success_step.cpu().tolist(),
         "max_true_clearance": _summary(max_clearance),
         "max_unlatched_clearance": _summary(max_unlatched_clearance),
+        "ever_unlatched_clearance_ge_5cm_count": int(
+            (max_unlatched_clearance >= 0.05).sum()
+        ),
         "false_lift_or_fling_count": int(fling.sum()),
         "max_grasp_quality": _summary(max_grasp_quality),
         "latch_occupancy": _summary(latch_steps.float() / args_cli.steps),
@@ -641,6 +775,48 @@ def main() -> None:
     }
     if curriculum_initial is not None:
         metrics["curriculum_initial"] = curriculum_initial
+    if close_controller is not None:
+        assert close_servo_gate_steps is not None and close_servo_delta_abs_sum is not None
+        metrics["tactile_close_servo"] = {
+            "enabled": True,
+            "arm_zero": close_controller.arm_zero,
+            "token_hold": close_controller.token_hold,
+            "entry_proximity": close_controller.entry_proximity,
+            "exit_proximity": close_controller.exit_proximity,
+            "entry_pregrasp_score": args_cli.close_servo_pregrasp_score,
+            "require_touch": args_cli.close_servo_require_touch,
+            "low_force_N": close_controller.low_force,
+            "high_force_N": close_controller.high_force,
+            "normalized_step": close_controller.step,
+            "normalized_max_travel": close_controller.max_travel,
+            "timeout_steps": close_controller.timeout_steps,
+            "entry_count": int(close_controller.entry_count.sum()),
+            "entered_envs": int((close_controller.entry_count > 0).sum()),
+            "gate_occupancy": _summary(close_servo_gate_steps.float() / args_cli.steps),
+            "mean_abs_delta_arm_token_distal": (
+                close_servo_delta_abs_sum / args_cli.steps
+            ).mean(dim=0).cpu().tolist(),
+        }
+    if distal_adapter is not None:
+        assert distal_adapter_payload is not None
+        assert distal_close_gate is not None
+        assert distal_adapter_gate_steps is not None
+        assert distal_adapter_delta_abs_sum is not None
+        assert distal_adapter_delta_abs_max is not None
+        metrics["distal_adapter"] = {
+            "path": str(Path(args_cli.distal_adapter).resolve()),
+            "scale": args_cli.distal_adapter_scale,
+            "entry_pregrasp_score": args_cli.distal_adapter_pregrasp_score,
+            "timeout_steps": args_cli.distal_adapter_timeout,
+            "entry_proximity": distal_close_gate.entry_proximity,
+            "exit_proximity": distal_close_gate.exit_proximity,
+            "base_sha256": distal_adapter_payload["base_sha256"],
+            "delta_limit": distal_adapter.delta_limit,
+            "train_meta": distal_adapter_payload.get("train_meta"),
+            "gate_occupancy": _summary(distal_adapter_gate_steps.float() / args_cli.steps),
+            "mean_abs_delta": float((distal_adapter_delta_abs_sum / args_cli.steps).mean()),
+            "max_abs_delta": _summary(distal_adapter_delta_abs_max),
+        }
     if reach_actor is not None:
         metrics["option"] = {
             "reach_checkpoint": str(Path(args_cli.reach_checkpoint).resolve()),

@@ -127,3 +127,59 @@ R_success = 500 × newly_successful          # 一次性(成功会结束回合)
 
 本轮可复现交付位于忽略版本控制的
 `logs/rl_games/pick_tool_token/0_bootstrap_handoff_20260720/`：包含最佳 actor、8-env oracle 数据和两组严格评估 JSON。
+
+---
+
+## 八、冻结基策略后的 close-window 消融（2026-07-20）
+
+两 seed 基线的最大损失是 `touch -> grasp latch`：465 个环境碰到物体，只有 130
+个形成严格 latch（28.0%）；latch 后的 `5 cm -> 20 cm -> stable success` 条件转化率已经是
+83.8%、85.3%、89.2%。因此这一轮冻结最佳 actor 和 observation RMS，只允许在
+「合格 pregrasp、尚未 latch」窗口做有界修正，并先在 seed 99 / 256 env / 1000 step
+筛选。所有结果继续使用真实网格 clearance、严格 latch、15-step stable success 和既有力安全
+终止；未过 seed 99 的候选不运行 seed 100。
+
+| 控制器 | seed | strict | latch | latch+5 cm | 20 cm | fling* | unsafe events/env | 决策 |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| 冻结基线 | 99 | 42 | 71 | 58 | 49 | 10 | 41/36 | 保留 |
+| 冻结基线 | 100 | 41 | 59 | 51 | 44 | 4 | 44/37 | 保留 |
+| arm-zero + token-hold + distal servo | 99 | 32 | 68 | 44 | 36 | 8 | 35/31 | 拒绝 |
+| **仅 close-window arm-zero** | 99 | **43** | 62 | 48 | 44 | 6 | 35/31 | 提升仅 +1，不晋级 |
+| 首次 touch 后 arm-zero | 99 | 41 | 57 | 47 | 41 | 2 | 32/29 | 拒绝 |
+| distal-only DAgger adapter，±0.05 | 99 | 35 | 55 | 41 | 37 | 4 | 35/29 | 拒绝 |
+| distal-only DAgger adapter，±0.10 | 99 | 29 | 45 | 37 | 32 | 5 | 35/32 | 拒绝 |
+
+手写 servo 的第一次运行还暴露了两个重要控制问题：只靠 proximity 进入会在正式 pregrasp
+前闭手，使 `pregrasp_score >= 0.25` 从 154/256 降到 32/256；把 distal 当绝对命令保持则会
+抹掉基策略后续有用的手部变化。加入 `pregrasp_score >= 0.25` 入口、把命令改成叠加残差并
+收紧到 ±0.10 后，reach/touch 恢复，但统一同向闭合仍降低 latch。arm-zero 的小幅正结果说明
+闭合时掌位稳定有价值，不过不是独立解决方案。arm-zero 与基线做同 seed 环境槽配对后是
+14 个新增成功、13 个原成功丢失，属于结果重排而不是支配性提升。默认路径的两次重复回归为
+42/256 和 45/256 strict；GPU PhysX 的接触 rollout 有小幅非确定性，因此晋级不能依赖单次
+latch 波动或 +1 success。
+
+监督残差采用冻结 actor latent64 + close observation suffix28 + base distal5，网络仅为
+`97 -> 32 -> 5`；末层零初始化，`action[:16]` 位级不变，checkpoint 与 base SHA-256 绑定。
+训练只取 95% learner-visitation DAgger 的 11,037 条 close 样本，并按 episode 隔离验证。
+尽管离线 normalized MAE 达到 0.233，物理成功率仍下降；±0.10 也只能覆盖 61.4% 的教师
+差值。结论是这批数据由 4 个成功、252 个失败 rollout 构成，失败/不可恢复状态的纠正标签
+不适合直接蒸馏，即便只更新 distal5、严格限幅也会造成闭环分布偏移。
+
+### 决策
+
+1. 默认部署仍使用
+   `logs/rl_games/pick_tool_token/0_bootstrap_handoff_20260720/nn/pick_tool_stage7_dagger_full_iter3_bc.pth`，严格结果保持
+   83/512（16.2%）；本节所有 controller/adapter 都是显式 opt-in 诊断项，没有改变默认路径。
+2. 不再继续 reward 权重、统一闭合 servo 或「失败占多数的 DAgger 数据 + action regression」。
+3. 下一批数据必须先改变成功比例：在 close/micro 边界做 reverse curriculum，或在在线 rollout
+   中按完整 option（不是随机单步）介入脚本教师；只保留真实完成 20 cm 且满足力安全的轨迹，再
+   逐级扩大初始状态分布。
+4. 学习对象应拆成 `reach actor -> close option -> lift option`。先要求 close option 从策略真实
+   pregrasp 状态达到至少 80% latch，再训练 lift；最后只学习 option gate 或用带 behavior-anchor
+   的 PPO 做小步联合微调。任何模型仍须先过 seed 99，再以 seed 99+100 合计 strict >=91/512、
+   每 seed 相对基线下降不超过 2 个、fling <=14、unsafe env <=73 才能替换当前基线。
+
+\* 这里旧 `fling` 字段定义为「最终未成功且曾在未 latch 时超过 5 cm」，所以会漏掉先 fling、
+后恢复成功的环境槽；评估器现已另报不排除最终成功的
+`ever_unlatched_clearance_ge_5cm_count`。安全 reset 后同一环境槽会开始新尝试，而漏斗继续累计，
+因此表中是 1000-step campaign 的 ever-event，不是严格逐 episode 条件概率。
