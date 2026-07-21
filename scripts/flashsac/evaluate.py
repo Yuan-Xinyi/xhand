@@ -198,6 +198,35 @@ def task_mode_from_option_flags(
     return FULL_TASK_MODE
 
 
+def apply_coupled_controller_ablation(
+    actor_action: torch.Tensor,
+    teacher_action: torch.Tensor,
+    mode: str,
+) -> torch.Tensor:
+    """Compose one explicit diagnostic arm-by-hand controller condition."""
+
+    if (
+        not isinstance(actor_action, torch.Tensor)
+        or not isinstance(teacher_action, torch.Tensor)
+    ):
+        raise TypeError("controller ablation actions must be torch tensors")
+    if actor_action.shape != teacher_action.shape or actor_action.ndim != 2:
+        raise ValueError("actor and teacher actions must share a two-dimensional shape")
+    if actor_action.shape[1] != ACTION_DIM:
+        raise ValueError(f"controller ablation requires {ACTION_DIM}-D actions")
+    if actor_action.device != teacher_action.device:
+        raise ValueError("actor and teacher actions must share a device")
+    if actor_action.dtype != teacher_action.dtype:
+        raise TypeError("actor and teacher actions must share a dtype")
+    if mode == "exact_teacher":
+        return teacher_action.clone()
+    if mode == "teacher_arm_actor_hand":
+        return torch.cat((teacher_action[:, :7], actor_action[:, 7:]), dim=-1)
+    if mode == "actor_arm_teacher_hand":
+        return torch.cat((actor_action[:, :7], teacher_action[:, 7:]), dim=-1)
+    raise ValueError(f"unsupported coupled controller ablation {mode!r}")
+
+
 def requested_policy_action_contract(task_mode: str) -> dict[str, Any]:
     """Return the evaluator-side policy/environment action boundary."""
 
@@ -2339,6 +2368,25 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         ),
     )
     parser.add_argument(
+        "--coupled_controller_ablation",
+        choices=(
+            "exact_teacher",
+            "teacher_arm_actor_hand",
+            "actor_arm_teacher_hand",
+        ),
+        default=None,
+        help=(
+            "Diagnostic-only exact/actor arm-by-hand controller override for the coupled "
+            "option. It requires the strict CEM artifact and its byte-identical curriculum."
+        ),
+    )
+    parser.add_argument(
+        "--coupled_teacher_artifact",
+        type=Path,
+        default=None,
+        help="Fail-closed strict coupled CEM artifact used only by controller ablation.",
+    )
+    parser.add_argument(
         "--allow_cross_task_actor",
         action="store_true",
         help=(
@@ -2530,6 +2578,33 @@ def _validate_args(args: argparse.Namespace) -> None:
         min_hold_quality=args.arm_hold_min_hold_quality,
         safe_force_limit=args.arm_hold_safe_force_limit,
     )
+    controller_ablation = getattr(args, "coupled_controller_ablation", None)
+    teacher_artifact = getattr(args, "coupled_teacher_artifact", None)
+    if controller_ablation is None:
+        if teacher_artifact is not None:
+            raise ValueError(
+                "--coupled_teacher_artifact requires --coupled_controller_ablation"
+            )
+    else:
+        if task_mode != COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE:
+            raise ValueError(
+                "--coupled_controller_ablation requires "
+                "--coupled_power_align_close_option_mode"
+            )
+        if teacher_artifact is None or not teacher_artifact.is_file():
+            raise FileNotFoundError(
+                teacher_artifact
+                if teacher_artifact is not None
+                else "--coupled_teacher_artifact"
+            )
+        if args.curriculum_dataset is None:
+            raise ValueError(
+                "--coupled_controller_ablation requires --curriculum_dataset"
+            )
+        if args.curriculum_probability != 1.0 or args.curriculum_joint_noise != 0.0:
+            raise ValueError(
+                "controller ablation requires curriculum probability 1 and exact zero joint noise"
+            )
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -2544,6 +2619,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         args.episode_length_s = 5.0
     _validate_args(args)
     _seed_everything(args.seed)
+
+    controller_ablation = getattr(args, "coupled_controller_ablation", None)
+    teacher_prior = None
+    if controller_ablation is not None:
+        from coupled_teacher_prior import load_coupled_teacher_prior
+
+        teacher_prior = load_coupled_teacher_prior(
+            args.coupled_teacher_artifact,
+            args.curriculum_dataset,
+        )
 
     # Import the sibling contract reader before agent_bridge prepends the
     # upstream FlashSAC directory to sys.path; both trees contain train.py.
@@ -2755,6 +2840,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 {"next_observation": observation},
                 training=False,
             )
+            if controller_ablation is not None:
+                assert teacher_prior is not None
+                teacher_action = teacher_prior.teacher_action(observation)
+                action = apply_coupled_controller_ablation(
+                    action,
+                    teacher_action,
+                    controller_ablation,
+                )
             # Slots whose deterministic quota is complete continue simulating
             # independently but cannot contribute additional events.
             action = torch.where(tracker.active.unsqueeze(-1), action, torch.zeros_like(action))
@@ -2861,6 +2954,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         metrics["hold_arm_until_stable_grasp"] = bool(
             args.hold_arm_until_stable_grasp
         )
+        metrics["coupled_controller_ablation"] = controller_ablation
+        if teacher_prior is not None:
+            metrics["coupled_teacher_prior"] = teacher_prior.contract_payload()
+            metrics["coupled_teacher_artifact"] = teacher_prior.teacher_artifact_path
+            metrics["policy"] = (
+                "diagnostic_"
+                + str(controller_ablation)
+                + "+native_phase_shield"
+            )
         if args.hold_arm_until_stable_grasp:
             metrics["policy"] = (
                 "deterministic_tanh_actor_mean+arm_hold_supervisor"

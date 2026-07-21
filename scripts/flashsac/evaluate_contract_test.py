@@ -32,6 +32,7 @@ from evaluate import (
     SMOKE_CRITIC_BINS,
     StrictEpisodeTracker,
     _atomic_write_json,
+    apply_coupled_controller_ablation,
     build_strict_metrics,
     episode_quotas,
     infer_actor_architecture_from_state,
@@ -1176,6 +1177,40 @@ def test_power_close_tracker_metrics_and_hand_action_contract() -> None:
     }
 
 
+def test_coupled_controller_ablation_composition() -> None:
+    actor = torch.arange(42, dtype=torch.float32).reshape(2, 21)
+    teacher = -actor - 1.0
+    exact = apply_coupled_controller_ablation(actor, teacher, "exact_teacher")
+    assert torch.equal(exact, teacher)
+    assert exact.data_ptr() != teacher.data_ptr()
+
+    teacher_arm = apply_coupled_controller_ablation(
+        actor, teacher, "teacher_arm_actor_hand"
+    )
+    assert torch.equal(teacher_arm[:, :7], teacher[:, :7])
+    assert torch.equal(teacher_arm[:, 7:], actor[:, 7:])
+
+    teacher_hand = apply_coupled_controller_ablation(
+        actor, teacher, "actor_arm_teacher_hand"
+    )
+    assert torch.equal(teacher_hand[:, :7], actor[:, :7])
+    assert torch.equal(teacher_hand[:, 7:], teacher[:, 7:])
+    _expect_error(
+        ValueError,
+        apply_coupled_controller_ablation,
+        actor,
+        teacher,
+        "unknown",
+    )
+    _expect_error(
+        ValueError,
+        apply_coupled_controller_ablation,
+        actor[:, :14],
+        teacher[:, :14],
+        "exact_teacher",
+    )
+
+
 def test_curriculum_argument_contract() -> None:
     assert task_mode_from_option_flags(
         close_option_mode=False, power_close_option_mode=False
@@ -1683,6 +1718,7 @@ def main() -> None:
     test_exact_episode_quotas_and_strict_tracker()
     test_close_option_tracker_and_metrics_are_separate_from_full_success()
     test_power_close_tracker_metrics_and_hand_action_contract()
+    test_coupled_controller_ablation_composition()
     test_curriculum_argument_contract()
     test_checkpoint_architecture_and_path_contract()
     test_checkpoint_task_mode_evaluation_contract()
