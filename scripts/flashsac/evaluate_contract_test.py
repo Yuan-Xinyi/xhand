@@ -35,10 +35,12 @@ from evaluate import (
     PRODUCTION_CRITIC_BINS,
     SMOKE_CRITIC_BINS,
     StrictEpisodeTracker,
+    _atomic_torch_save,
     _atomic_write_json,
     apply_coupled_controller_ablation,
     apply_public_latch_arm_gate,
     apply_public_latch_hand_hold,
+    build_diagnostic_handoff_artifact,
     build_strict_metrics,
     episode_quotas,
     infer_actor_architecture_from_state,
@@ -48,6 +50,7 @@ from evaluate import (
     resolve_checkpoint_directory,
     resolve_cross_task_actor_evaluation,
     requested_policy_action_contract,
+    select_diagnostic_approach_action,
     task_mode_from_option_flags,
     summarize,
     update_diagnostic_approach_handoff,
@@ -1547,6 +1550,127 @@ def test_diagnostic_approach_handoff_debounce_is_explicit() -> None:
         hold_steps=4,
     )
 
+    search_action = torch.full((3, 21), 0.25)
+    flashsac_action = torch.full((3, 21), -0.75)
+    base_only = select_diagnostic_approach_action(
+        search_action=search_action,
+        flashsac_action=flashsac_action,
+        approach_active=torch.ones(3, dtype=torch.bool),
+    )
+    routed = select_diagnostic_approach_action(
+        search_action=search_action,
+        flashsac_action=flashsac_action,
+        approach_active=torch.tensor([True, False, False]),
+    )
+    assert torch.equal(base_only, search_action)
+    assert torch.equal(routed[0], search_action[0])
+    assert torch.equal(routed[1:], flashsac_action[1:])
+    assert torch.equal(search_action, torch.full((3, 21), 0.25))
+
+
+def _handoff_artifact_row(*, env_slot: int = 3) -> dict[str, Any]:
+    observation = torch.linspace(-1.0, 1.0, 115, dtype=torch.float32)
+    observation[106] = 0.0
+    return {
+        "observation": observation,
+        "search_action": torch.linspace(-0.5, 0.5, 21),
+        "flashsac_action": torch.linspace(0.5, -0.5, 21),
+        "env_slot": env_slot,
+        "slot_episode_index": 0,
+        "episode_index": 17,
+        "handoff_step": 403,
+        "pregrasp_score": 0.34,
+        "proximity_quality": 0.08,
+        "max_force_n": 12.0,
+        "true_clearance_m": 0.001,
+        "outcome_episode_length": 612,
+        "outcome_max_true_clearance_m": 0.205,
+        "outcome_success": True,
+        "outcome_failure": False,
+        "outcome_time_out": False,
+        "outcome_ever_grasped": True,
+        "outcome_ever_clearance_ge_5cm": True,
+        "outcome_ever_clearance_ge_20cm": True,
+        "outcome_dropped": False,
+        "outcome_unsafe_force": False,
+        "outcome_ever_unlatched_clearance_ge_5cm": False,
+        "outcome_ever_post_candidate_latch": True,
+    }
+
+
+def test_diagnostic_handoff_artifact_is_strict_and_weights_only() -> None:
+    metadata = {
+        "treatment": "handoff_to_flashsac",
+        "seed": 257,
+        "supervisor": {
+            "minimum_zero_based_episode_step": 400,
+            "pregrasp_score_threshold": 0.32,
+            "minimum_proximity_quality": 0.02,
+            "hold_steps": 4,
+            "safe_force_limit_n": 30.0,
+            "requires_unlatched": True,
+            "requires_abs_true_clearance_le_m": 0.005,
+        },
+    }
+    payload = build_diagnostic_handoff_artifact(
+        [_handoff_artifact_row(env_slot=8), _handoff_artifact_row(env_slot=2)],
+        metadata=metadata,
+    )
+    assert payload["observation"].shape == (2, 115)
+    assert payload["search_action"].shape == (2, 21)
+    assert payload["env_slot"].tolist() == [2, 8]
+    assert payload["metadata"]["handoff_rows"] == 2
+    assert payload["observation"].device.type == "cpu"
+    assert payload["observation"].is_contiguous()
+
+    empty = build_diagnostic_handoff_artifact([], metadata=metadata)
+    assert empty["observation"].shape == (0, 115)
+    assert empty["outcome_success"].shape == (0,)
+
+    duplicate = _handoff_artifact_row()
+    _expect_error(
+        ValueError,
+        build_diagnostic_handoff_artifact,
+        [duplicate, dict(duplicate)],
+        metadata=metadata,
+    )
+    invalid_success = _handoff_artifact_row()
+    invalid_success["outcome_ever_clearance_ge_20cm"] = False
+    _expect_error(
+        ValueError,
+        build_diagnostic_handoff_artifact,
+        [invalid_success],
+        metadata=metadata,
+    )
+    non_finite = _handoff_artifact_row()
+    non_finite["observation"] = non_finite["observation"].clone()
+    non_finite["observation"][0] = float("nan")
+    _expect_error(
+        ValueError,
+        build_diagnostic_handoff_artifact,
+        [non_finite],
+        metadata=metadata,
+    )
+    invalid_bool = _handoff_artifact_row()
+    invalid_bool["outcome_success"] = "False"
+    _expect_error(
+        TypeError,
+        build_diagnostic_handoff_artifact,
+        [invalid_bool],
+        metadata=metadata,
+    )
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "handoff.pt"
+        _atomic_torch_save(path, payload)
+        restored = torch.load(path, map_location="cpu", weights_only=True)
+        assert torch.equal(restored["observation"], payload["observation"])
+        _expect_error(FileExistsError, _atomic_torch_save, path, payload)
+        dangling = Path(directory) / "dangling.pt"
+        dangling.symlink_to(Path(directory) / "missing-target.pt")
+        _expect_error(FileExistsError, _atomic_torch_save, dangling, payload)
+        assert not list(Path(directory).glob(".*.tmp-*"))
+
 
 def test_public_latch_hand_hold_uses_observed_previous_action() -> None:
     action = torch.arange(42, dtype=torch.float32).reshape(2, 21) / 42.0
@@ -2264,6 +2388,7 @@ def main() -> None:
     test_coupled_controller_ablation_composition()
     test_public_latch_arm_gate_is_memoryless_and_exact()
     test_diagnostic_approach_handoff_debounce_is_explicit()
+    test_diagnostic_handoff_artifact_is_strict_and_weights_only()
     test_public_latch_hand_hold_uses_observed_previous_action()
     test_curriculum_argument_contract()
     test_checkpoint_architecture_and_path_contract()

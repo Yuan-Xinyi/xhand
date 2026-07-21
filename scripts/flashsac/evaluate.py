@@ -47,6 +47,28 @@ ARM_ACTION_DIM = 7
 HAND_ACTION_DIM = 14
 NATIVE_FULL_TASK_EPISODE_LENGTH_S = 20.0
 NATIVE_FULL_TASK_MAX_EPISODE_STEPS = 1000
+DIAGNOSTIC_HANDOFF_ARTIFACT_KIND = (
+    "pick_tool_diagnostic_search_to_flashsac_handoff_v1"
+)
+DIAGNOSTIC_HANDOFF_SOURCE_FILES = (
+    "scripts/flashsac/evaluate.py",
+    "scripts/flashsac/adapter.py",
+    "scripts/flashsac/agent_bridge.py",
+    "scripts/flashsac/train.py",
+    "scripts/rl_games/bc_pick_tool.py",
+    "source/xhand_inhand/xhand_inhand/tasks/direct/pick_tool_token/pick_tool_token_env.py",
+    "source/xhand_inhand/xhand_inhand/tasks/direct/pick_tool_token/pick_tool_token_env_cfg.py",
+    "source/xhand_inhand/xhand_inhand/tasks/direct/pick_tool_token/grasp_signals.py",
+    "source/xhand_inhand/xhand_inhand/tasks/direct/pick_tool_token/hybrid_action.py",
+    "source/xhand_inhand/xhand_inhand/tasks/direct/pick_tool_token/tool_asset.py",
+    "source/xhand_inhand/xhand_inhand/tasks/direct/pick_tool_token/textured_mesh.obj",
+    "source/xhand_inhand/xhand_inhand/tasks/direct/pick_cube_token/pick_cube_token_env.py",
+    "source/xhand_inhand/xhand_inhand/tasks/direct/pick_cube_token/pick_cube_token_env_cfg.py",
+    "source/xhand_inhand/xhand_inhand/tasks/direct/pick_cube_token/retarget_infer.py",
+    "source/xhand_inhand/xhand_inhand/robots/xarm7_xhand.py",
+    "tools/crossdex_retarget/models/retarget_nn_xhand.pt",
+    "tools/crossdex_retarget/models/retarget_nn_xhand_meta.pkl",
+)
 FULL_TASK_GRASP_LATCH_OBSERVATION_INDEX = 106
 FULL_TASK_LAST_ARM_TOKEN_ACTION_START = 70
 FULL_TASK_LAST_ARM_TOKEN_ACTION_STOP = 86
@@ -298,6 +320,39 @@ def update_diagnostic_approach_handoff(
     enter_close = approach_active & (next_ready_steps >= hold_steps)
     next_active = approach_active & (~enter_close)
     return ApproachHandoffState(next_active, next_ready_steps, enter_close)
+
+
+def select_diagnostic_approach_action(
+    *,
+    search_action: torch.Tensor,
+    flashsac_action: torch.Tensor,
+    approach_active: torch.Tensor,
+) -> torch.Tensor:
+    """Select SEARCH or FlashSAC without giving a shadow gate action authority."""
+
+    if (
+        search_action.ndim != 2
+        or flashsac_action.shape != search_action.shape
+        or approach_active.shape != (search_action.shape[0],)
+    ):
+        raise ValueError("diagnostic approach action tensors have incompatible shapes")
+    if approach_active.dtype != torch.bool:
+        raise TypeError("approach_active must be boolean")
+    if (
+        search_action.device != flashsac_action.device
+        or search_action.device != approach_active.device
+    ):
+        raise ValueError("diagnostic approach action tensors must share a device")
+    if search_action.dtype != flashsac_action.dtype:
+        raise TypeError("SEARCH and FlashSAC actions must share a dtype")
+    if not search_action.is_floating_point() or not bool(
+        torch.isfinite(search_action).all()
+        and torch.isfinite(flashsac_action).all()
+    ):
+        raise ValueError("diagnostic approach actions must be finite floating tensors")
+    return torch.where(
+        approach_active.unsqueeze(-1), search_action, flashsac_action
+    )
 
 
 def _validate_task_mode(task_mode: str) -> str:
@@ -1410,7 +1465,13 @@ def _read_physical_truth(
 
 def _diagnostic_pregrasp_measurements(
     unwrapped: Any,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     """Read the historical geometric handoff gate from live simulator state.
 
     The score intentionally matches ``base_handoff_close_dataset.py`` byte for
@@ -1446,6 +1507,7 @@ def _diagnostic_pregrasp_measurements(
         signals["proximity_quality"].detach().to(dtype=torch.float32),
         signals["force_magnitude"].detach().amax(dim=-1).to(dtype=torch.float32),
         unwrapped._is_grasped.detach().to(dtype=torch.bool),
+        clearance.detach().to(dtype=torch.float32),
     )
 
 
@@ -2715,12 +2777,290 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _atomic_torch_save(path: Path, payload: Mapping[str, Any]) -> None:
+    """Write one immutable evidence artifact without exposing partial bytes."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() or path.is_symlink():
+        raise FileExistsError(f"handoff artifact already exists: {path}")
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    if temporary.exists() or temporary.is_symlink():
+        raise FileExistsError(f"temporary handoff artifact already exists: {temporary}")
+    try:
+        with temporary.open("xb") as stream:
+            torch.save(dict(payload), stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        # A same-directory hard link is an atomic no-clobber publication:
+        # unlike os.replace(), it fails if even a dangling symlink owns path.
+        os.link(temporary, path)
+    finally:
+        if temporary.exists() or temporary.is_symlink():
+            temporary.unlink()
+
+
+def build_diagnostic_handoff_artifact(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build a CPU-only, simulation-free SEARCH/V6 handoff evidence payload."""
+
+    metadata_copy = dict(metadata)
+    # Keep metadata serialization strict even though torch.save itself accepts
+    # arbitrary Python objects.  Downstream pairing must never depend on code
+    # execution or non-finite JSON values hidden in provenance.
+    json.dumps(metadata_copy, sort_keys=True, allow_nan=False)
+    if metadata_copy.get("treatment") not in {
+        "handoff_to_flashsac",
+        "continue_search",
+    }:
+        raise ValueError(
+            "handoff artifact treatment must be handoff_to_flashsac or continue_search"
+        )
+
+    vector_fields = {
+        "observation": OBSERVATION_DIM,
+        "search_action": ACTION_DIM,
+        "flashsac_action": ACTION_DIM,
+    }
+    long_fields = (
+        "env_slot",
+        "slot_episode_index",
+        "episode_index",
+        "handoff_step",
+        "outcome_episode_length",
+    )
+    float_fields = (
+        "pregrasp_score",
+        "proximity_quality",
+        "max_force_n",
+        "true_clearance_m",
+        "outcome_max_true_clearance_m",
+    )
+    bool_fields = (
+        "outcome_success",
+        "outcome_failure",
+        "outcome_time_out",
+        "outcome_ever_grasped",
+        "outcome_ever_clearance_ge_5cm",
+        "outcome_ever_clearance_ge_20cm",
+        "outcome_dropped",
+        "outcome_unsafe_force",
+        "outcome_ever_unlatched_clearance_ge_5cm",
+        "outcome_ever_post_candidate_latch",
+    )
+    required = set(vector_fields) | set(long_fields) | set(float_fields) | set(
+        bool_fields
+    )
+    normalized_rows: list[Mapping[str, Any]] = []
+    seen_keys: set[tuple[int, int]] = set()
+    for row_index, row in enumerate(rows):
+        missing = sorted(required - set(row))
+        if missing:
+            raise KeyError(f"handoff row {row_index} is missing fields: {missing}")
+        key = (int(row["env_slot"]), int(row["slot_episode_index"]))
+        if key in seen_keys:
+            raise ValueError(f"duplicate handoff episode key: {key}")
+        seen_keys.add(key)
+        for name in long_fields:
+            if type(row[name]) is not int:
+                raise TypeError(
+                    f"handoff row {row_index} {name} must be a Python int"
+                )
+        for name in float_fields:
+            if type(row[name]) not in {int, float} or not math.isfinite(
+                float(row[name])
+            ):
+                raise TypeError(
+                    f"handoff row {row_index} {name} must be a finite real scalar"
+                )
+        for name in bool_fields:
+            if type(row[name]) is not bool:
+                raise TypeError(
+                    f"handoff row {row_index} {name} must be a Python bool"
+                )
+        normalized_rows.append(row)
+    normalized_rows.sort(
+        key=lambda row: (int(row["env_slot"]), int(row["slot_episode_index"]))
+    )
+
+    payload: dict[str, Any] = {
+        "kind": DIAGNOSTIC_HANDOFF_ARTIFACT_KIND,
+        "format_version": 1,
+        "metadata": {**metadata_copy, "handoff_rows": len(normalized_rows)},
+    }
+    for name, width in vector_fields.items():
+        values: list[torch.Tensor] = []
+        for row_index, row in enumerate(normalized_rows):
+            value = row[name]
+            if not isinstance(value, torch.Tensor) or value.shape != (width,):
+                shape = tuple(value.shape) if isinstance(value, torch.Tensor) else None
+                raise ValueError(
+                    f"handoff row {row_index} {name} must have shape {(width,)}, "
+                    f"got {shape}"
+                )
+            if value.dtype != torch.float32 or not bool(torch.isfinite(value).all()):
+                raise ValueError(
+                    f"handoff row {row_index} {name} must be finite torch.float32"
+                )
+            values.append(value.detach().to(device="cpu", dtype=torch.float32))
+        payload[name] = (
+            torch.stack(values).contiguous()
+            if values
+            else torch.empty((0, width), dtype=torch.float32)
+        )
+
+    for name in long_fields:
+        payload[name] = torch.tensor(
+            [int(row[name]) for row in normalized_rows], dtype=torch.long
+        )
+    for name in float_fields:
+        value = torch.tensor(
+            [float(row[name]) for row in normalized_rows], dtype=torch.float32
+        )
+        if not bool(torch.isfinite(value).all()):
+            raise ValueError(f"handoff scalar field {name} contains NaN or infinity")
+        payload[name] = value
+    for name in bool_fields:
+        payload[name] = torch.tensor(
+            [bool(row[name]) for row in normalized_rows], dtype=torch.bool
+        )
+
+    if bool((payload["handoff_step"] < 0).any()):
+        raise ValueError("captured handoff steps must be non-negative")
+    if bool((payload["slot_episode_index"] != 0).any()):
+        raise ValueError("handoff evidence allows only the first episode per env slot")
+    if "num_envs" in metadata_copy and (
+        bool((payload["env_slot"] < 0).any())
+        or bool((payload["env_slot"] >= int(metadata_copy["num_envs"])).any())
+    ):
+        raise ValueError("captured env_slot is outside the configured vector width")
+    if "requested_episodes" in metadata_copy and (
+        bool((payload["episode_index"] < 0).any())
+        or bool(
+            (
+                payload["episode_index"]
+                >= int(metadata_copy["requested_episodes"])
+            ).any()
+        )
+    ):
+        raise ValueError("captured episode_index is outside the requested episode count")
+    if bool((payload["outcome_episode_length"] <= payload["handoff_step"]).any()):
+        raise ValueError("handoff must precede the recorded terminal episode length")
+    if bool((payload["max_force_n"] < 0.0).any()):
+        raise ValueError("captured maximum force must be non-negative")
+    if bool((payload["observation"][:, FULL_TASK_GRASP_LATCH_OBSERVATION_INDEX] != 0.0).any()):
+        raise ValueError("handoff candidate observation must be physically unlatched")
+    for name in ("search_action", "flashsac_action"):
+        if bool((payload[name].abs() > 1.0 + 1.0e-6).any()):
+            raise ValueError(f"captured {name} exceeds the normalized action bounds")
+    supervisor = metadata_copy.get("supervisor")
+    if not isinstance(supervisor, Mapping):
+        raise TypeError("handoff artifact metadata requires a supervisor mapping")
+    supervisor_required = {
+        "minimum_zero_based_episode_step",
+        "pregrasp_score_threshold",
+        "minimum_proximity_quality",
+        "hold_steps",
+        "safe_force_limit_n",
+        "requires_unlatched",
+        "requires_abs_true_clearance_le_m",
+    }
+    missing_supervisor = sorted(supervisor_required - set(supervisor))
+    if missing_supervisor:
+        raise KeyError(f"handoff supervisor is missing fields: {missing_supervisor}")
+    min_step = int(supervisor["minimum_zero_based_episode_step"])
+    hold_steps = int(supervisor["hold_steps"])
+    score_threshold = float(supervisor["pregrasp_score_threshold"])
+    proximity_threshold = float(supervisor["minimum_proximity_quality"])
+    safe_force_limit_n = float(supervisor["safe_force_limit_n"])
+    clearance_limit_m = float(supervisor["requires_abs_true_clearance_le_m"])
+    if not bool(supervisor["requires_unlatched"]):
+        raise ValueError("handoff supervisor must require an unlatched state")
+    if bool((payload["handoff_step"] < min_step + hold_steps - 1).any()):
+        raise ValueError("handoff step precedes the debounced supervisor gate")
+    if bool((payload["pregrasp_score"] < score_threshold - 1.0e-6).any()):
+        raise ValueError("captured pregrasp score is below the supervisor threshold")
+    if bool((payload["proximity_quality"] < proximity_threshold - 1.0e-6).any()):
+        raise ValueError("captured proximity is below the supervisor threshold")
+    if bool((payload["max_force_n"] > safe_force_limit_n + 1.0e-5).any()):
+        raise ValueError("captured force exceeds the supervisor safety limit")
+    if bool((payload["true_clearance_m"].abs() > clearance_limit_m + 1.0e-6).any()):
+        raise ValueError("captured true mesh clearance violates the supervisor gate")
+    terminal_count = (
+        payload["outcome_success"].long()
+        + payload["outcome_failure"].long()
+        + payload["outcome_time_out"].long()
+    )
+    if not bool((terminal_count == 1).all()):
+        raise ValueError("every handoff row must have exactly one terminal outcome")
+    if bool(payload["outcome_success"].any()) and not bool(
+        payload["outcome_ever_clearance_ge_20cm"][
+            payload["outcome_success"]
+        ].all()
+    ):
+        raise ValueError("strict success requires true clearance >= 20 cm")
+    success = payload["outcome_success"]
+    if bool(success.any()) and (
+        not bool(payload["outcome_ever_grasped"][success].all())
+        or not bool(payload["outcome_ever_clearance_ge_5cm"][success].all())
+        or bool((payload["outcome_max_true_clearance_m"][success] < 0.20).any())
+        or bool(payload["outcome_dropped"][success].any())
+        or bool(payload["outcome_unsafe_force"][success].any())
+    ):
+        raise ValueError("strict success violates grasp, clearance, or safety truth")
+    ever_5cm_from_max = payload["outcome_max_true_clearance_m"] >= 0.05
+    ever_20cm_from_max = payload["outcome_max_true_clearance_m"] >= 0.20
+    if not torch.equal(
+        payload["outcome_ever_clearance_ge_5cm"], ever_5cm_from_max
+    ) or not torch.equal(
+        payload["outcome_ever_clearance_ge_20cm"], ever_20cm_from_max
+    ):
+        raise ValueError("clearance funnel flags disagree with true-clearance maxima")
+    if bool(
+        (
+            payload["outcome_ever_post_candidate_latch"]
+            & (~payload["outcome_ever_grasped"])
+        ).any()
+    ):
+        raise ValueError("post-candidate latch requires an episode grasp event")
+    return payload
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def diagnostic_handoff_source_fingerprints(repository_root: Path) -> dict[str, str]:
+    """Bind evidence to task, clearance, action-retargeting, and tool bytes."""
+
+    fingerprints: dict[str, str] = {}
+    for relative in DIAGNOSTIC_HANDOFF_SOURCE_FILES:
+        path = repository_root / relative
+        if not path.is_file() or path.is_symlink():
+            raise FileNotFoundError(
+                f"handoff evidence source must be a regular file: {path}"
+            )
+        fingerprints[relative] = _sha256(path)
+    flashsac_source_root = repository_root / "third_party/FlashSAC/flash_rl"
+    flashsac_sources = sorted(flashsac_source_root.rglob("*.py"))
+    if not flashsac_sources:
+        raise FileNotFoundError(
+            f"FlashSAC execution source tree is unavailable: {flashsac_source_root}"
+        )
+    for path in flashsac_sources:
+        if not path.is_file() or path.is_symlink():
+            raise FileNotFoundError(
+                f"FlashSAC evidence source must be a regular file: {path}"
+            )
+        relative = path.relative_to(repository_root).as_posix()
+        fingerprints[relative] = _sha256(path)
+    return fingerprints
 
 
 def _load_diagnostic_approach_actor(
@@ -2849,6 +3189,15 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
     parser.add_argument("--approach_handoff_score", type=float, default=0.30)
     parser.add_argument("--approach_handoff_min_proximity", type=float, default=0.02)
     parser.add_argument("--approach_handoff_hold_steps", type=int, default=4)
+    parser.add_argument(
+        "--approach_handoff_output",
+        type=Path,
+        default=None,
+        help=(
+            "Optional immutable .pt evidence artifact. Both routed and --approach_base_only "
+            "runs evaluate the same shadow handoff gate and save its pre-action state."
+        ),
+    )
     parser.add_argument(
         "--architecture",
         choices=("production", "smoke", "auto"),
@@ -3139,6 +3488,27 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--episodes and --num_envs must be positive")
     if args.approach_base_only and args.approach_checkpoint is None:
         raise ValueError("--approach_base_only requires --approach_checkpoint")
+    if args.approach_handoff_output is not None:
+        if args.approach_checkpoint is None:
+            raise ValueError(
+                "--approach_handoff_output requires --approach_checkpoint"
+            )
+        if args.episodes > args.num_envs:
+            raise ValueError(
+                "handoff evidence requires --episodes <= --num_envs so every env slot "
+                "contributes at most one reset trajectory"
+            )
+        if args.approach_handoff_output.is_symlink():
+            raise FileExistsError(
+                "handoff artifact output must not be a symlink, including a dangling one"
+            )
+        handoff_output = args.approach_handoff_output.resolve()
+        if handoff_output == args.output.resolve():
+            raise ValueError("handoff artifact and JSON metrics outputs must differ")
+        if handoff_output.exists() or handoff_output.is_symlink():
+            raise FileExistsError(
+                f"handoff artifact output already exists: {handoff_output}"
+            )
     if args.approach_checkpoint is not None:
         if task_mode != FULL_TASK_MODE:
             raise ValueError("--approach_checkpoint requires full-task mode")
@@ -3322,19 +3692,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(f"PickTool FlashSAC evaluation requires CUDA, got {device_string}")
 
     checkpoint = resolve_checkpoint_directory(args.checkpoint)
+    repository_root = Path(__file__).resolve().parents[2]
+    handoff_source_sha256 = (
+        diagnostic_handoff_source_fingerprints(repository_root)
+        if args.approach_handoff_output is not None
+        else None
+    )
     checkpoint_contract = read_checkpoint_task_contract(checkpoint)
     checkpoint_actor_sha256 = _sha256(checkpoint / "actor.pt")
+    checkpoint_task_contract_sha256 = _sha256(checkpoint / "task_contract.json")
     checkpoint_task_mode = str(checkpoint_contract["task_mode"])
     checkpoint_authority = checkpoint_contract.get("policy_action_authority", [])
     checkpoint_router = checkpoint_contract.get("policy_router")
     checkpoint_native_router = checkpoint_router is not None
     if (
         args.approach_checkpoint is not None
-        and not args.approach_base_only
+        and (not args.approach_base_only or args.approach_handoff_output is not None)
         and not checkpoint_native_router
     ):
         raise ValueError(
-            "diagnostic SEARCH handoff requires a checkpoint-native CLOSE/LIFT router"
+            "diagnostic SEARCH handoff evidence requires a checkpoint-native "
+            "CLOSE/LIFT router"
         )
     expected_public_latch_authority = [
         {
@@ -3660,18 +4038,50 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     approach_max_pregrasp_score = torch.zeros(
         args.num_envs, dtype=torch.float32, device=env.device
     )
+    approach_handoff_observation = torch.full(
+        (args.num_envs, OBSERVATION_DIM),
+        float("nan"),
+        dtype=torch.float32,
+        device=env.device,
+    )
+    approach_handoff_search_action = torch.full(
+        (args.num_envs, ACTION_DIM),
+        float("nan"),
+        dtype=torch.float32,
+        device=env.device,
+    )
+    approach_handoff_flashsac_action = torch.full_like(
+        approach_handoff_search_action, float("nan")
+    )
+    approach_handoff_pregrasp_score = torch.full(
+        (args.num_envs,), float("nan"), dtype=torch.float32, device=env.device
+    )
+    approach_handoff_proximity_quality = torch.full_like(
+        approach_handoff_pregrasp_score, float("nan")
+    )
+    approach_handoff_max_force_n = torch.full_like(
+        approach_handoff_pregrasp_score, float("nan")
+    )
+    approach_handoff_true_clearance_m = torch.full_like(
+        approach_handoff_pregrasp_score, float("nan")
+    )
+    approach_handoff_rows: list[dict[str, Any]] = []
     hierarchy_approach_rows = torch.zeros((), dtype=torch.long, device=env.device)
     hierarchy_flashsac_rows = torch.zeros((), dtype=torch.long, device=env.device)
 
     try:
         while not tracker.complete and vector_steps < max_vector_steps:
             vector_steps += 1
+            new_handoff = torch.zeros(
+                args.num_envs, dtype=torch.bool, device=env.device
+            )
             if approach_actor is not None:
                 (
                     pregrasp_score,
                     proximity_quality,
                     max_force_n,
                     physical_latch,
+                    true_clearance_m,
                 ) = _diagnostic_pregrasp_measurements(env.unwrapped)
                 observed_latch = (
                     observation[:, FULL_TASK_GRASP_LATCH_OBSERVATION_INDEX] == 1.0
@@ -3689,30 +4099,48 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         approach_max_pregrasp_score,
                     )
                 )
+                handoff = update_diagnostic_approach_handoff(
+                    # In base-only mode this is a shadow gate: it captures the
+                    # same candidate state but never changes the executed actor.
+                    approach_active=tracker.active & (~approach_handoff_seen),
+                    ready_steps=approach_ready_steps,
+                    episode_step=approach_episode_step,
+                    pregrasp_score=pregrasp_score,
+                    proximity_quality=proximity_quality,
+                    max_force_n=max_force_n,
+                    grasp_latch=physical_latch,
+                    min_step=args.approach_handoff_min_step,
+                    score_threshold=args.approach_handoff_score,
+                    proximity_threshold=args.approach_handoff_min_proximity,
+                    safe_force_limit_n=close_option_safe_force_limit,
+                    hold_steps=args.approach_handoff_hold_steps,
+                )
+                new_handoff = tracker.active & handoff.enter_close
+                approach_handoff_seen |= new_handoff
+                approach_handoff_step = torch.where(
+                    new_handoff,
+                    approach_episode_step,
+                    approach_handoff_step,
+                )
+                approach_ready_steps = handoff.ready_steps
                 if not args.approach_base_only:
-                    handoff = update_diagnostic_approach_handoff(
-                        approach_active=approach_active,
-                        ready_steps=approach_ready_steps,
-                        episode_step=approach_episode_step,
-                        pregrasp_score=pregrasp_score,
-                        proximity_quality=proximity_quality,
-                        max_force_n=max_force_n,
-                        grasp_latch=physical_latch,
-                        min_step=args.approach_handoff_min_step,
-                        score_threshold=args.approach_handoff_score,
-                        proximity_threshold=args.approach_handoff_min_proximity,
-                        safe_force_limit_n=close_option_safe_force_limit,
-                        hold_steps=args.approach_handoff_hold_steps,
-                    )
-                    new_handoff = tracker.active & handoff.enter_close
-                    approach_handoff_seen |= new_handoff
-                    approach_handoff_step = torch.where(
-                        new_handoff,
-                        approach_episode_step,
-                        approach_handoff_step,
-                    )
                     approach_active = handoff.approach_active
-                    approach_ready_steps = handoff.ready_steps
+                if bool(new_handoff.any()):
+                    approach_handoff_observation[new_handoff] = observation[
+                        new_handoff, :OBSERVATION_DIM
+                    ]
+                    approach_handoff_pregrasp_score[new_handoff] = pregrasp_score[
+                        new_handoff
+                    ]
+                    approach_handoff_proximity_quality[new_handoff] = (
+                        proximity_quality[new_handoff]
+                    )
+                    approach_handoff_max_force_n[new_handoff] = max_force_n[
+                        new_handoff
+                    ]
+                    approach_handoff_true_clearance_m[new_handoff] = (
+                        true_clearance_m[new_handoff]
+                    )
                 approach_ever_post_handoff_latch |= (
                     tracker.active & approach_handoff_seen & physical_latch
                 )
@@ -3734,6 +4162,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     training=False,
                 )
             if approach_actor is not None:
+                flashsac_candidate_action = action
                 with torch.no_grad():
                     approach_action = approach_actor(observation[:, :OBSERVATION_DIM])
                 if approach_action.shape != action.shape:
@@ -3743,8 +4172,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 if not bool(torch.isfinite(approach_action).all()):
                     raise FloatingPointError("approach actor produced a non-finite action")
                 approach_action = approach_action.clamp(-1.0, 1.0)
-                action = torch.where(
-                    approach_active.unsqueeze(-1), approach_action, action
+                if bool(new_handoff.any()):
+                    approach_handoff_search_action[new_handoff] = approach_action[
+                        new_handoff
+                    ]
+                    approach_handoff_flashsac_action[new_handoff] = (
+                        flashsac_candidate_action[new_handoff]
+                    )
+                action = select_diagnostic_approach_action(
+                    search_action=approach_action,
+                    flashsac_action=action,
+                    approach_active=approach_active,
                 )
                 hierarchy_approach_rows.add_(
                     (tracker.active & approach_active).sum()
@@ -3812,6 +4250,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     int(env_id): {
                         "hierarchy_handoff": bool(
                             approach_handoff_seen[env_id].item()
+                            and not args.approach_base_only
+                        ),
+                        "hierarchy_handoff_candidate": bool(
+                            approach_handoff_seen[env_id].item()
                         ),
                         "hierarchy_handoff_step": int(
                             approach_handoff_step[env_id].item()
@@ -3851,6 +4293,91 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 for record in new_records:
                     env_id = int(record["env_slot"])
                     record.update(done_hierarchy[env_id])
+                    if bool(record["hierarchy_handoff_candidate"]):
+                        snapshot_finite = {
+                            "observation": bool(
+                                torch.isfinite(
+                                    approach_handoff_observation[env_id]
+                                ).all()
+                            ),
+                            "search_action": bool(
+                                torch.isfinite(
+                                    approach_handoff_search_action[env_id]
+                                ).all()
+                            ),
+                            "flashsac_action": bool(
+                                torch.isfinite(
+                                    approach_handoff_flashsac_action[env_id]
+                                ).all()
+                            ),
+                        }
+                        if not all(snapshot_finite.values()):
+                            raise RuntimeError(
+                                "handoff candidate terminated without a complete pre-action "
+                                f"snapshot: env_slot={env_id}, finite={snapshot_finite}"
+                            )
+                        approach_handoff_rows.append(
+                            {
+                                "observation": approach_handoff_observation[
+                                    env_id
+                                ].detach().cpu().clone(),
+                                "search_action": approach_handoff_search_action[
+                                    env_id
+                                ].detach().cpu().clone(),
+                                "flashsac_action": (
+                                    approach_handoff_flashsac_action[env_id]
+                                    .detach()
+                                    .cpu()
+                                    .clone()
+                                ),
+                                "env_slot": env_id,
+                                "slot_episode_index": int(
+                                    record["slot_episode_index"]
+                                ),
+                                "episode_index": int(record["episode_index"]),
+                                "handoff_step": int(
+                                    record["hierarchy_handoff_step"]
+                                ),
+                                "pregrasp_score": float(
+                                    approach_handoff_pregrasp_score[env_id].item()
+                                ),
+                                "proximity_quality": float(
+                                    approach_handoff_proximity_quality[env_id].item()
+                                ),
+                                "max_force_n": float(
+                                    approach_handoff_max_force_n[env_id].item()
+                                ),
+                                "true_clearance_m": float(
+                                    approach_handoff_true_clearance_m[env_id].item()
+                                ),
+                                "outcome_episode_length": int(record["length"]),
+                                "outcome_max_true_clearance_m": float(
+                                    record["max_true_clearance_m"]
+                                ),
+                                "outcome_success": bool(record["success"]),
+                                "outcome_failure": bool(record["failure"]),
+                                "outcome_time_out": bool(record["time_out"]),
+                                "outcome_ever_grasped": bool(
+                                    record["ever_grasped"]
+                                ),
+                                "outcome_ever_clearance_ge_5cm": bool(
+                                    record["ever_clearance_ge_5cm"]
+                                ),
+                                "outcome_ever_clearance_ge_20cm": bool(
+                                    record["ever_clearance_ge_20cm"]
+                                ),
+                                "outcome_dropped": bool(record["dropped"]),
+                                "outcome_unsafe_force": bool(
+                                    record["unsafe_force"]
+                                ),
+                                "outcome_ever_unlatched_clearance_ge_5cm": bool(
+                                    record["ever_unlatched_clearance_ge_5cm"]
+                                ),
+                                "outcome_ever_post_candidate_latch": bool(
+                                    record["hierarchy_ever_post_handoff_latch"]
+                                ),
+                            }
+                        )
 
                 next_step = approach_episode_step + active_before_step.long()
                 approach_episode_step = torch.where(
@@ -3871,6 +4398,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     accepted_done, False
                 )
                 approach_max_pregrasp_score.masked_fill_(accepted_done, 0.0)
+                for buffer in (
+                    approach_handoff_observation,
+                    approach_handoff_search_action,
+                    approach_handoff_flashsac_action,
+                ):
+                    buffer[accepted_done] = float("nan")
+                for buffer in (
+                    approach_handoff_pregrasp_score,
+                    approach_handoff_proximity_quality,
+                    approach_handoff_max_force_n,
+                    approach_handoff_true_clearance_m,
+                ):
+                    buffer.masked_fill_(accepted_done, float("nan"))
             observation = next_observation
 
         if not tracker.complete:
@@ -3923,6 +4463,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         metrics["checkpoint_policy_contract"] = source_policy_contract
         metrics["checkpoint_actor_sha256"] = checkpoint_actor_sha256
+        metrics["checkpoint_task_contract_sha256"] = (
+            checkpoint_task_contract_sha256
+        )
         metrics["flashsac_fork_commit"] = FLASH_SAC_FORK_COMMIT
         metrics["actor_action_projection_indices"] = (
             list(source_action_indices) if source_action_indices is not None else None
@@ -4062,6 +4605,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "approach checkpoint changed during strict evaluation; refusing metrics"
                 )
             hierarchy_records = tracker.records
+            candidate_records = [
+                record
+                for record in hierarchy_records
+                if bool(record["hierarchy_handoff_candidate"])
+            ]
             handoff_records = [
                 record
                 for record in hierarchy_records
@@ -4124,10 +4672,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "approach_action_sampling": "deterministic_rl_games_mean",
                 "approach_rows": int(hierarchy_approach_rows.item()),
                 "flashsac_rows": int(hierarchy_flashsac_rows.item()),
+                "shadow_gate_evaluated": True,
+                "candidate_count": len(candidate_records),
                 "handoff_count": len(handoff_records),
                 "post_handoff_latch_count": sum(
                     bool(record["hierarchy_ever_post_handoff_latch"])
                     for record in handoff_records
+                ),
+                "post_candidate_latch_count": sum(
+                    bool(record["hierarchy_ever_post_handoff_latch"])
+                    for record in candidate_records
+                ),
+                "candidate_step": (
+                    summarize(
+                        [
+                            int(record["hierarchy_handoff_step"])
+                            for record in candidate_records
+                        ]
+                    )
+                    if candidate_records
+                    else None
                 ),
                 "handoff_step": (
                     summarize(
@@ -4147,6 +4711,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 ),
                 "base_only_outcomes": hierarchy_cohort(base_only_records),
                 "assisted_outcomes": hierarchy_cohort(handoff_records),
+                "candidate_outcomes": hierarchy_cohort(candidate_records),
                 "supervisor": {
                     "minimum_zero_based_episode_step": (
                         args.approach_handoff_min_step
@@ -4167,6 +4732,92 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 else "diagnostic_frozen_rlgames_search_then_"
                 "checkpoint_native_flashsac_close_lift"
             )
+            if args.approach_handoff_output is not None:
+                if len(approach_handoff_rows) != len(candidate_records):
+                    raise RuntimeError(
+                        "handoff artifact rows disagree with shadow-gate candidate records"
+                    )
+                if (
+                    _sha256(checkpoint / "actor.pt") != checkpoint_actor_sha256
+                    or _sha256(checkpoint / "task_contract.json")
+                    != checkpoint_task_contract_sha256
+                ):
+                    raise RuntimeError(
+                        "FlashSAC checkpoint changed during handoff evidence collection"
+                    )
+                assert handoff_source_sha256 is not None
+                if (
+                    diagnostic_handoff_source_fingerprints(repository_root)
+                    != handoff_source_sha256
+                ):
+                    raise RuntimeError(
+                        "task, evaluator, retargeter, or tool bytes changed during "
+                        "handoff evidence collection"
+                    )
+                handoff_output = args.approach_handoff_output.resolve()
+                handoff_artifact = build_diagnostic_handoff_artifact(
+                    approach_handoff_rows,
+                    metadata={
+                        "treatment": (
+                            "continue_search"
+                            if args.approach_base_only
+                            else "handoff_to_flashsac"
+                        ),
+                        "task_mode": FULL_TASK_MODE,
+                        "observation_contract": STANDARD_OBSERVATION_CONTRACT,
+                        "observation_dim": OBSERVATION_DIM,
+                        "action_dim": ACTION_DIM,
+                        "seed": int(args.seed),
+                        "requested_episodes": int(args.episodes),
+                        "num_envs": int(args.num_envs),
+                        "episode_length_s": float(env.unwrapped.cfg.episode_length_s),
+                        "max_episode_steps": int(env.max_episode_steps),
+                        "deterministic_policy_actions": True,
+                        "approach_checkpoint": str(approach_checkpoint),
+                        "approach_checkpoint_sha256": approach_checkpoint_sha256,
+                        "flashsac_checkpoint": str(checkpoint),
+                        "flashsac_actor_sha256": checkpoint_actor_sha256,
+                        "flashsac_task_contract_sha256": (
+                            checkpoint_task_contract_sha256
+                        ),
+                        "flashsac_fork_commit": FLASH_SAC_FORK_COMMIT,
+                        "flashsac_upstream_commit": FLASH_SAC_COMMIT,
+                        "source_sha256": handoff_source_sha256,
+                        "hierarchy_metrics_output": str(args.output.resolve()),
+                        "supervisor": metrics[
+                            "diagnostic_approach_hierarchy"
+                        ]["supervisor"],
+                        "selector_eligible_fields": [
+                            "observation",
+                            "search_action",
+                            "flashsac_action",
+                        ],
+                        "audit_only_private_fields": [
+                            "handoff_step",
+                            "pregrasp_score",
+                            "proximity_quality",
+                            "max_force_n",
+                            "true_clearance_m",
+                        ],
+                        "outcome_semantics": (
+                            "reset-before terminal truth; strict success requires the "
+                            "real convex-mesh minimum clearance to reach 0.20 m"
+                        ),
+                        "pairing_limitation": (
+                            "independent Isaac GPU rollouts are noisy paired outcomes, "
+                            "not an exact simulator-state fork; a merger must audit the "
+                            "two candidate observations before labeling advantage"
+                        ),
+                    },
+                )
+                _atomic_torch_save(handoff_output, handoff_artifact)
+                metrics["diagnostic_approach_hierarchy"]["handoff_artifact"] = {
+                    "path": str(handoff_output),
+                    "sha256": _sha256(handoff_output),
+                    "kind": DIAGNOSTIC_HANDOFF_ARTIFACT_KIND,
+                    "rows": len(approach_handoff_rows),
+                    "treatment": handoff_artifact["metadata"]["treatment"],
+                }
         _atomic_write_json(args.output.resolve(), metrics)
         return metrics
     finally:
