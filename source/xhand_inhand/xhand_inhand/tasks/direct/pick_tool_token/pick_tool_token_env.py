@@ -1351,9 +1351,34 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             self._close_option_unlatched_lift_total.add_(self._close_option_unlatched_lift.sum())
             self._close_option_horizontal_escape_total.add_(self._close_option_horizontal_escape.sum())
             self._close_option_lost_window_total.add_(self._close_option_lost_window.sum())
+            # Clone terminal truth before DirectRLEnv auto-resets the selected environments.  Off-policy
+            # collectors otherwise see only the reset observation and cannot distinguish a strict close
+            # success from an unsafe/drop termination.  These tensors are diagnostics only; they do not
+            # alter reset or reward semantics.
+            self.extras["pick_tool_terminal"] = {
+                "success": self._close_option_success.clone(),
+                "failure": self._close_option_failure.clone(),
+                "time_out": time_out.clone(),
+                "dropped": dropped.clone(),
+                "unsafe_force": unsafe_force.clone(),
+                "unlatched_clearance_ge_5cm": (
+                    (clearance >= 0.05) & (~self._is_grasped)
+                ).clone(),
+            }
             return terminated, time_out
 
-        return dropped | unsafe_force | self._is_success, time_out
+        terminated = dropped | unsafe_force | self._is_success
+        self.extras["pick_tool_terminal"] = {
+            "success": self._is_success.clone(),
+            "failure": (dropped | unsafe_force).clone(),
+            "time_out": time_out.clone(),
+            "dropped": dropped.clone(),
+            "unsafe_force": unsafe_force.clone(),
+            "unlatched_clearance_ge_5cm": (
+                (clearance >= 0.05) & (~self._is_grasped)
+            ).clone(),
+        }
+        return terminated, time_out
 
     # ------------------------------------------------------------------ reset
     def _reset_idx(self, env_ids: Sequence[int] | None):
