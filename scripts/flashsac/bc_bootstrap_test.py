@@ -16,9 +16,11 @@ from bc_bootstrap import (
     ACTION_LAYOUT,
     BCArchitecture,
     BCTrainConfig,
+    COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM,
     OBSERVATION_DIM,
     PICK_TOOL_NOISE_GROUPS,
     _checkpoint_agent_config,
+    _write_bootstrap_task_contract,
     evaluate_actor,
     export_bridge_checkpoint,
     load_demonstrations,
@@ -50,6 +52,114 @@ def _synthetic_dataset(path: Path, *, episodes: int = 6, steps: int = 16) -> Non
             "episode_offsets": offsets,
             "episode_success": torch.ones(episodes, dtype=torch.bool),
             "meta": {"action_layout": ACTION_LAYOUT},
+        },
+        path,
+    )
+
+
+def _synthetic_coupled_dataset(path: Path, *, episodes: int = 4, steps: int = 18) -> None:
+    observation_dim = COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM
+    if steps < 18:
+        raise ValueError("synthetic coupled episodes need at least 18 steps")
+    generator = torch.Generator().manual_seed(321)
+    rows = episodes * steps
+    observation = torch.randn(rows, observation_dim, generator=generator)
+    phase = torch.tensor([0, 0, 1] + [2] * (steps - 3), dtype=torch.uint8).repeat(
+        episodes
+    )
+    observation[:, 129] = (phase == 0).float()
+    observation[:, 106] = (phase == 2).float()
+    action = torch.tanh(torch.randn(rows, ACTION_DIM, generator=generator) * 0.2)
+    action[phase == 0, 7:] = 0.0
+    action[(phase == 1) | (phase == 2), :7] = 0.0
+    offsets = torch.arange(0, rows + 1, steps, dtype=torch.long)
+    torch.save(
+        {
+            "obs": observation,
+            "action": action,
+            "phase": phase,
+            "episode_id": torch.arange(episodes).repeat_interleave(steps),
+            "episode_offsets": offsets,
+            "episode_success": torch.ones(episodes, dtype=torch.bool),
+            "episode_native_success": torch.ones(episodes, dtype=torch.bool),
+            "episode_native_failure": torch.zeros(episodes, dtype=torch.bool),
+            "episode_native_timeout": torch.zeros(episodes, dtype=torch.bool),
+            "episode_conservative_teacher_pass": torch.ones(
+                episodes, dtype=torch.bool
+            ),
+            "episode_terminal_stable_steps": torch.full(
+                (episodes,), 15, dtype=torch.int64
+            ),
+            "episode_terminal_power_is_grasped": torch.ones(
+                episodes, dtype=torch.bool
+            ),
+            "episode_terminal_thumb_contact": torch.ones(
+                episodes, dtype=torch.bool
+            ),
+            "episode_terminal_legal_other_contact_count": torch.full(
+                (episodes,), 3, dtype=torch.int64
+            ),
+            "episode_terminal_power_grasp_quality": torch.full(
+                (episodes,), 0.35, dtype=torch.float32
+            ),
+            "episode_terminal_hold_quality": torch.full(
+                (episodes,), 0.5, dtype=torch.float32
+            ),
+            "episode_terminal_max_force": torch.full(
+                (episodes,), 30.0, dtype=torch.float32
+            ),
+            "episode_trajectory_max_force": torch.full(
+                (episodes,), 30.0, dtype=torch.float32
+            ),
+            "episode_trajectory_max_xy_drift": torch.full(
+                (episodes,), 0.03, dtype=torch.float32
+            ),
+            "episode_trajectory_max_rotation_drift": torch.full(
+                (episodes,), 0.35, dtype=torch.float32
+            ),
+            "episode_trajectory_max_true_clearance": torch.full(
+                (episodes,), 0.015, dtype=torch.float32
+            ),
+            "episode_arm_target_saturated": torch.zeros(
+                episodes, dtype=torch.bool
+            ),
+            "episode_terminal_align_active": torch.zeros(
+                episodes, dtype=torch.bool
+            ),
+            "meta": {
+                "format_version": 1,
+                "task_mode": "coupled_power_align_close_option_v1",
+                "observation_dim": observation_dim,
+                "observation_contract": (
+                    "pick_tool_coupled_power_align_close_state131_v1"
+                ),
+                "observation_layout": (
+                    "legacy_prefix87|distal_action5|grasp_transport23|coupled_state16"
+                ),
+                "action_dim": ACTION_DIM,
+                "action_layout": ACTION_LAYOUT,
+                "action_projection": "identity_v1",
+                "action_semantics": (
+                    "canonical_policy_action_before_phase_shield_v1"
+                ),
+                "collector": "successful_coupled_power_align_close_teacher",
+                "dataset_phase": "align_close_hold",
+                "phase_names": ["align", "close_unlatched", "hold_latched"],
+                "teacher_probability": 1.0,
+                "executed_teacher_fraction": 1.0,
+                "align_hand_action_abs_max": 0.0,
+                "close_arm_action_abs_max": 0.0,
+                "first_observation_last_action_max_error": 0.0,
+                "terminal_observation": "not_saved_auto_reset_excluded_v1",
+                "trajectory_acceptance": (
+                    "native_success_and_conservative_teacher_audit_v1"
+                ),
+                "clearance_authority": (
+                    "true_mesh_convex_hull_min_z_minus_table_v1"
+                ),
+                "teacher_artifact_sha256": "a" * 64,
+                "curriculum_dataset_sha256": "b" * 64,
+            },
         },
         path,
     )
@@ -112,6 +222,98 @@ def test_loader_rejects_non_markov_or_failed_data() -> None:
             assert "failed episodes" in str(exc)
         else:
             raise AssertionError("failed demonstration episode was accepted")
+
+
+def test_coupled_131d_loader_and_actor_are_parameterized_and_strict() -> None:
+    observation_dim = COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "coupled.pt"
+        _synthetic_coupled_dataset(path)
+        data = load_demonstrations([path], observation_dim=observation_dim)
+        assert data.observation.shape == (72, observation_dim)
+        assert data.observation_dim == observation_dim
+        assert data.sources[0].source_contract == (
+            "successful_coupled_power_align_close_teacher_v1"
+        )
+
+        split = split_by_episode(data, 0.25, seed=5)
+        config = BCTrainConfig(
+            epochs=3,
+            batch_size=12,
+            learning_rate=1.0e-3,
+            validation_fraction=0.25,
+            use_amp=False,
+            seed=5,
+        )
+        state, metrics = train_actor(
+            data,
+            split,
+            config,
+            _small_architecture(),
+            "cpu",
+        )
+        actor = FlashSACActor(0, observation_dim, 32, ACTION_DIM)
+        actor.load_state_dict(state)
+        mean, _ = actor.get_mean_and_std(data.observation[:2], training=False)
+        assert mean.shape == (2, ACTION_DIM)
+        assert set(metrics["sampling"]["source_phase_counts"]) == {"0", "1", "2"}
+
+        contradictory = torch.load(path, weights_only=True)
+        contradictory["action"][contradictory["phase"] == 0, 7] = 0.2
+        contradictory_path = Path(directory) / "contradictory.pt"
+        torch.save(contradictory, contradictory_path)
+        try:
+            load_demonstrations(
+                [contradictory_path],
+                observation_dim=observation_dim,
+            )
+        except ValueError as exc:
+            assert "exact zero action slice" in str(exc)
+        else:
+            raise AssertionError("contradictory coupled canonical actions were accepted")
+
+        bad_metadata = torch.load(path, weights_only=True)
+        bad_metadata["meta"]["teacher_artifact_sha256"] = "bad"
+        bad_metadata_path = Path(directory) / "bad_metadata.pt"
+        torch.save(bad_metadata, bad_metadata_path)
+        try:
+            load_demonstrations(
+                [bad_metadata_path],
+                observation_dim=observation_dim,
+            )
+        except ValueError as exc:
+            assert "SHA256" in str(exc)
+        else:
+            raise AssertionError("coupled dataset with invalid lineage SHA was accepted")
+
+        failed_teacher_audit = torch.load(path, weights_only=True)
+        failed_teacher_audit["episode_conservative_teacher_pass"][0] = False
+        failed_teacher_path = Path(directory) / "failed_teacher_audit.pt"
+        torch.save(failed_teacher_audit, failed_teacher_path)
+        try:
+            load_demonstrations(
+                [failed_teacher_path],
+                observation_dim=observation_dim,
+            )
+        except ValueError as exc:
+            assert "episode_conservative_teacher_pass" in str(exc)
+        else:
+            raise AssertionError("failed coupled teacher audit was accepted by BC")
+
+        other_curriculum_path = Path(directory) / "other_curriculum.pt"
+        _synthetic_coupled_dataset(other_curriculum_path)
+        other_curriculum = torch.load(other_curriculum_path, weights_only=True)
+        other_curriculum["meta"]["curriculum_dataset_sha256"] = "c" * 64
+        torch.save(other_curriculum, other_curriculum_path)
+        try:
+            load_demonstrations(
+                [path, other_curriculum_path],
+                observation_dim=observation_dim,
+            )
+        except ValueError as exc:
+            assert "must share one curriculum_dataset_sha256" in str(exc)
+        else:
+            raise AssertionError("mixed coupled curriculum lineages were accepted by BC")
 
 
 def test_safe_atanh_matches_flashsac_action_semantics() -> None:
@@ -241,6 +443,44 @@ def test_export_is_a_fresh_bridge_loadable_checkpoint() -> None:
         assert restored._update_step == 0  # noqa: SLF001
 
 
+def test_coupled_export_has_131d_actor_and_auditable_task_contract() -> None:
+    observation_dim = COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM
+    architecture = _small_architecture()
+    actor = FlashSACActor(0, observation_dim, 32, ACTION_DIM)
+    actor_state = {name: value.detach().clone() for name, value in actor.state_dict().items()}
+    with tempfile.TemporaryDirectory() as directory:
+        checkpoint = Path(directory) / "coupled_checkpoint"
+        exported = export_bridge_checkpoint(
+            actor_state,
+            checkpoint,
+            architecture=architecture,
+            device="cpu",
+            seed=12,
+            normalize_reward=False,
+            observation_dim=observation_dim,
+        )
+        action = exported.sample_actions(
+            0,
+            {"next_observation": torch.randn(3, observation_dim)},
+            training=False,
+        )
+        assert action.shape == (3, ACTION_DIM)
+
+        _write_bootstrap_task_contract(checkpoint, observation_dim)
+        assert json.loads((checkpoint / "task_contract.json").read_text()) == {
+            "version": 3,
+            "task_mode": "coupled_power_align_close_option_v1",
+            "replay_n_step": 3,
+            "replay_gamma": 0.99,
+            "observation_dim": observation_dim,
+            "observation_contract": "pick_tool_coupled_power_align_close_state131_v1",
+            "policy_action_dim": ACTION_DIM,
+            "policy_action_layout": ACTION_LAYOUT,
+            "environment_action_dim": ACTION_DIM,
+            "action_projection": "identity_v1",
+        }
+
+
 def test_metadata_contract_is_strict_json() -> None:
     # Exercise the metadata claims independently of the CUDA-only CLI path.
     claim = {
@@ -256,10 +496,12 @@ def main() -> None:
     tests = (
         test_loader_and_episode_split,
         test_loader_rejects_non_markov_or_failed_data,
+        test_coupled_131d_loader_and_actor_are_parameterized_and_strict,
         test_safe_atanh_matches_flashsac_action_semantics,
         test_phase_balanced_sampling_equalizes_every_epoch,
         test_bc_uses_demo_actions_and_reduces_holdout_error,
         test_export_is_a_fresh_bridge_loadable_checkpoint,
+        test_coupled_export_has_131d_actor_and_auditable_task_contract,
         test_metadata_contract_is_strict_json,
     )
     for test in tests:

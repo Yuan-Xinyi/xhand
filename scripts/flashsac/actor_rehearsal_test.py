@@ -19,6 +19,7 @@ from actor_rehearsal import (  # noqa: E402
     ACTOR_REHEARSAL_KEYS,
     PICK_TOOL_ACTOR_DEMO_CONTRACTS,
     PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS,
+    PICK_TOOL_COUPLED_POWER_ACTOR_DEMO_CONTRACTS,
     PICK_TOOL_LIFT_ACTOR_DEMO_CONTRACTS,
     ActorRehearsalReservoir,
     load_actor_rehearsal,
@@ -158,6 +159,93 @@ def _pick_tool_actor_payload(*, close: bool, production_close: bool = False) -> 
     return payload
 
 
+def _coupled_power_actor_payload() -> dict[str, Any]:
+    episodes = 2
+    episode_steps = 18
+    per_episode_phase = torch.tensor([0, 0, 1] + [2] * 15, dtype=torch.uint8)
+    phase = per_episode_phase.repeat(episodes)
+    rows = episodes * episode_steps
+    observation = torch.randn(
+        rows, 131, generator=torch.Generator().manual_seed(9)
+    )
+    observation[:, 129] = (phase == 0).float()
+    observation[:, 106] = (phase == 2).float()
+    action = torch.linspace(-0.7, 0.7, rows * 21).reshape(rows, 21)
+    action[phase == 0, 7:] = 0.0
+    action[(phase == 1) | (phase == 2), :7] = 0.0
+    return {
+        "obs": observation,
+        "action": action,
+        "phase": phase,
+        "episode_id": torch.arange(episodes).repeat_interleave(episode_steps),
+        "episode_offsets": torch.tensor([0, 18, 36], dtype=torch.int64),
+        "episode_success": torch.ones(2, dtype=torch.bool),
+        "episode_native_success": torch.ones(2, dtype=torch.bool),
+        "episode_native_failure": torch.zeros(2, dtype=torch.bool),
+        "episode_native_timeout": torch.zeros(2, dtype=torch.bool),
+        "episode_conservative_teacher_pass": torch.ones(2, dtype=torch.bool),
+        "episode_terminal_stable_steps": torch.full((2,), 15, dtype=torch.int64),
+        "episode_terminal_power_is_grasped": torch.ones(2, dtype=torch.bool),
+        "episode_terminal_thumb_contact": torch.ones(2, dtype=torch.bool),
+        "episode_terminal_legal_other_contact_count": torch.tensor(
+            [3, 4], dtype=torch.int64
+        ),
+        "episode_terminal_power_grasp_quality": torch.tensor(
+            [0.35, 0.6], dtype=torch.float32
+        ),
+        "episode_terminal_hold_quality": torch.tensor(
+            [0.5, 0.8], dtype=torch.float32
+        ),
+        "episode_terminal_max_force": torch.tensor(
+            [20.0, 30.0], dtype=torch.float32
+        ),
+        "episode_trajectory_max_force": torch.tensor(
+            [25.0, 30.0], dtype=torch.float32
+        ),
+        "episode_trajectory_max_xy_drift": torch.tensor(
+            [0.02, 0.03], dtype=torch.float32
+        ),
+        "episode_trajectory_max_rotation_drift": torch.tensor(
+            [0.2, 0.35], dtype=torch.float32
+        ),
+        "episode_trajectory_max_true_clearance": torch.tensor(
+            [0.01, 0.015], dtype=torch.float32
+        ),
+        "episode_arm_target_saturated": torch.zeros(2, dtype=torch.bool),
+        "episode_terminal_align_active": torch.zeros(2, dtype=torch.bool),
+        "meta": {
+            "format_version": 1,
+            "task_mode": "coupled_power_align_close_option_v1",
+            "observation_dim": 131,
+            "observation_contract": "pick_tool_coupled_power_align_close_state131_v1",
+            "observation_layout": (
+                "legacy_prefix87|distal_action5|grasp_transport23|coupled_state16"
+            ),
+            "action_dim": 21,
+            "action_layout": "arm_delta7|crossdex_token9|distal_residual5",
+            "action_projection": "identity_v1",
+            "action_semantics": "canonical_policy_action_before_phase_shield_v1",
+            "collector": "successful_coupled_power_align_close_teacher",
+            "dataset_phase": "align_close_hold",
+            "phase_names": ["align", "close_unlatched", "hold_latched"],
+            "teacher_probability": 1.0,
+            "executed_teacher_fraction": 1.0,
+            "align_hand_action_abs_max": 0.0,
+            "close_arm_action_abs_max": 0.0,
+            "first_observation_last_action_max_error": 0.0,
+            "terminal_observation": "not_saved_auto_reset_excluded_v1",
+            "trajectory_acceptance": (
+                "native_success_and_conservative_teacher_audit_v1"
+            ),
+            "clearance_authority": (
+                "true_mesh_convex_hull_min_z_minus_table_v1"
+            ),
+            "teacher_artifact_sha256": "a" * 64,
+            "curriculum_dataset_sha256": "b" * 64,
+        },
+    }
+
+
 def test_pick_tool_actor_demo_allowlist_and_phase_contracts() -> None:
     with tempfile.TemporaryDirectory(prefix="actor_rehearsal_allowlist_") as directory:
         root = Path(directory)
@@ -250,6 +338,223 @@ def test_pick_tool_actor_demo_allowlist_and_phase_contracts() -> None:
             action_dim=ACTION_DIM,
             allowed_contracts=PICK_TOOL_ACTOR_DEMO_CONTRACTS,
         )
+
+
+def test_coupled_power_multiphase_contract_and_canonical_actions() -> None:
+    with tempfile.TemporaryDirectory(prefix="coupled_actor_rehearsal_") as directory:
+        root = Path(directory)
+        valid = root / "valid.pt"
+        source = _write_payload(valid, _coupled_power_actor_payload())
+        batch, phase, audit = load_actor_rehearsal(
+            valid,
+            device="cpu",
+            observation_dim=131,
+            action_dim=21,
+            allowed_contracts=PICK_TOOL_COUPLED_POWER_ACTOR_DEMO_CONTRACTS,
+        )
+        assert batch["observation"].shape == (36, 131)
+        assert phase is not None and set(phase.tolist()) == {0, 1, 2}
+        assert audit["source_contract"] == (
+            "successful_coupled_power_align_close_teacher_v1"
+        )
+        assert audit["teacher_artifact_sha256"] == "a" * 64
+        assert audit["curriculum_dataset_sha256"] == "b" * 64
+
+        early_latch = _coupled_power_actor_payload()
+        early_latch["phase"][early_latch["phase"] == 1] = 2
+        early_latch["obs"][:, 106] = (early_latch["phase"] == 2).float()
+        early_latch_path = root / "early_latch.pt"
+        _write_payload(early_latch_path, early_latch)
+        _, early_phase, _ = load_actor_rehearsal(
+            early_latch_path,
+            device="cpu",
+            observation_dim=131,
+            action_dim=21,
+            allowed_contracts=PICK_TOOL_COUPLED_POWER_ACTOR_DEMO_CONTRACTS,
+        )
+        assert early_phase is not None and set(early_phase.tolist()) == {0, 2}
+
+        missing_phase = _coupled_power_actor_payload()
+        missing_phase["phase"][missing_phase["phase"] == 2] = 1
+        missing_phase_path = root / "missing_phase.pt"
+        _write_payload(missing_phase_path, missing_phase)
+        _expect_error(
+            ValueError,
+            load_actor_rehearsal,
+            missing_phase_path,
+            device="cpu",
+            observation_dim=131,
+            action_dim=21,
+            allowed_contracts=PICK_TOOL_COUPLED_POWER_ACTOR_DEMO_CONTRACTS,
+        )
+
+        bad_hash = _coupled_power_actor_payload()
+        bad_hash["meta"]["teacher_artifact_sha256"] = "not-a-sha"
+        bad_hash_path = root / "bad_hash.pt"
+        _write_payload(bad_hash_path, bad_hash)
+        _expect_error(
+            ValueError,
+            load_actor_rehearsal,
+            bad_hash_path,
+            device="cpu",
+            observation_dim=131,
+            action_dim=21,
+            allowed_contracts=PICK_TOOL_COUPLED_POWER_ACTOR_DEMO_CONTRACTS,
+        )
+
+        wrong_numeric_type = _coupled_power_actor_payload()
+        wrong_numeric_type["meta"]["teacher_probability"] = 1
+        wrong_numeric_type_path = root / "wrong_numeric_type.pt"
+        _write_payload(wrong_numeric_type_path, wrong_numeric_type)
+        _expect_error(
+            ValueError,
+            load_actor_rehearsal,
+            wrong_numeric_type_path,
+            device="cpu",
+            observation_dim=131,
+            action_dim=21,
+            allowed_contracts=PICK_TOOL_COUPLED_POWER_ACTOR_DEMO_CONTRACTS,
+        )
+
+        contradictory = _coupled_power_actor_payload()
+        contradictory["action"][contradictory["phase"] == 0, 7] = 0.1
+        contradictory_path = root / "contradictory.pt"
+        _write_payload(contradictory_path, contradictory)
+        _expect_error(
+            ValueError,
+            load_actor_rehearsal,
+            contradictory_path,
+            device="cpu",
+            observation_dim=131,
+            action_dim=21,
+            allowed_contracts=PICK_TOOL_COUPLED_POWER_ACTOR_DEMO_CONTRACTS,
+        )
+
+        contradictory_optional_close = _coupled_power_actor_payload()
+        close_row = int((contradictory_optional_close["phase"] == 1).nonzero()[0])
+        contradictory_optional_close["action"][close_row, 0] = 0.1
+        contradictory_optional_path = root / "contradictory_optional_close.pt"
+        _write_payload(contradictory_optional_path, contradictory_optional_close)
+        _expect_error(
+            ValueError,
+            load_actor_rehearsal,
+            contradictory_optional_path,
+            device="cpu",
+            observation_dim=131,
+            action_dim=21,
+            allowed_contracts=PICK_TOOL_COUPLED_POWER_ACTOR_DEMO_CONTRACTS,
+        )
+
+        wrong_phase_bit = _coupled_power_actor_payload()
+        wrong_phase_bit["obs"][0, 129] = 0.0
+        wrong_phase_bit_path = root / "wrong_phase_bit.pt"
+        _write_payload(wrong_phase_bit_path, wrong_phase_bit)
+        _expect_error(
+            ValueError,
+            load_actor_rehearsal,
+            wrong_phase_bit_path,
+            device="cpu",
+            observation_dim=131,
+            action_dim=21,
+            allowed_contracts=PICK_TOOL_COUPLED_POWER_ACTOR_DEMO_CONTRACTS,
+        )
+
+        too_few_hold = _coupled_power_actor_payload()
+        for episode_start in (0, 18):
+            too_few_hold["phase"][episode_start + 3 : episode_start + 5] = 1
+        too_few_hold["obs"][:, 106] = (too_few_hold["phase"] == 2).float()
+        too_few_hold_path = root / "too_few_hold.pt"
+        _write_payload(too_few_hold_path, too_few_hold)
+        _expect_error(
+            ValueError,
+            load_actor_rehearsal,
+            too_few_hold_path,
+            device="cpu",
+            observation_dim=131,
+            action_dim=21,
+            allowed_contracts=PICK_TOOL_COUPLED_POWER_ACTOR_DEMO_CONTRACTS,
+        )
+
+        regressed_phase = _coupled_power_actor_payload()
+        regressed_phase["phase"][5] = 1
+        regressed_phase["obs"][5, 106] = 0.0
+        regressed_phase_path = root / "regressed_phase.pt"
+        _write_payload(regressed_phase_path, regressed_phase)
+        _expect_error(
+            ValueError,
+            load_actor_rehearsal,
+            regressed_phase_path,
+            device="cpu",
+            observation_dim=131,
+            action_dim=21,
+            allowed_contracts=PICK_TOOL_COUPLED_POWER_ACTOR_DEMO_CONTRACTS,
+        )
+
+        rejected_episode_evidence = {
+            "episode_native_success": False,
+            "episode_native_failure": True,
+            "episode_native_timeout": True,
+            "episode_conservative_teacher_pass": False,
+            "episode_terminal_stable_steps": 14,
+            "episode_terminal_power_is_grasped": False,
+            "episode_terminal_thumb_contact": False,
+            "episode_terminal_legal_other_contact_count": 2,
+            "episode_terminal_power_grasp_quality": 0.34,
+            "episode_terminal_hold_quality": 0.49,
+            "episode_terminal_max_force": 30.01,
+            "episode_trajectory_max_force": 30.01,
+            "episode_trajectory_max_xy_drift": 0.031,
+            "episode_trajectory_max_rotation_drift": 0.351,
+            "episode_trajectory_max_true_clearance": 0.016,
+            "episode_arm_target_saturated": True,
+            "episode_terminal_align_active": True,
+        }
+        for index, (field, rejected_value) in enumerate(
+            rejected_episode_evidence.items()
+        ):
+            rejected = _coupled_power_actor_payload()
+            rejected[field][0] = rejected_value
+            rejected_path = root / f"rejected_episode_{index}.pt"
+            _write_payload(rejected_path, rejected)
+            _expect_error(
+                ValueError,
+                load_actor_rehearsal,
+                rejected_path,
+                device="cpu",
+                observation_dim=131,
+                action_dim=21,
+                allowed_contracts=PICK_TOOL_COUPLED_POWER_ACTOR_DEMO_CONTRACTS,
+            )
+
+        post_terminal_pollution = _coupled_power_actor_payload()
+        post_terminal_pollution["episode_terminal_stable_steps"][0] = 16
+        post_terminal_path = root / "post_terminal_pollution.pt"
+        _write_payload(post_terminal_path, post_terminal_pollution)
+        _expect_error(
+            ValueError,
+            load_actor_rehearsal,
+            post_terminal_path,
+            device="cpu",
+            observation_dim=131,
+            action_dim=21,
+            allowed_contracts=PICK_TOOL_COUPLED_POWER_ACTOR_DEMO_CONTRACTS,
+        )
+
+        missing_evidence = _coupled_power_actor_payload()
+        del missing_evidence["episode_trajectory_max_force"]
+        missing_evidence_path = root / "missing_episode_evidence.pt"
+        _write_payload(missing_evidence_path, missing_evidence)
+        _expect_error(
+            TypeError,
+            load_actor_rehearsal,
+            missing_evidence_path,
+            device="cpu",
+            observation_dim=131,
+            action_dim=21,
+            allowed_contracts=PICK_TOOL_COUPLED_POWER_ACTOR_DEMO_CONTRACTS,
+        )
+
+        torch.testing.assert_close(batch["action"], source["action"])
 
 
 def test_loader_rejects_ambiguous_failed_or_malformed_sources() -> None:
@@ -466,6 +771,8 @@ def main() -> None:
     print("[PASS] obs/action loader and successful-episode audit")
     test_pick_tool_actor_demo_allowlist_and_phase_contracts()
     print("[PASS] PickTool actor-demo allowlist and phase contracts")
+    test_coupled_power_multiphase_contract_and_canonical_actions()
+    print("[PASS] coupled-power multi-phase and canonical-action contract")
     test_loader_rejects_ambiguous_failed_or_malformed_sources()
     print("[PASS] malformed data and metadata are rejected")
     test_gpu_style_stratification_and_private_generator()

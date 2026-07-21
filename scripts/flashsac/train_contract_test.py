@@ -61,6 +61,7 @@ from train import (  # noqa: E402
     validate_checkpoint_task_contract,
     validate_checkpoint_output_separation,
     validate_close_option_training_config,
+    validate_actor_demo_curriculum_lineage,
     validate_replay_task_contract,
     validate_training_source_selection,
     write_checkpoint_task_contract,
@@ -554,6 +555,28 @@ def test_task_mode_source_and_replay_contracts() -> None:
         coupled_power_align_close_option_mode=True,
         allow_cross_task_actor=True,
     )
+    validate_training_source_selection(
+        checkpoint=None,
+        actor_checkpoint=Path("coupled-bootstrap"),
+        resume_replay=False,
+        resume_actor_demo=False,
+        close_option_mode=False,
+        power_close_option_mode=False,
+        demo=None,
+        actor_demo=[Path("coupled-successes.pt")],
+        coupled_power_align_close_option_mode=True,
+    )
+    validate_training_source_selection(
+        checkpoint=Path("coupled-resume"),
+        actor_checkpoint=None,
+        resume_replay=False,
+        resume_actor_demo=True,
+        close_option_mode=False,
+        power_close_option_mode=False,
+        demo=None,
+        actor_demo=[Path("coupled-successes.pt")],
+        coupled_power_align_close_option_mode=True,
+    )
     _expect_error(
         ValueError,
         validate_training_source_selection,
@@ -638,6 +661,30 @@ def test_task_mode_source_and_replay_contracts() -> None:
         validate_checkpoint_output_separation,
         Path("same/checkpoint_final"),
         output_checkpoint=Path("same/checkpoint_final"),
+    )
+
+    curriculum_sha256 = "a" * 64
+    validate_actor_demo_curriculum_lineage(
+        {
+            "path": "coupled-demo.pt",
+            "curriculum_dataset_sha256": curriculum_sha256,
+        },
+        expected_curriculum_sha256=curriculum_sha256,
+    )
+    _expect_error(
+        ValueError,
+        validate_actor_demo_curriculum_lineage,
+        {
+            "path": "wrong-curriculum.pt",
+            "curriculum_dataset_sha256": "b" * 64,
+        },
+        expected_curriculum_sha256=curriculum_sha256,
+    )
+    _expect_error(
+        ValueError,
+        validate_actor_demo_curriculum_lineage,
+        {"path": "missing-lineage.pt"},
+        expected_curriculum_sha256=curriculum_sha256,
     )
 
     validate_close_option_training_config(

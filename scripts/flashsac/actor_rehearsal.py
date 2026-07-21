@@ -31,17 +31,147 @@ ACTOR_REHEARSAL_KEYS = ("observation", "action")
 
 
 @dataclass(frozen=True)
+class EpisodeTensorContract:
+    """Required per-episode evidence carried by an actor-demo source."""
+
+    name: str
+    dtype: torch.dtype
+    expected_bool: bool | None = None
+    minimum: float | int | None = None
+    maximum: float | int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("episode tensor contract name must be non-empty")
+        if not isinstance(self.dtype, torch.dtype):
+            raise TypeError("episode tensor contract dtype must be torch.dtype")
+        if self.dtype == torch.bool:
+            if (
+                self.expected_bool is None
+                or self.minimum is not None
+                or self.maximum is not None
+            ):
+                raise ValueError(
+                    "bool episode tensor contracts require expected_bool and no bounds"
+                )
+        elif self.expected_bool is not None:
+            raise ValueError("numeric episode tensor contracts cannot use expected_bool")
+        if self.minimum is not None and self.maximum is not None:
+            if self.minimum > self.maximum:
+                raise ValueError("episode tensor minimum cannot exceed maximum")
+
+
+@dataclass(frozen=True)
 class ActorRehearsalSourceContract:
     """Exact metadata/phase allowlist entry for an actor-only dataset."""
 
     name: str
     required_metadata: Mapping[str, Any]
-    required_phase: int
+    required_phase: int | None = None
+    required_phases: tuple[int, ...] = ()
+    optional_phases: tuple[int, ...] = ()
+    required_sha256_metadata: tuple[str, ...] = ()
+    required_zero_action_slices: tuple[tuple[int, int, int], ...] = ()
+    strict_metadata_types: bool = False
+    required_episode_tensors: tuple[EpisodeTensorContract, ...] = ()
+    phase_observation_state_indices: tuple[int, int] | None = None
+
+    def __post_init__(self) -> None:
+        has_single_phase = self.required_phase is not None
+        has_multiple_phases = bool(self.required_phases)
+        if has_single_phase == has_multiple_phases:
+            raise ValueError(
+                "actor rehearsal source contract must declare exactly one of "
+                "required_phase or required_phases"
+            )
+        if has_single_phase and (
+            not isinstance(self.required_phase, int)
+            or isinstance(self.required_phase, bool)
+            or self.required_phase < 0
+        ):
+            raise ValueError("required_phase must be a non-negative integer")
+        if has_multiple_phases:
+            if any(
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+                for value in self.required_phases
+            ):
+                raise ValueError("required_phases must contain non-negative integers")
+            if len(set(self.required_phases)) != len(self.required_phases):
+                raise ValueError("required_phases must not contain duplicates")
+        if any(
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+            for value in self.optional_phases
+        ):
+            raise ValueError("optional_phases must contain non-negative integers")
+        if len(set(self.optional_phases)) != len(self.optional_phases):
+            raise ValueError("optional_phases must not contain duplicates")
+        if set(self.optional_phases).intersection(self.phase_values):
+            raise ValueError("required and optional phases must be disjoint")
+        if len(set(self.required_sha256_metadata)) != len(
+            self.required_sha256_metadata
+        ):
+            raise ValueError("required SHA256 metadata keys must not contain duplicates")
+        if any(
+            not isinstance(key, str) or not key
+            for key in self.required_sha256_metadata
+        ):
+            raise ValueError("required SHA256 metadata keys must be non-empty strings")
+        if not isinstance(self.strict_metadata_types, bool):
+            raise TypeError("strict_metadata_types must be bool")
+        for phase, start, stop in self.required_zero_action_slices:
+            if phase not in self.allowed_phase_values:
+                raise ValueError(
+                    "zero-action slice phase must be declared by the source contract"
+                )
+            if (
+                not isinstance(start, int)
+                or isinstance(start, bool)
+                or not isinstance(stop, int)
+                or isinstance(stop, bool)
+                or start < 0
+                or stop <= start
+            ):
+                raise ValueError("zero-action slices must use integer 0 <= start < stop")
+        episode_field_names = [field.name for field in self.required_episode_tensors]
+        if len(set(episode_field_names)) != len(episode_field_names):
+            raise ValueError("required episode tensor names must not contain duplicates")
+        if self.phase_observation_state_indices is not None:
+            if (
+                len(self.phase_observation_state_indices) != 2
+                or any(
+                    not isinstance(index, int)
+                    or isinstance(index, bool)
+                    or index < 0
+                    for index in self.phase_observation_state_indices
+                )
+            ):
+                raise ValueError(
+                    "phase observation state indices must contain two non-negative integers"
+                )
+
+    @property
+    def phase_values(self) -> tuple[int, ...]:
+        if self.required_phase is not None:
+            return (self.required_phase,)
+        return self.required_phases
+
+    @property
+    def allowed_phase_values(self) -> tuple[int, ...]:
+        return (*self.phase_values, *self.optional_phases)
 
 
 _PICK_TOOL_ACTION_LAYOUT = "arm_delta7|crossdex_token9|distal_residual5"
 _PICK_TOOL_OBSERVATION_LAYOUT = "legacy_prefix87|distal_action5|grasp_transport23"
 _PICK_TOOL_PHASE_NAMES = ["approach", "close", "micro", "lift", "settle"]
+_COUPLED_POWER_TASK_MODE = "coupled_power_align_close_option_v1"
+_COUPLED_POWER_OBSERVATION_CONTRACT = (
+    "pick_tool_coupled_power_align_close_state131_v1"
+)
+_COUPLED_POWER_PHASE_NAMES = ["align", "close_unlatched", "hold_latched"]
 
 PICK_TOOL_ACTOR_DEMO_CONTRACTS = (
     ActorRehearsalSourceContract(
@@ -99,6 +229,148 @@ PICK_TOOL_LIFT_ACTOR_DEMO_CONTRACTS = tuple(
 )
 PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS = tuple(
     contract for contract in PICK_TOOL_ACTOR_DEMO_CONTRACTS if contract.required_phase == 1
+)
+
+PICK_TOOL_COUPLED_POWER_ACTOR_DEMO_CONTRACTS = (
+    ActorRehearsalSourceContract(
+        name="successful_coupled_power_align_close_teacher_v1",
+        required_metadata={
+            "format_version": 1,
+            "task_mode": _COUPLED_POWER_TASK_MODE,
+            "observation_dim": 131,
+            "observation_contract": _COUPLED_POWER_OBSERVATION_CONTRACT,
+            "observation_layout": (
+                "legacy_prefix87|distal_action5|grasp_transport23|coupled_state16"
+            ),
+            "action_dim": 21,
+            "action_layout": _PICK_TOOL_ACTION_LAYOUT,
+            "action_projection": "identity_v1",
+            "action_semantics": "canonical_policy_action_before_phase_shield_v1",
+            "collector": "successful_coupled_power_align_close_teacher",
+            "dataset_phase": "align_close_hold",
+            "phase_names": _COUPLED_POWER_PHASE_NAMES,
+            "teacher_probability": 1.0,
+            "executed_teacher_fraction": 1.0,
+            "align_hand_action_abs_max": 0.0,
+            "close_arm_action_abs_max": 0.0,
+            "first_observation_last_action_max_error": 0.0,
+            "terminal_observation": "not_saved_auto_reset_excluded_v1",
+            "trajectory_acceptance": (
+                "native_success_and_conservative_teacher_audit_v1"
+            ),
+            "clearance_authority": (
+                "true_mesh_convex_hull_min_z_minus_table_v1"
+            ),
+        },
+        required_phases=(0, 2),
+        optional_phases=(1,),
+        required_sha256_metadata=(
+            "teacher_artifact_sha256",
+            "curriculum_dataset_sha256",
+        ),
+        required_zero_action_slices=(
+            (0, 7, 21),
+            (1, 0, 7),
+            (2, 0, 7),
+        ),
+        strict_metadata_types=True,
+        required_episode_tensors=(
+            EpisodeTensorContract(
+                "episode_native_success",
+                torch.bool,
+                expected_bool=True,
+            ),
+            EpisodeTensorContract(
+                "episode_native_failure",
+                torch.bool,
+                expected_bool=False,
+            ),
+            EpisodeTensorContract(
+                "episode_native_timeout",
+                torch.bool,
+                expected_bool=False,
+            ),
+            EpisodeTensorContract(
+                "episode_conservative_teacher_pass",
+                torch.bool,
+                expected_bool=True,
+            ),
+            EpisodeTensorContract(
+                "episode_terminal_stable_steps",
+                torch.int64,
+                minimum=15,
+                maximum=15,
+            ),
+            EpisodeTensorContract(
+                "episode_terminal_power_is_grasped",
+                torch.bool,
+                expected_bool=True,
+            ),
+            EpisodeTensorContract(
+                "episode_terminal_thumb_contact",
+                torch.bool,
+                expected_bool=True,
+            ),
+            EpisodeTensorContract(
+                "episode_terminal_legal_other_contact_count",
+                torch.int64,
+                minimum=3,
+                maximum=4,
+            ),
+            EpisodeTensorContract(
+                "episode_terminal_power_grasp_quality",
+                torch.float32,
+                minimum=0.35,
+                maximum=1.0,
+            ),
+            EpisodeTensorContract(
+                "episode_terminal_hold_quality",
+                torch.float32,
+                minimum=0.50,
+                maximum=1.0,
+            ),
+            EpisodeTensorContract(
+                "episode_terminal_max_force",
+                torch.float32,
+                minimum=0.0,
+                maximum=30.0,
+            ),
+            EpisodeTensorContract(
+                "episode_trajectory_max_force",
+                torch.float32,
+                minimum=0.0,
+                maximum=30.0,
+            ),
+            EpisodeTensorContract(
+                "episode_trajectory_max_xy_drift",
+                torch.float32,
+                minimum=0.0,
+                maximum=0.03,
+            ),
+            EpisodeTensorContract(
+                "episode_trajectory_max_rotation_drift",
+                torch.float32,
+                minimum=0.0,
+                maximum=0.35,
+            ),
+            EpisodeTensorContract(
+                "episode_trajectory_max_true_clearance",
+                torch.float32,
+                maximum=0.015,
+            ),
+            EpisodeTensorContract(
+                "episode_arm_target_saturated",
+                torch.bool,
+                expected_bool=False,
+            ),
+            EpisodeTensorContract(
+                "episode_terminal_align_active",
+                torch.bool,
+                expected_bool=False,
+            ),
+        ),
+        phase_observation_state_indices=(129, 106),
+    ),
 )
 
 _INTEGER_DTYPES = {
@@ -249,7 +521,17 @@ def _audit_episode_partition(payload: Mapping[str, Any], *, rows: int) -> int:
     return episodes
 
 
-def _audit_metadata(
+def _metadata_value_matches(actual: Any, expected: Any, *, strict_type: bool) -> bool:
+    if strict_type and type(actual) is not type(expected):
+        return False
+    try:
+        comparison = actual == expected
+    except (TypeError, ValueError):
+        return False
+    return comparison if isinstance(comparison, bool) else False
+
+
+def audit_actor_rehearsal_metadata(
     payload: Mapping[str, Any],
     *,
     observation_dim: int,
@@ -265,9 +547,18 @@ def _audit_metadata(
         raise ValueError(
             f"actor rehearsal format_version={metadata.get('format_version')!r}, expected 1"
         )
-    for key in ("action_layout", "observation_layout", "collector"):
+    for key in ("action_layout", "collector"):
         if not isinstance(metadata.get(key), str) or not metadata[key]:
             raise ValueError(f"actor rehearsal metadata requires non-empty {key!r}")
+    observation_schema_keys = ("observation_layout", "observation_contract")
+    if not any(
+        isinstance(metadata.get(key), str) and bool(metadata[key])
+        for key in observation_schema_keys
+    ):
+        raise ValueError(
+            "actor rehearsal metadata requires a non-empty observation_layout "
+            "or observation_contract"
+        )
     if "dataset_phase" in metadata:
         if not isinstance(metadata["dataset_phase"], str) or not metadata["dataset_phase"]:
             raise ValueError("actor rehearsal metadata dataset_phase must be non-empty when present")
@@ -299,7 +590,14 @@ def _audit_metadata(
         matches = [
             contract
             for contract in allowed_contracts
-            if all(metadata.get(key) == expected for key, expected in contract.required_metadata.items())
+            if all(
+                _metadata_value_matches(
+                    metadata.get(key),
+                    expected,
+                    strict_type=contract.strict_metadata_types,
+                )
+                for key, expected in contract.required_metadata.items()
+            )
         ]
         if len(matches) != 1:
             names = [contract.name for contract in allowed_contracts]
@@ -317,12 +615,31 @@ def _audit_metadata(
             raise ValueError(
                 f"actor rehearsal source contract {matched_contract.name!r} requires phase labels"
             )
-        if bool((phase != matched_contract.required_phase).any()):
-            values = sorted(int(value) for value in torch.unique(phase).detach().cpu().tolist())
+        values = tuple(
+            sorted(int(value) for value in torch.unique(phase).detach().cpu().tolist())
+        )
+        actual_phases = set(values)
+        required_phases = set(matched_contract.phase_values)
+        allowed_phases = set(matched_contract.allowed_phase_values)
+        if not required_phases.issubset(actual_phases) or not actual_phases.issubset(
+            allowed_phases
+        ):
             raise ValueError(
-                f"actor rehearsal source contract {matched_contract.name!r} requires every "
-                f"phase={matched_contract.required_phase}, got {values}"
+                f"actor rehearsal source contract {matched_contract.name!r} requires "
+                f"phases={sorted(required_phases)}, allows={sorted(allowed_phases)}, "
+                f"got {list(values)}"
             )
+        for key in matched_contract.required_sha256_metadata:
+            value = metadata.get(key)
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ValueError(
+                    f"actor rehearsal metadata {key!r} must be a 64-character "
+                    "lowercase hexadecimal SHA256"
+                )
 
     phase_names = metadata.get("phase_names")
     if phase_names is not None:
@@ -342,6 +659,173 @@ def _audit_metadata(
             if not 0.0 <= float(value) <= 1.0:
                 raise ValueError(f"actor rehearsal metadata {key} must be in [0, 1]")
     return metadata, matched_contract
+
+
+def audit_actor_rehearsal_action_semantics(
+    action: torch.Tensor,
+    phase: torch.Tensor | None,
+    source_contract: ActorRehearsalSourceContract | None,
+) -> None:
+    """Verify action values that metadata alone cannot prove.
+
+    Coupled option demonstrations use canonical policy labels: inactive hand
+    dimensions are exactly zero during ALIGN, and inactive arm dimensions are
+    exactly zero during CLOSE/HOLD.  Checking the stored tensors prevents a
+    self-reported zero maximum from allowlisting contradictory supervision.
+    """
+
+    if source_contract is None or not source_contract.required_zero_action_slices:
+        return
+    if phase is None:
+        raise ValueError(
+            f"actor rehearsal source contract {source_contract.name!r} requires phase labels"
+        )
+    if action.ndim != 2 or phase.shape != (action.shape[0],):
+        raise ValueError("action/phase shapes are incompatible for semantics audit")
+    for phase_value, start, stop in source_contract.required_zero_action_slices:
+        if stop > action.shape[1]:
+            raise ValueError(
+                f"source contract {source_contract.name!r} action slice "
+                f"[{start}:{stop}] exceeds action_dim={action.shape[1]}"
+            )
+        selected = action[phase == phase_value, start:stop]
+        if selected.numel() < 1:
+            if phase_value in source_contract.optional_phases:
+                continue
+            raise ValueError(
+                f"source contract {source_contract.name!r} has no phase={phase_value} rows"
+            )
+        maximum = float(selected.abs().max())
+        if maximum != 0.0:
+            raise ValueError(
+                f"source contract {source_contract.name!r} requires exact zero action "
+                f"slice [{start}:{stop}] for phase={phase_value}, got max abs={maximum}"
+            )
+
+
+def audit_actor_rehearsal_phase_observation_semantics(
+    payload: Mapping[str, Any],
+    observation: torch.Tensor,
+    phase: torch.Tensor | None,
+    source_contract: ActorRehearsalSourceContract | None,
+) -> None:
+    """Cross-check coupled phase labels against Markov state and episode order."""
+
+    if source_contract is None or source_contract.phase_observation_state_indices is None:
+        return
+    if phase is None or phase.shape != (observation.shape[0],):
+        raise ValueError("phase labels must match observations for phase-state audit")
+    align_index, latch_index = source_contract.phase_observation_state_indices
+    if max(align_index, latch_index) >= observation.shape[1]:
+        raise ValueError(
+            f"source contract {source_contract.name!r} phase-state index exceeds "
+            f"observation_dim={observation.shape[1]}"
+        )
+    align_value = observation[:, align_index]
+    latch_value = observation[:, latch_index]
+    for name, value in (("align", align_value), ("power_latch", latch_value)):
+        if not bool(((value == 0.0) | (value == 1.0)).all()):
+            raise ValueError(
+                f"source contract {source_contract.name!r} requires exact 0/1 "
+                f"{name} observation bit"
+            )
+    expected_phase = torch.where(
+        align_value.bool(),
+        torch.zeros_like(phase),
+        torch.where(
+            latch_value.bool(),
+            torch.full_like(phase, 2),
+            torch.ones_like(phase),
+        ),
+    )
+    if not torch.equal(phase, expected_phase):
+        mismatch = int((phase != expected_phase).nonzero(as_tuple=False)[0])
+        raise ValueError(
+            f"source contract {source_contract.name!r} phase disagrees with obs131 "
+            f"at row {mismatch}: phase={int(phase[mismatch])}, "
+            f"expected={int(expected_phase[mismatch])}"
+        )
+
+    offsets = payload.get("episode_offsets")
+    if not isinstance(offsets, torch.Tensor):
+        raise TypeError("phase-state audit requires tensor episode_offsets")
+    offset_values = offsets.detach().to(device="cpu", dtype=torch.int64).tolist()
+    required_phases = set(source_contract.phase_values)
+    for episode, (start, stop) in enumerate(
+        zip(offset_values[:-1], offset_values[1:], strict=True)
+    ):
+        segment = phase[start:stop]
+        segment_phases = set(int(value) for value in torch.unique(segment).tolist())
+        if not required_phases.issubset(segment_phases):
+            raise ValueError(
+                f"source contract {source_contract.name!r} episode {episode} is missing "
+                f"required phases {sorted(required_phases.difference(segment_phases))}"
+            )
+        if segment.numel() < 1 or int(segment[-1]) != 2:
+            raise ValueError(
+                f"source contract {source_contract.name!r} episode {episode} must end "
+                "with pre-step hold_latched phase=2"
+            )
+        if segment.numel() > 1 and bool((segment[1:] < segment[:-1]).any()):
+            raise ValueError(
+                f"source contract {source_contract.name!r} episode {episode} phase "
+                "must be monotonic ALIGN->CLOSE->HOLD"
+            )
+        hold_rows = int((segment == 2).sum())
+        if hold_rows < 14:
+            raise ValueError(
+                f"source contract {source_contract.name!r} episode {episode} requires "
+                f"at least 14 pre-step hold_latched rows, got {hold_rows}"
+            )
+
+
+def audit_actor_rehearsal_episode_semantics(
+    payload: Mapping[str, Any],
+    *,
+    episodes: int,
+    source_contract: ActorRehearsalSourceContract | None,
+) -> None:
+    """Validate per-episode physical evidence required by a source contract."""
+
+    if source_contract is None or not source_contract.required_episode_tensors:
+        return
+    for requirement in source_contract.required_episode_tensors:
+        value = payload.get(requirement.name)
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"source contract {source_contract.name!r} requires tensor "
+                f"{requirement.name!r}"
+            )
+        if value.dtype != requirement.dtype or value.shape != (episodes,):
+            raise ValueError(
+                f"source contract {source_contract.name!r} requires "
+                f"{requirement.name!r} as {requirement.dtype} shape ({episodes},), "
+                f"got {value.dtype}{tuple(value.shape)}"
+            )
+        if requirement.dtype == torch.bool:
+            assert requirement.expected_bool is not None
+            if bool((value != requirement.expected_bool).any()):
+                raise ValueError(
+                    f"source contract {source_contract.name!r} requires every "
+                    f"{requirement.name}={requirement.expected_bool}"
+                )
+            continue
+        if value.is_floating_point() and not bool(torch.isfinite(value).all()):
+            raise ValueError(f"{requirement.name} contains NaN or infinity")
+        if requirement.minimum is not None and bool(
+            (value < requirement.minimum).any()
+        ):
+            raise ValueError(
+                f"source contract {source_contract.name!r} requires "
+                f"{requirement.name}>={requirement.minimum}"
+            )
+        if requirement.maximum is not None and bool(
+            (value > requirement.maximum).any()
+        ):
+            raise ValueError(
+                f"source contract {source_contract.name!r} requires "
+                f"{requirement.name}<={requirement.maximum}"
+            )
 
 
 def load_actor_rehearsal(
@@ -389,13 +873,29 @@ def load_actor_rehearsal(
     }
     phase = _require_phase(payload.get("phase"), rows=rows, device=resolved_device)
     episodes = _audit_episode_partition(payload, rows=rows)
-    metadata, source_contract = _audit_metadata(
+    metadata, source_contract = audit_actor_rehearsal_metadata(
         payload,
         observation_dim=observation_dim,
         action_dim=action_dim,
         phase=phase,
         expected_metadata=expected_metadata,
         allowed_contracts=allowed_contracts,
+    )
+    audit_actor_rehearsal_action_semantics(
+        batch["action"],
+        phase,
+        source_contract,
+    )
+    audit_actor_rehearsal_phase_observation_semantics(
+        payload,
+        batch["observation"],
+        phase,
+        source_contract,
+    )
+    audit_actor_rehearsal_episode_semantics(
+        payload,
+        episodes=episodes,
+        source_contract=source_contract,
     )
     phase_counts: dict[str, int] = {}
     if phase is not None:
@@ -418,6 +918,9 @@ def load_actor_rehearsal(
         "dataset_phase": metadata.get("dataset_phase"),
         "source_contract": source_contract.name if source_contract is not None else None,
     }
+    if source_contract is not None:
+        for key in source_contract.required_sha256_metadata:
+            audit[key] = str(metadata[key])
     return batch, phase, audit
 
 

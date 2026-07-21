@@ -27,6 +27,11 @@ Only actor weights and BatchNorm statistics come from BC.  Critic, target
 critic, temperature, optimizers, schedulers, reward normalizer, update counter,
 and exploration state are freshly initialized before export, so online RL does
 not inherit BC optimizer moments or a meaningless random-critic history.
+
+The legacy 115D actor remains the default.  Selecting the 131D coupled-power
+contract additionally requires an allowlisted ALIGN/CLOSE/HOLD dataset with
+canonical inactive action dimensions and per-episode physical success evidence;
+the exported checkpoint is tagged with the matching v3 task contract.
 """
 
 from __future__ import annotations
@@ -47,6 +52,13 @@ import torch
 import torch.nn.functional as F
 
 from agent_bridge import ActionNoiseGroup, FlashSACTorchBridge, build_agent_config
+from actor_rehearsal import (
+    PICK_TOOL_COUPLED_POWER_ACTOR_DEMO_CONTRACTS,
+    audit_actor_rehearsal_action_semantics,
+    audit_actor_rehearsal_episode_semantics,
+    audit_actor_rehearsal_metadata,
+    audit_actor_rehearsal_phase_observation_semantics,
+)
 
 # Importing agent_bridge installs the pinned upstream path and its Torch-only
 # annotation fallback before these imports are resolved.
@@ -55,8 +67,19 @@ from flash_rl.agents.utils.network import Network
 
 
 OBSERVATION_DIM = 115
+COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM = 131
 ACTION_DIM = 21
 ACTION_LAYOUT = "arm_delta7|crossdex_token9|distal_residual5"
+FULL_TASK_MODE = "full_task"
+COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE = "coupled_power_align_close_option_v1"
+PICK_TOOL_OBSERVATION_CONTRACT = "pick_tool_markov115_v1"
+COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_CONTRACT = (
+    "pick_tool_coupled_power_align_close_state131_v1"
+)
+IDENTITY_ACTION_PROJECTION = "identity_v1"
+TASK_CONTRACT_FILENAME = "task_contract.json"
+TASK_CONTRACT_VERSION = 3
+FLASH_SAC_GAMMA = 0.99
 BC_METADATA_FILENAME = "bc_bootstrap.json"
 BC_FORMAT_VERSION = 1
 
@@ -74,6 +97,9 @@ class DemoSource:
     transitions: int
     episodes: int
     phases: dict[str, int]
+    source_contract: str | None
+    teacher_artifact_sha256: str | None
+    curriculum_dataset_sha256: str | None
 
 
 @dataclass(frozen=True)
@@ -91,6 +117,10 @@ class Demonstrations:
     @property
     def num_episodes(self) -> int:
         return int(self.episode_id.max().item()) + 1
+
+    @property
+    def observation_dim(self) -> int:
+        return int(self.observation.shape[1])
 
 
 @dataclass(frozen=True)
@@ -172,6 +202,37 @@ def _phase_counts(phase: torch.Tensor) -> dict[str, int]:
     return {str(int(value)): int(count) for value, count in zip(values, counts, strict=True)}
 
 
+def _bootstrap_task_mode(observation_dim: int) -> str:
+    if not isinstance(observation_dim, int) or isinstance(observation_dim, bool):
+        raise TypeError("observation_dim must be an integer")
+    if observation_dim == OBSERVATION_DIM:
+        return FULL_TASK_MODE
+    if observation_dim == COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM:
+        return COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE
+    raise ValueError(
+        "BC bootstrap supports only the 115D full-task and 131D coupled-power "
+        f"observation contracts, got observation_dim={observation_dim}"
+    )
+
+
+def _bootstrap_runtime_contract(observation_dim: int) -> dict[str, Any]:
+    task_mode = _bootstrap_task_mode(observation_dim)
+    observation_contract = (
+        COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_CONTRACT
+        if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE
+        else PICK_TOOL_OBSERVATION_CONTRACT
+    )
+    return {
+        "task_mode": task_mode,
+        "observation_dim": observation_dim,
+        "observation_contract": observation_contract,
+        "policy_action_dim": ACTION_DIM,
+        "policy_action_layout": ACTION_LAYOUT,
+        "environment_action_dim": ACTION_DIM,
+        "action_projection": IDENTITY_ACTION_PROJECTION,
+    }
+
+
 def phase_balanced_epoch_rows(
     phase: torch.Tensor,
     *,
@@ -249,7 +310,11 @@ def _optimizer_batches(rows: torch.Tensor, batch_size: int) -> list[torch.Tensor
     return batches
 
 
-def load_demonstrations(paths: Sequence[Path | str]) -> Demonstrations:
+def load_demonstrations(
+    paths: Sequence[Path | str],
+    *,
+    observation_dim: int = OBSERVATION_DIM,
+) -> Demonstrations:
     """Load one or more successful full-trajectory Torch demo files.
 
     Accepted observation keys are ``obs`` and ``observation``.  Episodes must
@@ -260,6 +325,8 @@ def load_demonstrations(paths: Sequence[Path | str]) -> Demonstrations:
 
     if not paths:
         raise ValueError("at least one demonstration path is required")
+    task_mode = _bootstrap_task_mode(observation_dim)
+    coupled_contract = task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE
 
     observations: list[torch.Tensor] = []
     actions: list[torch.Tensor] = []
@@ -276,15 +343,29 @@ def load_demonstrations(paths: Sequence[Path | str]) -> Demonstrations:
         if not isinstance(payload, Mapping):
             raise TypeError(f"{path}: demonstration root must be a mapping")
 
-        observation = _require_tensor(payload, ("obs", "observation"), path).detach().to(
-            device="cpu", dtype=torch.float32
-        )
-        action = _require_tensor(payload, ("action",), path).detach().to(
-            device="cpu", dtype=torch.float32
-        )
-        if observation.ndim != 2 or observation.shape[1] != OBSERVATION_DIM:
+        if coupled_contract:
+            observation_keys = [
+                key for key in ("obs", "observation") if key in payload
+            ]
+            if len(observation_keys) != 1:
+                raise KeyError(
+                    f"{path}: coupled-power BC requires exactly one of 'obs' or "
+                    "'observation'"
+                )
+        observation_value = _require_tensor(payload, ("obs", "observation"), path)
+        action_value = _require_tensor(payload, ("action",), path)
+        if coupled_contract and (
+            not observation_value.is_floating_point()
+            or not action_value.is_floating_point()
+        ):
+            raise TypeError(
+                f"{path}: coupled-power observation and action must use floating dtypes"
+            )
+        observation = observation_value.detach().to(device="cpu", dtype=torch.float32)
+        action = action_value.detach().to(device="cpu", dtype=torch.float32)
+        if observation.ndim != 2 or observation.shape[1] != observation_dim:
             raise ValueError(
-                f"{path}: observation must have shape [N, {OBSERVATION_DIM}], "
+                f"{path}: observation must have shape [N, {observation_dim}], "
                 f"got {tuple(observation.shape)}"
             )
         if action.shape != (observation.shape[0], ACTION_DIM):
@@ -314,7 +395,15 @@ def load_demonstrations(paths: Sequence[Path | str]) -> Demonstrations:
                 raise ValueError(f"{path}: episode_id disagrees with episode_offsets")
 
         episode_success = payload.get("episode_success")
+        if coupled_contract and not isinstance(episode_success, torch.Tensor):
+            raise TypeError(
+                f"{path}: coupled-power BC requires tensor episode_success"
+            )
         if isinstance(episode_success, torch.Tensor):
+            if coupled_contract and episode_success.dtype != torch.bool:
+                raise TypeError(
+                    f"{path}: coupled-power episode_success must use torch.bool"
+                )
             success = episode_success.to(device="cpu", dtype=torch.bool)
             if success.shape != (offsets.numel() - 1,):
                 raise ValueError(f"{path}: episode_success shape does not match episode_offsets")
@@ -323,8 +412,18 @@ def load_demonstrations(paths: Sequence[Path | str]) -> Demonstrations:
 
         phase_value = payload.get("phase")
         if phase_value is None:
+            if coupled_contract:
+                raise TypeError(f"{path}: coupled-power BC requires tensor phase labels")
             phase = torch.full((observation.shape[0],), -1, dtype=torch.long)
         elif isinstance(phase_value, torch.Tensor):
+            if coupled_contract and phase_value.dtype not in (
+                torch.uint8,
+                torch.int8,
+                torch.int16,
+                torch.int32,
+                torch.int64,
+            ):
+                raise TypeError(f"{path}: coupled-power phase must use an integer dtype")
             phase = phase_value.to(device="cpu", dtype=torch.long)
             if phase.shape != (observation.shape[0],):
                 raise ValueError(f"{path}: phase must have one value per transition")
@@ -332,6 +431,35 @@ def load_demonstrations(paths: Sequence[Path | str]) -> Demonstrations:
             raise TypeError(f"{path}: phase must be a tensor when present")
 
         meta = payload.get("meta")
+        source_contract: str | None = None
+        if coupled_contract:
+            _, matched_contract = audit_actor_rehearsal_metadata(
+                payload,
+                observation_dim=observation_dim,
+                action_dim=ACTION_DIM,
+                phase=phase,
+                expected_metadata=None,
+                allowed_contracts=PICK_TOOL_COUPLED_POWER_ACTOR_DEMO_CONTRACTS,
+            )
+            if matched_contract is None:
+                raise RuntimeError("coupled-power BC metadata audit returned no contract")
+            audit_actor_rehearsal_action_semantics(
+                action,
+                phase,
+                matched_contract,
+            )
+            audit_actor_rehearsal_phase_observation_semantics(
+                payload,
+                observation,
+                phase,
+                matched_contract,
+            )
+            audit_actor_rehearsal_episode_semantics(
+                payload,
+                episodes=int(offsets.numel() - 1),
+                source_contract=matched_contract,
+            )
+            source_contract = matched_contract.name
         if isinstance(meta, Mapping):
             declared_action_layout = meta.get("action_layout")
             if declared_action_layout not in (None, ACTION_LAYOUT):
@@ -352,9 +480,30 @@ def load_demonstrations(paths: Sequence[Path | str]) -> Demonstrations:
                 transitions=int(observation.shape[0]),
                 episodes=int(num_episodes),
                 phases=_phase_counts(phase),
+                source_contract=source_contract,
+                teacher_artifact_sha256=(
+                    str(meta["teacher_artifact_sha256"])
+                    if coupled_contract
+                    else None
+                ),
+                curriculum_dataset_sha256=(
+                    str(meta["curriculum_dataset_sha256"])
+                    if coupled_contract
+                    else None
+                ),
             )
         )
         episode_base += int(num_episodes)
+
+    if coupled_contract:
+        curriculum_fingerprints = {
+            source.curriculum_dataset_sha256 for source in sources
+        }
+        if len(curriculum_fingerprints) != 1:
+            raise ValueError(
+                "coupled-power BC sources must share one curriculum_dataset_sha256, "
+                f"got {sorted(curriculum_fingerprints)}"
+            )
 
     dataset = Demonstrations(
         observation=torch.cat(observations, dim=0),
@@ -530,7 +679,7 @@ def train_actor(
 
     actor = FlashSACActor(
         num_blocks=architecture.actor_num_blocks,
-        input_dim=OBSERVATION_DIM,
+        input_dim=dataset.observation_dim,
         hidden_dim=architecture.actor_hidden_dim,
         action_dim=ACTION_DIM,
     ).to(device)
@@ -713,20 +862,22 @@ def export_bridge_checkpoint(
     device: torch.device | str,
     seed: int,
     normalize_reward: bool = True,
+    observation_dim: int = OBSERVATION_DIM,
 ) -> FlashSACTorchBridge:
     """Export BC actor weights with fresh online-RL state around them."""
 
+    _bootstrap_task_mode(observation_dim)
     output = Path(output_dir).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     device = torch.device(device)
     observation_space = gym.spaces.Box(
-        low=-math.inf, high=math.inf, shape=(OBSERVATION_DIM,), dtype="float32"
+        low=-math.inf, high=math.inf, shape=(observation_dim,), dtype="float32"
     )
     action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(ACTION_DIM,), dtype="float32")
     bridge = FlashSACTorchBridge(
         observation_space,
         action_space,
-        {"actor_observation_size": (OBSERVATION_DIM,), "asymmetric_obs": False},
+        {"actor_observation_size": (observation_dim,), "asymmetric_obs": False},
         _checkpoint_agent_config(
             architecture,
             device=device,
@@ -767,6 +918,19 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _write_bootstrap_task_contract(output: Path, observation_dim: int) -> None:
+    runtime = _bootstrap_runtime_contract(observation_dim)
+    _atomic_write_json(
+        output / TASK_CONTRACT_FILENAME,
+        {
+            "version": TASK_CONTRACT_VERSION,
+            "replay_n_step": 3,
+            "replay_gamma": FLASH_SAC_GAMMA,
+            **runtime,
+        },
+    )
+
+
 def bootstrap(
     demo_paths: Sequence[Path | str],
     output_dir: Path | str,
@@ -776,6 +940,7 @@ def bootstrap(
     device: torch.device | str = "cuda:0",
     overwrite: bool = False,
     normalize_reward: bool = True,
+    observation_dim: int = OBSERVATION_DIM,
 ) -> dict[str, Any]:
     """Load demos, train actor, and write a bridge-loadable checkpoint."""
 
@@ -787,7 +952,9 @@ def bootstrap(
         raise FileExistsError(f"refusing to overwrite non-empty output directory: {output}")
     output.mkdir(parents=True, exist_ok=True)
 
-    dataset = load_demonstrations(demo_paths)
+    task_mode = _bootstrap_task_mode(observation_dim)
+    task_runtime = _bootstrap_runtime_contract(observation_dim)
+    dataset = load_demonstrations(demo_paths, observation_dim=observation_dim)
     split = split_by_episode(dataset, train_config.validation_fraction, train_config.seed)
     actor_state, training_metrics = train_actor(
         dataset,
@@ -803,15 +970,26 @@ def bootstrap(
         device=device,
         seed=train_config.seed,
         normalize_reward=normalize_reward,
+        observation_dim=observation_dim,
     )
     del bridge
+    _write_bootstrap_task_contract(output, observation_dim)
 
     metadata: dict[str, Any] = {
         "format_version": BC_FORMAT_VERSION,
         "checkpoint_type": "FlashSACTorchBridge",
-        "observation_dim": OBSERVATION_DIM,
+        "actor_sha256": _sha256(output / "actor.pt"),
+        "task_mode": task_mode,
+        "observation_dim": observation_dim,
+        "observation_contract": task_runtime["observation_contract"],
         "action_dim": ACTION_DIM,
         "action_layout": ACTION_LAYOUT,
+        "action_projection": task_runtime["action_projection"],
+        "action_semantics": (
+            "canonical_policy_action_before_phase_shield_v1"
+            if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE
+            else "normalized_policy_action_v1"
+        ),
         "supervision": {
             "source": "explicit_demo_action",
             "target": "atanh(clamp(action))",
@@ -841,6 +1019,11 @@ def bootstrap(
             "phase_counts": _phase_counts(dataset.phase),
             "train_phase_counts": _phase_counts(dataset.phase[split.train_rows]),
             "validation_phase_counts": _phase_counts(dataset.phase[split.validation_rows]),
+            "curriculum_dataset_sha256": (
+                dataset.sources[0].curriculum_dataset_sha256
+                if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE
+                else None
+            ),
             "sources": [asdict(source) for source in dataset.sources],
         },
         "sampling": training_metrics["sampling"],
@@ -856,6 +1039,16 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--demo", type=Path, nargs="+", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--observation_dim",
+        type=int,
+        choices=(OBSERVATION_DIM, COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM),
+        default=OBSERVATION_DIM,
+        help=(
+            "Actor observation width. Selecting 131 enables the strict coupled-power "
+            "dataset and checkpoint contract."
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch", type=int, default=2048)
     parser.add_argument("--lr", type=float, default=3.0e-4)
@@ -901,6 +1094,7 @@ def main() -> None:
         train_config=config,
         device=args.device,
         overwrite=args.overwrite,
+        observation_dim=args.observation_dim,
     )
     print(json.dumps(_json_safe(metadata), indent=2, sort_keys=True, allow_nan=False))
 
@@ -914,6 +1108,7 @@ __all__ = [
     "ACTION_LAYOUT",
     "BCArchitecture",
     "BCTrainConfig",
+    "COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM",
     "Demonstrations",
     "EpisodeSplit",
     "OBSERVATION_DIM",

@@ -770,10 +770,42 @@ def validate_training_source_selection(
             "--power_close_option_mode rejects --actor_demo until a strict, "
             "power-authority hand14 dataset contract is implemented"
         )
-    if coupled_power_align_close_option_mode and actor_demo is not None:
+    if (
+        coupled_power_align_close_option_mode
+        and actor_demo is not None
+        and actor_checkpoint is None
+        and not (checkpoint is not None and resume_actor_demo)
+    ):
         raise ValueError(
-            "--coupled_power_align_close_option_mode rejects --actor_demo until a strict, "
-            "coupled-power 131D/21D dataset contract is implemented"
+            "--coupled_power_align_close_option_mode with --actor_demo requires either "
+            "an initial --actor_checkpoint or --checkpoint plus --resume_actor_demo; "
+            "coupled rehearsal must not start the long-horizon bridge from a random actor"
+        )
+
+
+def validate_actor_demo_curriculum_lineage(
+    audit: Mapping[str, Any],
+    *,
+    expected_curriculum_sha256: str,
+) -> None:
+    """Bind a strict actor demonstration to the active reset curriculum."""
+
+    for label, value in (
+        ("expected curriculum", expected_curriculum_sha256),
+        ("actor demo curriculum", audit.get("curriculum_dataset_sha256")),
+    ):
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError(f"{label} SHA256 must be 64-character lowercase hex")
+    actual = str(audit["curriculum_dataset_sha256"])
+    if actual != expected_curriculum_sha256:
+        raise ValueError(
+            "coupled actor-demo curriculum lineage mismatch: "
+            f"demo={actual}, active={expected_curriculum_sha256}, "
+            f"source={audit.get('path')!r}"
         )
 
 
@@ -1143,7 +1175,9 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         default=None,
         help=(
             "Successful observation/action-only teacher datasets used exclusively for actor "
-            "rehearsal; they are never inserted into critic replay."
+            "rehearsal; they are never inserted into critic replay. Coupled-power sources "
+            "must satisfy the strict 131D phase contract and require --actor_checkpoint "
+            "initially (or --checkpoint plus --resume_actor_demo when resuming)."
         ),
     )
     parser.add_argument(
@@ -1986,6 +2020,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     from actor_rehearsal import (
         PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS,
+        PICK_TOOL_COUPLED_POWER_ACTOR_DEMO_CONTRACTS,
         PICK_TOOL_LIFT_ACTOR_DEMO_CONTRACTS,
         ActorRehearsalReservoir,
         load_actor_rehearsal,
@@ -2201,11 +2236,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         }
 
     if args.actor_demo is not None:
-        actor_demo_contracts = (
-            PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS
-            if is_close_option_task_mode(task_mode)
-            else PICK_TOOL_LIFT_ACTOR_DEMO_CONTRACTS
-        )
+        if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE:
+            actor_demo_contracts = PICK_TOOL_COUPLED_POWER_ACTOR_DEMO_CONTRACTS
+        elif is_close_option_task_mode(task_mode):
+            actor_demo_contracts = PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS
+        else:
+            actor_demo_contracts = PICK_TOOL_LIFT_ACTOR_DEMO_CONTRACTS
         for path in args.actor_demo:
             batch, labels, audit = load_actor_rehearsal(
                 path.resolve(),
@@ -2214,6 +2250,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 action_dim=env.action_dim,
                 allowed_contracts=actor_demo_contracts,
             )
+            if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE:
+                initial_curriculum_sha256 = curriculum_metrics[
+                    "curriculum_dataset_sha256"
+                ]
+                if (
+                    not isinstance(initial_curriculum_sha256, str)
+                    or args.curriculum_dataset is None
+                ):
+                    raise RuntimeError(
+                        "coupled actor-demo validation requires an active curriculum SHA256"
+                    )
+                expected_curriculum_sha256 = _sha256(args.curriculum_dataset)
+                if expected_curriculum_sha256 != initial_curriculum_sha256:
+                    raise RuntimeError(
+                        "coupled curriculum dataset changed while the run was starting"
+                    )
+                validate_actor_demo_curriculum_lineage(
+                    audit,
+                    expected_curriculum_sha256=expected_curriculum_sha256,
+                )
             actor_batches.append(batch)
             actor_phases.append(labels)
             actor_source_metrics.append({"role": "actor_only", **audit})
