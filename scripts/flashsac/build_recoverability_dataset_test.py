@@ -4,13 +4,17 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import tempfile
 from typing import Any
+from unittest import mock
 
 import torch
 
+import build_recoverability_dataset as recoverability_module
 from build_recoverability_dataset import (
+    _publish_dataset_and_report,
     build_dataset,
     pair_handoff_artifacts,
     sha256_file,
@@ -40,6 +44,7 @@ def _metadata(treatment: str, *, seed: int = 257) -> dict[str, Any]:
         "episode_length_s": 20.0,
         "max_episode_steps": 1000,
         "deterministic_policy_actions": True,
+        "use_compile": False,
         "approach_checkpoint_sha256": "a" * 64,
         "flashsac_actor_sha256": "b" * 64,
         "flashsac_task_contract_sha256": "c" * 64,
@@ -272,6 +277,7 @@ def _write_artifact_pair(
             "completed_episodes": metadata["requested_episodes"],
             "episode_length_s": metadata["episode_length_s"],
             "max_episode_steps": metadata["max_episode_steps"],
+            "use_compile": metadata["use_compile"],
             "checkpoint_actor_sha256": metadata["flashsac_actor_sha256"],
             "checkpoint_task_contract_sha256": metadata[
                 "flashsac_task_contract_sha256"
@@ -357,10 +363,72 @@ def test_build_dataset_checks_companions_and_cross_seed_leakage() -> None:
         _expect_error(ValueError, build_dataset, [pair_257], **kwargs)
 
 
+def test_transactional_publication_is_no_clobber() -> None:
+    payload = {"kind": "test", "value": torch.tensor([1.0])}
+    report = {"status": "complete"}
+    with tempfile.TemporaryDirectory() as directory_name:
+        directory = Path(directory_name)
+        output = directory / "dataset.pt"
+        report_path = directory / "report.json"
+        final = _publish_dataset_and_report(
+            payload, report, output=output, report_path=report_path
+        )
+        assert output.is_file() and report_path.is_file()
+        assert final["dataset_sha256"] == sha256_file(output)
+        _expect_error(
+            FileExistsError,
+            _publish_dataset_and_report,
+            payload,
+            report,
+            output=output,
+            report_path=report_path,
+        )
+
+        dangling = directory / "dangling.pt"
+        dangling.symlink_to(directory / "missing.pt")
+        _expect_error(
+            FileExistsError,
+            _publish_dataset_and_report,
+            payload,
+            report,
+            output=dangling,
+            report_path=directory / "unused.json",
+        )
+
+    with tempfile.TemporaryDirectory() as directory_name:
+        directory = Path(directory_name)
+        output = directory / "dataset.pt"
+        report_path = directory / "report.json"
+        real_link = os.link
+        calls = 0
+
+        def fail_second_link(source, target):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("injected report publication failure")
+            return real_link(source, target)
+
+        with mock.patch.object(
+            recoverability_module.os, "link", side_effect=fail_second_link
+        ):
+            _expect_error(
+                OSError,
+                _publish_dataset_and_report,
+                payload,
+                report,
+                output=output,
+                report_path=report_path,
+            )
+        assert not output.exists() and not report_path.exists()
+        assert not list(directory.glob(".*.tmp-*"))
+
+
 def main() -> None:
     test_pair_labels_and_canonical_features()
     test_pair_quality_fails_closed()
     test_build_dataset_checks_companions_and_cross_seed_leakage()
+    test_transactional_publication_is_no_clobber()
     print("recoverability dataset tests passed")
 
 

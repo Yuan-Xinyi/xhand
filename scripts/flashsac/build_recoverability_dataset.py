@@ -68,6 +68,7 @@ PROVENANCE_KEYS = (
     "episode_length_s",
     "max_episode_steps",
     "deterministic_policy_actions",
+    "use_compile",
     "approach_checkpoint_sha256",
     "flashsac_actor_sha256",
     "flashsac_task_contract_sha256",
@@ -406,6 +407,7 @@ def validate_companion_metrics(
         "action_dim": "action_dim",
         "episode_length_s": "episode_length_s",
         "max_episode_steps": "max_episode_steps",
+        "use_compile": "use_compile",
         "flashsac_fork_commit": "flashsac_fork_commit",
         "flashsac_upstream_commit": "flashsac_upstream_commit",
     }
@@ -799,7 +801,9 @@ def build_dataset(
     for row in range(int(tensors["seed"].numel())):
         digest = hashlib.sha256()
         for name in ("observation", "search_action", "flashsac_action"):
-            digest.update(tensors[name][row].contiguous().numpy().tobytes())
+            canonical = tensors[name][row].contiguous().clone()
+            canonical[canonical == 0.0] = 0.0
+            digest.update(canonical.numpy().tobytes())
         semantic_sha256 = digest.hexdigest()
         key = (
             int(tensors["seed"][row]),
@@ -842,8 +846,10 @@ def build_dataset(
         ),
         "feature_policy": (
             "training may use only canonical observation/search_action/flashsac_action "
-            "from the continue_search arm on outcome_label_valid rows; audit scalars "
-            "and outcomes are forbidden as features"
+            "from the continue_search arm; direct preference uses "
+            "preference_label_valid, while dual outcome heads use "
+            "paired_outcome_label_valid; audit scalars and outcomes are forbidden "
+            "as features"
         ),
         "strict_success_semantics": (
             "reset-before terminal truth with real convex-mesh clearance >= 0.20 m"

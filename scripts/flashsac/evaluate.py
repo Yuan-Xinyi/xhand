@@ -4773,6 +4773,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         "episode_length_s": float(env.unwrapped.cfg.episode_length_s),
                         "max_episode_steps": int(env.max_episode_steps),
                         "deterministic_policy_actions": True,
+                        "use_compile": bool(args.use_compile),
                         "approach_checkpoint": str(approach_checkpoint),
                         "approach_checkpoint_sha256": approach_checkpoint_sha256,
                         "flashsac_checkpoint": str(checkpoint),
