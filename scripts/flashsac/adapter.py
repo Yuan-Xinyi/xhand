@@ -19,7 +19,9 @@ path.
 The adapter is deliberately task-specific:
 
 * policy observation: 115 floats (the duplicate ``critic`` group is ignored)
-* action: 21 normalized values in [-1, 1]
+* ordinary action: 21 normalized values in [-1, 1]
+* opt-in close-option action: 14 hand values, expanded to seven zero arm
+  values plus the hand action immediately before the underlying environment
 * raw Gymnasium ``terminated`` and ``truncated`` flags are preserved
 * timeout transitions bootstrap from their captured final observation
 * all original Isaac Lab extras are retained
@@ -43,6 +45,8 @@ import torch
 PICK_TOOL_ENV_ID = "Pick-Tool-Token-Direct-v0"
 POLICY_OBSERVATION_DIM = 115
 ACTION_DIM = 21
+ARM_ACTION_DIM = 7
+HAND_ACTION_DIM = ACTION_DIM - ARM_ACTION_DIM
 
 # These values already exist under PickTool's ``extras["log"]``.  The adapter
 # exposes a reference-only subset at ``info["strict_metrics"]`` for loggers; it
@@ -196,6 +200,8 @@ def build_replay_transition(
     terminated: torch.Tensor,
     truncated: torch.Tensor,
     info: Mapping[str, Any],
+    *,
+    action_dim: int = ACTION_DIM,
 ) -> dict[str, torch.Tensor]:
     """Build the six standard FlashSAC buffer fields with correct final obs.
 
@@ -205,6 +211,8 @@ def build_replay_transition(
     gives the intended time-limit bootstrap behavior.
     """
 
+    if not isinstance(action_dim, int) or isinstance(action_dim, bool) or action_dim < 1:
+        raise ValueError("action_dim must be a positive integer")
     signals = classify_done(terminated, truncated)
     next_observation = info.get("transition_next_observation")
     if not isinstance(next_observation, torch.Tensor):
@@ -216,9 +224,10 @@ def build_replay_transition(
         )
     if observation.device != next_observation.device:
         raise ValueError("observation and transition_next_observation devices differ")
-    if action.ndim != 2 or action.shape != (observation.shape[0], ACTION_DIM):
+    if action.ndim != 2 or action.shape != (observation.shape[0], action_dim):
         raise ValueError(
-            f"action must have shape ({observation.shape[0]}, {ACTION_DIM}), got {tuple(action.shape)}"
+            f"action must have shape ({observation.shape[0]}, {action_dim}), "
+            f"got {tuple(action.shape)}"
         )
     if reward.shape != signals.terminated.shape:
         raise ValueError(
@@ -260,7 +269,7 @@ class PickToolIsaacLabAdapter:
     """A batched, Torch-only adapter around the PickTool DirectRLEnv."""
 
     observation_dim = POLICY_OBSERVATION_DIM
-    action_dim = ACTION_DIM
+    environment_action_dim = ACTION_DIM
 
     def __init__(
         self,
@@ -270,6 +279,7 @@ class PickToolIsaacLabAdapter:
         strict: bool = True,
         require_cuda: bool = True,
         validate_finite: bool = False,
+        hand_only_actions: bool = False,
     ) -> None:
         if not np.isfinite(action_clip) or not 0.0 < action_clip <= 1.0:
             raise ValueError("action_clip must be finite and in (0, 1]")
@@ -281,6 +291,8 @@ class PickToolIsaacLabAdapter:
         self.action_clip = float(action_clip)
         self.strict = bool(strict)
         self.validate_finite = bool(validate_finite)
+        self.hand_only_actions = bool(hand_only_actions)
+        self.action_dim = HAND_ACTION_DIM if self.hand_only_actions else ACTION_DIM
         self.max_episode_steps = int(getattr(self.unwrapped, "max_episode_length", 0))
 
         if self.num_envs < 1:
@@ -300,9 +312,14 @@ class PickToolIsaacLabAdapter:
                 raise ValueError(
                     f"environment declares {declared_obs} policy observations, expected {self.observation_dim}"
                 )
-            if declared_action is not None and declared_action != self.action_dim:
+            if declared_action is not None and declared_action != self.environment_action_dim:
                 raise ValueError(
-                    f"environment declares {declared_action} actions, expected {self.action_dim}"
+                    f"environment declares {declared_action} actions, "
+                    f"expected {self.environment_action_dim}"
+                )
+            if self.hand_only_actions and getattr(cfg, "close_option_mode", False) is not True:
+                raise ValueError(
+                    "hand_only_actions is restricted to an environment with close_option_mode=True"
                 )
             if strict and getattr(cfg, "observation_noise_model", None) is not None:
                 raise ValueError(
@@ -371,6 +388,19 @@ class PickToolIsaacLabAdapter:
         if self.validate_finite and not bool(torch.isfinite(action).all()):
             raise FloatingPointError("action contains NaN or infinity")
         return action.clamp(-self.action_clip, self.action_clip)
+
+    def _environment_action(self, action: torch.Tensor) -> torch.Tensor:
+        """Expand an opt-in hand policy action to the task's native 21-D action."""
+
+        if not self.hand_only_actions:
+            return action
+        arm = action.new_zeros((self.num_envs, ARM_ACTION_DIM))
+        environment_action = torch.cat((arm, action), dim=-1)
+        if environment_action.shape != (self.num_envs, self.environment_action_dim):
+            raise RuntimeError(
+                "hand-only action expansion produced an invalid environment action shape"
+            )
+        return environment_action
 
     def sample_random_actions(self, generator: torch.Generator | None = None) -> torch.Tensor:
         """Sample normalized actions directly on the environment device."""
@@ -462,7 +492,8 @@ class PickToolIsaacLabAdapter:
         dict[str, Any],
     ]:
         action = self._validate_action(action)
-        result, captures = self._step_with_terminal_capture(action)
+        environment_action = self._environment_action(action)
+        result, captures = self._step_with_terminal_capture(environment_action)
         if not isinstance(result, tuple) or len(result) != 5:
             raise TypeError("DirectRLEnv.step must return (obs, reward, terminated, truncated, extras)")
         observations, reward, terminated, truncated, extras = result
@@ -546,6 +577,7 @@ def make_pick_tool_env(
     action_clip: float = 1.0,
     strict: bool = True,
     validate_finite: bool = False,
+    hand_only_actions: bool = False,
 ) -> PickToolIsaacLabAdapter:
     """Create the registered PickTool task after Isaac Sim has been launched."""
 
@@ -573,11 +605,14 @@ def make_pick_tool_env(
         strict=strict,
         require_cuda=True,
         validate_finite=validate_finite,
+        hand_only_actions=hand_only_actions,
     )
 
 
 __all__ = [
     "ACTION_DIM",
+    "ARM_ACTION_DIM",
+    "HAND_ACTION_DIM",
     "PICK_TOOL_ENV_ID",
     "POLICY_OBSERVATION_DIM",
     "STRICT_METRIC_KEYS",

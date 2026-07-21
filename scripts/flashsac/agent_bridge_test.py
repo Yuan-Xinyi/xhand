@@ -67,6 +67,24 @@ def _agent(**config_overrides: Any) -> FlashSACTorchBridge:
     )
 
 
+def _agent_with_action_dim(
+    action_dim: int,
+    *,
+    use_compile: bool = False,
+) -> FlashSACTorchBridge:
+    observation_space = gym.spaces.Box(
+        -1.0, 1.0, shape=(OBSERVATION_DIM,), dtype="float32"
+    )
+    action_space = gym.spaces.Box(-1.0, 1.0, shape=(action_dim,), dtype="float32")
+    return FlashSACTorchBridge(
+        observation_space,
+        action_space,
+        {},
+        _config(use_compile=use_compile),
+        noise_groups=(ActionNoiseGroup("all", 0, action_dim),),
+    )
+
+
 def _transition(observation: torch.Tensor, action: torch.Tensor) -> dict[str, torch.Tensor]:
     num_envs = observation.shape[0]
     return {
@@ -444,6 +462,92 @@ def test_actor_only_checkpoint_is_portable_and_leaves_fresh_state() -> None:
             )
 
 
+def test_actor_only_projection_slices_exact_outputs_and_keeps_fresh_state() -> None:
+    source_action_dim = 21
+    target_action_dim = 14
+    hand_indices = tuple(range(7, 21))
+    output_keys = {
+        "predictor.mean_w.w.weight",
+        "predictor.mean_bias",
+        "predictor.std_w.w.weight",
+        "predictor.std_bias",
+    }
+    for source_compiled, target_compiled in ((False, True), (True, False)):
+        torch.manual_seed(310 + int(source_compiled))
+        source = _agent_with_action_dim(source_action_dim, use_compile=source_compiled)
+        observations = torch.randn(NUM_ENVS, OBSERVATION_DIM)
+
+        with tempfile.TemporaryDirectory(prefix="flashsac_actor_projection_") as directory:
+            checkpoint = Path(directory) / "checkpoint"
+            source.save(str(checkpoint))
+            source_action = source.sample_actions(
+                1, {"next_observation": observations}, training=False
+            )
+
+            target = _agent_with_action_dim(target_action_dim, use_compile=target_compiled)
+            untouched_networks = {
+                name: _canonical_network_state(getattr(target, name))
+                for name in ("_critic", "_target_critic", "_temperature")
+            }
+            untouched_optimizer = target._actor.optimizer.state_dict()  # noqa: SLF001
+            target.load_actor(
+                str(checkpoint),
+                source_action_indices=hand_indices,
+                expected_source_action_dim=source_action_dim,
+            )
+
+            source_state = _canonical_network_state(source._actor)  # noqa: SLF001
+            target_state = _canonical_network_state(target._actor)  # noqa: SLF001
+            assert target_state.keys() == source_state.keys()
+            index = torch.tensor(hand_indices, dtype=torch.long)
+            for key, target_value in target_state.items():
+                expected = (
+                    source_state[key].index_select(0, index)
+                    if key in output_keys
+                    else source_state[key]
+                )
+                torch.testing.assert_close(target_value, expected, rtol=0.0, atol=0.0)
+
+            target_action = target.sample_actions(
+                1, {"next_observation": observations}, training=False
+            )
+            torch.testing.assert_close(
+                target_action,
+                source_action[:, 7:],
+                rtol=1.0e-6,
+                atol=1.0e-7,
+            )
+            for name, expected in untouched_networks.items():
+                _assert_nested_equal(
+                    _canonical_network_state(getattr(target, name)), expected
+                )
+            _assert_nested_equal(
+                target._actor.optimizer.state_dict(), untouched_optimizer  # noqa: SLF001
+            )
+            assert target._update_step == 0  # noqa: SLF001
+
+            _expect_error(
+                ValueError,
+                target.load_actor,
+                str(checkpoint),
+                source_action_indices=hand_indices,
+            )
+            _expect_error(
+                ValueError,
+                target.load_actor,
+                str(checkpoint),
+                source_action_indices=(7,) * target_action_dim,
+                expected_source_action_dim=source_action_dim,
+            )
+            _expect_error(
+                RuntimeError,
+                target.load_actor,
+                str(checkpoint),
+                source_action_indices=tuple(range(6, 20)),
+                expected_source_action_dim=20,
+            )
+
+
 def test_group_partition_is_validated() -> None:
     observation_space, action_space = _spaces()
     overlapping = (
@@ -482,6 +586,8 @@ def main() -> None:
     print("[PASS] enabled/disabled AMP checkpoint portability (both directions)")
     test_actor_only_checkpoint_is_portable_and_leaves_fresh_state()
     print("[PASS] actor-only portability and fresh critic/replay/normalizer state")
+    test_actor_only_projection_slices_exact_outputs_and_keeps_fresh_state()
+    print("[PASS] actor-only 21D-to-14D output projection")
     test_group_partition_is_validated()
     print("[PASS] noise-group validation")
     print("All FlashSAC Torch bridge tests passed.")

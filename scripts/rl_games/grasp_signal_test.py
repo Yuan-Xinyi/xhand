@@ -88,6 +88,24 @@ def evaluate_wrap(case: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     )
 
 
+def make_power_wrap_case() -> dict[str, torch.Tensor]:
+    case = make_wrap_case()
+    # Thumb plus index/middle/ring are legal opposed contacts; pinky starts open.
+    case["force"][:, :4] = 10.0
+    case["force"][:, 4] = 0.0
+    case["normal"][:, 1:5] = torch.tensor((-1.0, 0.0, 0.0))
+    return case
+
+
+def evaluate_power_wrap(case: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return signals.power_wrap_quality(
+        case["force"], case["distance"], case["normal"], case["alignment"],
+        case["palm_facing"], 0, torch.tensor((1, 2, 3, 4)), force_threshold=0.2,
+        force_saturation=5.0, surface_margin=0.008, palm_facing_min=0.5,
+        alignment_min=0.3, opposition_min=0.5,
+    )
+
+
 def test_wrap_quality() -> None:
     legal = evaluate_wrap(make_wrap_case())
     check(legal["quality"].item() > 0.79, f"legal wrap too low: {legal['quality'].item()}")
@@ -132,6 +150,78 @@ def test_wrap_quality() -> None:
     print("PASS wrap truth table: thumb+2 opposed pads required; back/misaligned/off-handle rejected")
 
 
+def test_power_wrap_quality() -> None:
+    thumb_plus_two = make_power_wrap_case()
+    thumb_plus_two["force"][:, 3:] = 0.0
+    legacy = evaluate_wrap(thumb_plus_two)
+    power = evaluate_power_wrap(thumb_plus_two)
+    check(legacy["quality"].item() > 0.79, "legacy thumb+two reference stopped passing")
+    check(power["power_wrap_quality"].item() == 0.0, "thumb+two passed power grasp")
+    check(
+        power["power_legal_other_contact_count"].item() == 2,
+        "thumb+two legal-contact count is wrong",
+    )
+
+    thumb_plus_three = make_power_wrap_case()
+    power = evaluate_power_wrap(thumb_plus_three)
+    check(
+        power["power_wrap_quality"].item() > 0.79,
+        f"thumb+three legal grasp too low: {power['power_wrap_quality'].item()}",
+    )
+    check(power["power_thumb_contact"].item(), "power grasp lost thumb contact")
+    check(
+        power["power_legal_other_contact_count"].item() == 3,
+        "thumb+three legal-contact count is wrong",
+    )
+
+    wrong_side = make_power_wrap_case()
+    wrong_side["normal"][:, 3] = torch.tensor((1.0, 0.0, 0.0))
+    wrong_power = evaluate_power_wrap(wrong_side)
+    check(
+        wrong_power["power_wrap_quality"].item() == 0.0,
+        "wrong-side third contact passed power grasp",
+    )
+    check(
+        wrong_power["power_legal_other_contact_count"].item() == 2,
+        "wrong-side third contact was counted as legal",
+    )
+
+    misaligned = make_power_wrap_case()
+    misaligned["alignment"][:, 3] = 0.1
+    misaligned_power = evaluate_power_wrap(misaligned)
+    check(
+        misaligned_power["power_wrap_quality"].item() == 0.0,
+        "misaligned third contact passed power grasp",
+    )
+    check(
+        misaligned_power["power_legal_other_contact_count"].item() == 2,
+        "misaligned third contact was counted as legal",
+    )
+
+    # Column order is an implementation detail.  Moving the open finger and all three legal
+    # contacts to different non-thumb columns must preserve the scalar signal and contact count.
+    permutation = torch.tensor((0, 3, 1, 4, 2))
+    permuted = {
+        key: value[:, permutation] if value.ndim == 2 else value[:, permutation, :]
+        for key, value in thumb_plus_three.items()
+        if key != "palm_facing"
+    }
+    permuted["palm_facing"] = thumb_plus_three["palm_facing"].clone()
+    permuted_power = evaluate_power_wrap(permuted)
+    check(
+        torch.allclose(permuted_power["power_wrap_quality"], power["power_wrap_quality"]),
+        "power quality depends on non-thumb column order",
+    )
+    check(
+        torch.equal(
+            permuted_power["power_legal_other_contact_count"],
+            power["power_legal_other_contact_count"],
+        ),
+        "power legal-contact count depends on non-thumb column order",
+    )
+    print("PASS power wrap: thumb+3 required; wrong-side/misaligned rejected; permutation invariant")
+
+
 def test_staged_close_quality() -> None:
     def close(case: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         palm_score = torch.clamp((case["palm_facing"] - 0.5) / 0.5, 0.0, 1.0)
@@ -162,6 +252,50 @@ def test_staged_close_quality() -> None:
         "same-side contacts receive nearly as much close shaping as opposed contacts",
     )
     print("PASS staged close: near -> thumb -> thumb+1 -> thumb+2 is monotonic and direction-gated")
+
+
+def test_power_staged_close_quality() -> None:
+    def close(case: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        palm_score = torch.clamp((case["palm_facing"] - 0.5) / 0.5, 0.0, 1.0)
+        return signals.power_staged_close_quality(
+            case["force"], case["distance"], case["distance"] < 0.008,
+            case["normal"], case["alignment"], palm_score, 0,
+            torch.tensor((1, 2, 3, 4)), alignment_min=0.3, opposition_min=0.5,
+            proximity_scale_far=0.08, proximity_scale_near=0.02, force_saturation=5.0,
+        )
+
+    values = []
+    for other_contacts in range(-1, 5):
+        case = make_power_wrap_case()
+        case["force"].zero_()
+        if other_contacts >= 0:
+            case["force"][:, 0] = 10.0
+            if other_contacts:
+                case["force"][:, 1 : 1 + other_contacts] = 10.0
+        values.append(close(case)["power_close_quality"].item())
+    check(values[0] > 0.0, "power near-handle shaping disappeared before contact")
+    check(
+        all(left < right for left, right in zip(values, values[1:])),
+        f"power close stages are not strictly monotonic: {values}",
+    )
+    check(values[4] - values[3] > 0.0, "third non-thumb closure has no dense increment")
+    check(values[5] - values[4] > 0.0, "fourth non-thumb closure has no dense increment")
+
+    wrong_third = make_power_wrap_case()
+    wrong_third["force"].zero_()
+    wrong_third["force"][:, :4] = 10.0
+    wrong_third["normal"][:, 3] = torch.tensor((1.0, 0.0, 0.0))
+    check(
+        close(wrong_third)["power_close_quality"].item() < values[4],
+        "wrong-side third finger received the legal third-contact increment",
+    )
+    back = make_power_wrap_case()
+    back["palm_facing"][:] = 0.2
+    check(
+        close(back)["power_close_quality"].item() == 0.0,
+        "back-of-hand power-close shaping is nonzero",
+    )
+    print("PASS power close: near -> thumb -> +1 -> +2 -> +3 -> +4 strictly monotonic")
 
 
 def test_schmitt_latch() -> None:
@@ -274,6 +408,61 @@ def test_close_option_state() -> None:
     print("PASS close option: 15-frame stable success; lift/shove/lost-window/unsafe rejected")
 
 
+def test_power_close_step_order_contract() -> None:
+    """Mirror DirectRLEnv's dones-before-reward order for the power-close horizon."""
+
+    grasped = torch.zeros(1, dtype=torch.bool)
+    latch_confirm = torch.zeros(1, dtype=torch.long)
+    latch_release = torch.zeros(1, dtype=torch.long)
+    stable = torch.zeros(1, dtype=torch.long)
+    lost = torch.zeros(1, dtype=torch.long)
+    quality = torch.tensor((0.6,))
+    success_steps: list[int] = []
+
+    for action_step in range(1, 20):
+        # DirectRLEnv calls task dones first.  The grasp latch seen here was therefore updated by
+        # the previous action's reward calculation, exactly like PickToolTokenEnv.
+        option = signals.update_close_option_state(
+            quality,
+            torch.tensor((0.8,)),
+            torch.tensor((10.0,)),
+            grasped,
+            stable,
+            torch.zeros(1),
+            torch.zeros(1),
+            torch.tensor((0.5,)),
+            lost,
+            torch.zeros(1, dtype=torch.bool),
+            grasp_quality_threshold=0.35,
+            hold_quality_threshold=0.5,
+            safe_force_limit=30.0,
+            confirm_steps=15,
+            unlatched_lift_limit=0.015,
+            horizontal_drift_limit=0.03,
+            min_proximity=0.01,
+            lost_window_steps=12,
+        )
+        stable = option["stable_count"]
+        lost = option["lost_window_count"]
+        if option["success"].item():
+            success_steps.append(action_step)
+
+        # Reward then advances the independent four-frame power latch.
+        grasped, latch_confirm, latch_release, _, _ = signals.update_grasp_latch(
+            quality,
+            grasped,
+            latch_confirm,
+            latch_release,
+            high_threshold=0.35,
+            low_threshold=0.20,
+            confirm_steps=4,
+            release_steps=6,
+        )
+
+    check(success_steps == [19], f"power close first succeeded at {success_steps}, expected [19]")
+    print("PASS power close timing: 4-frame latch + 15-frame stable window succeeds on action 19")
+
+
 def test_asymmetric_joint_residual() -> None:
     base = torch.tensor(
         [[0.1, 0.4, -0.2, 0.7, 0.6, 0.0], [0.2, 0.5, -0.1, 0.8, 0.7, 0.1],
@@ -300,11 +489,57 @@ def test_asymmetric_joint_residual() -> None:
     print("PASS hybrid action: full asymmetric range, zero identity, shuffled joints and rows")
 
 
+def test_close_option_arm_hold() -> None:
+    actions = torch.arange(42, dtype=torch.float32).reshape(2, 21)
+    constrained = hybrid_action.zero_action_prefix(actions, 7)
+    check(torch.count_nonzero(constrained[:, :7]).item() == 0, "close option arm action is nonzero")
+    check(torch.equal(constrained[:, 7:], actions[:, 7:]), "close option changed hand actions")
+    check(torch.equal(actions, torch.arange(42, dtype=torch.float32).reshape(2, 21)), "input was mutated")
+
+    joint_pos = torch.arange(38, dtype=torch.float32).reshape(2, 19) / 10.0
+    joint_vel = torch.ones_like(joint_pos)
+    targets = joint_pos + 0.5
+    last_action = actions.clone()
+    arm_ids = torch.tensor((6, 1, 4, 0, 3, 2, 5))
+    held_vel, held_targets, held_action = hybrid_action.hold_arm_reset_state(
+        joint_pos, joint_vel, targets, last_action, arm_ids, 7
+    )
+    check(torch.count_nonzero(held_vel[:, arm_ids]).item() == 0, "captured arm velocity survived")
+    check(
+        torch.equal(held_targets[:, arm_ids], joint_pos[:, arm_ids]),
+        "captured arm target preload survived",
+    )
+    hand_joint_ids = torch.tensor(tuple(index for index in range(19) if index not in arm_ids.tolist()))
+    check(torch.equal(held_vel[:, hand_joint_ids], joint_vel[:, hand_joint_ids]), "hand velocity changed")
+    check(torch.equal(held_targets[:, hand_joint_ids], targets[:, hand_joint_ids]), "hand target changed")
+    check(torch.count_nonzero(held_action[:, :7]).item() == 0, "reset arm action history survived")
+    check(torch.equal(held_action[:, 7:], last_action[:, 7:]), "reset hand action history changed")
+
+    stable_steps = torch.tensor((0, 1, 2, 3), dtype=torch.long)
+    released = torch.tensor((False, False, False, True))
+    next_steps, next_released = hybrid_action.update_arm_hold_release(
+        torch.tensor((True, False, True, False)),
+        stable_steps,
+        released,
+        confirm_steps=3,
+    )
+    check(torch.equal(next_steps, torch.tensor((1, 0, 3, 3))), "stable-window count is wrong")
+    check(
+        torch.equal(next_released, torch.tensor((False, False, True, True))),
+        "arm release is not one-way at the confirmation boundary",
+    )
+    print("PASS close option: arm action, momentum and target preload are held; hand state preserved")
+
+
 if __name__ == "__main__":
     test_rigid_hold_quality()
     test_wrap_quality()
+    test_power_wrap_quality()
     test_staged_close_quality()
+    test_power_staged_close_quality()
     test_schmitt_latch()
     test_close_option_state()
+    test_power_close_step_order_contract()
     test_asymmetric_joint_residual()
+    test_close_option_arm_hold()
     print("ALL GRASP SIGNAL TESTS PASSED")

@@ -117,9 +117,20 @@ CLOSE_OPTION_TERMINAL_EVENT_KEYS = (
     "close_option_lost_window",
 )
 
+POWER_CLOSE_OPTION_TERMINAL_EVENT_KEYS = (
+    "power_close_option_success",
+    "power_close_option_failure",
+    "power_close_option_timeout",
+    "dropped",
+    "unsafe_force",
+    "close_option_unlatched_lift",
+    "close_option_horizontal_escape",
+    "close_option_lost_window",
+)
+
 TASK_CONTRACT_FILENAME = "task_contract.json"
 INCOMPLETE_CHECKPOINT_FILENAME = ".incomplete_checkpoint.json"
-TASK_CONTRACT_VERSION = 2
+TASK_CONTRACT_VERSION = 3
 FLASH_SAC_GAMMA = 0.99
 CORE_CHECKPOINT_FILENAMES = (
     "actor.pt",
@@ -134,14 +145,133 @@ STALE_OPTIONAL_CHECKPOINT_FILENAMES = (
 )
 FULL_TASK_MODE = "full_task"
 CLOSE_OPTION_TASK_MODE = "close_option"
-TASK_MODES = (FULL_TASK_MODE, CLOSE_OPTION_TASK_MODE)
+POWER_CLOSE_OPTION_TASK_MODE = "power_close_option_v1"
+TASK_MODES = (
+    FULL_TASK_MODE,
+    CLOSE_OPTION_TASK_MODE,
+    POWER_CLOSE_OPTION_TASK_MODE,
+)
 PICK_TOOL_LATCH_OBSERVATION_INDEX = 106
 PICK_TOOL_ARM_ACTION_DIM = 7
+PICK_TOOL_HAND_ACTION_DIM = 14
 PICK_TOOL_ACTION_DIM = 21
+PICK_TOOL_ENVIRONMENT_ACTION_DIM = 21
+FULL_POLICY_ACTION_LAYOUT = "arm_delta7|crossdex_token9|distal_residual5"
+HAND_POLICY_ACTION_LAYOUT = "crossdex_token9|distal_residual5"
+IDENTITY_ACTION_PROJECTION = "identity_v1"
+PREPEND_ZERO_ARM_ACTION_PROJECTION = "prepend_zero_arm7_v1"
+FULL21_TO_HAND14_ACTOR_PROJECTION = "full21_to_hand14_v1"
+PICK_TOOL_OBSERVATION_DIM = 115
+PICK_TOOL_OBSERVATION_CONTRACT = "pick_tool_markov115_v1"
+POWER_CLOSE_OBSERVATION_CONTRACT = "pick_tool_power_close_markov115_v1"
+FULL_ACTION_NOISE_GROUP_SPECS = (
+    ("arm", 0, 7, 1.0, 1.0, 64),
+    ("token", 7, 16, 0.5, 1.25, 32),
+    ("residual", 16, 21, 0.35, 1.5, 16),
+)
+POWER_ACTION_NOISE_GROUP_SPECS = (
+    ("token", 0, 9, 0.5, 1.25, 32),
+    ("residual", 9, 14, 0.35, 1.5, 16),
+)
 
 
-def task_mode_from_close_option(close_option_mode: bool) -> str:
+def task_mode_from_close_option(
+    close_option_mode: bool,
+    power_close_option_mode: bool = False,
+) -> str:
+    """Resolve the mutually-exclusive task flag pair into a checkpoint mode."""
+
+    if close_option_mode and power_close_option_mode:
+        raise ValueError(
+            "--close_option_mode and --power_close_option_mode are mutually exclusive"
+        )
+    if power_close_option_mode:
+        return POWER_CLOSE_OPTION_TASK_MODE
     return CLOSE_OPTION_TASK_MODE if close_option_mode else FULL_TASK_MODE
+
+
+def is_close_option_task_mode(task_mode: str) -> bool:
+    if task_mode not in TASK_MODES:
+        raise ValueError(f"unsupported task_mode={task_mode!r}")
+    return task_mode in (CLOSE_OPTION_TASK_MODE, POWER_CLOSE_OPTION_TASK_MODE)
+
+
+def policy_action_contract(task_mode: str) -> dict[str, Any]:
+    """Return the policy/environment action boundary fixed by a task mode."""
+
+    if task_mode not in TASK_MODES:
+        raise ValueError(f"unsupported task_mode={task_mode!r}")
+    if task_mode == POWER_CLOSE_OPTION_TASK_MODE:
+        return {
+            "policy_action_dim": PICK_TOOL_HAND_ACTION_DIM,
+            "policy_action_layout": HAND_POLICY_ACTION_LAYOUT,
+            "environment_action_dim": PICK_TOOL_ENVIRONMENT_ACTION_DIM,
+            "action_projection": PREPEND_ZERO_ARM_ACTION_PROJECTION,
+        }
+    return {
+        "policy_action_dim": PICK_TOOL_ACTION_DIM,
+        "policy_action_layout": FULL_POLICY_ACTION_LAYOUT,
+        "environment_action_dim": PICK_TOOL_ENVIRONMENT_ACTION_DIM,
+        "action_projection": IDENTITY_ACTION_PROJECTION,
+    }
+
+
+def action_noise_group_specs(task_mode: str) -> tuple[tuple[Any, ...], ...]:
+    """Return grouped exploration slices in policy-action coordinates."""
+
+    if task_mode == POWER_CLOSE_OPTION_TASK_MODE:
+        return POWER_ACTION_NOISE_GROUP_SPECS
+    if task_mode in (FULL_TASK_MODE, CLOSE_OPTION_TASK_MODE):
+        return FULL_ACTION_NOISE_GROUP_SPECS
+    raise ValueError(f"unsupported task_mode={task_mode!r}")
+
+
+def observation_contract(task_mode: str) -> dict[str, Any]:
+    """Return the actor-visible observation semantics fixed by a task mode."""
+
+    if task_mode not in TASK_MODES:
+        raise ValueError(f"unsupported task_mode={task_mode!r}")
+    return {
+        "observation_dim": PICK_TOOL_OBSERVATION_DIM,
+        "observation_contract": (
+            POWER_CLOSE_OBSERVATION_CONTRACT
+            if task_mode == POWER_CLOSE_OPTION_TASK_MODE
+            else PICK_TOOL_OBSERVATION_CONTRACT
+        ),
+    }
+
+
+def runtime_contract(task_mode: str) -> dict[str, Any]:
+    """Return every non-discount tensor-layout contract for a task mode."""
+
+    return {
+        **observation_contract(task_mode),
+        **policy_action_contract(task_mode),
+    }
+
+
+def _validate_serialized_runtime_contract(
+    payload: Mapping[str, Any],
+    *,
+    task_mode: str,
+    path: Path,
+) -> dict[str, Any]:
+    expected = runtime_contract(task_mode)
+    actual: dict[str, Any] = {}
+    for key, expected_value in expected.items():
+        value = payload.get(key)
+        if isinstance(expected_value, int):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"checkpoint task contract {path} has invalid {key}")
+        elif not isinstance(value, str) or not value:
+            raise ValueError(f"checkpoint task contract {path} has invalid {key}")
+        if value != expected_value:
+            raise ValueError(
+                f"checkpoint task contract {path} has {key}={value!r}, "
+                f"expected {expected_value!r} for task_mode={task_mode!r}"
+            )
+        actual[key] = value
+    return actual
 
 
 def require_complete_core_checkpoint(checkpoint: Path) -> None:
@@ -182,6 +312,7 @@ def read_checkpoint_task_contract(checkpoint: Path) -> dict[str, Any]:
             "legacy_checkpoint": True,
             "replay_n_step": None,
             "replay_gamma": None,
+            **runtime_contract(FULL_TASK_MODE),
         }
     if not path.is_file():
         raise ValueError(f"checkpoint task contract is not a regular file: {path}")
@@ -196,16 +327,21 @@ def read_checkpoint_task_contract(checkpoint: Path) -> dict[str, Any]:
     if (
         not isinstance(version, int)
         or isinstance(version, bool)
-        or version not in (1, TASK_CONTRACT_VERSION)
+        or version not in (1, 2, TASK_CONTRACT_VERSION)
     ):
         raise ValueError(
             f"checkpoint task contract {path} has version={version!r}, "
-            f"expected 1 or {TASK_CONTRACT_VERSION}"
+            f"expected 1, 2 or {TASK_CONTRACT_VERSION}"
         )
     task_mode = payload.get("task_mode")
     if task_mode not in TASK_MODES:
         raise ValueError(
             f"checkpoint task contract {path} has unsupported task_mode={task_mode!r}"
+        )
+    if version < 3 and task_mode == POWER_CLOSE_OPTION_TASK_MODE:
+        raise ValueError(
+            f"checkpoint task contract {path} cannot use task_mode={task_mode!r} "
+            f"before version 3"
         )
     replay_n_step: int | None = None
     replay_gamma: float | None = None
@@ -219,12 +355,22 @@ def read_checkpoint_task_contract(checkpoint: Path) -> dict[str, Any]:
         replay_gamma = float(replay_gamma)
         if not math.isfinite(replay_gamma) or not 0.0 <= replay_gamma <= 1.0:
             raise ValueError(f"checkpoint task contract {path} has invalid replay_gamma")
+    serialized_runtime = (
+        _validate_serialized_runtime_contract(
+            payload,
+            task_mode=str(task_mode),
+            path=path,
+        )
+        if version >= 3
+        else runtime_contract(str(task_mode))
+    )
     return {
         "version": int(version),
         "task_mode": str(task_mode),
         "legacy_checkpoint": False,
         "replay_n_step": replay_n_step,
         "replay_gamma": replay_gamma,
+        **serialized_runtime,
     }
 
 
@@ -234,6 +380,12 @@ def write_checkpoint_task_contract(
     task_mode: str,
     replay_n_step: int,
     replay_gamma: float,
+    policy_action_dim: int | None = None,
+    policy_action_layout: str | None = None,
+    environment_action_dim: int | None = None,
+    action_projection: str | None = None,
+    observation_dim: int | None = None,
+    observation_contract_name: str | None = None,
 ) -> None:
     if task_mode not in TASK_MODES:
         raise ValueError(f"unsupported task_mode={task_mode!r}")
@@ -245,6 +397,25 @@ def write_checkpoint_task_contract(
         raise ValueError("replay_n_step must be a positive integer")
     if not math.isfinite(replay_gamma) or not 0.0 <= replay_gamma <= 1.0:
         raise ValueError("replay_gamma must be finite and in [0, 1]")
+    expected_runtime = runtime_contract(task_mode)
+    supplied_runtime = {
+        "policy_action_dim": policy_action_dim,
+        "policy_action_layout": policy_action_layout,
+        "environment_action_dim": environment_action_dim,
+        "action_projection": action_projection,
+        "observation_dim": observation_dim,
+        "observation_contract": observation_contract_name,
+    }
+    resolved_runtime = {
+        key: expected_runtime[key] if value is None else value
+        for key, value in supplied_runtime.items()
+    }
+    for key, expected in expected_runtime.items():
+        if resolved_runtime[key] != expected:
+            raise ValueError(
+                f"{key}={resolved_runtime[key]!r} is incompatible with "
+                f"task_mode={task_mode!r}; expected {expected!r}"
+            )
     atomic_write_json(
         checkpoint / TASK_CONTRACT_FILENAME,
         {
@@ -252,6 +423,7 @@ def write_checkpoint_task_contract(
             "task_mode": task_mode,
             "replay_n_step": replay_n_step,
             "replay_gamma": replay_gamma,
+            **resolved_runtime,
         },
     )
 
@@ -380,6 +552,13 @@ def validate_replay_task_contract(
             "--resume_replay cannot cross task modes: "
             f"checkpoint={contract['task_mode']!r}, current={task_mode!r}"
         )
+    current_runtime = runtime_contract(task_mode)
+    for key, expected in current_runtime.items():
+        if contract.get(key) != expected:
+            raise ValueError(
+                f"--resume_replay {key} mismatch: checkpoint={contract.get(key)!r}, "
+                f"current={expected!r}"
+            )
     checkpoint_n_step = contract["replay_n_step"]
     checkpoint_gamma = contract["replay_gamma"]
     if checkpoint_n_step is None or checkpoint_gamma is None:
@@ -425,6 +604,13 @@ def validate_checkpoint_task_contract(
             "critic/optimizer/normalizer state; use --actor_checkpoint instead: "
             f"checkpoint={contract['task_mode']!r}, current={task_mode!r}"
         )
+    current_runtime = runtime_contract(task_mode)
+    for key, expected in current_runtime.items():
+        if contract.get(key) != expected:
+            raise ValueError(
+                f"--checkpoint {key} mismatch; use --actor_checkpoint instead: "
+                f"checkpoint={contract.get(key)!r}, current={expected!r}"
+            )
     checkpoint_n_step = contract["replay_n_step"]
     checkpoint_gamma = contract["replay_gamma"]
     if checkpoint_n_step is None or checkpoint_gamma is None:
@@ -455,7 +641,9 @@ def validate_training_source_selection(
     resume_replay: bool,
     resume_actor_demo: bool,
     close_option_mode: bool,
+    power_close_option_mode: bool,
     demo: list[Path] | None,
+    actor_demo: list[Path] | None,
 ) -> None:
     """Validate mutually exclusive initialization and task-specific data sources."""
 
@@ -465,10 +653,16 @@ def validate_training_source_selection(
         raise ValueError("--resume_replay requires --checkpoint")
     if resume_actor_demo and checkpoint is None:
         raise ValueError("--resume_actor_demo requires --checkpoint")
-    if close_option_mode and demo is not None:
+    task_mode_from_close_option(close_option_mode, power_close_option_mode)
+    if (close_option_mode or power_close_option_mode) and demo is not None:
         raise ValueError(
-            "--close_option_mode rejects full-task transition --demo data; "
+            "close-option training rejects full-task transition --demo data; "
             "use allowlisted --actor_demo supervision instead"
+        )
+    if power_close_option_mode and actor_demo is not None:
+        raise ValueError(
+            "--power_close_option_mode rejects --actor_demo until a strict, "
+            "power-authority hand14 dataset contract is implemented"
         )
 
 
@@ -489,6 +683,7 @@ def validate_checkpoint_output_separation(
 def validate_close_option_training_config(
     *,
     close_option_mode: bool,
+    power_close_option_mode: bool,
     curriculum_dataset: Path | None,
     curriculum_boundary: str,
     curriculum_probability: float,
@@ -498,26 +693,37 @@ def validate_close_option_training_config(
 ) -> None:
     """Keep the close option on its physically meaningful pregrasp MDP."""
 
-    if not close_option_mode:
+    task_mode_from_close_option(close_option_mode, power_close_option_mode)
+    if not (close_option_mode or power_close_option_mode):
         return
+    flag = (
+        "--power_close_option_mode"
+        if power_close_option_mode
+        else "--close_option_mode"
+    )
     if curriculum_dataset is None:
-        raise ValueError("--close_option_mode requires a close-start curriculum dataset")
+        raise ValueError(f"{flag} requires a close-start curriculum dataset")
     if curriculum_boundary != "close_start":
-        raise ValueError("--close_option_mode requires --curriculum_boundary close_start")
+        raise ValueError(f"{flag} requires --curriculum_boundary close_start")
     if curriculum_probability != 1.0:
-        raise ValueError("--close_option_mode requires --curriculum_probability 1")
+        raise ValueError(f"{flag} requires --curriculum_probability 1")
     if not 0.0 <= curriculum_joint_noise <= 0.02:
         raise ValueError(
-            "--close_option_mode requires --curriculum_joint_noise in [0, 0.02]"
+            f"{flag} requires --curriculum_joint_noise in [0, 0.02]"
         )
-    if episode_length_s is None or not 0.30 <= episode_length_s <= 5.0:
+    minimum_episode_length_s = 0.40
+    if (
+        episode_length_s is None
+        or not minimum_episode_length_s <= episode_length_s <= 5.0
+    ):
         raise ValueError(
-            "--close_option_mode requires --episode_length_s in [0.30, 5] so the "
+            f"{flag} requires --episode_length_s in "
+            f"[{minimum_episode_length_s:.2f}, 5] so the "
             "15-frame confirmation window is physically reachable"
         )
     if randomize_episode_lengths:
         raise ValueError(
-            "--close_option_mode rejects --randomize_episode_lengths because shortened "
+            f"{flag} rejects --randomize_episode_lengths because shortened "
             "initial episodes can censor the stable-latch confirmation window"
         )
 
@@ -540,8 +746,11 @@ def build_latch_conditioned_noise_scale(
             "observation must be [batch, dim] and contain the PickTool latch bit at index "
             f"{PICK_TOOL_LATCH_OBSERVATION_INDEX}"
         )
-    if action_dim <= PICK_TOOL_ARM_ACTION_DIM:
-        raise ValueError("action_dim must contain both arm and hand action groups")
+    if action_dim not in (PICK_TOOL_HAND_ACTION_DIM, PICK_TOOL_ACTION_DIM):
+        raise ValueError(
+            f"action_dim must be {PICK_TOOL_HAND_ACTION_DIM} (hand-only) or "
+            f"{PICK_TOOL_ACTION_DIM} (arm+hand)"
+        )
     values = {
         "unlatched_arm": unlatched_arm,
         "unlatched_hand": unlatched_hand,
@@ -562,8 +771,11 @@ def build_latch_conditioned_noise_scale(
     hand_scale = torch.full_like(latched, unlatched_hand, dtype=torch.float32)
     arm_scale.masked_fill_(latched, latched_arm)
     hand_scale.masked_fill_(latched, latched_hand)
-    scale[:, :PICK_TOOL_ARM_ACTION_DIM] = arm_scale.unsqueeze(-1)
-    scale[:, PICK_TOOL_ARM_ACTION_DIM:] = hand_scale.unsqueeze(-1)
+    if action_dim == PICK_TOOL_HAND_ACTION_DIM:
+        scale[:] = hand_scale.unsqueeze(-1)
+    else:
+        scale[:, :PICK_TOOL_ARM_ACTION_DIM] = arm_scale.unsqueeze(-1)
+        scale[:, PICK_TOOL_ARM_ACTION_DIM:] = hand_scale.unsqueeze(-1)
     return scale
 
 
@@ -581,11 +793,11 @@ class TerminalEventAccumulator:
     def __post_init__(self) -> None:
         if self.task_mode not in TASK_MODES:
             raise ValueError(f"unsupported task_mode={self.task_mode!r}")
-        self._event_keys = (
-            TERMINAL_EVENT_KEYS
-            if self.task_mode == FULL_TASK_MODE
-            else CLOSE_OPTION_TERMINAL_EVENT_KEYS
-        )
+        self._event_keys = {
+            FULL_TASK_MODE: TERMINAL_EVENT_KEYS,
+            CLOSE_OPTION_TASK_MODE: CLOSE_OPTION_TERMINAL_EVENT_KEYS,
+            POWER_CLOSE_OPTION_TASK_MODE: POWER_CLOSE_OPTION_TERMINAL_EVENT_KEYS,
+        }[self.task_mode]
         self.counts = {
             name: torch.zeros((), dtype=torch.long, device=self.device)
             for name in self._event_keys
@@ -631,7 +843,7 @@ class TerminalEventAccumulator:
         # Every close-option field is a reset-before terminal event. Keep its
         # metrics explicitly option-named so a stable latch cannot be mistaken
         # for full-task 20 cm success in training reports.
-        for name in CLOSE_OPTION_TERMINAL_EVENT_KEYS:
+        for name in self._event_keys:
             self.counts[name].add_(validated[name].sum())
 
     def metrics(self) -> dict[str, int]:
@@ -838,10 +1050,19 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
     parser.add_argument("--curriculum_boundary", default="close_start")
     parser.add_argument("--curriculum_probability", type=float, default=0.0)
     parser.add_argument("--curriculum_joint_noise", type=float, default=0.0)
-    parser.add_argument(
+    task_mode_group = parser.add_mutually_exclusive_group()
+    task_mode_group.add_argument(
         "--close_option_mode",
         action="store_true",
-        help="Train the close-only task contract instead of the full reach/grasp/lift task.",
+        help="Train the legacy 21D close-only task contract.",
+    )
+    task_mode_group.add_argument(
+        "--power_close_option_mode",
+        action="store_true",
+        help=(
+            "Train the power-grasp close option with a 14D hand-only policy; the physical "
+            "environment still receives an exact zero arm7 prefix."
+        ),
     )
     parser.add_argument("--output_dir", type=Path, default=Path("logs/flashsac/pick_tool"))
     parser.add_argument("--metrics_every", type=int, default=100)
@@ -853,16 +1074,23 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    task_mode = task_mode_from_close_option(
+        args.close_option_mode,
+        args.power_close_option_mode,
+    )
     validate_training_source_selection(
         checkpoint=args.checkpoint,
         actor_checkpoint=args.actor_checkpoint,
         resume_replay=args.resume_replay,
         resume_actor_demo=args.resume_actor_demo,
         close_option_mode=args.close_option_mode,
+        power_close_option_mode=args.power_close_option_mode,
         demo=args.demo,
+        actor_demo=args.actor_demo,
     )
     validate_close_option_training_config(
         close_option_mode=args.close_option_mode,
+        power_close_option_mode=args.power_close_option_mode,
         curriculum_dataset=args.curriculum_dataset,
         curriculum_boundary=args.curriculum_boundary,
         curriculum_probability=args.curriculum_probability,
@@ -972,6 +1200,17 @@ def _validate_args(args: argparse.Namespace) -> None:
         value = getattr(args, name)
         if not math.isfinite(value) or value < 0.0:
             raise ValueError(f"--{name} must be finite and non-negative")
+    if task_mode == POWER_CLOSE_OPTION_TASK_MODE:
+        if args.unlatched_arm_noise_scale != 0.0 or args.latched_arm_noise_scale != 0.0:
+            raise ValueError(
+                "--power_close_option_mode has no policy arm actions; both arm noise "
+                "scales must be exactly 0"
+            )
+        if args.demo_bc_arm_weight != 0.0:
+            raise ValueError(
+                "--power_close_option_mode has no policy arm actions; "
+                "--demo_bc_arm_weight must be 0"
+            )
 
 
 def _seed_everything(seed: int) -> None:
@@ -1016,7 +1255,8 @@ def audit_actor_checkpoint_source(
     actor_checkpoint: Path,
     *,
     output_checkpoint: Path,
-) -> dict[str, str]:
+    target_task_mode: str | None = None,
+) -> dict[str, Any]:
     """Resolve and fingerprint an actor-only initialization source."""
 
     source = actor_checkpoint.resolve()
@@ -1032,11 +1272,61 @@ def audit_actor_checkpoint_source(
     if not actor_path.is_file():
         raise FileNotFoundError(f"missing FlashSAC actor checkpoint: {actor_path}")
     source_contract = read_checkpoint_task_contract(source)
+    target_task_mode = (
+        str(source_contract["task_mode"])
+        if target_task_mode is None
+        else target_task_mode
+    )
+    target_runtime = runtime_contract(target_task_mode)
+    source_dim = int(source_contract["policy_action_dim"])
+    target_dim = int(target_runtime["policy_action_dim"])
+    actor_projection: str | None = None
+    if source_dim != target_dim:
+        if source_dim == PICK_TOOL_ACTION_DIM and target_dim == PICK_TOOL_HAND_ACTION_DIM:
+            actor_projection = FULL21_TO_HAND14_ACTOR_PROJECTION
+        else:
+            raise ValueError(
+                "--actor_checkpoint has no allowlisted actor projection: "
+                f"source policy_action_dim={source_dim}, target={target_dim}"
+            )
     return {
         "path": str(source),
         "actor_sha256": _sha256(actor_path),
         "source_task_mode": str(source_contract["task_mode"]),
+        "source_policy_action_dim": source_dim,
+        "source_policy_action_layout": str(source_contract["policy_action_layout"]),
+        "target_task_mode": target_task_mode,
+        "target_policy_action_dim": target_dim,
+        "actor_projection": actor_projection,
     }
+
+
+def load_audited_actor_checkpoint(agent: Any, audit: Mapping[str, Any]) -> None:
+    """Load an audited actor, applying only the explicit full21 -> hand14 slice."""
+
+    projection = audit.get("actor_projection")
+    source_dim = audit.get("source_policy_action_dim")
+    target_dim = audit.get("target_policy_action_dim")
+    if projection == FULL21_TO_HAND14_ACTOR_PROJECTION:
+        if source_dim != PICK_TOOL_ACTION_DIM or target_dim != PICK_TOOL_HAND_ACTION_DIM:
+            raise ValueError("invalid full21-to-hand14 actor projection audit")
+        agent.load_actor(
+            audit["path"],
+            source_action_indices=range(
+                PICK_TOOL_ARM_ACTION_DIM,
+                PICK_TOOL_ACTION_DIM,
+            ),
+            expected_source_action_dim=PICK_TOOL_ACTION_DIM,
+        )
+        return
+    if projection is not None:
+        raise ValueError(f"unsupported actor projection={projection!r}")
+    if source_dim != target_dim:
+        raise ValueError(
+            "identity actor load requires equal policy action dimensions: "
+            f"source={source_dim!r}, target={target_dim!r}"
+        )
+    agent.load_actor(audit["path"])
 
 
 def audit_pick_tool_demonstrations(path: Path) -> dict[str, Any]:
@@ -1118,6 +1408,9 @@ def audit_pick_tool_demonstrations(path: Path) -> dict[str, Any]:
 def run(args: argparse.Namespace) -> dict[str, Any]:
     """Create the environment and execute the minimal collection/update loop."""
 
+    physical_close_option_mode = bool(
+        args.close_option_mode or args.power_close_option_mode
+    )
     if args.smoke:
         args.steps = min(args.steps, 8)
         args.num_envs = min(args.num_envs, 8)
@@ -1125,12 +1418,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         args.batch = min(args.batch, 16)
         args.metrics_every = 1
         if args.episode_length_s is None:
-            args.episode_length_s = 0.5 if args.close_option_mode else 0.12
-    if args.close_option_mode and args.episode_length_s is None:
+            args.episode_length_s = 0.5 if physical_close_option_mode else 0.12
+    if physical_close_option_mode and args.episode_length_s is None:
         args.episode_length_s = 5.0
     _validate_args(args)
     _seed_everything(args.seed)
-    task_mode = task_mode_from_close_option(args.close_option_mode)
+    task_mode = task_mode_from_close_option(
+        args.close_option_mode,
+        args.power_close_option_mode,
+    )
+    current_runtime_contract = runtime_contract(task_mode)
     effective_n_step = 1 if args.smoke else args.n_step
     output_dir = args.output_dir.resolve()
     checkpoint_dir = output_dir / "checkpoint_final"
@@ -1159,6 +1456,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         audit_actor_checkpoint_source(
             args.actor_checkpoint,
             output_checkpoint=checkpoint_dir,
+            target_task_mode=task_mode,
         )
         if args.actor_checkpoint is not None
         else None
@@ -1169,11 +1467,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         and args.demo_bc_weight is None
         else float(args.demo_bc_weight or 0.0)
     )
-    demo_bc_group_weights = {
-        "arm": float(args.demo_bc_arm_weight),
-        "token": float(args.demo_bc_token_weight),
-        "residual": float(args.demo_bc_residual_weight),
-    }
+    demo_bc_group_weights = (
+        {
+            "token": float(args.demo_bc_token_weight),
+            "residual": float(args.demo_bc_residual_weight),
+        }
+        if task_mode == POWER_CLOSE_OPTION_TASK_MODE
+        else {
+            "arm": float(args.demo_bc_arm_weight),
+            "token": float(args.demo_bc_token_weight),
+            "residual": float(args.demo_bc_residual_weight),
+        }
+    )
 
     # These imports require the simulator process (and, for the task, its USD
     # plugins) to be initialized by AppLauncher first.
@@ -1216,7 +1521,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "curriculum_joint_noise": args.curriculum_joint_noise,
         }
 
-    cfg_overrides = {"close_option_mode": bool(args.close_option_mode)}
+    cfg_overrides = {
+        "close_option_mode": physical_close_option_mode,
+        "power_close_option_mode": bool(args.power_close_option_mode),
+    }
     if args.episode_length_s is not None:
         cfg_overrides["episode_length_s"] = args.episode_length_s
     if args.curriculum_dataset is not None:
@@ -1233,6 +1541,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         device=device,
         seed=args.seed,
         cfg_overrides=cfg_overrides,
+        hand_only_actions=task_mode == POWER_CLOSE_OPTION_TASK_MODE,
         validate_finite=args.smoke or args.validate_finite,
     )
     warmup_transitions = resolve_warmup_transitions(
@@ -1270,10 +1579,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         load_optimizer=args.checkpoint is not None,
         load_reward_normalizer=args.checkpoint is not None,
     )
-    noise_groups = (
-        ActionNoiseGroup("arm", 0, 7, scale=1.0, zeta_mu=1.0, zeta_max=64),
-        ActionNoiseGroup("token", 7, 16, scale=0.5, zeta_mu=1.25, zeta_max=32),
-        ActionNoiseGroup("residual", 16, 21, scale=0.35, zeta_mu=1.5, zeta_max=16),
+    noise_groups = tuple(
+        ActionNoiseGroup(
+            name,
+            start,
+            stop,
+            scale=scale,
+            zeta_mu=zeta_mu,
+            zeta_max=zeta_max,
+        )
+        for name, start, stop, scale, zeta_mu, zeta_max in action_noise_group_specs(
+            task_mode
+        )
     )
     agent = FlashSACTorchBridge(
         env.observation_space,
@@ -1387,7 +1704,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.actor_demo is not None:
         actor_demo_contracts = (
             PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS
-            if task_mode == CLOSE_OPTION_TASK_MODE
+            if is_close_option_task_mode(task_mode)
             else PICK_TOOL_LIFT_ACTOR_DEMO_CONTRACTS
         )
         for path in args.actor_demo:
@@ -1516,10 +1833,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         revalidated_actor = audit_actor_checkpoint_source(
             args.actor_checkpoint,
             output_checkpoint=checkpoint_dir,
+            target_task_mode=task_mode,
         )
         if revalidated_actor != actor_checkpoint_audit:
             raise RuntimeError("--actor_checkpoint changed while the run was starting")
-        agent.load_actor(actor_checkpoint_audit["path"])
+        load_audited_actor_checkpoint(agent, actor_checkpoint_audit)
         loaded_actor_sha256 = _sha256(
             Path(actor_checkpoint_audit["path"]) / "actor.pt"
         )
@@ -1610,6 +1928,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 terminated,
                 truncated,
                 info,
+                action_dim=env.action_dim,
             )
             agent.process_transition(transition)
 
@@ -1682,12 +2001,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         if actor_checkpoint_audit
                         else None
                     ),
+                    "initial_actor_checkpoint_source_policy_action_dim": (
+                        actor_checkpoint_audit["source_policy_action_dim"]
+                        if actor_checkpoint_audit
+                        else None
+                    ),
+                    "initial_actor_checkpoint_source_policy_action_layout": (
+                        actor_checkpoint_audit["source_policy_action_layout"]
+                        if actor_checkpoint_audit
+                        else None
+                    ),
+                    "initial_actor_checkpoint_projection": (
+                        actor_checkpoint_audit["actor_projection"]
+                        if actor_checkpoint_audit
+                        else None
+                    ),
                     "resumed_replay": bool(args.resume_replay),
                     "resumed_task_contract": resumed_task_contract,
                     "resumed_actor_demo": bool(args.resume_actor_demo),
                     "restore_checkpoint_rng": False,
                     "flashsac_upstream_commit": FLASH_SAC_COMMIT,
-                    "observation_dim": env.observation_dim,
+                    **current_runtime_contract,
                     "action_dim": env.action_dim,
                     "buffer_capacity": args.buffer,
                     "warmup_transitions": warmup_transitions,

@@ -10,6 +10,97 @@ from __future__ import annotations
 import torch
 
 
+def zero_action_prefix(actions: torch.Tensor, prefix_width: int) -> torch.Tensor:
+    """Return actions with a leading control group replaced by exact zeros."""
+
+    if actions.ndim != 2:
+        raise ValueError("actions must have shape (N, A)")
+    if not 0 <= prefix_width <= actions.shape[1]:
+        raise ValueError("prefix_width must be within the action dimension")
+    constrained = actions.clone()
+    constrained[:, :prefix_width] = 0.0
+    return constrained
+
+
+def hold_arm_reset_state(
+    joint_pos: torch.Tensor,
+    joint_vel: torch.Tensor,
+    dof_targets: torch.Tensor,
+    last_action: torch.Tensor,
+    arm_joint_indices: torch.Tensor,
+    arm_action_width: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Remove captured arm momentum, target preload and action history at an option reset.
+
+    The hand portions remain physically captured.  This makes a close-only option begin from the
+    recorded pregrasp geometry while the arm holds that pose instead of continuing a parent
+    policy's reach/lift command.
+    """
+
+    if joint_pos.ndim != 2 or joint_vel.shape != joint_pos.shape or dof_targets.shape != joint_pos.shape:
+        raise ValueError("joint_pos, joint_vel and dof_targets must share shape (N, J)")
+    if last_action.ndim != 2 or last_action.shape[0] != joint_pos.shape[0]:
+        raise ValueError("last_action must have shape (N, A)")
+    if arm_joint_indices.ndim != 1:
+        raise ValueError("arm_joint_indices must be one-dimensional")
+    if arm_joint_indices.numel() != arm_action_width:
+        raise ValueError("arm action width must equal the number of arm joints")
+    if not 0 <= arm_action_width <= last_action.shape[1]:
+        raise ValueError("arm_action_width must be within the action dimension")
+    if arm_joint_indices.numel() and (
+        int(arm_joint_indices.min()) < 0 or int(arm_joint_indices.max()) >= joint_pos.shape[1]
+    ):
+        raise ValueError("arm_joint_indices contains an out-of-range joint")
+    if arm_joint_indices.unique().numel() != arm_joint_indices.numel():
+        raise ValueError("arm_joint_indices must not contain duplicates")
+
+    held_velocity = joint_vel.clone()
+    held_targets = dof_targets.clone()
+    held_action = zero_action_prefix(last_action, arm_action_width)
+    held_velocity.index_fill_(1, arm_joint_indices, 0.0)
+    held_targets.index_copy_(1, arm_joint_indices, joint_pos.index_select(1, arm_joint_indices))
+    return held_velocity, held_targets, held_action
+
+
+def update_arm_hold_release(
+    stable_grasp: torch.Tensor,
+    stable_steps: torch.Tensor,
+    released: torch.Tensor,
+    *,
+    confirm_steps: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Advance a one-way stable-grasp arm-hold supervisor.
+
+    Only environments whose arm is still held accumulate consecutive stable-grasp frames.  Once
+    the confirmation window is reached, release is permanent and the counter is frozen at its
+    release value.  Freezing makes the terminal payload an auditable record even if the grasp is
+    later lost during lift.
+    """
+
+    if stable_grasp.ndim != 1:
+        raise ValueError("stable_grasp must be one-dimensional")
+    if stable_steps.shape != stable_grasp.shape or stable_steps.dtype != torch.long:
+        raise ValueError("stable_steps must be a long vector matching stable_grasp")
+    if released.shape != stable_grasp.shape or released.dtype != torch.bool:
+        raise ValueError("released must be a bool vector matching stable_grasp")
+    if stable_grasp.dtype != torch.bool:
+        raise ValueError("stable_grasp must be boolean")
+    if stable_steps.device != stable_grasp.device or released.device != stable_grasp.device:
+        raise ValueError("arm-hold state tensors must share a device")
+    if confirm_steps < 1:
+        raise ValueError("confirm_steps must be positive")
+
+    pending = ~released
+    candidate_steps = torch.where(
+        stable_grasp,
+        stable_steps + 1,
+        torch.zeros_like(stable_steps),
+    )
+    next_steps = torch.where(pending, candidate_steps, stable_steps)
+    next_released = released | (pending & (next_steps >= confirm_steps))
+    return next_steps, next_released
+
+
 def apply_asymmetric_joint_residual(
     base_target: torch.Tensor,
     lower: torch.Tensor,

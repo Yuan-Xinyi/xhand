@@ -9,6 +9,8 @@ import torch
 
 from adapter import (
     ACTION_DIM,
+    ARM_ACTION_DIM,
+    HAND_ACTION_DIM,
     POLICY_OBSERVATION_DIM,
     PickToolIsaacLabAdapter,
     build_replay_transition,
@@ -23,6 +25,7 @@ class _Cfg:
     state_space: int = POLICY_OBSERVATION_DIM
     action_space: int = ACTION_DIM
     observation_noise_model: object | None = None
+    close_option_mode: bool = False
 
 
 class _FakeDirectEnv:
@@ -36,6 +39,7 @@ class _FakeDirectEnv:
         self.episode_length_buf = torch.zeros(self.num_envs, dtype=torch.long)
         self.call_reset_for_done = call_reset_for_done
         self.state = torch.zeros(self.num_envs, POLICY_OBSERVATION_DIM)
+        self.last_action: torch.Tensor | None = None
         self.last_extras: dict[str, object] = {}
         self.closed = False
 
@@ -69,6 +73,7 @@ class _FakeDirectEnv:
         torch.Tensor,
         dict[str, object],
     ]:
+        self.last_action = action.detach().clone()
         self.state.add_(action[:, :1])
         self.episode_length_buf.add_(1)
         terminated = torch.tensor([False, True, False])
@@ -153,6 +158,64 @@ def test_terminal_capture_and_replay_semantics() -> None:
     assert info["strict_metrics"]["success_frac"] is raw.last_extras["log"]["success_frac"]
 
 
+def test_hand_only_actions_expand_at_environment_boundary_and_stay_14d_in_replay() -> None:
+    raw = _FakeDirectEnv()
+    raw.cfg.close_option_mode = True
+    env = PickToolIsaacLabAdapter(raw, require_cuda=False, hand_only_actions=True)
+    observation, _ = env.reset()
+    observation = observation.clone()
+    action = torch.linspace(
+        -0.8,
+        0.8,
+        raw.num_envs * HAND_ACTION_DIM,
+        dtype=torch.float32,
+    ).reshape(raw.num_envs, HAND_ACTION_DIM)
+
+    next_observation, reward, terminated, truncated, info = env.step(action)
+    del next_observation
+    assert env.action_dim == HAND_ACTION_DIM
+    assert env.environment_action_dim == ACTION_DIM
+    assert env.action_space.shape == (raw.num_envs, HAND_ACTION_DIM)
+    assert env.sample_random_actions().shape == (raw.num_envs, HAND_ACTION_DIM)
+    assert raw.last_action is not None
+    assert raw.last_action.shape == (raw.num_envs, ACTION_DIM)
+    torch.testing.assert_close(
+        raw.last_action[:, :ARM_ACTION_DIM],
+        torch.zeros(raw.num_envs, ARM_ACTION_DIM),
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        raw.last_action[:, ARM_ACTION_DIM:], action, rtol=0.0, atol=0.0
+    )
+
+    transition = build_replay_transition(
+        observation,
+        action,
+        reward,
+        terminated,
+        truncated,
+        info,
+        action_dim=HAND_ACTION_DIM,
+    )
+    assert transition["action"].shape == (raw.num_envs, HAND_ACTION_DIM)
+    torch.testing.assert_close(transition["action"], action, rtol=0.0, atol=0.0)
+
+    try:
+        build_replay_transition(
+            observation,
+            action,
+            reward,
+            terminated,
+            truncated,
+            info,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("14D replay action was accepted under the default 21D contract")
+
+
 def test_done_logic() -> None:
     terminated = torch.tensor([False, True, False, True])
     truncated = torch.tensor([False, False, True, True])
@@ -184,6 +247,28 @@ def test_contract_failures() -> None:
         pass
     else:
         raise AssertionError("20D action was accepted")
+
+    try:
+        PickToolIsaacLabAdapter(
+            _FakeDirectEnv(), require_cuda=False, hand_only_actions=True
+        )
+    except ValueError as exc:
+        assert "close_option_mode=True" in str(exc)
+    else:
+        raise AssertionError("hand-only actions were accepted outside close-option mode")
+
+    close_raw = _FakeDirectEnv()
+    close_raw.cfg.close_option_mode = True
+    close_env = PickToolIsaacLabAdapter(
+        close_raw, require_cuda=False, hand_only_actions=True
+    )
+    close_env.reset()
+    try:
+        close_env.step(torch.zeros(close_raw.num_envs, HAND_ACTION_DIM + 1))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("wrong-width hand-only action was accepted")
 
     missing_capture = PickToolIsaacLabAdapter(
         _FakeDirectEnv(call_reset_for_done=False), require_cuda=False, strict=True
@@ -220,6 +305,7 @@ def main() -> None:
     tests = (
         test_policy_only_and_spaces,
         test_terminal_capture_and_replay_semantics,
+        test_hand_only_actions_expand_at_environment_boundary_and_stay_14d_in_replay,
         test_done_logic,
         test_contract_failures,
         test_episode_length_randomization_and_close,

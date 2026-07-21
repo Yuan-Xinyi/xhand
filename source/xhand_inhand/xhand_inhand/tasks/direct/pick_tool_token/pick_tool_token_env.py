@@ -29,13 +29,20 @@ from isaaclab.utils.math import quat_apply, quat_conjugate, sample_uniform
 
 from ..pick_cube_token.pick_cube_token_env import PickCubeTokenEnv
 from .grasp_signals import (
+    power_staged_close_quality,
+    power_wrap_quality,
     rigid_hold_quality,
     staged_close_quality,
     update_close_option_state,
     update_grasp_latch,
     wrap_quality,
 )
-from .hybrid_action import apply_asymmetric_joint_residual
+from .hybrid_action import (
+    apply_asymmetric_joint_residual,
+    hold_arm_reset_state,
+    update_arm_hold_release,
+    zero_action_prefix,
+)
 from .pick_tool_token_env_cfg import PickToolTokenEnvCfg
 
 
@@ -43,6 +50,68 @@ class PickToolTokenEnv(PickCubeTokenEnv):
     cfg: PickToolTokenEnvCfg
 
     def __init__(self, cfg: PickToolTokenEnvCfg, render_mode: str | None = None, **kwargs):
+        if cfg.power_close_option_mode and not cfg.close_option_mode:
+            raise ValueError("power_close_option_mode requires close_option_mode=True")
+        if cfg.close_option_mode and cfg.hold_arm_until_stable_grasp:
+            raise ValueError(
+                "close_option_mode and hold_arm_until_stable_grasp are mutually exclusive"
+            )
+        if cfg.power_close_option_mode:
+            if (
+                not isinstance(cfg.power_grasp_required_other_contacts, int)
+                or isinstance(cfg.power_grasp_required_other_contacts, bool)
+                or cfg.power_grasp_required_other_contacts != 3
+            ):
+                raise ValueError(
+                    "power_close_option_mode v1 requires exactly three non-thumb contacts"
+                )
+            for name, value, expected in (
+                ("power_grasp_confirm_steps", cfg.power_grasp_confirm_steps, 4),
+                ("power_grasp_release_steps", cfg.power_grasp_release_steps, 6),
+                ("close_option_confirm_steps", cfg.close_option_confirm_steps, 15),
+            ):
+                if (
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value != expected
+                ):
+                    raise ValueError(
+                        f"power_close_option_mode v1 requires {name}={expected}"
+                    )
+            if (
+                float(cfg.power_grasp_quality_low) != 0.20
+                or float(cfg.power_grasp_quality_high) != 0.35
+            ):
+                raise ValueError(
+                    "power_close_option_mode v1 requires power grasp thresholds low=0.20, high=0.35"
+                )
+        if cfg.hold_arm_until_stable_grasp:
+            if not cfg.curriculum_dataset:
+                raise ValueError(
+                    "hold_arm_until_stable_grasp requires a close_start curriculum dataset"
+                )
+            if cfg.curriculum_boundary != "close_start":
+                raise ValueError(
+                    "hold_arm_until_stable_grasp requires curriculum_boundary='close_start'"
+                )
+            if float(cfg.curriculum_reset_probability) != 1.0:
+                raise ValueError(
+                    "hold_arm_until_stable_grasp requires curriculum_reset_probability=1"
+                )
+            if not 0.0 <= float(cfg.curriculum_joint_noise) <= 0.02:
+                raise ValueError(
+                    "hold_arm_until_stable_grasp requires curriculum_joint_noise in [0, 0.02]"
+                )
+            if int(cfg.arm_hold_confirm_steps) < 1:
+                raise ValueError("arm_hold_confirm_steps must be positive")
+            for name, value in (
+                ("arm_hold_grasp_quality_threshold", cfg.arm_hold_grasp_quality_threshold),
+                ("arm_hold_min_hold_quality", cfg.arm_hold_min_hold_quality),
+            ):
+                if not 0.0 <= float(value) <= 1.0:
+                    raise ValueError(f"{name} must be in [0, 1]")
+            if float(cfg.arm_hold_safe_force_limit) <= 0.0:
+                raise ValueError("arm_hold_safe_force_limit must be positive")
         super().__init__(cfg, render_mode, **kwargs)
         dev, N = self.device, self.num_envs
 
@@ -207,6 +276,14 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._is_grasped = torch.zeros(N, dtype=torch.bool, device=dev)          # confirmed stable grasp state
         self._grasp_bonus_given = torch.zeros(N, dtype=torch.bool, device=dev)   # safe stable-grasp bonus latch
         self._safe_grasp_steps = torch.zeros(N, dtype=torch.long, device=dev)    # consecutive low-impact latch steps
+        # Independent thumb+three state.  It is deliberately not substituted for the legacy latch:
+        # old full-task checkpoints observe that latch at feature 106 and must retain identical MDP
+        # semantics unless the new close task is explicitly selected.
+        self._power_contact_steps = torch.zeros(N, dtype=torch.long, device=dev)
+        self._power_lost_contact_steps = torch.zeros(N, dtype=torch.long, device=dev)
+        self._power_is_grasped = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._power_grasp_bonus_given = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._power_safe_grasp_steps = torch.zeros(N, dtype=torch.long, device=dev)
         self._grasp_age = torch.zeros(N, dtype=torch.long, device=dev)           # steps since is_grasped became True (unused mvp20)
         self._success_paid = torch.zeros(N, dtype=torch.bool, device=dev)        # one-shot stable-success bonus latch (unused mvp20)
         self._unlatched_lift_failure = torch.zeros(N, dtype=torch.bool, device=dev)
@@ -218,6 +295,18 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._close_option_lost_window = torch.zeros(N, dtype=torch.bool, device=dev)
         self._close_option_stable_steps = torch.zeros(N, dtype=torch.long, device=dev)
         self._close_option_lost_window_steps = torch.zeros(N, dtype=torch.long, device=dev)
+        self._arm_hold_stable_steps = torch.zeros(N, dtype=torch.long, device=dev)
+        self._arm_hold_released = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._arm_hold_release_other_contacts = torch.full(
+            (N,), -1, dtype=torch.long, device=dev
+        )
+        self._arm_hold_release_grasp_quality = torch.zeros(N, device=dev)
+        self._arm_hold_release_wrap_quality = torch.zeros(N, device=dev)
+        self._arm_hold_release_power_other_contacts = torch.full(
+            (N,), -1, dtype=torch.long, device=dev
+        )
+        self._arm_hold_release_power_grasp_quality = torch.zeros(N, device=dev)
+        self._arm_hold_release_max_force = torch.zeros(N, device=dev)
         self._close_option_start_xy = torch.zeros((N, 2), device=dev)
         self._close_option_episode_total = torch.zeros((), dtype=torch.long, device=dev)
         self._close_option_success_total = torch.zeros((), dtype=torch.long, device=dev)
@@ -389,7 +478,17 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         limits = self.robot.data.soft_joint_pos_limits[selected_envs]
         joint_pos = torch.clamp(joint_pos, limits[..., 0], limits[..., 1])
         dof_targets = torch.clamp(dof_targets, limits[..., 0], limits[..., 1])
-        joint_vel = states["joint_vel"][state_ids]
+        joint_vel = states["joint_vel"][state_ids].clone()
+        last_action = states["last_action"][state_ids].clone()
+        if self.cfg.close_option_mode or self.cfg.hold_arm_until_stable_grasp:
+            joint_vel, dof_targets, last_action = hold_arm_reset_state(
+                joint_pos,
+                joint_vel,
+                dof_targets,
+                last_action,
+                self._arm_ids_t,
+                self._n_arm,
+            )
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=selected_envs)
         self.robot.set_joint_position_target(dof_targets, env_ids=selected_envs)
         self.dof_targets[selected_envs] = dof_targets
@@ -398,11 +497,18 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         object_pose[:, :3] = states["object_local_pos"][state_ids] + self.scene.env_origins[selected_envs]
         object_pose[:, 3:] = states["object_quat"][state_ids]
         self.object.write_root_pose_to_sim(object_pose, env_ids=selected_envs)
-        # Restore both sides of the captured hand-object motion.  Zeroing only the object while the
-        # arm retained a mid-lift joint velocity created an artificial first-frame slip impulse.
-        self.object.write_root_velocity_to_sim(states["object_velocity"][state_ids], env_ids=selected_envs)
-        self.actions[selected_envs] = states["last_action"][state_ids]
-        self.prev_actions[selected_envs] = states["last_action"][state_ids]
+        # Ordinary curriculum states restore both sides of the captured hand-object motion.  The
+        # close supervisor instead starts from an explicitly stationary arm/table-side object pair.
+        object_velocity = states["object_velocity"][state_ids].clone()
+        if self.cfg.close_option_mode or self.cfg.hold_arm_until_stable_grasp:
+            # The arm is reset to a position hold with zero velocity.  Keeping the captured object
+            # velocity would manufacture relative palm/object slip (the close-start holdout has
+            # non-trivial motion), so make the table-side object state stationary as well.  Finger
+            # joint velocities remain captured and may continue the intended closure.
+            object_velocity.zero_()
+        self.object.write_root_velocity_to_sim(object_velocity, env_ids=selected_envs)
+        self.actions[selected_envs] = last_action
+        self.prev_actions[selected_envs] = last_action
         # These are part of the Markov task state, not diagnostics.  In
         # particular every lift_start snapshot is already latched.  Dropping
         # the latch at reset makes the public observation contradict the
@@ -858,6 +964,46 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 force_saturation=self.cfg.contact_force_saturation,
             )
         )
+        # Independent power-close contract.  These signals are computed alongside, never in place
+        # of, the legacy thumb+two truth so old full-task observations and latches retain their
+        # exact semantics.  Only the explicit power close option consumes these keys.
+        power = power_wrap_quality(
+            force_magnitude,
+            torch.where(
+                self._handle_contact_region,
+                self._handle_side_distances,
+                torch.full_like(self._handle_side_distances, torch.inf),
+            ),
+            self._handle_surface_normal_w,
+            self._finger_align,
+            palm_facing,
+            self._contact_thumb_idx,
+            self._contact_other_ids,
+            force_threshold=self.cfg.contact_force_thr,
+            force_saturation=self.cfg.contact_force_saturation,
+            surface_margin=self.cfg.handle_contact_margin,
+            palm_facing_min=self.cfg.grasp_palm_facing_min,
+            alignment_min=self.cfg.grasp_align_min,
+            opposition_min=self.cfg.grasp_opposition_min,
+        )
+        power.update(
+            power_staged_close_quality(
+                force_magnitude,
+                self._handle_surface_distances,
+                self._handle_contact_region,
+                self._handle_surface_normal_w,
+                self._finger_align,
+                power["power_palm_score"],
+                self._contact_thumb_idx,
+                self._contact_other_ids,
+                alignment_min=self.cfg.grasp_align_min,
+                opposition_min=self.cfg.grasp_opposition_min,
+                proximity_scale_far=self.cfg.close_proximity_scale_far,
+                proximity_scale_near=self.cfg.close_proximity_scale_near,
+                force_saturation=self.cfg.contact_force_saturation,
+            )
+        )
+        wrap.update(power)
 
         hold, slip_lin, slip_ang = rigid_hold_quality(
             self.robot.data.body_com_pos_w[:, self.palm_idx],
@@ -886,6 +1032,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         wrap["slip_lin_palm"] = quat_apply(palm_inv, slip_lin_w)
         wrap["slip_ang_palm"] = quat_apply(palm_inv, slip_ang_w)
         wrap["grasp_quality"] = torch.minimum(wrap["quality"], hold)
+        wrap["power_grasp_quality"] = torch.minimum(wrap["power_wrap_quality"], hold)
         wrap["force_magnitude"] = force_magnitude
         wrap["palm_facing"] = palm_facing
         return wrap
@@ -906,19 +1053,39 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             old_action = self.actions[:, : self._n_arm + self._n_tokens]
             residual_action = self.actions[:, self._n_arm + self._n_tokens :]
             signals = self._compute_grasp_signals()
-            latch = self._is_grasped.float().unsqueeze(-1)
+            if self.cfg.power_close_option_mode:
+                # Keep the 115-D layout fixed, but make the task-specific close slots Markov for
+                # the authority that actually terminates the option.  In particular index 106 must
+                # not turn on at the legacy thumb+two minimum and prematurely suppress hand
+                # exploration before the required third opposed pad arrives.
+                observation_close_quality = signals["power_close_quality"]
+                observation_wrap_quality = signals["power_wrap_quality"]
+                observation_latch = self._power_is_grasped
+                observation_confirm_steps = self._power_contact_steps
+                observation_release_steps = self._power_lost_contact_steps
+                observation_confirm_limit = self.cfg.power_grasp_confirm_steps
+                observation_release_limit = self.cfg.power_grasp_release_steps
+            else:
+                observation_close_quality = signals["close_quality"]
+                observation_wrap_quality = signals["quality"]
+                observation_latch = self._is_grasped
+                observation_confirm_steps = self._contact_steps
+                observation_release_steps = self._lost_contact_steps
+                observation_confirm_limit = self.cfg.grasp_confirm_steps
+                observation_release_limit = self.cfg.grasp_release_steps
+            latch = observation_latch.float().unsqueeze(-1)
             confirm_progress = torch.clamp(
-                self._contact_steps.float() / self.cfg.grasp_confirm_steps, 0.0, 1.0
+                observation_confirm_steps.float() / observation_confirm_limit, 0.0, 1.0
             ).unsqueeze(-1)
             release_progress = torch.clamp(
-                self._lost_contact_steps.float() / self.cfg.grasp_release_steps, 0.0, 1.0
+                observation_release_steps.float() / observation_release_limit, 0.0, 1.0
             ).unsqueeze(-1)
             phase = torch.cat(
                 (
                     signals["legal_finger_proximity"],
                     signals["finger_force_strength"],
-                    signals["close_quality"].unsqueeze(-1),
-                    signals["quality"].unsqueeze(-1),
+                    observation_close_quality.unsqueeze(-1),
+                    observation_wrap_quality.unsqueeze(-1),
                     signals["hold_quality"].unsqueeze(-1),
                     1.0 - latch,
                     latch,
@@ -945,7 +1112,19 @@ class PickToolTokenEnv(PickCubeTokenEnv):
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         """Apply a grasp-phase arm shield before the shared relative-action controller."""
 
+        # The close option owns only finger closure.  Holding the arm is part of its physical
+        # contract: otherwise an inherited full-task actor immediately continues reach/lift,
+        # shoves the hammer out of the 3 cm option window and prevents learning the missing bridge.
         shielded = actions.clone()
+        if self.cfg.close_option_mode:
+            shielded = zero_action_prefix(shielded, self._n_arm)
+        elif self.cfg.hold_arm_until_stable_grasp:
+            hold_arm = ~self._arm_hold_released
+            shielded[:, : self._n_arm] = torch.where(
+                hold_arm.unsqueeze(-1),
+                torch.zeros_like(shielded[:, : self._n_arm]),
+                shielded[:, : self._n_arm],
+            )
         self._arm_up_shield_fraction.zero_()
         object_force = None
         soft = None
@@ -1105,6 +1284,10 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         q_close = signals["close_quality"]
         q_contact = signals["contact_quality"]
         grasp_quality = signals["grasp_quality"]
+        power_q_wrap = signals["power_wrap_quality"]
+        power_q_close = signals["power_close_quality"]
+        power_q_contact = signals["power_contact_quality"]
+        power_grasp_quality = signals["power_grasp_quality"]
 
         self._is_grasped, self._contact_steps, self._lost_contact_steps, _, _ = update_grasp_latch(
             grasp_quality,
@@ -1117,7 +1300,71 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             release_steps=cfg.grasp_release_steps,
         )
         is_grasped_phase = self._is_grasped
+        if cfg.power_close_option_mode:
+            (
+                self._power_is_grasped,
+                self._power_contact_steps,
+                self._power_lost_contact_steps,
+                _,
+                _,
+            ) = update_grasp_latch(
+                power_grasp_quality,
+                self._power_is_grasped,
+                self._power_contact_steps,
+                self._power_lost_contact_steps,
+                high_threshold=cfg.power_grasp_quality_high,
+                low_threshold=cfg.power_grasp_quality_low,
+                confirm_steps=cfg.power_grasp_confirm_steps,
+                release_steps=cfg.power_grasp_release_steps,
+            )
         max_force = signals["force_magnitude"].max(dim=-1).values
+        if cfg.hold_arm_until_stable_grasp:
+            arm_hold_stable = (
+                is_grasped_phase
+                & (grasp_quality >= cfg.arm_hold_grasp_quality_threshold)
+                & (hold_quality >= cfg.arm_hold_min_hold_quality)
+                & (max_force <= cfg.arm_hold_safe_force_limit)
+            )
+            was_released = self._arm_hold_released
+            next_stable_steps, next_released = update_arm_hold_release(
+                arm_hold_stable,
+                self._arm_hold_stable_steps,
+                self._arm_hold_released,
+                confirm_steps=cfg.arm_hold_confirm_steps,
+            )
+            newly_released = next_released & (~was_released)
+            self._arm_hold_release_other_contacts = torch.where(
+                newly_released,
+                other_count,
+                self._arm_hold_release_other_contacts,
+            )
+            self._arm_hold_release_grasp_quality = torch.where(
+                newly_released,
+                grasp_quality,
+                self._arm_hold_release_grasp_quality,
+            )
+            self._arm_hold_release_wrap_quality = torch.where(
+                newly_released,
+                q_wrap,
+                self._arm_hold_release_wrap_quality,
+            )
+            self._arm_hold_release_power_other_contacts = torch.where(
+                newly_released,
+                signals["power_legal_other_contact_count"],
+                self._arm_hold_release_power_other_contacts,
+            )
+            self._arm_hold_release_power_grasp_quality = torch.where(
+                newly_released,
+                power_grasp_quality,
+                self._arm_hold_release_power_grasp_quality,
+            )
+            self._arm_hold_release_max_force = torch.where(
+                newly_released,
+                max_force,
+                self._arm_hold_release_max_force,
+            )
+            self._arm_hold_stable_steps = next_stable_steps
+            self._arm_hold_released = next_released
         safe_grasp = (
             (grasp_quality >= cfg.grasp_quality_high)
             & (max_force <= cfg.grasp_bonus_max_force)
@@ -1131,6 +1378,36 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             & (~self._grasp_bonus_given)
         )
         self._grasp_bonus_given = self._grasp_bonus_given | first_stable_grasp
+        power_safe_grasp = (
+            (power_grasp_quality >= cfg.power_grasp_quality_high)
+            & signals["power_thumb_contact"]
+            & (
+                signals["power_legal_other_contact_count"]
+                >= cfg.power_grasp_required_other_contacts
+            )
+            & (max_force <= cfg.grasp_bonus_max_force)
+        )
+        if cfg.power_close_option_mode:
+            self._power_safe_grasp_steps = torch.where(
+                power_safe_grasp,
+                self._power_safe_grasp_steps + 1,
+                torch.zeros_like(self._power_safe_grasp_steps),
+            )
+        first_stable_power_grasp = (
+            self._power_is_grasped
+            & (self._power_safe_grasp_steps >= cfg.power_grasp_confirm_steps)
+            & (~self._power_grasp_bonus_given)
+        )
+        if cfg.power_close_option_mode:
+            self._power_grasp_bonus_given = (
+                self._power_grasp_bonus_given | first_stable_power_grasp
+            )
+
+        reward_q_close = power_q_close if cfg.power_close_option_mode else q_close
+        reward_q_wrap = power_q_wrap if cfg.power_close_option_mode else q_wrap
+        reward_first_stable_grasp = (
+            first_stable_power_grasp if cfg.power_close_option_mode else first_stable_grasp
+        )
 
         clearance = self._object_true_min_z() - self._table_surface_z
         lift_fraction = torch.clamp(clearance / cfg.lift_success_height, 0.0, 1.0)
@@ -1138,13 +1415,13 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         # Gamma-correct potential shaping cannot be farmed by repeatedly approaching and retreating.
         # The first post-reset sample only initializes the potential and pays no state-only reset bonus.
         potential_ready = self._potential_initialized.float()
-        close_delta = cfg.shaping_discount * q_close - self._prev_close_quality
-        wrap_delta = cfg.shaping_discount * q_wrap - self._prev_wrap_quality
+        close_delta = cfg.shaping_discount * reward_q_close - self._prev_close_quality
+        wrap_delta = cfg.shaping_discount * reward_q_wrap - self._prev_wrap_quality
         r_close_progress = cfg.close_progress_scale * close_delta * potential_ready
         r_wrap_progress = cfg.wrap_progress_scale * wrap_delta * potential_ready
         # Keep the one-shot strict-latch event as the end of the close sequence.  Unlike the removed
         # contact/hold occupancies it cannot be farmed by waiting or by drop/regrasp cycles.
-        r_grasp = cfg.grasp_bonus * first_stable_grasp.float()
+        r_grasp = cfg.grasp_bonus * reward_first_stable_grasp.float()
         transport_x = torch.clamp(
             (grasp_quality - cfg.grasp_quality_low)
             / max(cfg.grasp_quality_high - cfg.grasp_quality_low, 1.0e-6),
@@ -1193,8 +1470,8 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         residual_action = self.actions[:, self._n_arm + self._n_tokens :]
         r_residual_penalty = -cfg.distal_residual_penalty_scale * residual_action.square().sum(dim=-1)
 
-        self._prev_close_quality.copy_(q_close)
-        self._prev_wrap_quality.copy_(q_wrap)
+        self._prev_close_quality.copy_(reward_q_close)
+        self._prev_wrap_quality.copy_(reward_q_wrap)
         self._prev_lift_potential.copy_(lift_potential)
         self._potential_initialized.fill_(True)
 
@@ -1215,6 +1492,14 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         log["q_contact_mean"] = q_contact.mean()
         log["q_proximity_mean"] = signals["proximity_quality"].mean()
         log["grasp_quality_mean"] = grasp_quality.mean()
+        log["power_q_wrap_mean"] = power_q_wrap.mean()
+        log["power_q_close_mean"] = power_q_close.mean()
+        log["power_q_contact_mean"] = power_q_contact.mean()
+        log["power_grasp_quality_mean"] = power_grasp_quality.mean()
+        log["power_legal_other_contacts_mean"] = signals[
+            "power_legal_other_contact_count"
+        ].float().mean()
+        log["power_is_grasped_frac"] = self._power_is_grasped.float().mean()
         log["palm_gate_mean"] = signals["palm_score"].mean()
         log["align_gate_mean"] = signals["alignment_score"].mean()
         log["opposition_mean"] = signals["opposition_raw"].mean()
@@ -1275,6 +1560,16 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         log["r_force_penalty_mean"] = r_force_penalty.mean()
         log["r_residual_penalty_mean"] = r_residual_penalty.mean()
         log["arm_up_shield_fraction"] = self._arm_up_shield_fraction
+        log["hierarchical_arm_hold_fraction"] = (
+            (~self._arm_hold_released).float().mean()
+            if cfg.hold_arm_until_stable_grasp
+            else torch.zeros((), device=self.device)
+        )
+        log["hierarchical_arm_released_fraction"] = (
+            self._arm_hold_released.float().mean()
+            if cfg.hold_arm_until_stable_grasp
+            else torch.zeros((), device=self.device)
+        )
         log["tactile_soft_shield_fraction"] = self._tactile_soft_shield_fraction
         log["tactile_hard_shield_fraction"] = self._tactile_hard_shield_fraction
         log["tactile_terminate_fraction"] = self._tactile_terminate_fraction
@@ -1365,24 +1660,76 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             "object_lin_speed": obj_lin.clone(),
             "object_ang_speed": obj_ang.clone(),
             "success_steps": self._success_steps.clone(),
+            "arm_hold_stable_steps": self._arm_hold_stable_steps.clone(),
+            "arm_hold_released": self._arm_hold_released.clone(),
+            "arm_hold_release_other_contacts": (
+                self._arm_hold_release_other_contacts.clone()
+            ),
+            "arm_hold_release_grasp_quality": (
+                self._arm_hold_release_grasp_quality.clone()
+            ),
+            "arm_hold_release_wrap_quality": (
+                self._arm_hold_release_wrap_quality.clone()
+            ),
+            "arm_hold_release_power_other_contacts": (
+                self._arm_hold_release_power_other_contacts.clone()
+            ),
+            "arm_hold_release_power_grasp_quality": (
+                self._arm_hold_release_power_grasp_quality.clone()
+            ),
+            "arm_hold_release_max_force": self._arm_hold_release_max_force.clone(),
+            "power_is_grasped": self._power_is_grasped.clone(),
+            "power_thumb_contact": signals["power_thumb_contact"].clone(),
+            "power_legal_other_contact_count": signals[
+                "power_legal_other_contact_count"
+            ].clone(),
+            "power_wrap_quality": signals["power_wrap_quality"].clone(),
+            "power_grasp_quality": signals["power_grasp_quality"].clone(),
         }
 
         if cfg.close_option_mode:
             horizontal_drift = (
                 self._object_com_position_w()[:, :2] - self._close_option_start_xy
             ).norm(dim=-1)
+            option_grasp_quality = (
+                signals["power_grasp_quality"]
+                if cfg.power_close_option_mode
+                else signals["grasp_quality"]
+            )
+            option_is_grasped = (
+                (
+                    self._power_is_grasped
+                    & signals["power_thumb_contact"]
+                    & (
+                        signals["power_legal_other_contact_count"]
+                        >= cfg.power_grasp_required_other_contacts
+                    )
+                )
+                if cfg.power_close_option_mode
+                else self._is_grasped
+            )
+            option_proximity_quality = (
+                signals["power_proximity_quality"]
+                if cfg.power_close_option_mode
+                else signals["proximity_quality"]
+            )
+            option_grasp_threshold = (
+                cfg.power_grasp_quality_high
+                if cfg.power_close_option_mode
+                else cfg.grasp_quality_high
+            )
             option = update_close_option_state(
-                signals["grasp_quality"],
+                option_grasp_quality,
                 signals["hold_quality"],
                 max_force,
-                self._is_grasped,
+                option_is_grasped,
                 self._close_option_stable_steps,
                 clearance,
                 horizontal_drift,
-                signals["proximity_quality"],
+                option_proximity_quality,
                 self._close_option_lost_window_steps,
                 unsafe_force | dropped,
-                grasp_quality_threshold=cfg.grasp_quality_high,
+                grasp_quality_threshold=option_grasp_threshold,
                 hold_quality_threshold=cfg.close_option_min_hold_quality,
                 safe_force_limit=cfg.grasp_bonus_max_force,
                 confirm_steps=cfg.close_option_confirm_steps,
@@ -1433,6 +1780,26 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 "close_option_horizontal_escape": self._close_option_horizontal_escape.clone(),
                 "close_option_lost_window": self._close_option_lost_window.clone(),
                 "close_option_stable_steps": self._close_option_stable_steps.clone(),
+                "power_close_option_success": (
+                    self._close_option_success.clone()
+                    if cfg.power_close_option_mode
+                    else torch.zeros_like(self._close_option_success)
+                ),
+                "power_close_option_failure": (
+                    self._close_option_failure.clone()
+                    if cfg.power_close_option_mode
+                    else torch.zeros_like(self._close_option_failure)
+                ),
+                "power_close_option_timeout": (
+                    self._close_option_timeout.clone()
+                    if cfg.power_close_option_mode
+                    else torch.zeros_like(self._close_option_timeout)
+                ),
+                "power_close_option_stable_steps": (
+                    self._close_option_stable_steps.clone()
+                    if cfg.power_close_option_mode
+                    else torch.zeros_like(self._close_option_stable_steps)
+                ),
                 **terminal_state,
             }
             return terminated, time_out
@@ -1463,6 +1830,12 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             "close_option_horizontal_escape": self._close_option_horizontal_escape.clone(),
             "close_option_lost_window": self._close_option_lost_window.clone(),
             "close_option_stable_steps": self._close_option_stable_steps.clone(),
+            "power_close_option_success": torch.zeros_like(self._close_option_success),
+            "power_close_option_failure": torch.zeros_like(self._close_option_failure),
+            "power_close_option_timeout": torch.zeros_like(self._close_option_timeout),
+            "power_close_option_stable_steps": torch.zeros_like(
+                self._close_option_stable_steps
+            ),
             **terminal_state,
         }
         return terminated, time_out
@@ -1485,6 +1858,11 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._is_grasped[env_ids] = False
         self._grasp_bonus_given[env_ids] = False
         self._safe_grasp_steps[env_ids] = 0
+        self._power_contact_steps[env_ids] = 0
+        self._power_lost_contact_steps[env_ids] = 0
+        self._power_is_grasped[env_ids] = False
+        self._power_grasp_bonus_given[env_ids] = False
+        self._power_safe_grasp_steps[env_ids] = 0
         self._grasp_age[env_ids] = 0
         self._success_paid[env_ids] = False
         self._unlatched_lift_failure[env_ids] = False
@@ -1496,6 +1874,14 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._close_option_lost_window[env_ids] = False
         self._close_option_stable_steps[env_ids] = 0
         self._close_option_lost_window_steps[env_ids] = 0
+        self._arm_hold_stable_steps[env_ids] = 0
+        self._arm_hold_released[env_ids] = False
+        self._arm_hold_release_other_contacts[env_ids] = -1
+        self._arm_hold_release_grasp_quality[env_ids] = 0.0
+        self._arm_hold_release_wrap_quality[env_ids] = 0.0
+        self._arm_hold_release_power_other_contacts[env_ids] = -1
+        self._arm_hold_release_power_grasp_quality[env_ids] = 0.0
+        self._arm_hold_release_max_force[env_ids] = 0.0
         self._hard_force_steps[env_ids] = 0
         self._overforce_steps[env_ids] = 0
         self._lift_bonus_given[env_ids] = False

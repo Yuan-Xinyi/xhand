@@ -15,6 +15,9 @@ from __future__ import annotations
 import torch
 
 
+POWER_CLOSE_STAGE_WEIGHTS = (0.10, 0.10, 0.15, 0.15, 0.35, 0.15)
+
+
 def rigid_hold_quality(
     palm_com_pos_w: torch.Tensor,
     palm_com_lin_vel_w: torch.Tensor,
@@ -200,6 +203,190 @@ def staged_close_quality(
         "finger_force_strength": force_strength,
         "finger_alignment_score": alignment_score,
         "finger_opposition_score": opposition_score,
+    }
+
+
+def power_wrap_quality(
+    force_magnitude: torch.Tensor,
+    handle_surface_distance: torch.Tensor,
+    handle_surface_normal_w: torch.Tensor,
+    finger_alignment: torch.Tensor,
+    palm_facing: torch.Tensor,
+    thumb_index: int,
+    other_indices: torch.Tensor,
+    *,
+    force_threshold: float,
+    force_saturation: float,
+    surface_margin: float,
+    palm_facing_min: float,
+    alignment_min: float,
+    opposition_min: float,
+) -> dict[str, torch.Tensor]:
+    """Compute an independent thumb-plus-three power-grasp quality.
+
+    This deliberately does not replace :func:`wrap_quality`: existing full-task checkpoints keep
+    their thumb-plus-two latch semantics.  Candidate ranking uses contact strength, pad alignment
+    and opposition, but force coverage and the geometric gates remain independent minima so none
+    of the factors is applied twice.  Three legal non-thumb contacts are necessary for non-zero
+    quality; a strong wrong-side collision cannot displace weaker legal contacts.
+    """
+
+    if other_indices.numel() < 3:
+        raise ValueError("power_wrap_quality requires at least three non-thumb fingers")
+
+    near_handle = handle_surface_distance < surface_margin
+    force_present = force_magnitude > force_threshold
+    contact = near_handle & force_present
+    contact_strength = torch.tanh(force_magnitude / force_saturation) * contact.float()
+
+    other_strength = contact_strength[:, other_indices]
+    thumb_strength = contact_strength[:, thumb_index]
+    thumb_align = finger_alignment[:, thumb_index]
+    thumb_normal = handle_surface_normal_w[:, thumb_index].unsqueeze(1)
+    other_normals = handle_surface_normal_w[:, other_indices]
+    opposition_each = 0.5 * (1.0 - (thumb_normal * other_normals).sum(dim=-1))
+    opposition_each_score = torch.clamp(
+        (opposition_each - opposition_min) / max(1.0 - opposition_min, 1.0e-6), 0.0, 1.0
+    )
+    other_align = finger_alignment[:, other_indices]
+    other_align_score = torch.clamp(
+        (other_align - alignment_min) / max(1.0 - alignment_min, 1.0e-6), 0.0, 1.0
+    )
+
+    other_candidate = other_strength * other_align_score * opposition_each_score
+    _, selected_local_idx = torch.topk(other_candidate, k=3, dim=1)
+    selected_finger_idx = other_indices[selected_local_idx]
+    selected_strength = torch.gather(other_strength, 1, selected_local_idx)
+    other_coverage = selected_strength.min(dim=1).values
+
+    selected_align = torch.gather(finger_alignment, 1, selected_finger_idx)
+    alignment_raw = torch.minimum(thumb_align, selected_align.min(dim=1).values)
+    alignment_score = torch.clamp(
+        (alignment_raw - alignment_min) / max(1.0 - alignment_min, 1.0e-6), 0.0, 1.0
+    )
+    selected_opposition = torch.gather(opposition_each, 1, selected_local_idx)
+    opposition_raw = selected_opposition.min(dim=1).values
+    opposition_score = torch.clamp(
+        (opposition_raw - opposition_min) / max(1.0 - opposition_min, 1.0e-6), 0.0, 1.0
+    )
+    palm_score = torch.clamp(
+        (palm_facing - palm_facing_min) / max(1.0 - palm_facing_min, 1.0e-6), 0.0, 1.0
+    )
+
+    quality = torch.stack(
+        (thumb_strength, other_coverage, alignment_score, opposition_score, palm_score), dim=1
+    ).min(dim=1).values
+    legal_other_contact = (
+        contact[:, other_indices]
+        & (other_align_score > 0.0)
+        & (opposition_each_score > 0.0)
+    )
+    return {
+        "power_wrap_quality": quality,
+        "power_contact": contact,
+        "power_contact_strength": contact_strength,
+        "power_thumb_strength": thumb_strength,
+        "power_other_coverage": other_coverage,
+        "power_thumb_contact": contact[:, thumb_index],
+        "power_other_contact_count": contact[:, other_indices].sum(dim=1),
+        "power_legal_other_contact": legal_other_contact,
+        "power_legal_other_contact_count": legal_other_contact.sum(dim=1),
+        "power_palm_score": palm_score,
+        "power_alignment_score": alignment_score,
+        "power_alignment_raw": alignment_raw,
+        "power_opposition_score": opposition_score,
+        "power_opposition_raw": opposition_raw,
+        "power_selected_other_indices": selected_finger_idx,
+    }
+
+
+def power_staged_close_quality(
+    force_magnitude: torch.Tensor,
+    handle_surface_distance: torch.Tensor,
+    handle_contact_region: torch.Tensor,
+    handle_surface_normal_w: torch.Tensor,
+    finger_alignment: torch.Tensor,
+    palm_score: torch.Tensor,
+    thumb_index: int,
+    other_indices: torch.Tensor,
+    *,
+    alignment_min: float,
+    opposition_min: float,
+    proximity_scale_far: float,
+    proximity_scale_near: float,
+    force_saturation: float,
+    stage_weights: tuple[float, float, float, float, float, float] = POWER_CLOSE_STAGE_WEIGHTS,
+) -> dict[str, torch.Tensor]:
+    """Return dense near -> thumb -> four-non-thumb power-close shaping.
+
+    The six weights correspond to proximity, thumb contact and the first through fourth ranked
+    opposed non-thumb contacts.  Defaults yield ideal stage potentials
+    ``0.10, 0.20, 0.35, 0.50, 0.85, 1.00``.  Thus the third non-thumb contact bridges the strict
+    thumb-plus-three objective, while the fourth contact retains a separate dense improvement.
+    This is a shaping potential only and cannot by itself authorize a latch or lift.
+    """
+
+    if other_indices.numel() < 4:
+        raise ValueError("power_staged_close_quality requires at least four non-thumb fingers")
+    if len(stage_weights) != 6:
+        raise ValueError("stage_weights must contain proximity, thumb and four contact weights")
+    if any(weight < 0.0 for weight in stage_weights):
+        raise ValueError("stage_weights must be non-negative")
+    if abs(sum(stage_weights) - 1.0) > 1.0e-6:
+        raise ValueError("stage_weights must sum to one")
+
+    alignment_score = torch.clamp(
+        (finger_alignment - alignment_min) / max(1.0 - alignment_min, 1.0e-6), 0.0, 1.0
+    )
+    thumb_normal = handle_surface_normal_w[:, thumb_index].unsqueeze(1)
+    other_normals = handle_surface_normal_w[:, other_indices]
+    opposition_raw = 0.5 * (1.0 - (thumb_normal * other_normals).sum(dim=-1))
+    opposition_score = torch.clamp(
+        (opposition_raw - opposition_min) / max(1.0 - opposition_min, 1.0e-6), 0.0, 1.0
+    )
+
+    proximity = 0.5 * torch.exp(-handle_surface_distance / proximity_scale_far)
+    proximity = proximity + 0.5 * torch.exp(-handle_surface_distance / proximity_scale_near)
+    proximity = proximity * handle_contact_region.float()
+    force_strength = torch.tanh(force_magnitude / force_saturation)
+
+    legal_near = proximity * alignment_score
+    legal_other_near = legal_near[:, other_indices] * opposition_score
+    legal_finger_proximity = legal_near.clone()
+    legal_finger_proximity.index_copy_(1, other_indices, legal_other_near)
+    ranked_other_near, ranked_other_near_idx = torch.topk(legal_other_near, k=4, dim=1)
+    thumb_near = legal_near[:, thumb_index]
+    proximity_quality = (thumb_near + ranked_other_near.sum(dim=-1)) / 5.0
+
+    thumb_contact = thumb_near * force_strength[:, thumb_index]
+    other_contact = legal_other_near * force_strength[:, other_indices]
+    ranked_other_contact, ranked_other_contact_idx = torch.topk(other_contact, k=4, dim=1)
+    contact_stages = torch.minimum(thumb_contact.unsqueeze(1), ranked_other_contact)
+    weights = stage_weights
+    contact_quality_unscaled = (
+        weights[1] * thumb_contact
+        + weights[2] * contact_stages[:, 0]
+        + weights[3] * contact_stages[:, 1]
+        + weights[4] * contact_stages[:, 2]
+        + weights[5] * contact_stages[:, 3]
+    )
+    quality = palm_score * (weights[0] * proximity_quality + contact_quality_unscaled)
+    contact_quality = palm_score * contact_quality_unscaled
+    return {
+        "power_close_quality": quality,
+        "power_contact_quality": contact_quality,
+        "power_proximity_quality": proximity_quality,
+        "power_finger_proximity": proximity,
+        "power_legal_finger_proximity": legal_finger_proximity,
+        "power_finger_force_strength": force_strength,
+        "power_finger_alignment_score": alignment_score,
+        "power_finger_opposition_score": opposition_score,
+        "power_thumb_close_strength": thumb_contact,
+        "power_ranked_other_proximity": ranked_other_near,
+        "power_ranked_other_proximity_indices": ranked_other_near_idx,
+        "power_ranked_other_close_strength": ranked_other_contact,
+        "power_ranked_other_close_indices": ranked_other_contact_idx,
+        "power_close_stage_strength": contact_stages,
     }
 
 

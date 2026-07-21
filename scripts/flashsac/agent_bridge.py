@@ -36,6 +36,12 @@ FLASH_SAC_COMMIT = "87edc9061150ae9e962dd84e6544e27a1554b3ab"
 BRIDGE_STATE_FILENAME = "torch_bridge_state.pt"
 BRIDGE_CHECKPOINT_VERSION = 1
 _COMPILED_STATE_PREFIX = "_orig_mod."
+_ACTOR_ACTION_OUTPUT_KEYS = (
+    "predictor.mean_w.w.weight",
+    "predictor.mean_bias",
+    "predictor.std_w.w.weight",
+    "predictor.std_bias",
+)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _UPSTREAM_ROOT = _PROJECT_ROOT / "third_party" / "FlashSAC"
@@ -292,6 +298,149 @@ def _load_network_portably(bundle: Any, path: str, *, load_optimizer: bool) -> N
             "[Warning] load_optimizer=True but scheduler is None or checkpoint has no scheduler state."
             f" Skipping scheduler load for {path}."
         )
+
+
+def _target_root_key(
+    canonical_key: str,
+    target_state: Mapping[str, torch.Tensor],
+    *,
+    path: str,
+) -> str:
+    """Resolve one canonical actor key after portable root-prefix translation."""
+
+    candidates = (canonical_key, f"{_COMPILED_STATE_PREFIX}{canonical_key}")
+    matches = [key for key in candidates if key in target_state]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"actor checkpoint target for {path} has ambiguous or missing key {canonical_key!r}"
+        )
+    return matches[0]
+
+
+def _project_actor_action_outputs(
+    checkpoint_state: Mapping[str, torch.Tensor],
+    target_state: Mapping[str, torch.Tensor],
+    *,
+    source_action_indices: Sequence[int],
+    expected_source_action_dim: int,
+    target_action_dim: int,
+    path: str,
+) -> dict[str, torch.Tensor]:
+    """Strictly reduce only a FlashSAC actor's four action-output tensors.
+
+    The shared observation embedder, encoder, normalization parameters and
+    buffers must remain shape compatible. Requiring an explicit source
+    dimension prevents an action-layout mistake from being accepted merely
+    because the requested indices happen to fit the checkpoint.
+    """
+
+    if (
+        not isinstance(expected_source_action_dim, int)
+        or isinstance(expected_source_action_dim, bool)
+        or expected_source_action_dim < 1
+    ):
+        raise ValueError("expected_source_action_dim must be a positive integer")
+    if target_action_dim < 1:
+        raise ValueError("target_action_dim must be positive")
+    if expected_source_action_dim <= target_action_dim:
+        raise ValueError("actor action projection must reduce a larger source action space")
+    try:
+        indices = tuple(source_action_indices)
+    except TypeError as error:
+        raise TypeError("source_action_indices must be an integer sequence") from error
+    if len(indices) != target_action_dim:
+        raise ValueError(
+            f"source_action_indices has length {len(indices)}, "
+            f"expected target action_dim={target_action_dim}"
+        )
+    if any(not isinstance(index, int) or isinstance(index, bool) for index in indices):
+        raise TypeError("source_action_indices must contain only integers")
+    if any(left >= right for left, right in zip(indices, indices[1:])):
+        raise ValueError("source_action_indices must be unique and strictly increasing")
+    if not indices or indices[0] < 0 or indices[-1] >= expected_source_action_dim:
+        raise ValueError(
+            "source_action_indices are outside the declared source action dimension"
+        )
+
+    state = _portable_network_state_dict(checkpoint_state, target_state, path=path)
+    output_keys = {
+        _target_root_key(key, target_state, path=path) for key in _ACTOR_ACTION_OUTPUT_KEYS
+    }
+    projected = dict(state)
+    index_cache: dict[torch.device, torch.Tensor] = {}
+    for key, target_value in target_state.items():
+        source_value = state[key]
+        if not isinstance(source_value, torch.Tensor):
+            raise TypeError(f"actor checkpoint tensor {key!r} in {path} is not a tensor")
+        if key not in output_keys:
+            if source_value.shape != target_value.shape:
+                raise RuntimeError(
+                    f"actor checkpoint {path} changes non-output tensor {key!r}: "
+                    f"source={tuple(source_value.shape)}, target={tuple(target_value.shape)}"
+                )
+            continue
+        if source_value.ndim not in (1, 2) or target_value.ndim != source_value.ndim:
+            raise RuntimeError(
+                f"actor output tensor {key!r} in {path} has incompatible ranks: "
+                f"source={source_value.ndim}, target={target_value.ndim}"
+            )
+        if source_value.shape[0] != expected_source_action_dim:
+            raise RuntimeError(
+                f"actor output tensor {key!r} in {path} declares "
+                f"source action_dim={source_value.shape[0]}, "
+                f"expected {expected_source_action_dim}"
+            )
+        if target_value.shape[0] != target_action_dim:
+            raise RuntimeError(
+                f"target actor output tensor {key!r} has action_dim={target_value.shape[0]}, "
+                f"expected {target_action_dim}"
+            )
+        if source_value.shape[1:] != target_value.shape[1:]:
+            raise RuntimeError(
+                f"actor output tensor {key!r} in {path} changes hidden dimensions: "
+                f"source={tuple(source_value.shape)}, target={tuple(target_value.shape)}"
+            )
+        index = index_cache.get(source_value.device)
+        if index is None:
+            index = torch.tensor(indices, dtype=torch.long, device=source_value.device)
+            index_cache[source_value.device] = index
+        selected = source_value.index_select(0, index)
+        if selected.shape != target_value.shape:
+            raise RuntimeError(
+                f"projected actor output tensor {key!r} has shape {tuple(selected.shape)}, "
+                f"expected {tuple(target_value.shape)}"
+            )
+        projected[key] = selected
+    return projected
+
+
+def _load_actor_portably(
+    bundle: Any,
+    path: str,
+    *,
+    source_action_indices: Sequence[int],
+    expected_source_action_dim: int,
+    target_action_dim: int,
+) -> None:
+    """Load an actor trunk exactly while projecting a declared action subset."""
+
+    device = next(bundle.network.parameters()).device
+    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    if not isinstance(checkpoint, Mapping):
+        raise TypeError(f"network checkpoint {path} must contain a mapping")
+    checkpoint_state = checkpoint.get("network_state_dict")
+    if not isinstance(checkpoint_state, Mapping):
+        raise TypeError(f"network checkpoint {path} has no mapping network_state_dict")
+    target_state = bundle.network.state_dict()
+    state = _project_actor_action_outputs(
+        checkpoint_state,
+        target_state,
+        source_action_indices=source_action_indices,
+        expected_source_action_dim=expected_source_action_dim,
+        target_action_dim=target_action_dim,
+        path=path,
+    )
+    bundle.network.load_state_dict(state, strict=True)
 
 
 def _load_grad_scaler_portably(
@@ -749,12 +898,22 @@ class FlashSACTorchBridge(FlashSACAgent):
         super().save(path)
         torch.save(self._bridge_checkpoint_state(), os.path.join(path, BRIDGE_STATE_FILENAME))
 
-    def load_actor(self, path: str) -> None:
+    def load_actor(
+        self,
+        path: str,
+        *,
+        source_action_indices: Sequence[int] | None = None,
+        expected_source_action_dim: int | None = None,
+    ) -> None:
         """Strictly load only actor weights from a portable checkpoint directory.
 
         This transfer path intentionally leaves the actor optimizer/scheduler,
         critic, target critic, temperature, replay, reward normalizer,
         exploration state, agent update counter, AMP scaler, and RNG untouched.
+
+        Supplying both projection arguments permits a declared larger actor to
+        initialize a smaller action space. Only the four actor output tensors
+        may be sliced; every shared trunk tensor must remain shape compatible.
         It is the safe initialization boundary between different task modes.
         """
 
@@ -764,10 +923,29 @@ class FlashSACTorchBridge(FlashSACAgent):
         actor_path = os.path.join(checkpoint_dir, "actor.pt")
         if not os.path.isfile(actor_path):
             raise FileNotFoundError(f"missing FlashSAC actor checkpoint: {actor_path}")
-        _load_network_portably(self._actor, actor_path, load_optimizer=False)
+        if (source_action_indices is None) != (expected_source_action_dim is None):
+            raise ValueError(
+                "source_action_indices and expected_source_action_dim must be provided together"
+            )
+        if source_action_indices is None:
+            _load_network_portably(self._actor, actor_path, load_optimizer=False)
+            detail = ""
+        else:
+            assert expected_source_action_dim is not None
+            _load_actor_portably(
+                self._actor,
+                actor_path,
+                source_action_indices=source_action_indices,
+                expected_source_action_dim=expected_source_action_dim,
+                target_action_dim=self._action_dim,
+            )
+            detail = (
+                f" with action projection {expected_source_action_dim}"
+                f"->{self._action_dim}"
+            )
         print(
             f"\033[32m[FlashSAC]\033[0m Successfully loaded actor-only checkpoint "
-            f"from {checkpoint_dir}."
+            f"from {checkpoint_dir}{detail}."
         )
 
     def load(self, path: str) -> None:

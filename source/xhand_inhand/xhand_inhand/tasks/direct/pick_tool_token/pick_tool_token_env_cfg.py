@@ -39,9 +39,22 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
 
     # Short-horizon reverse-curriculum task used to train a coupled arm+hand close option.  The
     # default end-to-end task is unchanged.  Option mode deliberately has no height reward: it must
-    # hold a safe strict latch for 0.30s, while lifting before latch or pushing the object sideways
-    # terminates as a failure.  Deployment then switches to a separately validated lift option.
+    # hold a safe strict latch for 15 post-latch frames. With the four-frame latch and the
+    # DirectRLEnv dones-before-reward order, the first possible success is action 19 (0.38 s), so
+    # launchers fail closed on horizons below 0.40 s. Lifting before latch or pushing sideways
+    # terminates as a failure. Deployment then switches to a separately validated lift option.
     close_option_mode = False
+    # Opt-in replacement for the legacy thumb+two close objective.  It keeps the public 115-D
+    # observation and the full-task grasp contract unchanged, but trains closure to thumb+three
+    # geometrically legal pads so the policy cannot terminate at the exact minimum topology that
+    # failed transport in every release audit.  This flag is only legal together with
+    # ``close_option_mode``.
+    power_close_option_mode = False
+    power_grasp_required_other_contacts = 3
+    power_grasp_quality_high = 0.35
+    power_grasp_quality_low = 0.20
+    power_grasp_confirm_steps = 4
+    power_grasp_release_steps = 6
     close_option_success_bonus = 100.0
     close_option_confirm_steps = 15
     close_option_min_hold_quality = 0.5
@@ -51,6 +64,15 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     close_option_lost_window_steps = 12
     close_option_failure_penalty = 100.0
     close_option_timeout_penalty = 20.0
+    # Deployment-time hierarchy for a captured close_start state: keep the arm fixed until its
+    # independent strict close contract remains valid, then release arm control to the lift policy
+    # without resetting physical or controller state.  These values are deliberately separate from
+    # close_option_* so deployment A/Bs cannot silently change the training MDP contract.
+    hold_arm_until_stable_grasp = False
+    arm_hold_confirm_steps = 15
+    arm_hold_grasp_quality_threshold = 0.35
+    arm_hold_min_hold_quality = 0.5
+    arm_hold_safe_force_limit = 30.0
 
     # Action = 7 arm relative deltas + 9 CrossDex tokens + 5 absolute distal residuals.  A residual
     # of -1/0/+1 reaches the runtime lower/token/upper target respectively, before the existing EMA.

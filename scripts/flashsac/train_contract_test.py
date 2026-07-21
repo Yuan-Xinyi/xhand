@@ -16,23 +16,38 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from adapter import ACTION_DIM, build_replay_transition  # noqa: E402
+from adapter import ACTION_DIM, HAND_ACTION_DIM, build_replay_transition  # noqa: E402
 from train import (  # noqa: E402
     CLOSE_OPTION_TASK_MODE,
     CORE_CHECKPOINT_FILENAMES,
     EpisodeAccumulator,
+    FULL21_TO_HAND14_ACTOR_PROJECTION,
+    FULL_ACTION_NOISE_GROUP_SPECS,
+    FULL_POLICY_ACTION_LAYOUT,
     FULL_TASK_MODE,
     FractionalUpdateBudget,
+    HAND_POLICY_ACTION_LAYOUT,
+    IDENTITY_ACTION_PROJECTION,
     INCOMPLETE_CHECKPOINT_FILENAME,
+    PICK_TOOL_OBSERVATION_CONTRACT,
+    POWER_ACTION_NOISE_GROUP_SPECS,
+    POWER_CLOSE_OBSERVATION_CONTRACT,
+    POWER_CLOSE_OPTION_TASK_MODE,
+    PREPEND_ZERO_ARM_ACTION_PROJECTION,
     STALE_OPTIONAL_CHECKPOINT_FILENAMES,
     TASK_CONTRACT_FILENAME,
+    TASK_CONTRACT_VERSION,
     TerminalEventAccumulator,
+    action_noise_group_specs,
     audit_actor_checkpoint_source,
     atomic_write_json,
     build_latch_conditioned_noise_scale,
+    policy_action_contract,
     clear_stale_checkpoint_optional_artifacts,
+    load_audited_actor_checkpoint,
     read_checkpoint_task_contract,
     resolve_warmup_transitions,
+    runtime_contract,
     save_final_checkpoint,
     task_mode_from_close_option,
     validate_checkpoint_task_contract,
@@ -105,6 +120,28 @@ def test_auto_reset_replay_boundary() -> None:
     assert torch.equal(rollout_observation[0], torch.full((obs_dim,), 9.0))
     assert torch.equal(transition["terminated"], terminated)
     assert torch.equal(transition["truncated"], truncated)
+
+    hand_action = torch.zeros(num_envs, HAND_ACTION_DIM)
+    hand_transition = build_replay_transition(
+        observation,
+        hand_action,
+        reward,
+        terminated,
+        truncated,
+        info,
+        action_dim=HAND_ACTION_DIM,
+    )
+    assert hand_transition["action"].shape == (num_envs, HAND_ACTION_DIM)
+    _expect_error(
+        ValueError,
+        build_replay_transition,
+        observation,
+        hand_action,
+        reward,
+        terminated,
+        truncated,
+        info,
+    )
 
 
 def test_episode_accumulator() -> None:
@@ -191,6 +228,36 @@ def test_terminal_event_accumulator() -> None:
         "pick_tool_terminal/close_option_lost_window": 0,
     }
 
+    power = TerminalEventAccumulator(
+        num_envs=2,
+        device=torch.device("cpu"),
+        task_mode=POWER_CLOSE_OPTION_TASK_MODE,
+    )
+    power.step(
+        {
+            "pick_tool_terminal": {
+                "power_close_option_success": torch.tensor([True, False]),
+                "power_close_option_failure": torch.tensor([False, True]),
+                "power_close_option_timeout": torch.tensor([False, False]),
+                "dropped": torch.tensor([False, True]),
+                "unsafe_force": torch.tensor([False, False]),
+                "close_option_unlatched_lift": torch.tensor([False, False]),
+                "close_option_horizontal_escape": torch.tensor([False, False]),
+                "close_option_lost_window": torch.tensor([False, False]),
+            }
+        }
+    )
+    assert power.metrics() == {
+        "pick_tool_terminal/power_close_option_success": 1,
+        "pick_tool_terminal/power_close_option_failure": 1,
+        "pick_tool_terminal/power_close_option_timeout": 0,
+        "pick_tool_terminal/dropped": 1,
+        "pick_tool_terminal/unsafe_force": 0,
+        "pick_tool_terminal/close_option_unlatched_lift": 0,
+        "pick_tool_terminal/close_option_horizontal_escape": 0,
+        "pick_tool_terminal/close_option_lost_window": 0,
+    }
+
 
 def test_atomic_json() -> None:
     with tempfile.TemporaryDirectory() as directory:
@@ -207,13 +274,55 @@ def test_atomic_json() -> None:
 def test_task_mode_source_and_replay_contracts() -> None:
     assert task_mode_from_close_option(False) == FULL_TASK_MODE
     assert task_mode_from_close_option(True) == CLOSE_OPTION_TASK_MODE
+    assert (
+        task_mode_from_close_option(False, True)
+        == POWER_CLOSE_OPTION_TASK_MODE
+    )
+    _expect_error(ValueError, task_mode_from_close_option, True, True)
+    assert policy_action_contract(FULL_TASK_MODE) == {
+        "policy_action_dim": ACTION_DIM,
+        "policy_action_layout": FULL_POLICY_ACTION_LAYOUT,
+        "environment_action_dim": ACTION_DIM,
+        "action_projection": IDENTITY_ACTION_PROJECTION,
+    }
+    assert policy_action_contract(CLOSE_OPTION_TASK_MODE) == policy_action_contract(
+        FULL_TASK_MODE
+    )
+    assert policy_action_contract(POWER_CLOSE_OPTION_TASK_MODE) == {
+        "policy_action_dim": HAND_ACTION_DIM,
+        "policy_action_layout": HAND_POLICY_ACTION_LAYOUT,
+        "environment_action_dim": ACTION_DIM,
+        "action_projection": PREPEND_ZERO_ARM_ACTION_PROJECTION,
+    }
+    assert action_noise_group_specs(FULL_TASK_MODE) == FULL_ACTION_NOISE_GROUP_SPECS
+    assert (
+        action_noise_group_specs(CLOSE_OPTION_TASK_MODE)
+        == FULL_ACTION_NOISE_GROUP_SPECS
+    )
+    assert (
+        action_noise_group_specs(POWER_CLOSE_OPTION_TASK_MODE)
+        == POWER_ACTION_NOISE_GROUP_SPECS
+    )
+
     validate_training_source_selection(
         checkpoint=None,
         actor_checkpoint=Path("actor"),
         resume_replay=False,
         resume_actor_demo=False,
         close_option_mode=True,
+        power_close_option_mode=False,
         demo=None,
+        actor_demo=[Path("legacy-close-actor.pt")],
+    )
+    validate_training_source_selection(
+        checkpoint=None,
+        actor_checkpoint=Path("actor"),
+        resume_replay=False,
+        resume_actor_demo=False,
+        close_option_mode=False,
+        power_close_option_mode=True,
+        demo=None,
+        actor_demo=None,
     )
     _expect_error(
         ValueError,
@@ -223,7 +332,9 @@ def test_task_mode_source_and_replay_contracts() -> None:
         resume_replay=False,
         resume_actor_demo=False,
         close_option_mode=False,
+        power_close_option_mode=False,
         demo=None,
+        actor_demo=None,
     )
     _expect_error(
         ValueError,
@@ -233,7 +344,33 @@ def test_task_mode_source_and_replay_contracts() -> None:
         resume_replay=False,
         resume_actor_demo=False,
         close_option_mode=True,
+        power_close_option_mode=False,
         demo=[Path("full-transition.pt")],
+        actor_demo=None,
+    )
+    _expect_error(
+        ValueError,
+        validate_training_source_selection,
+        checkpoint=None,
+        actor_checkpoint=None,
+        resume_replay=False,
+        resume_actor_demo=False,
+        close_option_mode=False,
+        power_close_option_mode=True,
+        demo=None,
+        actor_demo=[Path("uncontracted-power-actor.pt")],
+    )
+    _expect_error(
+        ValueError,
+        validate_training_source_selection,
+        checkpoint=None,
+        actor_checkpoint=None,
+        resume_replay=False,
+        resume_actor_demo=False,
+        close_option_mode=True,
+        power_close_option_mode=True,
+        demo=None,
+        actor_demo=None,
     )
     validate_checkpoint_output_separation(
         Path("source/checkpoint_final"),
@@ -248,11 +385,22 @@ def test_task_mode_source_and_replay_contracts() -> None:
 
     validate_close_option_training_config(
         close_option_mode=True,
+        power_close_option_mode=False,
         curriculum_dataset=Path("close.pt"),
         curriculum_boundary="close_start",
         curriculum_probability=1.0,
         curriculum_joint_noise=0.005,
-        episode_length_s=5.0,
+        episode_length_s=0.40,
+        randomize_episode_lengths=False,
+    )
+    validate_close_option_training_config(
+        close_option_mode=False,
+        power_close_option_mode=True,
+        curriculum_dataset=Path("close.pt"),
+        curriculum_boundary="close_start",
+        curriculum_probability=1.0,
+        curriculum_joint_noise=0.005,
+        episode_length_s=0.40,
         randomize_episode_lengths=False,
     )
     for override in (
@@ -260,12 +408,13 @@ def test_task_mode_source_and_replay_contracts() -> None:
         {"curriculum_boundary": "lift_start"},
         {"curriculum_probability": 0.5},
         {"curriculum_joint_noise": 0.021},
-        {"episode_length_s": 0.29},
+        {"episode_length_s": 0.39},
         {"episode_length_s": 20.0},
         {"randomize_episode_lengths": True},
     ):
         config = {
             "close_option_mode": True,
+            "power_close_option_mode": False,
             "curriculum_dataset": Path("close.pt"),
             "curriculum_boundary": "close_start",
             "curriculum_probability": 1.0,
@@ -275,6 +424,22 @@ def test_task_mode_source_and_replay_contracts() -> None:
         }
         config.update(override)
         _expect_error(ValueError, validate_close_option_training_config, **config)
+
+    power_too_short = {
+        "close_option_mode": False,
+        "power_close_option_mode": True,
+        "curriculum_dataset": Path("close.pt"),
+        "curriculum_boundary": "close_start",
+        "curriculum_probability": 1.0,
+        "curriculum_joint_noise": 0.005,
+        "episode_length_s": 0.39,
+        "randomize_episode_lengths": False,
+    }
+    _expect_error(
+        ValueError,
+        validate_close_option_training_config,
+        **power_too_short,
+    )
 
     with tempfile.TemporaryDirectory(prefix="flashsac_task_contract_") as directory:
         checkpoint = Path(directory) / "checkpoint"
@@ -294,6 +459,7 @@ def test_task_mode_source_and_replay_contracts() -> None:
             "legacy_checkpoint": True,
             "replay_n_step": None,
             "replay_gamma": None,
+            **runtime_contract(FULL_TASK_MODE),
         }
         _expect_error(
             ValueError,
@@ -366,10 +532,11 @@ def test_task_mode_source_and_replay_contracts() -> None:
             replay_gamma=0.99,
         )
         assert json.loads((checkpoint / TASK_CONTRACT_FILENAME).read_text()) == {
-            "version": 2,
+            "version": TASK_CONTRACT_VERSION,
             "task_mode": CLOSE_OPTION_TASK_MODE,
             "replay_n_step": 3,
             "replay_gamma": 0.99,
+            **runtime_contract(CLOSE_OPTION_TASK_MODE),
         }
         contract = validate_replay_task_contract(
             checkpoint,
@@ -419,6 +586,80 @@ def test_task_mode_source_and_replay_contracts() -> None:
             gamma=0.99,
         )
 
+        # V3 contracts fail closed when any policy/environment tensor boundary
+        # is missing or altered, before a checkpoint or replay can be restored.
+        valid_close_payload = {
+            "version": TASK_CONTRACT_VERSION,
+            "task_mode": CLOSE_OPTION_TASK_MODE,
+            "replay_n_step": 3,
+            "replay_gamma": 0.99,
+            **runtime_contract(CLOSE_OPTION_TASK_MODE),
+        }
+        invalid_values = {
+            "policy_action_dim": HAND_ACTION_DIM,
+            "policy_action_layout": HAND_POLICY_ACTION_LAYOUT,
+            "environment_action_dim": HAND_ACTION_DIM,
+            "action_projection": PREPEND_ZERO_ARM_ACTION_PROJECTION,
+            "observation_dim": 114,
+            "observation_contract": POWER_CLOSE_OBSERVATION_CONTRACT,
+        }
+        for key, invalid_value in invalid_values.items():
+            invalid_payload = dict(valid_close_payload)
+            invalid_payload[key] = invalid_value
+            (checkpoint / TASK_CONTRACT_FILENAME).write_text(
+                json.dumps(invalid_payload),
+                encoding="utf-8",
+            )
+            _expect_error(ValueError, read_checkpoint_task_contract, checkpoint)
+            _expect_error(
+                ValueError,
+                validate_checkpoint_task_contract,
+                checkpoint,
+                task_mode=CLOSE_OPTION_TASK_MODE,
+                n_step=3,
+                gamma=0.99,
+            )
+            _expect_error(
+                ValueError,
+                validate_replay_task_contract,
+                checkpoint,
+                task_mode=CLOSE_OPTION_TASK_MODE,
+                n_step=3,
+                gamma=0.99,
+            )
+        (checkpoint / TASK_CONTRACT_FILENAME).write_text(
+            json.dumps(valid_close_payload),
+            encoding="utf-8",
+        )
+        _expect_error(
+            ValueError,
+            write_checkpoint_task_contract,
+            checkpoint,
+            task_mode=CLOSE_OPTION_TASK_MODE,
+            replay_n_step=3,
+            replay_gamma=0.99,
+            policy_action_dim=HAND_ACTION_DIM,
+        )
+
+        # V0--V2 contracts predate policy-action fields and must infer the
+        # historic full 21D layout, including legacy close-option checkpoints.
+        (checkpoint / TASK_CONTRACT_FILENAME).write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "task_mode": CLOSE_OPTION_TASK_MODE,
+                    "replay_n_step": 3,
+                    "replay_gamma": 0.99,
+                }
+            ),
+            encoding="utf-8",
+        )
+        v2 = read_checkpoint_task_contract(checkpoint)
+        assert v2["policy_action_dim"] == ACTION_DIM
+        assert v2["policy_action_layout"] == FULL_POLICY_ACTION_LAYOUT
+        assert v2["action_projection"] == IDENTITY_ACTION_PROJECTION
+        assert v2["observation_contract"] == PICK_TOOL_OBSERVATION_CONTRACT
+
         # Version-1 contracts remain readable for checkpoints produced during
         # the transition, but replay resume still requires embedded metadata.
         (checkpoint / TASK_CONTRACT_FILENAME).write_text(
@@ -427,6 +668,8 @@ def test_task_mode_source_and_replay_contracts() -> None:
         )
         v1 = read_checkpoint_task_contract(checkpoint)
         assert v1["replay_n_step"] is None and v1["replay_gamma"] is None
+        assert v1["policy_action_dim"] == ACTION_DIM
+        assert v1["action_projection"] == IDENTITY_ACTION_PROJECTION
 
         (checkpoint / "replay_buffer.pt").unlink()
         torch.save({"observation": torch.zeros(1, 1)}, checkpoint / "replay_buffer.pt")
@@ -438,6 +681,74 @@ def test_task_mode_source_and_replay_contracts() -> None:
             n_step=3,
             gamma=0.99,
         )
+
+        # The hand-only power option is new in V3 and carries both its 14D
+        # policy boundary and the exact 14D -> physical 21D projection.
+        write_checkpoint_task_contract(
+            checkpoint,
+            task_mode=POWER_CLOSE_OPTION_TASK_MODE,
+            replay_n_step=3,
+            replay_gamma=0.99,
+        )
+        power_payload = json.loads(
+            (checkpoint / TASK_CONTRACT_FILENAME).read_text(encoding="utf-8")
+        )
+        assert power_payload == {
+            "version": TASK_CONTRACT_VERSION,
+            "task_mode": POWER_CLOSE_OPTION_TASK_MODE,
+            "replay_n_step": 3,
+            "replay_gamma": 0.99,
+            **runtime_contract(POWER_CLOSE_OPTION_TASK_MODE),
+        }
+        assert power_payload["policy_action_dim"] == HAND_ACTION_DIM
+        assert power_payload["environment_action_dim"] == ACTION_DIM
+        assert (
+            power_payload["observation_contract"]
+            == POWER_CLOSE_OBSERVATION_CONTRACT
+        )
+        torch.save({"observation": torch.zeros(1, 1)}, checkpoint / "replay_buffer.pt")
+        assert validate_checkpoint_task_contract(
+            checkpoint,
+            task_mode=POWER_CLOSE_OPTION_TASK_MODE,
+            n_step=3,
+            gamma=0.99,
+        )["policy_action_dim"] == HAND_ACTION_DIM
+        assert validate_replay_task_contract(
+            checkpoint,
+            task_mode=POWER_CLOSE_OPTION_TASK_MODE,
+            n_step=3,
+            gamma=0.99,
+        )["action_projection"] == PREPEND_ZERO_ARM_ACTION_PROJECTION
+        for incompatible_mode in (FULL_TASK_MODE, CLOSE_OPTION_TASK_MODE):
+            _expect_error(
+                ValueError,
+                validate_checkpoint_task_contract,
+                checkpoint,
+                task_mode=incompatible_mode,
+                n_step=3,
+                gamma=0.99,
+            )
+            _expect_error(
+                ValueError,
+                validate_replay_task_contract,
+                checkpoint,
+                task_mode=incompatible_mode,
+                n_step=3,
+                gamma=0.99,
+            )
+
+        (checkpoint / TASK_CONTRACT_FILENAME).write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "task_mode": POWER_CLOSE_OPTION_TASK_MODE,
+                    "replay_n_step": 3,
+                    "replay_gamma": 0.99,
+                }
+            ),
+            encoding="utf-8",
+        )
+        _expect_error(ValueError, read_checkpoint_task_contract, checkpoint)
 
 
 def test_actor_checkpoint_audit() -> None:
@@ -462,6 +773,11 @@ def test_actor_checkpoint_audit() -> None:
             "path": str(source.resolve()),
             "actor_sha256": hashlib.sha256(actor_bytes).hexdigest(),
             "source_task_mode": CLOSE_OPTION_TASK_MODE,
+            "source_policy_action_dim": ACTION_DIM,
+            "source_policy_action_layout": FULL_POLICY_ACTION_LAYOUT,
+            "target_task_mode": CLOSE_OPTION_TASK_MODE,
+            "target_policy_action_dim": ACTION_DIM,
+            "actor_projection": None,
         }
         _expect_error(
             ValueError,
@@ -476,6 +792,64 @@ def test_actor_checkpoint_audit() -> None:
             legacy_source,
             output_checkpoint=root / "other" / "checkpoint_final",
         )["source_task_mode"] == FULL_TASK_MODE
+        projected = audit_actor_checkpoint_source(
+            legacy_source,
+            output_checkpoint=root / "power" / "checkpoint_final",
+            target_task_mode=POWER_CLOSE_OPTION_TASK_MODE,
+        )
+        assert projected["source_policy_action_dim"] == ACTION_DIM
+        assert projected["target_policy_action_dim"] == HAND_ACTION_DIM
+        assert projected["actor_projection"] == FULL21_TO_HAND14_ACTOR_PROJECTION
+
+        class FakeAgent:
+            def __init__(self) -> None:
+                self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+            def load_actor(self, *args, **kwargs) -> None:
+                self.calls.append((args, kwargs))
+
+        projected_agent = FakeAgent()
+        load_audited_actor_checkpoint(projected_agent, projected)
+        assert len(projected_agent.calls) == 1
+        projected_args, projected_kwargs = projected_agent.calls[0]
+        assert projected_args == (str(legacy_source.resolve()),)
+        assert list(projected_kwargs["source_action_indices"]) == list(range(7, 21))
+        assert projected_kwargs["expected_source_action_dim"] == ACTION_DIM
+
+        identity_agent = FakeAgent()
+        load_audited_actor_checkpoint(identity_agent, audit)
+        assert identity_agent.calls == [((str(source.resolve()),), {})]
+
+        power_source = root / "power_source"
+        _write_core_checkpoint(power_source)
+        write_checkpoint_task_contract(
+            power_source,
+            task_mode=POWER_CLOSE_OPTION_TASK_MODE,
+            replay_n_step=3,
+            replay_gamma=0.99,
+        )
+        power_audit = audit_actor_checkpoint_source(
+            power_source,
+            output_checkpoint=root / "power_same" / "checkpoint_final",
+            target_task_mode=POWER_CLOSE_OPTION_TASK_MODE,
+        )
+        assert power_audit["source_policy_action_layout"] == HAND_POLICY_ACTION_LAYOUT
+        assert power_audit["actor_projection"] is None
+        _expect_error(
+            ValueError,
+            audit_actor_checkpoint_source,
+            power_source,
+            output_checkpoint=root / "full" / "checkpoint_final",
+            target_task_mode=FULL_TASK_MODE,
+        )
+        malformed_projection = dict(projected)
+        malformed_projection["actor_projection"] = "unknown_projection"
+        _expect_error(
+            ValueError,
+            load_audited_actor_checkpoint,
+            FakeAgent(),
+            malformed_projection,
+        )
 
 
 def test_final_checkpoint_cleanup_and_contract_order() -> None:
@@ -526,10 +900,11 @@ def test_final_checkpoint_cleanup_and_contract_order() -> None:
         assert sentinel.read_text(encoding="utf-8") == "preserve"
         assert not (checkpoint / INCOMPLETE_CHECKPOINT_FILENAME).exists()
         assert json.loads((checkpoint / TASK_CONTRACT_FILENAME).read_text()) == {
-            "version": 2,
+            "version": TASK_CONTRACT_VERSION,
             "task_mode": CLOSE_OPTION_TASK_MODE,
             "replay_n_step": 3,
             "replay_gamma": 0.99,
+            **runtime_contract(CLOSE_OPTION_TASK_MODE),
         }
 
         class FailingAgent:
@@ -576,6 +951,30 @@ def test_latch_conditioned_noise_scale() -> None:
     torch.testing.assert_close(scale[:, :7], expected_arm[:, None].expand(-1, 7))
     torch.testing.assert_close(scale[:, 7:], expected_hand[:, None].expand(-1, 14))
     assert scale.dtype == torch.float32 and scale.device == observation.device
+
+    hand_scale = build_latch_conditioned_noise_scale(
+        observation,
+        unlatched_arm=99.0,
+        unlatched_hand=0.6,
+        latched_arm=88.0,
+        latched_hand=0.1,
+        action_dim=HAND_ACTION_DIM,
+    )
+    assert hand_scale.shape == (4, HAND_ACTION_DIM)
+    torch.testing.assert_close(
+        hand_scale,
+        expected_hand[:, None].expand(-1, HAND_ACTION_DIM),
+    )
+    _expect_error(
+        ValueError,
+        build_latch_conditioned_noise_scale,
+        observation,
+        unlatched_arm=1.0,
+        unlatched_hand=1.0,
+        latched_arm=1.0,
+        latched_hand=1.0,
+        action_dim=13,
+    )
 
 
 def main() -> None:
