@@ -22,3 +22,25 @@ gym.register(
         "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
     },
 )
+
+gym.register(
+    id="Pick-Tool-Floating-XHand-Direct-v0",
+    entry_point=f"{__name__}.pick_tool_floating_env:PickToolFloatingXHandEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.pick_tool_floating_env_cfg:PickToolFloatingXHandEnvCfg"
+        ),
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
+    },
+)
+
+gym.register(
+    id="Pick-Tool-Gripper-Direct-v0",
+    entry_point=f"{__name__}.pick_tool_gripper_env:PickToolGripperEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.pick_tool_gripper_env_cfg:PickToolGripperEnvCfg",
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
+    },
+)

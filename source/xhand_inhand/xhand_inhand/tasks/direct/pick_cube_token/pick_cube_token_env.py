@@ -52,7 +52,7 @@ class PickCubeTokenEnv(PickCubeEnv):
         self._retarget2isaac = self.retarget.permutation_to(hand_joint_names)
 
         # split the index range of the action vector
-        self._n_arm = len(self._arm_joint_ids)
+        self._n_arm = int(getattr(cfg, "arm_action_dim", len(self._arm_joint_ids)))
         self._n_tokens = cfg.n_hand_tokens
 
     # ------------------------------------------------------------------ step
@@ -78,9 +78,12 @@ class PickCubeTokenEnv(PickCubeEnv):
 
         # arm: relative joint position control (same scheme as pick_cube)
         raw_targets = self.dof_targets.clone()
-        raw_targets[:, self._arm_ids_t] = (
-            self.dof_targets[:, self._arm_ids_t] + self.cfg.action_scale * arm_a
-        )
+        if self._arm_ids_t.numel() > 0:
+            raw_targets[:, self._arm_ids_t] = (
+                self.dof_targets[:, self._arm_ids_t] + self.cfg.action_scale * arm_a
+            )
+        elif self._n_arm > 0:
+            self._preprocess_virtual_arm_action(arm_a)
 
         # hand: subclass hook -> absolute targets in articulation hand-joint order
         hand_abs = self._decode_hand_action(hand_action)
@@ -93,3 +96,8 @@ class PickCubeTokenEnv(PickCubeEnv):
             + (1.0 - self.cfg.act_moving_average) * self.dof_targets
         )
         self.dof_targets = torch.clamp(self.dof_targets, self.dof_lower, self.dof_upper)
+
+    def _preprocess_virtual_arm_action(self, arm_action: torch.Tensor) -> None:
+        """Hook for an arm-free environment that supplies virtual Cartesian actions."""
+
+        raise RuntimeError("virtual arm actions require an environment override")

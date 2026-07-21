@@ -8,7 +8,9 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import json
 import sys
+from pathlib import Path
 
 from isaaclab.app import AppLauncher
 
@@ -37,6 +39,8 @@ parser.add_argument(
     help="When no checkpoint provided, use the last saved model. Otherwise use the best saved model.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument("--max_steps", type=int, default=0, help="Stop after this many control steps (0 runs forever).")
+parser.add_argument("--eval_json", type=str, default=None, help="Optional path for finite-run terminal metrics.")
 parser.add_argument(
     "--external_cube_pose_npy",
     type=str,
@@ -379,6 +383,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if isinstance(obs, dict):
         obs = obs["obs"]
     timestep = 0
+    terminal_successes = 0
+    terminal_failures = 0
+    terminal_timeouts = 0
+    max_true_clearance = float("-inf")
+    grasped_env_steps = 0
+    lift_5cm_env_steps = 0
+    evaluated_env_steps = 0
     # required: enables the flag for batched observations
     _ = agent.get_batch_size(obs, 1)
     # initialize RNN states if used
@@ -405,22 +416,56 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # env stepping
             obs, _, dones, _ = env.step(actions)
 
+            terminal = env.unwrapped.extras.get("pick_tool_terminal")
+            if terminal is not None:
+                done_mask = dones.bool()
+                terminal_successes += int((terminal["success"] & done_mask).sum().item())
+                terminal_failures += int((terminal["failure"] & done_mask).sum().item())
+                terminal_timeouts += int((terminal["time_out"] & done_mask).sum().item())
+                clearance = terminal["true_clearance"]
+                max_true_clearance = max(max_true_clearance, float(clearance.max().item()))
+                grasped_env_steps += int(terminal["is_grasped"].sum().item())
+                lift_5cm_env_steps += int((clearance >= 0.05).sum().item())
+                evaluated_env_steps += int(clearance.numel())
+
             # perform operations for terminated episodes
             if len(dones) > 0:
                 # reset rnn state for terminated episodes
                 if agent.is_rnn and agent.states is not None:
                     for s in agent.states:
                         s[:, dones, :] = 0.0
+        timestep += 1
         if args_cli.video:
-            timestep += 1
             # exit the play loop after recording one video
             if timestep == args_cli.video_length:
                 break
+        if args_cli.max_steps > 0 and timestep >= args_cli.max_steps:
+            break
 
         # time delay for real-time evaluation
         sleep_time = dt - (time.time() - start_time)
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
+
+    if args_cli.max_steps > 0:
+        result = {
+            "task": args_cli.task,
+            "checkpoint": str(resume_path),
+            "seed": agent_cfg["params"]["seed"],
+            "num_envs": env.unwrapped.num_envs,
+            "control_steps": timestep,
+            "evaluated_env_steps": evaluated_env_steps,
+            "terminal_successes": terminal_successes,
+            "terminal_failures": terminal_failures,
+            "terminal_timeouts": terminal_timeouts,
+            "terminal_episodes": terminal_successes + terminal_failures + terminal_timeouts,
+            "max_true_clearance_m": max_true_clearance,
+            "grasped_env_step_fraction": grasped_env_steps / max(evaluated_env_steps, 1),
+            "lift_5cm_env_step_fraction": lift_5cm_env_steps / max(evaluated_env_steps, 1),
+        }
+        print("[finite-eval] " + json.dumps(result, sort_keys=True), flush=True)
+        if args_cli.eval_json:
+            Path(args_cli.eval_json).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
 
     # close the simulator
     if cube_pose_provider is not None:
