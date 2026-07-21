@@ -28,7 +28,8 @@ import os
 from pathlib import Path
 import random
 import time
-from typing import Any, Mapping
+import traceback
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -134,8 +135,10 @@ COUPLED_POWER_ALIGN_CLOSE_OPTION_TERMINAL_EVENT_KEYS = (
 )
 
 TASK_CONTRACT_FILENAME = "task_contract.json"
+TEACHER_ACTION_PRIOR_FILENAME = "teacher_action_prior.json"
+TEACHER_RESIDUAL_STATE_FILENAME = "teacher_residual_training_state.json"
 INCOMPLETE_CHECKPOINT_FILENAME = ".incomplete_checkpoint.json"
-TASK_CONTRACT_VERSION = 3
+TASK_CONTRACT_VERSION = 5
 FLASH_SAC_GAMMA = 0.99
 CORE_CHECKPOINT_FILENAMES = (
     "actor.pt",
@@ -146,17 +149,21 @@ CORE_CHECKPOINT_FILENAMES = (
 STALE_OPTIONAL_CHECKPOINT_FILENAMES = (
     "replay_buffer.pt",
     "actor_rehearsal.pt",
+    TEACHER_ACTION_PRIOR_FILENAME,
+    TEACHER_RESIDUAL_STATE_FILENAME,
     TASK_CONTRACT_FILENAME,
 )
 FULL_TASK_MODE = "full_task"
 CLOSE_OPTION_TASK_MODE = "close_option"
 POWER_CLOSE_OPTION_TASK_MODE = "power_close_option_v1"
 COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE = "coupled_power_align_close_option_v1"
+COUPLED_TEACHER_RESIDUAL_TASK_MODE = "coupled_power_teacher_residual_v1"
 TASK_MODES = (
     FULL_TASK_MODE,
     CLOSE_OPTION_TASK_MODE,
     POWER_CLOSE_OPTION_TASK_MODE,
     COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+    COUPLED_TEACHER_RESIDUAL_TASK_MODE,
 )
 PICK_TOOL_LATCH_OBSERVATION_INDEX = 106
 PICK_TOOL_ARM_ACTION_DIM = 7
@@ -165,16 +172,32 @@ PICK_TOOL_ACTION_DIM = 21
 PICK_TOOL_ENVIRONMENT_ACTION_DIM = 21
 FULL_POLICY_ACTION_LAYOUT = "arm_delta7|crossdex_token9|distal_residual5"
 HAND_POLICY_ACTION_LAYOUT = "crossdex_token9|distal_residual5"
+TEACHER_RESIDUAL_POLICY_ACTION_LAYOUT = (
+    "crossdex_token_residual9|distal_action_residual5"
+)
 IDENTITY_ACTION_PROJECTION = "identity_v1"
 PREPEND_ZERO_ARM_ACTION_PROJECTION = "prepend_zero_arm7_v1"
+COUPLED_TEACHER_RESIDUAL_ACTION_PROJECTION = (
+    "coupled_cem_teacher_prior_plus_bounded_hand_residual_v1"
+)
 FULL21_TO_HAND14_ACTOR_PROJECTION = "full21_to_hand14_v1"
 FULL115_TO_COUPLED131_ACTOR_PROJECTION = (
     "full115_to_coupled131_zero_pad_input_v1"
 )
 PICK_TOOL_OBSERVATION_DIM = 115
 PICK_TOOL_OBSERVATION_CONTRACT = "pick_tool_markov115_v1"
+PUBLIC_LATCH_ARM_ACTION_AUTHORITY = (
+    {
+        "name": "arm_after_public_latch",
+        "start": 0,
+        "stop": PICK_TOOL_ARM_ACTION_DIM,
+        "observation_index": PICK_TOOL_LATCH_OBSERVATION_INDEX,
+        "active_value": 1.0,
+    },
+)
 POWER_CLOSE_OBSERVATION_CONTRACT = "pick_tool_power_close_markov115_v1"
 COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM = 131
+COUPLED_ALIGN_ACTIVE_OBSERVATION_INDEX = 129
 COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_CONTRACT = (
     "pick_tool_coupled_power_align_close_state131_v1"
 )
@@ -189,10 +212,88 @@ POWER_ACTION_NOISE_GROUP_SPECS = (
 )
 
 
+def policy_action_authority_contract(
+    public_latch_arm_gate: bool,
+) -> list[dict[str, Any]]:
+    """Return the JSON/task-contract form of the public action gate."""
+
+    if not isinstance(public_latch_arm_gate, bool):
+        raise TypeError("public_latch_arm_gate must be bool")
+    return (
+        [dict(rule) for rule in PUBLIC_LATCH_ARM_ACTION_AUTHORITY]
+        if public_latch_arm_gate
+        else []
+    )
+
+
+def validate_policy_action_authority_contract(
+    value: Any,
+    *,
+    task_mode: str,
+    source: str,
+) -> list[dict[str, Any]]:
+    """Validate the only state-dependent policy authority currently supported."""
+
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(f"{source} policy_action_authority must be a list")
+    normalized: list[dict[str, Any]] = []
+    expected_keys = {
+        "name",
+        "start",
+        "stop",
+        "observation_index",
+        "active_value",
+    }
+    for index, raw_rule in enumerate(value):
+        if not isinstance(raw_rule, Mapping) or set(raw_rule) != expected_keys:
+            raise ValueError(
+                f"{source} policy_action_authority[{index}] has invalid fields"
+            )
+        if not isinstance(raw_rule["name"], str) or not raw_rule["name"]:
+            raise ValueError(
+                f"{source} policy_action_authority[{index}] has invalid name"
+            )
+        for key in ("start", "stop", "observation_index"):
+            if not isinstance(raw_rule[key], int) or isinstance(raw_rule[key], bool):
+                raise ValueError(
+                    f"{source} policy_action_authority[{index}].{key} must be int"
+                )
+        active_value = raw_rule["active_value"]
+        if (
+            not isinstance(active_value, (int, float))
+            or isinstance(active_value, bool)
+            or not math.isfinite(float(active_value))
+        ):
+            raise ValueError(
+                f"{source} policy_action_authority[{index}].active_value is invalid"
+            )
+        normalized.append(
+            {
+                "name": raw_rule["name"],
+                "start": raw_rule["start"],
+                "stop": raw_rule["stop"],
+                "observation_index": raw_rule["observation_index"],
+                "active_value": float(active_value),
+            }
+        )
+    unrestricted: list[dict[str, Any]] = []
+    public_latch = [dict(rule) for rule in PUBLIC_LATCH_ARM_ACTION_AUTHORITY]
+    if normalized == unrestricted:
+        return normalized
+    if normalized != public_latch:
+        raise ValueError(f"{source} has an unsupported policy_action_authority")
+    if task_mode != FULL_TASK_MODE:
+        raise ValueError(
+            f"{source} public latch arm authority requires task_mode={FULL_TASK_MODE!r}"
+        )
+    return normalized
+
+
 def task_mode_from_close_option(
     close_option_mode: bool,
     power_close_option_mode: bool = False,
     coupled_power_align_close_option_mode: bool = False,
+    coupled_teacher_residual_mode: bool = False,
 ) -> str:
     """Resolve the mutually-exclusive task flags into a checkpoint mode."""
 
@@ -201,13 +302,17 @@ def task_mode_from_close_option(
             bool(close_option_mode),
             bool(power_close_option_mode),
             bool(coupled_power_align_close_option_mode),
+            bool(coupled_teacher_residual_mode),
         )
     )
     if selected > 1:
         raise ValueError(
             "--close_option_mode, --power_close_option_mode, and "
-            "--coupled_power_align_close_option_mode are mutually exclusive"
+            "--coupled_power_align_close_option_mode, and "
+            "--coupled_teacher_residual_mode are mutually exclusive"
         )
+    if coupled_teacher_residual_mode:
+        return COUPLED_TEACHER_RESIDUAL_TASK_MODE
     if coupled_power_align_close_option_mode:
         return COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE
     if power_close_option_mode:
@@ -222,6 +327,16 @@ def is_close_option_task_mode(task_mode: str) -> bool:
         CLOSE_OPTION_TASK_MODE,
         POWER_CLOSE_OPTION_TASK_MODE,
         COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+        COUPLED_TEACHER_RESIDUAL_TASK_MODE,
+    )
+
+
+def is_coupled_task_mode(task_mode: str) -> bool:
+    if task_mode not in TASK_MODES:
+        raise ValueError(f"unsupported task_mode={task_mode!r}")
+    return task_mode in (
+        COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+        COUPLED_TEACHER_RESIDUAL_TASK_MODE,
     )
 
 
@@ -234,7 +349,7 @@ def resolve_default_episode_length_s(
 
     if task_mode not in TASK_MODES:
         raise ValueError(f"unsupported task_mode={task_mode!r}")
-    if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE:
+    if is_coupled_task_mode(task_mode):
         return 3.0 if smoke else 5.0
     if is_close_option_task_mode(task_mode):
         return 0.5 if smoke else 5.0
@@ -246,7 +361,7 @@ def environment_task_mode_overrides(task_mode: str) -> dict[str, bool | int]:
 
     if task_mode not in TASK_MODES:
         raise ValueError(f"unsupported task_mode={task_mode!r}")
-    coupled = task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE
+    coupled = is_coupled_task_mode(task_mode)
     power = task_mode == POWER_CLOSE_OPTION_TASK_MODE or coupled
     overrides: dict[str, bool | int] = {
         "close_option_mode": is_close_option_task_mode(task_mode),
@@ -268,7 +383,7 @@ def resolve_smoke_interaction_steps(*, requested: int, task_mode: str) -> int:
 
     if task_mode not in TASK_MODES:
         raise ValueError(f"unsupported task_mode={task_mode!r}")
-    if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE:
+    if is_coupled_task_mode(task_mode):
         return 64
     return min(requested, 8)
 
@@ -278,12 +393,23 @@ def policy_action_contract(task_mode: str) -> dict[str, Any]:
 
     if task_mode not in TASK_MODES:
         raise ValueError(f"unsupported task_mode={task_mode!r}")
-    if task_mode == POWER_CLOSE_OPTION_TASK_MODE:
+    if task_mode in (
+        POWER_CLOSE_OPTION_TASK_MODE,
+        COUPLED_TEACHER_RESIDUAL_TASK_MODE,
+    ):
         return {
             "policy_action_dim": PICK_TOOL_HAND_ACTION_DIM,
-            "policy_action_layout": HAND_POLICY_ACTION_LAYOUT,
+            "policy_action_layout": (
+                TEACHER_RESIDUAL_POLICY_ACTION_LAYOUT
+                if task_mode == COUPLED_TEACHER_RESIDUAL_TASK_MODE
+                else HAND_POLICY_ACTION_LAYOUT
+            ),
             "environment_action_dim": PICK_TOOL_ENVIRONMENT_ACTION_DIM,
-            "action_projection": PREPEND_ZERO_ARM_ACTION_PROJECTION,
+            "action_projection": (
+                COUPLED_TEACHER_RESIDUAL_ACTION_PROJECTION
+                if task_mode == COUPLED_TEACHER_RESIDUAL_TASK_MODE
+                else PREPEND_ZERO_ARM_ACTION_PROJECTION
+            ),
         }
     return {
         "policy_action_dim": PICK_TOOL_ACTION_DIM,
@@ -296,7 +422,10 @@ def policy_action_contract(task_mode: str) -> dict[str, Any]:
 def action_noise_group_specs(task_mode: str) -> tuple[tuple[Any, ...], ...]:
     """Return grouped exploration slices in policy-action coordinates."""
 
-    if task_mode == POWER_CLOSE_OPTION_TASK_MODE:
+    if task_mode in (
+        POWER_CLOSE_OPTION_TASK_MODE,
+        COUPLED_TEACHER_RESIDUAL_TASK_MODE,
+    ):
         return POWER_ACTION_NOISE_GROUP_SPECS
     if task_mode in (
         FULL_TASK_MODE,
@@ -312,7 +441,7 @@ def observation_contract(task_mode: str) -> dict[str, Any]:
 
     if task_mode not in TASK_MODES:
         raise ValueError(f"unsupported task_mode={task_mode!r}")
-    if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE:
+    if is_coupled_task_mode(task_mode):
         return {
             "observation_dim": COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM,
             "observation_contract": COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_CONTRACT,
@@ -360,6 +489,114 @@ def _validate_serialized_runtime_contract(
     return actual
 
 
+def validate_teacher_residual_training_state(
+    payload: Mapping[str, Any],
+    *,
+    source: str = "teacher residual training state",
+) -> dict[str, Any]:
+    """Validate the resumable actor-authority gate for residual training."""
+
+    if not isinstance(payload, Mapping):
+        raise TypeError(f"{source} must be a JSON object")
+    expected_keys = {
+        "version",
+        "task_mode",
+        "actor_unlock_successes",
+        "native_strict_successes",
+        "actor_unlocked",
+    }
+    if set(payload) != expected_keys:
+        raise ValueError(
+            f"{source} fields differ from the closed contract: "
+            f"missing={sorted(expected_keys.difference(payload))}, "
+            f"extra={sorted(set(payload).difference(expected_keys))}"
+        )
+    if payload.get("version") != 1:
+        raise ValueError(f"{source}.version must be 1")
+    if payload.get("task_mode") != COUPLED_TEACHER_RESIDUAL_TASK_MODE:
+        raise ValueError(
+            f"{source}.task_mode must be {COUPLED_TEACHER_RESIDUAL_TASK_MODE!r}"
+        )
+    threshold = payload.get("actor_unlock_successes")
+    successes = payload.get("native_strict_successes")
+    unlocked = payload.get("actor_unlocked")
+    if (
+        not isinstance(threshold, int)
+        or isinstance(threshold, bool)
+        or threshold < 1
+    ):
+        raise ValueError(f"{source}.actor_unlock_successes must be positive")
+    if (
+        not isinstance(successes, int)
+        or isinstance(successes, bool)
+        or successes < 0
+    ):
+        raise ValueError(f"{source}.native_strict_successes must be non-negative")
+    if not isinstance(unlocked, bool):
+        raise TypeError(f"{source}.actor_unlocked must be bool")
+    expected_unlocked = successes >= threshold
+    if unlocked is not expected_unlocked:
+        raise ValueError(
+            f"{source}.actor_unlocked={unlocked} disagrees with "
+            f"native_strict_successes={successes} and threshold={threshold}"
+        )
+    return {
+        "version": 1,
+        "task_mode": COUPLED_TEACHER_RESIDUAL_TASK_MODE,
+        "actor_unlock_successes": threshold,
+        "native_strict_successes": successes,
+        "actor_unlocked": unlocked,
+    }
+
+
+def residual_actor_should_unlock(
+    *,
+    native_strict_successes: int,
+    actor_unlock_successes: int,
+    success_transition_in_replay: bool,
+) -> bool:
+    """Authorize learning only after the threshold transition is in replay."""
+
+    for name, value, minimum in (
+        ("native_strict_successes", native_strict_successes, 0),
+        ("actor_unlock_successes", actor_unlock_successes, 1),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+            raise ValueError(f"{name} must be an integer >= {minimum}")
+    if not isinstance(success_transition_in_replay, bool):
+        raise TypeError("success_transition_in_replay must be bool")
+    return (
+        success_transition_in_replay
+        and native_strict_successes >= actor_unlock_successes
+    )
+
+
+def read_teacher_residual_training_state(
+    path: Path,
+    *,
+    expected_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Read and hash-bind the residual actor gate sidecar."""
+
+    if path.is_symlink() or not path.is_file():
+        raise FileNotFoundError(
+            f"checkpoint teacher residual state is missing or not a regular file: {path}"
+        )
+    try:
+        raw_bytes = path.read_bytes()
+        actual_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+        if expected_sha256 is not None and actual_sha256 != expected_sha256:
+            raise ValueError(
+                f"checkpoint teacher residual state SHA256 mismatch: {path}"
+            )
+        payload = json.loads(raw_bytes.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"cannot read checkpoint teacher residual state {path}: {error}"
+        ) from error
+    return validate_teacher_residual_training_state(payload, source=str(path))
+
+
 def require_complete_core_checkpoint(checkpoint: Path) -> None:
     """Require the portable network files used to identify a legacy checkpoint."""
 
@@ -387,9 +624,23 @@ def read_checkpoint_task_contract(checkpoint: Path) -> dict[str, Any]:
         )
     require_complete_core_checkpoint(checkpoint)
     path = checkpoint / TASK_CONTRACT_FILENAME
+    if path.is_symlink():
+        raise ValueError(f"checkpoint task contract must not be a symlink: {path}")
     if not path.exists():
-        if path.is_symlink():
-            raise ValueError(f"checkpoint task contract is a dangling symlink: {path}")
+        unexpected_sidecars = [
+            checkpoint / filename
+            for filename in (
+                TEACHER_ACTION_PRIOR_FILENAME,
+                TEACHER_RESIDUAL_STATE_FILENAME,
+            )
+            if (checkpoint / filename).exists()
+            or (checkpoint / filename).is_symlink()
+        ]
+        if unexpected_sidecars:
+            raise ValueError(
+                "checkpoint has residual sidecars but no task contract: "
+                f"{unexpected_sidecars}"
+            )
         # A missing contract is only backward-compatible evidence when the
         # directory is demonstrably a complete pre-contract network snapshot.
         return {
@@ -398,6 +649,9 @@ def read_checkpoint_task_contract(checkpoint: Path) -> dict[str, Any]:
             "legacy_checkpoint": True,
             "replay_n_step": None,
             "replay_gamma": None,
+            "policy_action_authority": [],
+            "teacher_action_prior": None,
+            "teacher_residual_state": None,
             **runtime_contract(FULL_TASK_MODE),
         }
     if not path.is_file():
@@ -413,11 +667,11 @@ def read_checkpoint_task_contract(checkpoint: Path) -> dict[str, Any]:
     if (
         not isinstance(version, int)
         or isinstance(version, bool)
-        or version not in (1, 2, TASK_CONTRACT_VERSION)
+        or version not in (1, 2, 3, 4, TASK_CONTRACT_VERSION)
     ):
         raise ValueError(
             f"checkpoint task contract {path} has version={version!r}, "
-            f"expected 1, 2 or {TASK_CONTRACT_VERSION}"
+            f"expected 1, 2, 3, 4 or {TASK_CONTRACT_VERSION}"
         )
     task_mode = payload.get("task_mode")
     if task_mode not in TASK_MODES:
@@ -427,10 +681,16 @@ def read_checkpoint_task_contract(checkpoint: Path) -> dict[str, Any]:
     if version < 3 and task_mode in (
         POWER_CLOSE_OPTION_TASK_MODE,
         COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+        COUPLED_TEACHER_RESIDUAL_TASK_MODE,
     ):
         raise ValueError(
             f"checkpoint task contract {path} cannot use task_mode={task_mode!r} "
             f"before version 3"
+        )
+    if version < 4 and task_mode == COUPLED_TEACHER_RESIDUAL_TASK_MODE:
+        raise ValueError(
+            f"checkpoint task contract {path} cannot use task_mode={task_mode!r} "
+            "before version 4"
         )
     replay_n_step: int | None = None
     replay_gamma: float | None = None
@@ -453,12 +713,98 @@ def read_checkpoint_task_contract(checkpoint: Path) -> dict[str, Any]:
         if version >= 3
         else runtime_contract(str(task_mode))
     )
+    serialized_authority = validate_policy_action_authority_contract(
+        payload.get("policy_action_authority") if version >= 5 else [],
+        task_mode=str(task_mode),
+        source=f"checkpoint task contract {path}",
+    )
+    teacher_action_prior: dict[str, str] | None = None
+    teacher_residual_state: dict[str, Any] | None = None
+    prior_payload = payload.get("teacher_action_prior")
+    state_reference = payload.get("teacher_residual_state")
+    if task_mode == COUPLED_TEACHER_RESIDUAL_TASK_MODE:
+        if not isinstance(prior_payload, Mapping) or set(prior_payload) != {
+            "filename",
+            "sha256",
+        }:
+            raise ValueError(
+                f"checkpoint task contract {path} has invalid teacher_action_prior"
+            )
+        if prior_payload.get("filename") != TEACHER_ACTION_PRIOR_FILENAME:
+            raise ValueError(
+                f"checkpoint task contract {path} names an unsupported teacher prior file"
+            )
+        prior_sha = prior_payload.get("sha256")
+        if (
+            not isinstance(prior_sha, str)
+            or len(prior_sha) != 64
+            or any(character not in "0123456789abcdef" for character in prior_sha)
+        ):
+            raise ValueError(
+                f"checkpoint task contract {path} has invalid teacher prior SHA256"
+            )
+        teacher_action_prior = {
+            "filename": TEACHER_ACTION_PRIOR_FILENAME,
+            "sha256": prior_sha,
+        }
+        prior_path = checkpoint / TEACHER_ACTION_PRIOR_FILENAME
+        if not prior_path.is_file() or prior_path.is_symlink():
+            raise FileNotFoundError(
+                f"checkpoint teacher prior is missing or not a regular file: {prior_path}"
+            )
+        if _sha256(prior_path) != prior_sha:
+            raise ValueError(f"checkpoint teacher prior SHA256 mismatch: {prior_path}")
+        if not isinstance(state_reference, Mapping) or set(state_reference) != {
+            "filename",
+            "sha256",
+        }:
+            raise ValueError(
+                f"checkpoint task contract {path} has invalid teacher_residual_state"
+            )
+        if state_reference.get("filename") != TEACHER_RESIDUAL_STATE_FILENAME:
+            raise ValueError(
+                f"checkpoint task contract {path} names an unsupported residual state file"
+            )
+        state_sha = state_reference.get("sha256")
+        if (
+            not isinstance(state_sha, str)
+            or len(state_sha) != 64
+            or any(character not in "0123456789abcdef" for character in state_sha)
+        ):
+            raise ValueError(
+                f"checkpoint task contract {path} has invalid residual state SHA256"
+            )
+        teacher_residual_state = read_teacher_residual_training_state(
+            checkpoint / TEACHER_RESIDUAL_STATE_FILENAME,
+            expected_sha256=state_sha,
+        )
+    elif prior_payload is not None:
+        raise ValueError(
+            f"checkpoint task contract {path} has a teacher prior outside residual mode"
+        )
+    elif state_reference is not None:
+        raise ValueError(
+            f"checkpoint task contract {path} has residual state outside residual mode"
+        )
+    if task_mode != COUPLED_TEACHER_RESIDUAL_TASK_MODE:
+        for filename in (
+            TEACHER_ACTION_PRIOR_FILENAME,
+            TEACHER_RESIDUAL_STATE_FILENAME,
+        ):
+            unexpected = checkpoint / filename
+            if unexpected.exists() or unexpected.is_symlink():
+                raise ValueError(
+                    f"checkpoint has unexpected residual sidecar outside residual mode: {unexpected}"
+                )
     return {
         "version": int(version),
         "task_mode": str(task_mode),
         "legacy_checkpoint": False,
         "replay_n_step": replay_n_step,
         "replay_gamma": replay_gamma,
+        "policy_action_authority": serialized_authority,
+        "teacher_action_prior": teacher_action_prior,
+        "teacher_residual_state": teacher_residual_state,
         **serialized_runtime,
     }
 
@@ -475,6 +821,9 @@ def write_checkpoint_task_contract(
     action_projection: str | None = None,
     observation_dim: int | None = None,
     observation_contract_name: str | None = None,
+    policy_action_authority: Sequence[Mapping[str, Any]] = (),
+    teacher_action_prior_sha256: str | None = None,
+    teacher_residual_state_sha256: str | None = None,
 ) -> None:
     if task_mode not in TASK_MODES:
         raise ValueError(f"unsupported task_mode={task_mode!r}")
@@ -499,22 +848,68 @@ def write_checkpoint_task_contract(
         key: expected_runtime[key] if value is None else value
         for key, value in supplied_runtime.items()
     }
+    resolved_authority = validate_policy_action_authority_contract(
+        policy_action_authority,
+        task_mode=task_mode,
+        source="checkpoint writer",
+    )
     for key, expected in expected_runtime.items():
         if resolved_runtime[key] != expected:
             raise ValueError(
                 f"{key}={resolved_runtime[key]!r} is incompatible with "
                 f"task_mode={task_mode!r}; expected {expected!r}"
             )
-    atomic_write_json(
-        checkpoint / TASK_CONTRACT_FILENAME,
-        {
-            "version": TASK_CONTRACT_VERSION,
-            "task_mode": task_mode,
-            "replay_n_step": replay_n_step,
-            "replay_gamma": replay_gamma,
-            **resolved_runtime,
-        },
-    )
+    prior_entry: dict[str, str] | None = None
+    state_entry: dict[str, str] | None = None
+    if task_mode == COUPLED_TEACHER_RESIDUAL_TASK_MODE:
+        if (
+            not isinstance(teacher_action_prior_sha256, str)
+            or len(teacher_action_prior_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in teacher_action_prior_sha256
+            )
+        ):
+            raise ValueError("residual task checkpoints require a valid teacher prior SHA256")
+        prior_entry = {
+            "filename": TEACHER_ACTION_PRIOR_FILENAME,
+            "sha256": teacher_action_prior_sha256,
+        }
+        if (
+            not isinstance(teacher_residual_state_sha256, str)
+            or len(teacher_residual_state_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in teacher_residual_state_sha256
+            )
+        ):
+            raise ValueError(
+                "residual task checkpoints require a valid residual state SHA256"
+            )
+        state_entry = {
+            "filename": TEACHER_RESIDUAL_STATE_FILENAME,
+            "sha256": teacher_residual_state_sha256,
+        }
+    elif (
+        teacher_action_prior_sha256 is not None
+        or teacher_residual_state_sha256 is not None
+    ):
+        raise ValueError(
+            "teacher prior/residual state SHA256 is only valid for residual task checkpoints"
+        )
+    payload: dict[str, Any] = {
+        "version": TASK_CONTRACT_VERSION,
+        "task_mode": task_mode,
+        "replay_n_step": replay_n_step,
+        "replay_gamma": replay_gamma,
+        "policy_action_authority": resolved_authority,
+        **resolved_runtime,
+    }
+    if prior_entry is not None:
+        payload["teacher_action_prior"] = prior_entry
+    if state_entry is not None:
+        payload["teacher_residual_state"] = state_entry
+    atomic_write_json(checkpoint / TASK_CONTRACT_FILENAME, payload)
 
 
 def clear_stale_checkpoint_optional_artifacts(checkpoint: Path) -> tuple[str, ...]:
@@ -547,8 +942,37 @@ def save_final_checkpoint(
     replay_gamma: float,
     save_replay: bool,
     actor_rehearsal: Any | None,
+    policy_action_authority: Sequence[Mapping[str, Any]] = (),
+    teacher_prior: Any | None = None,
+    teacher_residual_state: Mapping[str, Any] | None = None,
 ) -> None:
     """Save one final checkpoint, publishing its task contract last."""
+
+    prior_payload: dict[str, Any] | None = None
+    residual_state_payload: dict[str, Any] | None = None
+    if task_mode == COUPLED_TEACHER_RESIDUAL_TASK_MODE:
+        if teacher_prior is None or teacher_residual_state is None:
+            raise ValueError(
+                "residual checkpoints require both teacher_prior and resumable actor gate state"
+            )
+        candidate = teacher_prior.contract_payload()
+        if not isinstance(candidate, Mapping):
+            raise TypeError("teacher_prior.contract_payload() must return a mapping")
+        from coupled_teacher_prior import coupled_teacher_prior_from_payload
+
+        validated_prior = coupled_teacher_prior_from_payload(
+            candidate,
+            source="checkpoint teacher prior",
+        )
+        prior_payload = validated_prior.contract_payload()
+        residual_state_payload = validate_teacher_residual_training_state(
+            teacher_residual_state,
+            source="checkpoint teacher residual state",
+        )
+    elif teacher_prior is not None or teacher_residual_state is not None:
+        raise ValueError(
+            "teacher prior/residual state can only be saved for residual task checkpoints"
+        )
 
     if checkpoint.is_symlink():
         raise ValueError(f"checkpoint output must be a real directory: {checkpoint}")
@@ -563,11 +987,24 @@ def save_final_checkpoint(
         agent.save_replay_buffer(str(checkpoint))
     if actor_rehearsal is not None:
         actor_rehearsal.save(checkpoint / "actor_rehearsal.pt")
+    teacher_prior_sha256: str | None = None
+    teacher_residual_state_sha256: str | None = None
+    if prior_payload is not None:
+        prior_path = checkpoint / TEACHER_ACTION_PRIOR_FILENAME
+        atomic_write_json(prior_path, prior_payload)
+        teacher_prior_sha256 = _sha256(prior_path)
+    if residual_state_payload is not None:
+        state_path = checkpoint / TEACHER_RESIDUAL_STATE_FILENAME
+        atomic_write_json(state_path, residual_state_payload)
+        teacher_residual_state_sha256 = _sha256(state_path)
     write_checkpoint_task_contract(
         checkpoint,
         task_mode=task_mode,
         replay_n_step=replay_n_step,
         replay_gamma=replay_gamma,
+        policy_action_authority=policy_action_authority,
+        teacher_action_prior_sha256=teacher_prior_sha256,
+        teacher_residual_state_sha256=teacher_residual_state_sha256,
     )
     incomplete.unlink()
 
@@ -623,6 +1060,7 @@ def validate_replay_task_contract(
     task_mode: str,
     n_step: int,
     gamma: float,
+    policy_action_authority: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Reject replay collected under different reward/termination semantics."""
 
@@ -636,6 +1074,11 @@ def validate_replay_task_contract(
     if not replay_path.is_file():
         raise FileNotFoundError(replay_path)
     contract = read_checkpoint_task_contract(checkpoint)
+    current_authority = validate_policy_action_authority_contract(
+        policy_action_authority,
+        task_mode=task_mode,
+        source="current replay",
+    )
     if contract["task_mode"] != task_mode:
         raise ValueError(
             "--resume_replay cannot cross task modes: "
@@ -648,6 +1091,12 @@ def validate_replay_task_contract(
                 f"--resume_replay {key} mismatch: checkpoint={contract.get(key)!r}, "
                 f"current={expected!r}"
             )
+    if contract.get("policy_action_authority") != current_authority:
+        raise ValueError(
+            "--resume_replay policy_action_authority mismatch: "
+            f"checkpoint={contract.get('policy_action_authority')!r}, "
+            f"current={current_authority!r}"
+        )
     checkpoint_n_step = contract["replay_n_step"]
     checkpoint_gamma = contract["replay_gamma"]
     if checkpoint_n_step is None or checkpoint_gamma is None:
@@ -671,6 +1120,7 @@ def validate_checkpoint_task_contract(
     task_mode: str,
     n_step: int,
     gamma: float,
+    policy_action_authority: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Reject a full-agent restore across reward/termination objectives.
 
@@ -687,6 +1137,11 @@ def validate_checkpoint_task_contract(
     if not math.isfinite(gamma) or not 0.0 <= gamma <= 1.0:
         raise ValueError("current checkpoint gamma must be finite and in [0, 1]")
     contract = read_checkpoint_task_contract(checkpoint)
+    current_authority = validate_policy_action_authority_contract(
+        policy_action_authority,
+        task_mode=task_mode,
+        source="current checkpoint",
+    )
     if contract["task_mode"] != task_mode:
         raise ValueError(
             "--checkpoint cannot cross task modes because it restores objective-specific "
@@ -700,6 +1155,13 @@ def validate_checkpoint_task_contract(
                 f"--checkpoint {key} mismatch; use --actor_checkpoint instead: "
                 f"checkpoint={contract.get(key)!r}, current={expected!r}"
             )
+    if contract.get("policy_action_authority") != current_authority:
+        raise ValueError(
+            "--checkpoint policy_action_authority mismatch; use --actor_checkpoint "
+            "instead: "
+            f"checkpoint={contract.get('policy_action_authority')!r}, "
+            f"current={current_authority!r}"
+        )
     checkpoint_n_step = contract["replay_n_step"]
     checkpoint_gamma = contract["replay_gamma"]
     if checkpoint_n_step is None or checkpoint_gamma is None:
@@ -734,7 +1196,9 @@ def validate_training_source_selection(
     demo: list[Path] | None,
     actor_demo: list[Path] | None,
     coupled_power_align_close_option_mode: bool = False,
+    coupled_teacher_residual_mode: bool = False,
     allow_cross_task_actor: bool = False,
+    public_latch_arm_gate: bool = False,
 ) -> None:
     """Validate mutually exclusive initialization and task-specific data sources."""
 
@@ -744,11 +1208,38 @@ def validate_training_source_selection(
         raise ValueError("--resume_replay requires --checkpoint")
     if resume_actor_demo and checkpoint is None:
         raise ValueError("--resume_actor_demo requires --checkpoint")
-    task_mode_from_close_option(
+    task_mode = task_mode_from_close_option(
         close_option_mode,
         power_close_option_mode,
         coupled_power_align_close_option_mode,
+        coupled_teacher_residual_mode,
     )
+    if coupled_teacher_residual_mode:
+        if checkpoint is not None and not resume_replay:
+            raise ValueError(
+                "teacher-residual --checkpoint requires --resume_replay so an "
+                "unlocked actor cannot resume without the strict success that "
+                "granted its authority"
+            )
+        if actor_checkpoint is not None:
+            raise ValueError(
+                "teacher-residual mode rejects absolute-action --actor_checkpoint sources"
+            )
+        if demo is not None:
+            raise ValueError(
+                "teacher-residual v1 rejects transition --demo sources; native strict "
+                "successes must enter online residual replay. A strictly audited coupled "
+                "teacher --actor_demo may only anchor the actor at residual14=0."
+            )
+    if public_latch_arm_gate:
+        if task_mode != FULL_TASK_MODE:
+            raise ValueError("--public_latch_arm_gate requires full_task mode")
+        if demo is not None:
+            raise ValueError(
+                "--public_latch_arm_gate rejects transition --demo sources because "
+                "their next observations/rewards were generated by ungated actions; "
+                "use actor-only --actor_demo supervision"
+            )
     if allow_cross_task_actor and actor_checkpoint is None:
         raise ValueError("--allow_cross_task_actor requires --actor_checkpoint")
     if allow_cross_task_actor and not coupled_power_align_close_option_mode:
@@ -760,6 +1251,7 @@ def validate_training_source_selection(
         close_option_mode
         or power_close_option_mode
         or coupled_power_align_close_option_mode
+        or coupled_teacher_residual_mode
     ) and demo is not None:
         raise ValueError(
             "close-option training rejects full-task transition --demo data; "
@@ -809,6 +1301,73 @@ def validate_actor_demo_curriculum_lineage(
         )
 
 
+def validate_teacher_residual_actor_demo_lineage(
+    audit: Mapping[str, Any],
+    *,
+    expected_curriculum_sha256: str,
+    expected_teacher_artifact_sha256: str,
+) -> None:
+    """Bind zero-residual rehearsal to the exact active teacher/reset pair."""
+
+    validate_actor_demo_curriculum_lineage(
+        audit,
+        expected_curriculum_sha256=expected_curriculum_sha256,
+    )
+    for label, value in (
+        ("expected teacher artifact", expected_teacher_artifact_sha256),
+        ("actor demo teacher artifact", audit.get("teacher_artifact_sha256")),
+    ):
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError(f"{label} SHA256 must be 64-character lowercase hex")
+    actual = str(audit["teacher_artifact_sha256"])
+    if actual != expected_teacher_artifact_sha256:
+        raise ValueError(
+            "teacher-residual actor-demo lineage mismatch: "
+            f"demo={actual}, active={expected_teacher_artifact_sha256}, "
+            f"source={audit.get('path')!r}"
+        )
+
+
+def project_coupled_teacher_demo_to_zero_residual(
+    batch: Mapping[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Represent an audited native teacher trajectory as residual14=0."""
+
+    observation = batch.get("observation")
+    action = batch.get("action")
+    if not isinstance(observation, torch.Tensor) or not isinstance(action, torch.Tensor):
+        raise TypeError("coupled teacher projection requires tensor observation/action")
+    if (
+        observation.ndim != 2
+        or observation.shape[1] != COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM
+    ):
+        raise ValueError("coupled teacher projection requires 131-D observations")
+    if action.shape != (observation.shape[0], PICK_TOOL_ENVIRONMENT_ACTION_DIM):
+        raise ValueError("coupled teacher projection requires native 21-D actions")
+    if (
+        observation.device != action.device
+        or observation.dtype != torch.float32
+        or action.dtype != torch.float32
+    ):
+        raise ValueError("coupled teacher projection requires co-located float32 tensors")
+    if not bool(torch.isfinite(observation).all()) or not bool(
+        torch.isfinite(action).all()
+    ):
+        raise ValueError("coupled teacher projection received NaN or infinity")
+    return {
+        "observation": observation,
+        "action": torch.zeros(
+            (observation.shape[0], PICK_TOOL_HAND_ACTION_DIM),
+            dtype=action.dtype,
+            device=action.device,
+        ),
+    }
+
+
 def validate_checkpoint_output_separation(
     checkpoint: Path | None,
     *,
@@ -834,6 +1393,7 @@ def validate_close_option_training_config(
     episode_length_s: float | None,
     randomize_episode_lengths: bool,
     coupled_power_align_close_option_mode: bool = False,
+    coupled_teacher_residual_mode: bool = False,
 ) -> None:
     """Keep the close option on its physically meaningful pregrasp MDP."""
 
@@ -841,15 +1401,19 @@ def validate_close_option_training_config(
         close_option_mode,
         power_close_option_mode,
         coupled_power_align_close_option_mode,
+        coupled_teacher_residual_mode,
     )
     if not (
         close_option_mode
         or power_close_option_mode
         or coupled_power_align_close_option_mode
+        or coupled_teacher_residual_mode
     ):
         return
     flag = (
-        "--coupled_power_align_close_option_mode"
+        "--coupled_teacher_residual_mode"
+        if coupled_teacher_residual_mode
+        else "--coupled_power_align_close_option_mode"
         if coupled_power_align_close_option_mode
         else (
             "--power_close_option_mode"
@@ -868,7 +1432,9 @@ def validate_close_option_training_config(
             f"{flag} requires --curriculum_joint_noise in [0, 0.02]"
         )
     minimum_episode_length_s = (
-        3.0 if coupled_power_align_close_option_mode else 0.40
+        3.0
+        if (coupled_power_align_close_option_mode or coupled_teacher_residual_mode)
+        else 0.40
     )
     if (
         episode_length_s is None
@@ -883,6 +1449,43 @@ def validate_close_option_training_config(
         raise ValueError(
             f"{flag} rejects --randomize_episode_lengths because shortened "
             "initial episodes can censor the stable-latch confirmation window"
+        )
+
+
+def validate_public_latch_arm_gate_config(
+    *,
+    enabled: bool,
+    task_mode: str,
+    curriculum_dataset: Path | None,
+    curriculum_boundary: str,
+    curriculum_probability: float,
+    curriculum_joint_noise: float,
+    episode_length_s: float | None,
+    randomize_episode_lengths: bool,
+) -> None:
+    """Keep latch-gated arm training on the close-to-lift conditional MDP."""
+
+    if not enabled:
+        return
+    if task_mode != FULL_TASK_MODE:
+        raise ValueError("--public_latch_arm_gate requires full_task mode")
+    if curriculum_dataset is None:
+        raise ValueError("--public_latch_arm_gate requires a close-start curriculum dataset")
+    if curriculum_boundary != "close_start":
+        raise ValueError("--public_latch_arm_gate requires --curriculum_boundary close_start")
+    if curriculum_probability != 1.0:
+        raise ValueError("--public_latch_arm_gate requires --curriculum_probability 1")
+    if not 0.0 <= curriculum_joint_noise <= 0.02:
+        raise ValueError(
+            "--public_latch_arm_gate requires --curriculum_joint_noise in [0, 0.02]"
+        )
+    if episode_length_s is None or episode_length_s < 0.30:
+        raise ValueError(
+            "--public_latch_arm_gate requires --episode_length_s >= 0.30"
+        )
+    if randomize_episode_lengths:
+        raise ValueError(
+            "--public_latch_arm_gate rejects --randomize_episode_lengths"
         )
 
 
@@ -958,6 +1561,9 @@ class TerminalEventAccumulator:
             COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE: (
                 COUPLED_POWER_ALIGN_CLOSE_OPTION_TERMINAL_EVENT_KEYS
             ),
+            COUPLED_TEACHER_RESIDUAL_TASK_MODE: (
+                COUPLED_POWER_ALIGN_CLOSE_OPTION_TERMINAL_EVENT_KEYS
+            ),
         }[self.task_mode]
         self.counts = {
             name: torch.zeros((), dtype=torch.long, device=self.device)
@@ -1014,7 +1620,7 @@ class TerminalEventAccumulator:
         }
 
 
-def _scalar(value: Any) -> float:
+def _scalar(value: Any, *, name: str | None = None) -> float:
     if isinstance(value, torch.Tensor):
         if value.numel() != 1:
             raise ValueError(f"metric tensor must be scalar, got {tuple(value.shape)}")
@@ -1023,7 +1629,8 @@ def _scalar(value: Any) -> float:
         value = value.item()
     result = float(value)
     if not math.isfinite(result):
-        raise FloatingPointError(f"metric is not finite: {result}")
+        label = "metric" if name is None else f"metric {name!r}"
+        raise FloatingPointError(f"{label} is not finite: {result}")
     return result
 
 
@@ -1107,6 +1714,14 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         type=float,
         default=0.2,
         help="Additional exploration multiplier for token/residual actions after observed latch.",
+    )
+    parser.add_argument(
+        "--public_latch_arm_gate",
+        action="store_true",
+        help=(
+            "Freeze only arm7 at exact zero while public grasp latch observation[106] "
+            "is zero; hand14 remains active and arm authority begins when it becomes one."
+        ),
     )
     parser.add_argument(
         "--episode_length_s",
@@ -1243,6 +1858,33 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
             "environment use the identity arm7+hand14 action boundary."
         ),
     )
+    task_mode_group.add_argument(
+        "--coupled_teacher_residual_mode",
+        action="store_true",
+        help=(
+            "Train a 14D canonical hand residual around the audited coupled CEM teacher; "
+            "the exact public-observation wrist prior owns ALIGN."
+        ),
+    )
+    parser.add_argument(
+        "--coupled_teacher_prior",
+        type=Path,
+        default=None,
+        help="Strict coupled CEM artifact required by --coupled_teacher_residual_mode.",
+    )
+    parser.add_argument("--residual_close_token_scale", type=float, default=0.04)
+    parser.add_argument("--residual_close_distal_scale", type=float, default=0.06)
+    parser.add_argument("--residual_hold_token_scale", type=float, default=0.015)
+    parser.add_argument("--residual_hold_distal_scale", type=float, default=0.025)
+    parser.add_argument(
+        "--actor_unlock_successes",
+        type=int,
+        default=1,
+        help=(
+            "For teacher-residual training, keep the actor deterministic at zero until this "
+            "many native strict close successes have entered online replay."
+        ),
+    )
     parser.add_argument("--output_dir", type=Path, default=Path("logs/flashsac/pick_tool"))
     parser.add_argument("--metrics_every", type=int, default=100)
     parser.add_argument(
@@ -1264,6 +1906,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         args.close_option_mode,
         args.power_close_option_mode,
         args.coupled_power_align_close_option_mode,
+        args.coupled_teacher_residual_mode,
     )
     validate_training_source_selection(
         checkpoint=args.checkpoint,
@@ -1277,7 +1920,9 @@ def _validate_args(args: argparse.Namespace) -> None:
         coupled_power_align_close_option_mode=(
             args.coupled_power_align_close_option_mode
         ),
+        coupled_teacher_residual_mode=args.coupled_teacher_residual_mode,
         allow_cross_task_actor=args.allow_cross_task_actor,
+        public_latch_arm_gate=args.public_latch_arm_gate,
     )
     validate_close_option_training_config(
         close_option_mode=args.close_option_mode,
@@ -1291,6 +1936,17 @@ def _validate_args(args: argparse.Namespace) -> None:
         coupled_power_align_close_option_mode=(
             args.coupled_power_align_close_option_mode
         ),
+        coupled_teacher_residual_mode=args.coupled_teacher_residual_mode,
+    )
+    validate_public_latch_arm_gate_config(
+        enabled=args.public_latch_arm_gate,
+        task_mode=task_mode,
+        curriculum_dataset=args.curriculum_dataset,
+        curriculum_boundary=args.curriculum_boundary,
+        curriculum_probability=args.curriculum_probability,
+        curriculum_joint_noise=args.curriculum_joint_noise,
+        episode_length_s=args.episode_length_s,
+        randomize_episode_lengths=args.randomize_episode_lengths,
     )
     for name in (
         "steps",
@@ -1394,17 +2050,45 @@ def _validate_args(args: argparse.Namespace) -> None:
         value = getattr(args, name)
         if not math.isfinite(value) or value < 0.0:
             raise ValueError(f"--{name} must be finite and non-negative")
-    if task_mode == POWER_CLOSE_OPTION_TASK_MODE:
+    if task_mode in (
+        POWER_CLOSE_OPTION_TASK_MODE,
+        COUPLED_TEACHER_RESIDUAL_TASK_MODE,
+    ):
         if args.unlatched_arm_noise_scale != 0.0 or args.latched_arm_noise_scale != 0.0:
             raise ValueError(
-                "--power_close_option_mode has no policy arm actions; both arm noise "
+                "the selected 14D policy has no arm actions; both arm noise "
                 "scales must be exactly 0"
             )
         if args.demo_bc_arm_weight != 0.0:
             raise ValueError(
-                "--power_close_option_mode has no policy arm actions; "
+                "the selected 14D policy has no arm actions; "
                 "--demo_bc_arm_weight must be 0"
             )
+    residual_mode = task_mode == COUPLED_TEACHER_RESIDUAL_TASK_MODE
+    if residual_mode:
+        if args.coupled_teacher_prior is None or not args.coupled_teacher_prior.is_file():
+            raise FileNotFoundError(
+                args.coupled_teacher_prior
+                if args.coupled_teacher_prior is not None
+                else "--coupled_teacher_prior"
+            )
+        if args.curriculum_joint_noise != 0.0:
+            raise ValueError("teacher-residual v1 requires exact-zero curriculum joint noise")
+        if args.actor_unlock_successes < 1:
+            raise ValueError("--actor_unlock_successes must be positive")
+        for name in (
+            "residual_close_token_scale",
+            "residual_close_distal_scale",
+            "residual_hold_token_scale",
+            "residual_hold_distal_scale",
+        ):
+            value = getattr(args, name)
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"--{name} must be finite and in [0, 1]")
+    elif args.coupled_teacher_prior is not None:
+        raise ValueError(
+            "--coupled_teacher_prior requires --coupled_teacher_residual_mode"
+        )
 
 
 def _seed_everything(seed: int) -> None:
@@ -1459,12 +2143,13 @@ def _strict_metrics(
     if not isinstance(values, Mapping):
         raise TypeError("adapter info['strict_metrics'] must be a mapping")
     metrics = {
-        str(name): _scalar(value)
+        str(name): _scalar(value, name=str(name))
         for name, value in values.items()
         if not (
             task_mode in (
                 POWER_CLOSE_OPTION_TASK_MODE,
                 COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+                COUPLED_TEACHER_RESIDUAL_TASK_MODE,
             )
             and str(name) in _POWER_CLOSE_INAPPLICABLE_LEGACY_METRICS
         )
@@ -1472,6 +2157,7 @@ def _strict_metrics(
     if task_mode not in (
         POWER_CLOSE_OPTION_TASK_MODE,
         COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+        COUPLED_TEACHER_RESIDUAL_TASK_MODE,
     ):
         return metrics
 
@@ -1488,7 +2174,7 @@ def _strict_metrics(
         "power_grasp_latch_confirm_steps": torch.long,
         "power_close_option_stable_steps": torch.long,
     }
-    if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE:
+    if is_coupled_task_mode(task_mode):
         specifications.update(
             {
                 "coupled_power_pose_escape": torch.bool,
@@ -1566,7 +2252,7 @@ def _strict_metrics(
             "power_grasp_phase_frac": float(power_latch.float().mean().item()),
         }
     )
-    if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE:
+    if is_coupled_task_mode(task_mode):
         nonnegative_names = (
             "coupled_power_rotation_drift",
             "coupled_power_xy_drift",
@@ -1637,6 +2323,15 @@ def audit_actor_checkpoint_source(
     actor_projection: str | None = None
     source_task_mode = str(source_contract["task_mode"])
     if (
+        COUPLED_TEACHER_RESIDUAL_TASK_MODE
+        in (source_task_mode, target_task_mode)
+        and source_task_mode != target_task_mode
+    ):
+        raise ValueError(
+            "teacher-residual actors cannot cross task modes: their 14D outputs are "
+            "canonical residuals, not absolute hand actions"
+        )
+    if (
         target_task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE
         and source_task_mode != target_task_mode
     ):
@@ -1688,6 +2383,9 @@ def audit_actor_checkpoint_source(
         "source_task_mode": source_task_mode,
         "source_policy_action_dim": source_dim,
         "source_policy_action_layout": str(source_contract["policy_action_layout"]),
+        "source_policy_action_authority": source_contract[
+            "policy_action_authority"
+        ],
         "target_task_mode": target_task_mode,
         "target_policy_action_dim": target_dim,
         "actor_projection": actor_projection,
@@ -1936,6 +2634,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         args.close_option_mode,
         args.power_close_option_mode,
         args.coupled_power_align_close_option_mode,
+        args.coupled_teacher_residual_mode,
+    )
+    current_policy_action_authority = policy_action_authority_contract(
+        args.public_latch_arm_gate
     )
     env_task_mode_overrides = environment_task_mode_overrides(task_mode)
     physical_close_option_mode = bool(env_task_mode_overrides["close_option_mode"])
@@ -1956,6 +2658,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _validate_args(args)
     _seed_everything(args.seed)
     current_runtime_contract = runtime_contract(task_mode)
+    teacher_prior = None
+    if task_mode == COUPLED_TEACHER_RESIDUAL_TASK_MODE:
+        from coupled_teacher_prior import (
+            HandResidualScales,
+            load_coupled_teacher_prior,
+            load_coupled_teacher_prior_payload,
+        )
+
+        assert args.curriculum_dataset is not None
+        assert args.coupled_teacher_prior is not None
+        teacher_prior = load_coupled_teacher_prior(
+            args.coupled_teacher_prior,
+            args.curriculum_dataset,
+            residual_scales=HandResidualScales(
+                close_token=args.residual_close_token_scale,
+                close_distal=args.residual_close_distal_scale,
+                hold_token=args.residual_hold_token_scale,
+                hold_distal=args.residual_hold_distal_scale,
+            ),
+        )
     effective_n_step = 1 if args.smoke else args.n_step
     output_dir = args.output_dir.resolve()
     checkpoint_dir = output_dir / "checkpoint_final"
@@ -1970,7 +2692,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             task_mode=task_mode,
             n_step=effective_n_step,
             gamma=FLASH_SAC_GAMMA,
+            policy_action_authority=current_policy_action_authority,
         )
+        if teacher_prior is not None:
+            prior_entry = resumed_task_contract.get("teacher_action_prior")
+            if not isinstance(prior_entry, Mapping):
+                raise ValueError("residual checkpoint has no teacher prior lineage")
+            checkpoint_prior = load_coupled_teacher_prior_payload(
+                args.checkpoint.resolve() / str(prior_entry["filename"]),
+                expected_sha256=str(prior_entry["sha256"]),
+            )
+            if checkpoint_prior.contract_payload() != teacher_prior.contract_payload():
+                raise ValueError(
+                    "--checkpoint teacher prior/scales differ from the active artifact and curriculum"
+                )
         if args.resume_replay:
             # Keep the replay-specific validation as an explicit second guard:
             # it documents why replay continuation is legal in this run.
@@ -1979,7 +2714,41 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 task_mode=task_mode,
                 n_step=effective_n_step,
                 gamma=FLASH_SAC_GAMMA,
+                policy_action_authority=current_policy_action_authority,
             )
+    residual_native_successes_base = 0
+    residual_actor_unlocked = task_mode != COUPLED_TEACHER_RESIDUAL_TASK_MODE
+    residual_actor_unlock_interaction_step: int | None = None
+    if task_mode == COUPLED_TEACHER_RESIDUAL_TASK_MODE:
+        if resumed_task_contract is None:
+            residual_state = validate_teacher_residual_training_state(
+                {
+                    "version": 1,
+                    "task_mode": COUPLED_TEACHER_RESIDUAL_TASK_MODE,
+                    "actor_unlock_successes": args.actor_unlock_successes,
+                    "native_strict_successes": 0,
+                    "actor_unlocked": False,
+                },
+                source="fresh residual training state",
+            )
+        else:
+            candidate_state = resumed_task_contract.get("teacher_residual_state")
+            if not isinstance(candidate_state, Mapping):
+                raise ValueError("residual checkpoint has no resumable actor gate state")
+            residual_state = validate_teacher_residual_training_state(
+                candidate_state,
+                source="resumed residual training state",
+            )
+            if residual_state["actor_unlock_successes"] != args.actor_unlock_successes:
+                raise ValueError(
+                    "--actor_unlock_successes differs from the residual checkpoint: "
+                    f"checkpoint={residual_state['actor_unlock_successes']}, "
+                    f"current={args.actor_unlock_successes}"
+                )
+        residual_native_successes_base = int(
+            residual_state["native_strict_successes"]
+        )
+        residual_actor_unlocked = bool(residual_state["actor_unlocked"])
     actor_checkpoint_audit = (
         audit_actor_checkpoint_source(
             args.actor_checkpoint,
@@ -2001,7 +2770,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "token": float(args.demo_bc_token_weight),
             "residual": float(args.demo_bc_residual_weight),
         }
-        if task_mode == POWER_CLOSE_OPTION_TASK_MODE
+        if task_mode in (
+            POWER_CLOSE_OPTION_TASK_MODE,
+            COUPLED_TEACHER_RESIDUAL_TASK_MODE,
+        )
         else {
             "arm": float(args.demo_bc_arm_weight),
             "token": float(args.demo_bc_token_weight),
@@ -2014,6 +2786,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     from adapter import build_replay_transition, make_pick_tool_env
     from agent_bridge import (
         FLASH_SAC_COMMIT,
+        FLASH_SAC_FORK_COMMIT,
+        ActionAuthorityRule,
         ActionNoiseGroup,
         FlashSACTorchBridge,
         build_agent_config,
@@ -2052,7 +2826,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         }
 
     cfg_overrides = dict(env_task_mode_overrides)
-    if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE:
+    if is_coupled_task_mode(task_mode):
         cfg_overrides.update(
             {
                 "observation_space": COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM,
@@ -2076,6 +2850,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         seed=args.seed,
         cfg_overrides=cfg_overrides,
         hand_only_actions=task_mode == POWER_CLOSE_OPTION_TASK_MODE,
+        action_transform=teacher_prior,
         validate_finite=args.smoke or args.validate_finite,
     )
     warmup_transitions = resolve_warmup_transitions(
@@ -2133,7 +2908,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         agent_cfg,
         noise_groups=noise_groups,
         restore_rng_state_on_load=False,
+        actor_action_active_observation_index=(
+            COUPLED_ALIGN_ACTIVE_OBSERVATION_INDEX
+            if task_mode == COUPLED_TEACHER_RESIDUAL_TASK_MODE
+            else None
+        ),
+        action_authority_rules=(
+            tuple(ActionAuthorityRule(**rule) for rule in current_policy_action_authority)
+        ),
+        unit_normalize_actor_mean_head=(
+            task_mode != COUPLED_TEACHER_RESIDUAL_TASK_MODE
+        ),
     )
+    if (
+        task_mode == COUPLED_TEACHER_RESIDUAL_TASK_MODE
+        and args.checkpoint is None
+    ):
+        agent.initialize_zero_actor_mean()
 
     demo_replay = None
     demo_metrics: dict[str, Any] = {
@@ -2236,21 +3027,32 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         }
 
     if args.actor_demo is not None:
-        if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE:
+        if task_mode in (
+            COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+            COUPLED_TEACHER_RESIDUAL_TASK_MODE,
+        ):
             actor_demo_contracts = PICK_TOOL_COUPLED_POWER_ACTOR_DEMO_CONTRACTS
         elif is_close_option_task_mode(task_mode):
             actor_demo_contracts = PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS
         else:
             actor_demo_contracts = PICK_TOOL_LIFT_ACTOR_DEMO_CONTRACTS
         for path in args.actor_demo:
+            source_action_dim = (
+                PICK_TOOL_ENVIRONMENT_ACTION_DIM
+                if task_mode == COUPLED_TEACHER_RESIDUAL_TASK_MODE
+                else env.action_dim
+            )
             batch, labels, audit = load_actor_rehearsal(
                 path.resolve(),
                 device=device,
                 observation_dim=env.observation_dim,
-                action_dim=env.action_dim,
+                action_dim=source_action_dim,
                 allowed_contracts=actor_demo_contracts,
             )
-            if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE:
+            if task_mode in (
+                COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+                COUPLED_TEACHER_RESIDUAL_TASK_MODE,
+            ):
                 initial_curriculum_sha256 = curriculum_metrics[
                     "curriculum_dataset_sha256"
                 ]
@@ -2270,6 +3072,45 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     audit,
                     expected_curriculum_sha256=expected_curriculum_sha256,
                 )
+            if task_mode == COUPLED_TEACHER_RESIDUAL_TASK_MODE:
+                if teacher_prior is None:
+                    raise RuntimeError("teacher-residual actor demo requires an active prior")
+                validate_teacher_residual_actor_demo_lineage(
+                    audit,
+                    expected_curriculum_sha256=expected_curriculum_sha256,
+                    expected_teacher_artifact_sha256=(
+                        teacher_prior.teacher_artifact_sha256
+                    ),
+                )
+                batch = project_coupled_teacher_demo_to_zero_residual(batch)
+                audit = {
+                    **audit,
+                    "source_policy_action_dim": PICK_TOOL_ENVIRONMENT_ACTION_DIM,
+                    "projected_policy_action_dim": PICK_TOOL_HAND_ACTION_DIM,
+                    "action_projection": (
+                        "audited_coupled_teacher21_to_exact_zero_residual14_v1"
+                    ),
+                }
+            if current_policy_action_authority:
+                source_action = batch["action"]
+                projected_action = agent.apply_action_authority(
+                    source_action, batch["observation"]
+                )
+                changed = projected_action != source_action
+                batch = {
+                    **batch,
+                    "action": projected_action,
+                }
+                audit = {
+                    **audit,
+                    "policy_action_authority": current_policy_action_authority,
+                    "authority_projected_elements": int(changed.sum().item()),
+                    "authority_removed_max_abs_action": (
+                        float(source_action[changed].abs().max().item())
+                        if bool(changed.any())
+                        else 0.0
+                    ),
+                }
             actor_batches.append(batch)
             actor_phases.append(labels)
             actor_source_metrics.append({"role": "actor_only", **audit})
@@ -2358,6 +3199,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             task_mode=task_mode,
             n_step=effective_n_step,
             gamma=FLASH_SAC_GAMMA,
+            policy_action_authority=current_policy_action_authority,
         )
         if revalidated_contract != resumed_task_contract:
             raise RuntimeError("--checkpoint task contract changed while the run was starting")
@@ -2367,6 +3209,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             task_mode=task_mode,
             n_step=effective_n_step,
             gamma=FLASH_SAC_GAMMA,
+            policy_action_authority=current_policy_action_authority,
         )
         if post_load_contract != resumed_task_contract:
             raise RuntimeError("--checkpoint changed while it was being loaded")
@@ -2399,6 +3242,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         if loaded_actor_sha256 != actor_checkpoint_audit["actor_sha256"]:
             raise RuntimeError("--actor_checkpoint changed while actor.pt was being loaded")
+        if args.public_latch_arm_gate and agent.replay_size != 0:
+            raise RuntimeError(
+                "public latch arm-gate actor-only initialization must start with fresh replay"
+            )
     if demo_max_abs_reward is not None:
         if agent.reward_normalizer is None:
             raise RuntimeError("demonstration replay requires the configured reward normalizer")
@@ -2434,11 +3281,31 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     run_max_strict: dict[str, float] = {}
     started = time.perf_counter()
 
+    def current_residual_native_successes() -> int:
+        if task_mode != COUPLED_TEACHER_RESIDUAL_TASK_MODE:
+            return 0
+        return residual_native_successes_base + int(
+            terminal_events.counts["power_close_option_success"].item()
+        )
+
     try:
         for interaction_step in range(1, args.steps + 1):
             training_ready = agent.can_start_training()
             if (
-                args.checkpoint is not None
+                task_mode == COUPLED_TEACHER_RESIDUAL_TASK_MODE
+                and not residual_actor_unlocked
+            ):
+                # Exact teacher-prior collection is the exploration bridge.
+                # Keep the canonical replay action at zero until a native
+                # strict success transition has actually entered online replay.
+                action = torch.zeros(
+                    (env.num_envs, env.action_dim),
+                    dtype=torch.float32,
+                    device=env.device,
+                )
+            elif (
+                task_mode == COUPLED_TEACHER_RESIDUAL_TASK_MODE
+                or args.checkpoint is not None
                 or args.actor_checkpoint is not None
                 or training_ready
             ):
@@ -2476,21 +3343,44 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             else:
                 action = env.sample_random_actions()
 
+            # Every proposal source converges here, including random warm-up.
+            # The same post-gate canonical action is executed and later stored.
+            action = agent.apply_action_authority(action, observation)
             next_observation, reward, terminated, truncated, info = env.step(action)
+            # Replay the exact canonical policy action that produced this
+            # transition, never the 21-D teacher-composed environment command.
+            # The adapter owns canonicalization so execution and replay cannot
+            # classify the phase from two different observation snapshots.
+            executed_policy_action = env.last_executed_policy_action
+            if executed_policy_action is None:
+                raise RuntimeError("adapter did not publish its executed policy action")
             transition = build_replay_transition(
                 observation,
-                action,
+                executed_policy_action,
                 reward,
                 terminated,
                 truncated,
                 info,
                 action_dim=env.action_dim,
             )
-            agent.process_transition(transition)
+            materialized_replay_rows = agent.process_transition(transition)
 
             done = terminated | truncated
             episodes.step(reward, done)
             terminal_events.step(info)
+            if (
+                task_mode == COUPLED_TEACHER_RESIDUAL_TASK_MODE
+                and not residual_actor_unlocked
+                and residual_actor_should_unlock(
+                    native_strict_successes=current_residual_native_successes(),
+                    actor_unlock_successes=args.actor_unlock_successes,
+                    success_transition_in_replay=(materialized_replay_rows > 0),
+                )
+            ):
+                # This check occurs after process_transition(): the strict
+                # success that opens actor authority is already in replay.
+                residual_actor_unlocked = True
+                residual_actor_unlock_interaction_step = interaction_step
             instant_strict = _strict_metrics(info, task_mode=task_mode)
             for name, value in instant_strict.items():
                 run_max_strict[name] = max(run_max_strict.get(name, -math.inf), value)
@@ -2504,10 +3394,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
             for _ in range(update_budget.grant(agent.can_start_training())):
                 update_info = agent.update(
-                    actor_enabled=update_count >= args.critic_burnin_updates
+                    actor_enabled=(
+                        update_count >= args.critic_burnin_updates
+                        and residual_actor_unlocked
+                    ),
+                    policy_actions_enabled=residual_actor_unlocked,
                 )
                 update_count += 1
-                if "actor/loss" in update_info:
+                actor_was_updated = (
+                    update_info.get(
+                        "actor/updated",
+                        1.0 if "actor/loss" in update_info else 0.0,
+                    )
+                    > 0.5
+                )
+                if actor_was_updated:
                     actor_update_count += 1
                     if actor_rehearsal is not None and demo_bc_weight > 0.0:
                         rehearsal_batch = actor_rehearsal.sample()
@@ -2522,7 +3423,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         )
                         demo_bc_update_count += 1
                 for name, value in update_info.items():
-                    update_sums[name] = update_sums.get(name, 0.0) + _scalar(value)
+                    update_sums[name] = update_sums.get(name, 0.0) + _scalar(
+                        value, name=name
+                    )
                     update_metric_counts[name] = update_metric_counts.get(name, 0) + 1
 
             if interaction_step % args.metrics_every == 0 or interaction_step == args.steps:
@@ -2536,6 +3439,25 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "gradient_updates": update_count,
                     "actor_updates": actor_update_count,
                     "critic_burnin_updates": args.critic_burnin_updates,
+                    "residual_actor_unlocked": residual_actor_unlocked,
+                    "residual_actor_unlock_successes": (
+                        args.actor_unlock_successes
+                        if task_mode == COUPLED_TEACHER_RESIDUAL_TASK_MODE
+                        else None
+                    ),
+                    "residual_native_strict_successes": (
+                        current_residual_native_successes()
+                        if task_mode == COUPLED_TEACHER_RESIDUAL_TASK_MODE
+                        else None
+                    ),
+                    "residual_actor_unlock_interaction_step": (
+                        residual_actor_unlock_interaction_step
+                    ),
+                    "teacher_action_prior": (
+                        teacher_prior.contract_payload()
+                        if teacher_prior is not None
+                        else None
+                    ),
                     "demo_bc_updates": demo_bc_update_count,
                     "demo_bc_weight": demo_bc_weight,
                     "demo_bc_group_weights": demo_bc_group_weights,
@@ -2567,6 +3489,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         if actor_checkpoint_audit
                         else None
                     ),
+                    "initial_actor_checkpoint_source_policy_action_authority": (
+                        actor_checkpoint_audit["source_policy_action_authority"]
+                        if actor_checkpoint_audit
+                        else None
+                    ),
                     "initial_actor_checkpoint_projection": (
                         actor_checkpoint_audit["actor_projection"]
                         if actor_checkpoint_audit
@@ -2575,9 +3502,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "allow_cross_task_actor": bool(args.allow_cross_task_actor),
                     "resumed_replay": bool(args.resume_replay),
                     "resumed_task_contract": resumed_task_contract,
+                    "policy_action_authority": current_policy_action_authority,
                     "resumed_actor_demo": bool(args.resume_actor_demo),
                     "restore_checkpoint_rng": False,
                     "flashsac_upstream_commit": FLASH_SAC_COMMIT,
+                    "flashsac_fork_commit": FLASH_SAC_FORK_COMMIT,
                     **current_runtime_contract,
                     "action_dim": env.action_dim,
                     "buffer_capacity": args.buffer,
@@ -2625,6 +3554,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     )
                 atomic_write_json(metrics_path, metrics)
 
+        final_residual_state = None
+        if task_mode == COUPLED_TEACHER_RESIDUAL_TASK_MODE:
+            final_residual_state = validate_teacher_residual_training_state(
+                {
+                    "version": 1,
+                    "task_mode": COUPLED_TEACHER_RESIDUAL_TASK_MODE,
+                    "actor_unlock_successes": args.actor_unlock_successes,
+                    "native_strict_successes": current_residual_native_successes(),
+                    "actor_unlocked": residual_actor_unlocked,
+                },
+                source="final residual training state",
+            )
         save_final_checkpoint(
             checkpoint_dir,
             agent=agent,
@@ -2633,9 +3574,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             replay_gamma=agent_cfg.gamma,
             save_replay=bool(args.save_replay),
             actor_rehearsal=actor_rehearsal,
+            policy_action_authority=current_policy_action_authority,
+            teacher_prior=teacher_prior,
+            teacher_residual_state=final_residual_state,
         )
         final_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
         final_metrics["checkpoint"] = str(checkpoint_dir)
+        final_metrics["checkpoint_task_contract"] = read_checkpoint_task_contract(
+            checkpoint_dir
+        )
         final_metrics["status"] = "complete"
         atomic_write_json(metrics_path, final_metrics)
         return final_metrics
@@ -2648,6 +3595,12 @@ def main() -> None:
     try:
         metrics = run(args)
         print(json.dumps(metrics, indent=2, sort_keys=True, allow_nan=False))
+    except BaseException:
+        # SimulationApp.close() can terminate Kit before Python renders an
+        # uncaught exception.  Emit it first so a failed training launch cannot
+        # look like a successful, output-free run.
+        traceback.print_exc()
+        raise
     finally:
         launcher.app.close()
 

@@ -23,6 +23,9 @@ The adapter is deliberately task-specific:
 * ordinary action: 21 normalized values in [-1, 1]
 * opt-in close-option action: 14 hand values, expanded to seven zero arm
   values plus the hand action immediately before the underlying environment
+* optional state-conditioned action transform: a declared policy action is
+  canonicalized from the current public observation and mapped to the native
+  21-D environment action; the canonical policy action remains the replay action
 * raw Gymnasium ``terminated`` and ``truncated`` flags are preserved
 * timeout transitions bootstrap from their captured final observation
 * all original Isaac Lab extras are retained
@@ -102,6 +105,31 @@ class DirectEnvLike(Protocol):
     ]: ...
 
     def close(self) -> None: ...
+
+
+class PolicyActionTransform(Protocol):
+    """Public-observation action map used at the policy/environment boundary.
+
+    ``contract_payload`` declares dimensions without coupling the generic
+    adapter to a concrete prior class.  ``CoupledTeacherPrior`` implements this
+    protocol through one authoritative ``compose_action`` operation.  Its
+    standalone canonicalization and environment mapping methods remain part of
+    the diagnostic contract.
+    """
+
+    def contract_payload(self) -> Mapping[str, Any]: ...
+
+    def canonicalize_residual(
+        self, observation: torch.Tensor, action: torch.Tensor
+    ) -> torch.Tensor: ...
+
+    def compose_action(
+        self, observation: torch.Tensor, action: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+    def to_environment_action(
+        self, observation: torch.Tensor, action: torch.Tensor
+    ) -> torch.Tensor: ...
 
 
 @dataclass(frozen=True)
@@ -254,6 +282,58 @@ def _declared_dimension(value: Any) -> int | None:
     return None
 
 
+def _validate_action_transform_contract(
+    transform: PolicyActionTransform,
+    *,
+    observation_dim: int,
+    environment_action_dim: int,
+) -> tuple[dict[str, Any], int]:
+    """Validate the dimension-bearing part of a policy action transform."""
+
+    for method_name in (
+        "contract_payload",
+        "canonicalize_residual",
+        "compose_action",
+        "to_environment_action",
+    ):
+        if not callable(getattr(transform, method_name, None)):
+            raise TypeError(f"action_transform does not implement callable {method_name}()")
+    payload = transform.contract_payload()
+    if not isinstance(payload, Mapping):
+        raise TypeError("action_transform.contract_payload() must return a mapping")
+
+    def require_dimension(key: str) -> int:
+        value = payload.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(
+                f"action_transform contract {key} must be a positive integer, got {value!r}"
+            )
+        return value
+
+    transform_observation_dim = require_dimension("observation_dim")
+    policy_action_dim = require_dimension("policy_action_dim")
+    transform_environment_action_dim = require_dimension("environment_action_dim")
+    if transform_observation_dim != observation_dim:
+        raise ValueError(
+            "action_transform observation dimension does not match the environment: "
+            f"{transform_observation_dim} != {observation_dim}"
+        )
+    if policy_action_dim != HAND_ACTION_DIM:
+        raise ValueError(
+            "PickTool state-conditioned action transforms must expose the 14-D hand "
+            f"residual, got {policy_action_dim}"
+        )
+    if transform_environment_action_dim != environment_action_dim:
+        raise ValueError(
+            "action_transform environment action dimension does not match PickTool: "
+            f"{transform_environment_action_dim} != {environment_action_dim}"
+        )
+    projection = payload.get("action_projection")
+    if not isinstance(projection, str) or not projection:
+        raise ValueError("action_transform contract action_projection must be a non-empty string")
+    return dict(payload), policy_action_dim
+
+
 def _set_cfg_override(cfg: Any, dotted_name: str, value: Any) -> None:
     target = cfg
     pieces = dotted_name.split(".")
@@ -282,9 +362,12 @@ class PickToolIsaacLabAdapter:
         require_cuda: bool = True,
         validate_finite: bool = False,
         hand_only_actions: bool = False,
+        action_transform: PolicyActionTransform | None = None,
     ) -> None:
         if not np.isfinite(action_clip) or not 0.0 < action_clip <= 1.0:
             raise ValueError("action_clip must be finite and in (0, 1]")
+        if hand_only_actions and action_transform is not None:
+            raise ValueError("action_transform and hand_only_actions cannot be enabled together")
 
         self.env = env
         self.unwrapped = getattr(env, "unwrapped", env)
@@ -294,7 +377,10 @@ class PickToolIsaacLabAdapter:
         self.strict = bool(strict)
         self.validate_finite = bool(validate_finite)
         self.hand_only_actions = bool(hand_only_actions)
-        self.action_dim = HAND_ACTION_DIM if self.hand_only_actions else ACTION_DIM
+        self.action_transform = action_transform
+        self.action_transform_contract: dict[str, Any] | None = None
+        self._current_policy_observation: torch.Tensor | None = None
+        self._last_executed_policy_action: torch.Tensor | None = None
         self.max_episode_steps = int(getattr(self.unwrapped, "max_episode_length", 0))
         cfg = getattr(self.unwrapped, "cfg", None)
         declared_obs = (
@@ -305,6 +391,17 @@ class PickToolIsaacLabAdapter:
         self.observation_dim = (
             POLICY_OBSERVATION_DIM if declared_obs is None else declared_obs
         )
+        if self.action_transform is None:
+            self.action_dim = HAND_ACTION_DIM if self.hand_only_actions else ACTION_DIM
+        else:
+            (
+                self.action_transform_contract,
+                self.action_dim,
+            ) = _validate_action_transform_contract(
+                self.action_transform,
+                observation_dim=self.observation_dim,
+                environment_action_dim=self.environment_action_dim,
+            )
 
         if self.num_envs < 1:
             raise ValueError("environment must contain at least one sub-environment")
@@ -377,6 +474,17 @@ class PickToolIsaacLabAdapter:
             "auto_reset": True,
         }
 
+    @property
+    def last_executed_policy_action(self) -> torch.Tensor | None:
+        """Exact canonical policy action used to produce the latest env action.
+
+        The returned tensor is an internal read-only reference intended for
+        immediate replay insertion; callers must not mutate it in place.
+        ``None`` means no action has executed since the most recent reset.
+        """
+
+        return self._last_executed_policy_action
+
     def _validate_policy(self, observations: Mapping[str, Any]) -> torch.Tensor:
         policy = extract_policy_observation(
             observations,
@@ -384,7 +492,20 @@ class PickToolIsaacLabAdapter:
             expected_num_envs=self.num_envs,
             expected_device=self.device,
         )
-        if self.validate_finite and not bool(torch.isfinite(policy).all()):
+        if (
+            self.validate_finite or self.action_transform is not None
+        ) and not bool(torch.isfinite(policy).all()):
+            raise FloatingPointError("policy observation contains NaN or infinity")
+        return policy
+
+    def _validate_public_observation(self, observation: torch.Tensor) -> torch.Tensor:
+        policy = extract_policy_observation(
+            {"policy": observation},
+            expected_dim=self.observation_dim,
+            expected_num_envs=self.num_envs,
+            expected_device=self.device,
+        )
+        if not bool(torch.isfinite(policy).all()):
             raise FloatingPointError("policy observation contains NaN or infinity")
         return policy
 
@@ -407,12 +528,74 @@ class PickToolIsaacLabAdapter:
                 "the adapter does not perform hidden host/device transfers"
             )
         action = action.to(dtype=torch.float32)
-        if self.validate_finite and not bool(torch.isfinite(action).all()):
+        if (
+            self.validate_finite or self.action_transform is not None
+        ) and not bool(torch.isfinite(action).all()):
             raise FloatingPointError("action contains NaN or infinity")
         return action.clamp(-self.action_clip, self.action_clip)
 
-    def _environment_action(self, action: torch.Tensor) -> torch.Tensor:
-        """Expand an opt-in hand policy action to the task's native 21-D action."""
+    def canonicalize_policy_action(
+        self, observation: torch.Tensor, action: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the exact policy action that belongs in replay.
+
+        For an ordinary or hand-only adapter this is just the validated policy
+        action.  A state-conditioned transform may additionally erase or clamp
+        phase-invalid coordinates, such as the teacher prior's ALIGN residual.
+        """
+
+        policy = self._validate_public_observation(observation)
+        action = self._validate_action(action)
+        if self.action_transform is None:
+            return action
+        canonical = self.action_transform.canonicalize_residual(policy, action)
+        return self._validate_transformed_action(
+            "canonical policy action",
+            canonical,
+            expected_dim=self.action_dim,
+            bound=self.action_clip,
+        )
+
+    def _validate_transformed_action(
+        self,
+        name: str,
+        action: torch.Tensor,
+        *,
+        expected_dim: int,
+        bound: float,
+    ) -> torch.Tensor:
+        if not isinstance(action, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor, got {type(action).__name__}")
+        expected_shape = (self.num_envs, expected_dim)
+        if action.shape != expected_shape:
+            raise ValueError(f"{name} must have shape {expected_shape}, got {tuple(action.shape)}")
+        if action.device != self.device:
+            raise ValueError(f"{name} is on {action.device}, expected {self.device}")
+        if action.dtype != torch.float32:
+            raise TypeError(f"{name} must use torch.float32, got {action.dtype}")
+        if not bool(torch.isfinite(action).all()):
+            raise FloatingPointError(f"{name} contains NaN or infinity")
+        if bool((action.abs() > bound).any()):
+            raise ValueError(f"{name} exceeds [-{bound}, {bound}]")
+        return action
+
+    def _environment_action(
+        self, observation: torch.Tensor | None, action: torch.Tensor
+    ) -> torch.Tensor:
+        """Map a validated policy action to the task's native 21-D action."""
+
+        if self.action_transform is not None:
+            if observation is None:
+                raise RuntimeError("action_transform requires a current public observation")
+            environment_action = self.action_transform.to_environment_action(
+                observation, action
+            )
+            return self._validate_transformed_action(
+                "environment action",
+                environment_action,
+                expected_dim=self.environment_action_dim,
+                bound=1.0,
+            )
 
         if not self.hand_only_actions:
             return action
@@ -452,6 +635,8 @@ class PickToolIsaacLabAdapter:
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         observations, extras = self.env.reset(seed=seed, options=options)
         policy = self._validate_policy(observations)
+        self._current_policy_observation = policy.detach().clone()
+        self._last_executed_policy_action = None
 
         if randomize_episode_lengths:
             episode_length = getattr(self.unwrapped, "episode_length_buf", None)
@@ -513,13 +698,38 @@ class PickToolIsaacLabAdapter:
         torch.Tensor,
         dict[str, Any],
     ]:
-        action = self._validate_action(action)
-        environment_action = self._environment_action(action)
+        current_policy = self._current_policy_observation
+        if self.action_transform is not None:
+            if current_policy is None:
+                raise RuntimeError(
+                    "reset() must be called before step() when action_transform is enabled"
+                )
+            action = self._validate_action(action)
+            canonical_action, environment_action = self.action_transform.compose_action(
+                current_policy, action
+            )
+            action = self._validate_transformed_action(
+                "canonical policy action",
+                canonical_action,
+                expected_dim=self.action_dim,
+                bound=self.action_clip,
+            )
+            environment_action = self._validate_transformed_action(
+                "environment action",
+                environment_action,
+                expected_dim=self.environment_action_dim,
+                bound=1.0,
+            )
+        else:
+            action = self._validate_action(action)
+            environment_action = self._environment_action(current_policy, action)
         result, captures = self._step_with_terminal_capture(environment_action)
+        self._last_executed_policy_action = action.detach()
         if not isinstance(result, tuple) or len(result) != 5:
             raise TypeError("DirectRLEnv.step must return (obs, reward, terminated, truncated, extras)")
         observations, reward, terminated, truncated, extras = result
         next_policy = self._validate_policy(observations)
+        self._current_policy_observation = next_policy.detach().clone()
 
         _require_vector("reward", reward)
         if reward.shape != (self.num_envs,):
@@ -600,6 +810,7 @@ def make_pick_tool_env(
     strict: bool = True,
     validate_finite: bool = False,
     hand_only_actions: bool = False,
+    action_transform: PolicyActionTransform | None = None,
 ) -> PickToolIsaacLabAdapter:
     """Create the registered PickTool task after Isaac Sim has been launched."""
 
@@ -628,6 +839,7 @@ def make_pick_tool_env(
         require_cuda=True,
         validate_finite=validate_finite,
         hand_only_actions=hand_only_actions,
+        action_transform=action_transform,
     )
 
 
@@ -640,6 +852,7 @@ __all__ = [
     "POLICY_OBSERVATION_DIM",
     "STRICT_METRIC_KEYS",
     "DoneSignals",
+    "PolicyActionTransform",
     "PickToolIsaacLabAdapter",
     "build_replay_transition",
     "classify_done",

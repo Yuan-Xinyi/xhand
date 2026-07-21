@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import inspect
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -16,6 +17,8 @@ from evaluate import (
     CLOSE_OPTION_MODE,
     COUPLED_OBSERVATION_DIM,
     COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+    COUPLED_TEACHER_RESIDUAL_ACTION_PROJECTION,
+    COUPLED_TEACHER_RESIDUAL_MODE,
     COUPLED_POWER_ARM_TARGET_OFFSET_LIMIT,
     COUPLED_POWER_OBSERVATION_CONTRACT,
     FULL_TASK_MODE,
@@ -24,6 +27,7 @@ from evaluate import (
     HAND_ACTION_PROJECTION,
     HAND_NOISE_GROUP_SPECS,
     HAND_POLICY_ACTION_LAYOUT,
+    TEACHER_RESIDUAL_POLICY_ACTION_LAYOUT,
     NOISE_GROUP_SPECS,
     POWER_CLOSE_OPTION_MODE,
     POWER_OBSERVATION_CONTRACT,
@@ -33,10 +37,12 @@ from evaluate import (
     StrictEpisodeTracker,
     _atomic_write_json,
     apply_coupled_controller_ablation,
+    apply_public_latch_arm_gate,
     build_strict_metrics,
     episode_quotas,
     infer_actor_architecture_from_state,
     infer_actor_action_dim_from_state,
+    load_checkpoint_teacher_prior,
     physical_truth_from_terminal_info,
     resolve_checkpoint_directory,
     resolve_cross_task_actor_evaluation,
@@ -46,6 +52,7 @@ from evaluate import (
     validate_close_option_evaluation_config,
     validate_curriculum_config,
     validate_hierarchical_arm_hold_evaluation_config,
+    validate_public_latch_arm_gate_evaluation_config,
     validate_arm_hold_handoff_state,
     validate_terminal_events,
     validate_checkpoint_evaluation_contract,
@@ -561,6 +568,30 @@ def test_power_close_terminal_and_physical_contract() -> None:
     assert truth.grasped.tolist() == [True, False]
     assert truth.clearance[0] < 0.20
 
+    for key, replacement, error_type in (
+        ("max_force", torch.tensor([-0.01, 0.0]), RuntimeError),
+        ("hold_quality", torch.tensor([1.01, 0.0]), RuntimeError),
+        ("max_force", torch.tensor([float("nan"), 0.0]), FloatingPointError),
+    ):
+        corrupt = _events()
+        corrupt[key] = replacement
+        _expect_error(
+            error_type,
+            validate_terminal_events,
+            {"pick_tool_terminal": corrupt},
+            torch.tensor([False, False]),
+            torch.tensor([False, False]),
+            task_mode=POWER_CLOSE_OPTION_MODE,
+        )
+        _expect_error(
+            error_type,
+            physical_truth_from_terminal_info,
+            {"pick_tool_terminal": corrupt},
+            num_envs=2,
+            device=torch.device("cpu"),
+            task_mode=POWER_CLOSE_OPTION_MODE,
+        )
+
     invalid_replacements = (
         ("success", torch.tensor([False, False], dtype=torch.bool)),
         ("power_thumb_contact", torch.tensor([False, False], dtype=torch.bool)),
@@ -714,6 +745,26 @@ def test_coupled_power_terminal_physical_and_metrics_contract() -> None:
         torch.tensor([False, False]),
         task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
     )
+    saturated_success = dict(raw)
+    saturated_success["coupled_power_arm_target_saturated"] = torch.tensor(
+        [True, True], dtype=torch.bool
+    )
+    _expect_error(
+        RuntimeError,
+        validate_terminal_events,
+        {"pick_tool_terminal": saturated_success},
+        torch.tensor([True, True]),
+        torch.tensor([False, False]),
+        task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+    )
+    _expect_error(
+        RuntimeError,
+        physical_truth_from_terminal_info,
+        {"pick_tool_terminal": saturated_success},
+        num_envs=2,
+        device=torch.device("cpu"),
+        task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+    )
     _expect_error(
         RuntimeError,
         physical_truth_from_terminal_info,
@@ -755,6 +806,22 @@ def test_coupled_power_terminal_physical_and_metrics_contract() -> None:
         initial_truth=_truth((-0.001, -0.001), (False, False)),
         task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
     )
+    # A transient 31 N excursion is below the task's unsafe-force termination
+    # in some configurations, but exceeds the conservative teacher contract.
+    progress = validate_terminal_events(
+        {"pick_tool_terminal": _events(max_force=(31.0, 5.0))},
+        torch.tensor([False, False]),
+        torch.tensor([False, False]),
+        task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+    )
+    tracker.step(
+        reward=torch.zeros(2),
+        terminated=torch.tensor([False, False]),
+        truncated=torch.tensor([False, False]),
+        events=progress,
+        transition_truth=_truth((0.0, 0.0), (False, False)),
+        post_reset_truth=_truth((0.0, 0.0), (False, False)),
+    )
     tracker.step(
         reward=torch.tensor([100.0, -100.0]),
         terminated=torch.tensor([True, True]),
@@ -765,6 +832,7 @@ def test_coupled_power_terminal_physical_and_metrics_contract() -> None:
     )
     assert tracker.records[0]["terminal_coupled_power_pose_escape"] is False
     assert tracker.records[1]["ever_coupled_power_pose_escape"] is True
+    assert tracker.records[0]["episode_max_power_force_n"] == 31.0
     policy = requested_policy_action_contract(
         COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE
     )
@@ -795,6 +863,8 @@ def test_coupled_power_terminal_physical_and_metrics_contract() -> None:
         observation_contract=policy["observation_contract"],
     )
     assert metrics["coupled_power_align_close_option_success_rate"] == 0.5
+    assert metrics["conservative_teacher_compatible_success_rate"] == 0.0
+    assert metrics["conservative_teacher_compatible_success_count"] == 0
     assert "strict_success_rate" not in metrics
     assert metrics["observation_dim"] == COUPLED_OBSERVATION_DIM
     assert metrics["observation_contract"] == COUPLED_POWER_OBSERVATION_CONTRACT
@@ -802,12 +872,147 @@ def test_coupled_power_terminal_physical_and_metrics_contract() -> None:
     assert metrics["action_projection"] == "identity_v1"
     assert metrics["success_contract"]["full_task_20cm_success"] == "not_evaluated"
     assert metrics["success_contract"]["pose_escape_required_false"] is True
+    assert (
+        metrics["success_contract"][
+            "arm_target_saturation_ever_required_false"
+        ]
+        is True
+    )
     assert metrics["success_contract"]["max_arm_target_offset_rad"] == 0.12
     assert "close_option_only" in metrics["evaluation_scope"]
     coupled_telemetry = metrics["coupled_power_telemetry"]
     assert coupled_telemetry["episodes_ever_pose_escape"] == 1
     assert coupled_telemetry["episodes_ever_arm_target_saturated"] == 1
     assert coupled_telemetry["episode_max_rotation_drift_rad"]["max"] > 0.35
+    assert metrics["power_close_telemetry"]["episode_max_force_n"]["max"] == 31.0
+    assert metrics["episodes"][0]["conservative_teacher_compatible_success"] is False
+
+
+def test_teacher_residual_strict_contract_and_metrics() -> None:
+    raw = _valid_coupled_power_events()
+    info = {"pick_tool_terminal": raw}
+    events = validate_terminal_events(
+        info,
+        torch.tensor([True, True]),
+        torch.tensor([False, False]),
+        task_mode=COUPLED_TEACHER_RESIDUAL_MODE,
+    )
+    truth = physical_truth_from_terminal_info(
+        info,
+        num_envs=2,
+        device=torch.device("cpu"),
+        task_mode=COUPLED_TEACHER_RESIDUAL_MODE,
+    )
+    tracker = StrictEpisodeTracker(
+        episodes=2,
+        num_envs=2,
+        device=torch.device("cpu"),
+        initial_truth=_truth((-0.001, -0.001), (False, False)),
+        task_mode=COUPLED_TEACHER_RESIDUAL_MODE,
+    )
+    tracker.step(
+        reward=torch.tensor([100.0, -100.0]),
+        terminated=torch.tensor([True, True]),
+        truncated=torch.tensor([False, False]),
+        events=events,
+        transition_truth=truth,
+        post_reset_truth=_truth((-0.001, -0.001), (False, False)),
+    )
+    policy = requested_policy_action_contract(COUPLED_TEACHER_RESIDUAL_MODE)
+    metrics = build_strict_metrics(
+        tracker.records,
+        checkpoint=Path("/tmp/residual-checkpoint"),
+        architecture="production",
+        seed=19,
+        num_envs=2,
+        vector_steps=1,
+        max_vector_steps=10,
+        episode_length_s=3.0,
+        max_episode_steps=150,
+        curriculum_dataset=Path("/tmp/coupled-close.pt"),
+        curriculum_dataset_sha256="test-coupled-close-dataset-sha256",
+        curriculum_boundary="close_start",
+        curriculum_probability=1.0,
+        curriculum_joint_noise=0.0,
+        use_compile=False,
+        upstream_commit="test-commit",
+        task_mode=COUPLED_TEACHER_RESIDUAL_MODE,
+        checkpoint_task_mode=COUPLED_TEACHER_RESIDUAL_MODE,
+        policy_action_dim=policy["policy_action_dim"],
+        environment_action_dim=policy["environment_action_dim"],
+        policy_action_layout=policy["policy_action_layout"],
+        action_projection=policy["action_projection"],
+        observation_dim=policy["observation_dim"],
+        observation_contract=policy["observation_contract"],
+        noise_group_specs=HAND_NOISE_GROUP_SPECS,
+    )
+    assert metrics["coupled_teacher_residual_close_option_success_rate"] == 0.5
+    assert metrics["conservative_teacher_compatible_success_rate"] == 0.5
+    assert metrics["policy_action_dim"] == HAND_ACTION_DIM
+    assert metrics["environment_action_dim"] == ACTION_DIM
+    assert metrics["policy_action_layout"] == TEACHER_RESIDUAL_POLICY_ACTION_LAYOUT
+    assert metrics["action_projection"] == COUPLED_TEACHER_RESIDUAL_ACTION_PROJECTION
+    assert metrics["observation_dim"] == COUPLED_OBSERVATION_DIM
+    assert metrics["coupled_power_telemetry"]["episodes_ever_pose_escape"] == 1
+
+
+def test_embedded_teacher_prior_sha_and_curriculum_lineage() -> None:
+    from coupled_teacher_prior import CoupledTeacherPrior
+
+    with tempfile.TemporaryDirectory(prefix="flashsac_residual_eval_") as directory:
+        checkpoint = Path(directory)
+        curriculum = checkpoint / "curriculum.pt"
+        curriculum.write_bytes(b"exact curriculum bytes")
+        curriculum_sha = hashlib.sha256(curriculum.read_bytes()).hexdigest()
+        prior = CoupledTeacherPrior(
+            arm_delta_target_rad=(0.0,) * 7,
+            hand_latent=(0.0,) * 14,
+            teacher_artifact_sha256="a" * 64,
+            curriculum_dataset_sha256=curriculum_sha,
+            teacher_artifact_path="<test>",
+            curriculum_dataset_path="<test>",
+        )
+        prior_path = checkpoint / "teacher_action_prior.json"
+        prior_path.write_text(
+            json.dumps(prior.contract_payload(), sort_keys=True),
+            encoding="utf-8",
+        )
+        prior_sha = hashlib.sha256(prior_path.read_bytes()).hexdigest()
+        contract = {
+            "task_mode": COUPLED_TEACHER_RESIDUAL_MODE,
+            "teacher_action_prior": {
+                "filename": "teacher_action_prior.json",
+                "sha256": prior_sha,
+            },
+        }
+        loaded, loaded_sha = load_checkpoint_teacher_prior(
+            checkpoint=checkpoint,
+            checkpoint_contract=contract,
+            curriculum_dataset=curriculum,
+        )
+        assert loaded.contract_payload() == prior.contract_payload()
+        assert loaded_sha == prior_sha
+
+        prior_path.write_text("{}", encoding="utf-8")
+        _expect_error(
+            ValueError,
+            load_checkpoint_teacher_prior,
+            checkpoint=checkpoint,
+            checkpoint_contract=contract,
+            curriculum_dataset=curriculum,
+        )
+        prior_path.write_text(
+            json.dumps(prior.contract_payload(), sort_keys=True),
+            encoding="utf-8",
+        )
+        curriculum.write_bytes(b"different curriculum bytes")
+        _expect_error(
+            ValueError,
+            load_checkpoint_teacher_prior,
+            checkpoint=checkpoint,
+            checkpoint_contract=contract,
+            curriculum_dataset=curriculum,
+        )
 
 def test_exact_episode_quotas_and_strict_tracker() -> None:
     assert torch.equal(episode_quotas(3, 2, device=torch.device("cpu")), torch.tensor([2, 1]))
@@ -1165,6 +1370,7 @@ def test_power_close_tracker_metrics_and_hand_action_contract() -> None:
     assert abs(telemetry["episode_max_wrap_quality"]["max"] - 0.65) < 1.0e-6
     assert abs(telemetry["episode_max_grasp_quality"]["max"] - 0.55) < 1.0e-6
     assert telemetry["episode_max_close_option_stable_steps"]["max"] == 15.0
+    assert telemetry["episode_max_force_n"]["max"] == 12.0
     assert metrics["success_contract"] == {
         "name": "stable_power_close_option_latch_v1",
         "confirm_steps": 15,
@@ -1211,6 +1417,45 @@ def test_coupled_controller_ablation_composition() -> None:
     )
 
 
+def test_public_latch_arm_gate_is_memoryless_and_exact() -> None:
+    action = torch.arange(42, dtype=torch.float32).reshape(2, 21)
+    observation = torch.zeros(2, 115)
+    observation[1, 106] = 1.0
+    original = action.clone()
+
+    gated = apply_public_latch_arm_gate(action, observation)
+    assert torch.equal(gated[0, :7], torch.zeros(7))
+    assert torch.equal(gated[0, 7:], action[0, 7:])
+    assert torch.equal(gated[1], action[1])
+    assert torch.equal(action, original)
+    assert gated.data_ptr() != action.data_ptr()
+
+    half_speed = apply_public_latch_arm_gate(
+        action,
+        observation,
+        latched_arm_scale=0.5,
+    )
+    torch.testing.assert_close(half_speed[1, :7], action[1, :7] * 0.5)
+    assert torch.equal(half_speed[1, 7:], action[1, 7:])
+
+    malformed = observation.clone()
+    malformed[0, 106] = 0.5
+    _expect_error(RuntimeError, apply_public_latch_arm_gate, action, malformed)
+    _expect_error(
+        ValueError,
+        apply_public_latch_arm_gate,
+        action[:, :14],
+        observation,
+    )
+    _expect_error(
+        ValueError,
+        apply_public_latch_arm_gate,
+        action,
+        observation,
+        latched_arm_scale=0.0,
+    )
+
+
 def test_curriculum_argument_contract() -> None:
     assert task_mode_from_option_flags(
         close_option_mode=False, power_close_option_mode=False
@@ -1226,6 +1471,11 @@ def test_curriculum_argument_contract() -> None:
         power_close_option_mode=False,
         coupled_power_align_close_option_mode=True,
     ) == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE
+    assert task_mode_from_option_flags(
+        close_option_mode=False,
+        power_close_option_mode=False,
+        coupled_teacher_residual_mode=True,
+    ) == COUPLED_TEACHER_RESIDUAL_MODE
     _expect_error(
         ValueError,
         task_mode_from_option_flags,
@@ -1238,6 +1488,14 @@ def test_curriculum_argument_contract() -> None:
         close_option_mode=False,
         power_close_option_mode=True,
         coupled_power_align_close_option_mode=True,
+    )
+    _expect_error(
+        ValueError,
+        task_mode_from_option_flags,
+        close_option_mode=False,
+        power_close_option_mode=False,
+        coupled_power_align_close_option_mode=True,
+        coupled_teacher_residual_mode=True,
     )
     validate_curriculum_config(dataset=None, probability=0.0, joint_noise=0.0)
     _expect_error(
@@ -1299,6 +1557,38 @@ def test_curriculum_argument_contract() -> None:
             min_hold_quality=0.5,
             safe_force_limit=30.0,
         )
+        validate_public_latch_arm_gate_evaluation_config(
+            enabled=True,
+            task_mode=FULL_TASK_MODE,
+            curriculum_dataset=dataset,
+            curriculum_boundary="close_start",
+            curriculum_probability=1.0,
+            curriculum_joint_noise=0.005,
+            episode_length_s=20.0,
+        )
+        for override in (
+            {"task_mode": CLOSE_OPTION_MODE},
+            {"curriculum_dataset": None},
+            {"curriculum_boundary": "lift_start"},
+            {"curriculum_probability": 0.5},
+            {"curriculum_joint_noise": 0.021},
+            {"episode_length_s": 0.29},
+        ):
+            config = {
+                "enabled": True,
+                "task_mode": FULL_TASK_MODE,
+                "curriculum_dataset": dataset,
+                "curriculum_boundary": "close_start",
+                "curriculum_probability": 1.0,
+                "curriculum_joint_noise": 0.005,
+                "episode_length_s": 20.0,
+            }
+            config.update(override)
+            _expect_error(
+                ValueError,
+                validate_public_latch_arm_gate_evaluation_config,
+                **config,
+            )
         for override in (
             {"curriculum_dataset": None},
             {"curriculum_boundary": "lift_start"},
@@ -1529,6 +1819,11 @@ def test_checkpoint_task_mode_evaluation_contract() -> None:
         requested_task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
         allow_cross_task_actor=False,
     )
+    assert not resolve_cross_task_actor_evaluation(
+        checkpoint_task_mode=COUPLED_TEACHER_RESIDUAL_MODE,
+        requested_task_mode=COUPLED_TEACHER_RESIDUAL_MODE,
+        allow_cross_task_actor=False,
+    )
     _expect_error(
         ValueError,
         resolve_cross_task_actor_evaluation,
@@ -1591,6 +1886,21 @@ def test_checkpoint_task_mode_evaluation_contract() -> None:
         "task_mode": COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
         **requested_policy_action_contract(COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE),
     }
+    residual_contract = {
+        "version": 4,
+        "task_mode": COUPLED_TEACHER_RESIDUAL_MODE,
+        **requested_policy_action_contract(COUPLED_TEACHER_RESIDUAL_MODE),
+    }
+    source, target, indices = validate_checkpoint_evaluation_contract(
+        checkpoint_task_mode=COUPLED_TEACHER_RESIDUAL_MODE,
+        checkpoint_contract=residual_contract,
+        requested_task_mode=COUPLED_TEACHER_RESIDUAL_MODE,
+        actor_action_dim=HAND_ACTION_DIM,
+    )
+    assert source == target == requested_policy_action_contract(
+        COUPLED_TEACHER_RESIDUAL_MODE
+    )
+    assert indices is None
     source, target, indices = validate_checkpoint_evaluation_contract(
         checkpoint_task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
         checkpoint_contract=coupled_contract,
@@ -1665,6 +1975,34 @@ def test_checkpoint_task_mode_evaluation_contract() -> None:
         requested_task_mode=FULL_TASK_MODE,
         actor_action_dim=ACTION_DIM,
     )
+    for source_mode, source_contract, target_mode, actor_dim in (
+        (
+            COUPLED_TEACHER_RESIDUAL_MODE,
+            residual_contract,
+            POWER_CLOSE_OPTION_MODE,
+            HAND_ACTION_DIM,
+        ),
+        (
+            POWER_CLOSE_OPTION_MODE,
+            power_contract,
+            COUPLED_TEACHER_RESIDUAL_MODE,
+            HAND_ACTION_DIM,
+        ),
+        (
+            FULL_TASK_MODE,
+            full_contract,
+            COUPLED_TEACHER_RESIDUAL_MODE,
+            ACTION_DIM,
+        ),
+    ):
+        _expect_error(
+            ValueError,
+            validate_checkpoint_evaluation_contract,
+            checkpoint_task_mode=source_mode,
+            checkpoint_contract=source_contract,
+            requested_task_mode=target_mode,
+            actor_action_dim=actor_dim,
+        )
     mismatched_contract = dict(power_contract)
     mismatched_contract["observation_contract"] = "wrong_observation_contract"
     _expect_error(
@@ -1683,6 +2021,11 @@ def test_local_train_contract_import_precedes_upstream_path_mutation() -> None:
     upstream_bridge_import = source.index("from agent_bridge import")
     assert local_contract_import < upstream_bridge_import
     assert "hand_only_actions=task_mode == POWER_CLOSE_OPTION_MODE" in source
+    assert "action_transform=(" in source
+    assert "env.canonicalize_policy_action(observation, action)" not in source
+    assert "next_observation, reward, terminated, truncated, info = env.step(action)" in source
+    assert "load_checkpoint_teacher_prior(" in source
+    assert 'metrics["teacher_action_prior_sha256"]' in source
     assert '"coupled_power_align_close_option_mode"' in source
     assert "zero_expanded_actor_checkpoint(checkpoint)" in source
     assert "source_action_indices=source_action_indices" in source
@@ -1715,10 +2058,13 @@ def main() -> None:
     test_close_option_physical_truth_is_not_20cm_success()
     test_power_close_terminal_and_physical_contract()
     test_coupled_power_terminal_physical_and_metrics_contract()
+    test_teacher_residual_strict_contract_and_metrics()
+    test_embedded_teacher_prior_sha_and_curriculum_lineage()
     test_exact_episode_quotas_and_strict_tracker()
     test_close_option_tracker_and_metrics_are_separate_from_full_success()
     test_power_close_tracker_metrics_and_hand_action_contract()
     test_coupled_controller_ablation_composition()
+    test_public_latch_arm_gate_is_memoryless_and_exact()
     test_curriculum_argument_contract()
     test_checkpoint_architecture_and_path_contract()
     test_checkpoint_task_mode_evaluation_contract()

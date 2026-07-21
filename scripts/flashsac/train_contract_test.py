@@ -22,6 +22,8 @@ from train import (  # noqa: E402
     COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_CONTRACT,
     COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM,
     COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+    COUPLED_TEACHER_RESIDUAL_ACTION_PROJECTION,
+    COUPLED_TEACHER_RESIDUAL_TASK_MODE,
     CORE_CHECKPOINT_FILENAMES,
     EpisodeAccumulator,
     FULL21_TO_HAND14_ACTOR_PROJECTION,
@@ -34,6 +36,7 @@ from train import (  # noqa: E402
     IDENTITY_ACTION_PROJECTION,
     INCOMPLETE_CHECKPOINT_FILENAME,
     PICK_TOOL_OBSERVATION_CONTRACT,
+    PUBLIC_LATCH_ARM_ACTION_AUTHORITY,
     POWER_ACTION_NOISE_GROUP_SPECS,
     POWER_CLOSE_OBSERVATION_CONTRACT,
     POWER_CLOSE_OPTION_TASK_MODE,
@@ -41,6 +44,9 @@ from train import (  # noqa: E402
     STALE_OPTIONAL_CHECKPOINT_FILENAMES,
     TASK_CONTRACT_FILENAME,
     TASK_CONTRACT_VERSION,
+    TEACHER_ACTION_PRIOR_FILENAME,
+    TEACHER_RESIDUAL_POLICY_ACTION_LAYOUT,
+    TEACHER_RESIDUAL_STATE_FILENAME,
     TerminalEventAccumulator,
     action_noise_group_specs,
     audit_actor_checkpoint_source,
@@ -48,10 +54,13 @@ from train import (  # noqa: E402
     build_latch_conditioned_noise_scale,
     environment_task_mode_overrides,
     policy_action_contract,
+    policy_action_authority_contract,
+    project_coupled_teacher_demo_to_zero_residual,
     project_full_actor_to_coupled_observation_state,
     clear_stale_checkpoint_optional_artifacts,
     load_audited_actor_checkpoint,
     read_checkpoint_task_contract,
+    residual_actor_should_unlock,
     resolve_default_episode_length_s,
     resolve_smoke_interaction_steps,
     resolve_warmup_transitions,
@@ -61,12 +70,16 @@ from train import (  # noqa: E402
     validate_checkpoint_task_contract,
     validate_checkpoint_output_separation,
     validate_close_option_training_config,
+    validate_public_latch_arm_gate_config,
     validate_actor_demo_curriculum_lineage,
+    validate_teacher_residual_actor_demo_lineage,
     validate_replay_task_contract,
     validate_training_source_selection,
+    validate_teacher_residual_training_state,
     write_checkpoint_task_contract,
     _strict_metrics,
 )
+from coupled_teacher_prior import CoupledTeacherPrior, HandResidualScales  # noqa: E402
 
 
 def _expect_error(error_type, function, *args, **kwargs) -> None:
@@ -83,6 +96,46 @@ def _write_core_checkpoint(checkpoint: Path) -> None:
         (checkpoint / filename).write_bytes(filename.encode("utf-8"))
 
 
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _residual_prior() -> CoupledTeacherPrior:
+    return CoupledTeacherPrior(
+        arm_delta_target_rad=(0.0,) * 7,
+        hand_latent=(0.0,) * 14,
+        teacher_artifact_sha256="a" * 64,
+        curriculum_dataset_sha256="b" * 64,
+        teacher_artifact_path="<test-teacher>",
+        curriculum_dataset_path="<test-curriculum>",
+        residual_scales=HandResidualScales(),
+    )
+
+
+def _write_residual_sidecars(
+    checkpoint: Path,
+    *,
+    threshold: int = 1,
+    successes: int = 0,
+) -> tuple[str, str, dict[str, object]]:
+    checkpoint.mkdir(parents=True, exist_ok=True)
+    prior_path = checkpoint / TEACHER_ACTION_PRIOR_FILENAME
+    atomic_write_json(prior_path, _residual_prior().contract_payload())
+    state = validate_teacher_residual_training_state(
+        {
+            "version": 1,
+            "task_mode": COUPLED_TEACHER_RESIDUAL_TASK_MODE,
+            "actor_unlock_successes": threshold,
+            "native_strict_successes": successes,
+            "actor_unlocked": successes >= threshold,
+        },
+        source="test residual state",
+    )
+    state_path = checkpoint / TEACHER_RESIDUAL_STATE_FILENAME
+    atomic_write_json(state_path, state)
+    return _sha256(prior_path), _sha256(state_path), state
+
+
 def test_update_budget() -> None:
     budget = FractionalUpdateBudget(0.25)
     assert [budget.grant(False) for _ in range(20)] == [0] * 20
@@ -90,6 +143,31 @@ def test_update_budget() -> None:
 
     budget = FractionalUpdateBudget(1.5)
     assert [budget.grant(True) for _ in range(4)] == [1, 2, 1, 2]
+
+
+def test_residual_actor_unlock_boundary() -> None:
+    assert not residual_actor_should_unlock(
+        native_strict_successes=1,
+        actor_unlock_successes=1,
+        success_transition_in_replay=False,
+    )
+    assert residual_actor_should_unlock(
+        native_strict_successes=1,
+        actor_unlock_successes=1,
+        success_transition_in_replay=True,
+    )
+    assert not residual_actor_should_unlock(
+        native_strict_successes=2,
+        actor_unlock_successes=3,
+        success_transition_in_replay=True,
+    )
+    _expect_error(
+        ValueError,
+        residual_actor_should_unlock,
+        native_strict_successes=-1,
+        actor_unlock_successes=1,
+        success_transition_in_replay=True,
+    )
 
 
 def test_warmup_resolution() -> None:
@@ -107,6 +185,10 @@ def test_default_episode_horizons() -> None:
     ) == 3.0
     assert resolve_default_episode_length_s(
         task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+        smoke=False,
+    ) == 5.0
+    assert resolve_default_episode_length_s(
+        task_mode=COUPLED_TEACHER_RESIDUAL_TASK_MODE,
         smoke=False,
     ) == 5.0
     assert resolve_default_episode_length_s(
@@ -128,6 +210,10 @@ def test_default_episode_horizons() -> None:
     assert resolve_smoke_interaction_steps(
         requested=1,
         task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+    ) == 64
+    assert resolve_smoke_interaction_steps(
+        requested=1,
+        task_mode=COUPLED_TEACHER_RESIDUAL_TASK_MODE,
     ) == 64
 
 
@@ -156,6 +242,11 @@ def test_environment_task_mode_overrides() -> None:
         "observation_space": COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM,
         "state_space": COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM,
     }
+    assert environment_task_mode_overrides(
+        COUPLED_TEACHER_RESIDUAL_TASK_MODE
+    ) == environment_task_mode_overrides(
+        COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE
+    )
 
 
 def test_auto_reset_replay_boundary() -> None:
@@ -475,9 +566,14 @@ def test_task_mode_source_and_replay_contracts() -> None:
         task_mode_from_close_option(False, False, True)
         == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE
     )
+    assert (
+        task_mode_from_close_option(False, False, False, True)
+        == COUPLED_TEACHER_RESIDUAL_TASK_MODE
+    )
     _expect_error(ValueError, task_mode_from_close_option, True, True)
     _expect_error(ValueError, task_mode_from_close_option, True, False, True)
     _expect_error(ValueError, task_mode_from_close_option, False, True, True)
+    _expect_error(ValueError, task_mode_from_close_option, False, False, True, True)
     assert policy_action_contract(FULL_TASK_MODE) == {
         "policy_action_dim": ACTION_DIM,
         "policy_action_layout": FULL_POLICY_ACTION_LAYOUT,
@@ -501,6 +597,12 @@ def test_task_mode_source_and_replay_contracts() -> None:
         "environment_action_dim": ACTION_DIM,
         "action_projection": IDENTITY_ACTION_PROJECTION,
     }
+    assert policy_action_contract(COUPLED_TEACHER_RESIDUAL_TASK_MODE) == {
+        "policy_action_dim": HAND_ACTION_DIM,
+        "policy_action_layout": TEACHER_RESIDUAL_POLICY_ACTION_LAYOUT,
+        "environment_action_dim": ACTION_DIM,
+        "action_projection": COUPLED_TEACHER_RESIDUAL_ACTION_PROJECTION,
+    }
     assert runtime_contract(COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE) == {
         "observation_dim": COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM,
         "observation_contract": COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_CONTRACT,
@@ -521,6 +623,10 @@ def test_task_mode_source_and_replay_contracts() -> None:
     assert (
         action_noise_group_specs(COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE)
         == FULL_ACTION_NOISE_GROUP_SPECS
+    )
+    assert (
+        action_noise_group_specs(COUPLED_TEACHER_RESIDUAL_TASK_MODE)
+        == POWER_ACTION_NOISE_GROUP_SPECS
     )
 
     validate_training_source_selection(
@@ -576,6 +682,104 @@ def test_task_mode_source_and_replay_contracts() -> None:
         demo=None,
         actor_demo=[Path("coupled-successes.pt")],
         coupled_power_align_close_option_mode=True,
+    )
+    validate_training_source_selection(
+        checkpoint=Path("residual-resume"),
+        actor_checkpoint=None,
+        resume_replay=True,
+        resume_actor_demo=False,
+        close_option_mode=False,
+        power_close_option_mode=False,
+        demo=None,
+        actor_demo=None,
+        coupled_teacher_residual_mode=True,
+    )
+    _expect_error(
+        ValueError,
+        validate_training_source_selection,
+        checkpoint=Path("residual-without-replay"),
+        actor_checkpoint=None,
+        resume_replay=False,
+        resume_actor_demo=False,
+        close_option_mode=False,
+        power_close_option_mode=False,
+        demo=None,
+        actor_demo=None,
+        coupled_teacher_residual_mode=True,
+    )
+    validate_training_source_selection(
+        checkpoint=None,
+        actor_checkpoint=Path("full-actor"),
+        resume_replay=False,
+        resume_actor_demo=False,
+        close_option_mode=False,
+        power_close_option_mode=False,
+        demo=None,
+        actor_demo=[Path("lift-actor.pt")],
+        public_latch_arm_gate=True,
+    )
+    _expect_error(
+        ValueError,
+        validate_training_source_selection,
+        checkpoint=None,
+        actor_checkpoint=Path("full-actor"),
+        resume_replay=False,
+        resume_actor_demo=False,
+        close_option_mode=False,
+        power_close_option_mode=False,
+        demo=[Path("ungated-transition.pt")],
+        actor_demo=None,
+        public_latch_arm_gate=True,
+    )
+    _expect_error(
+        ValueError,
+        validate_training_source_selection,
+        checkpoint=None,
+        actor_checkpoint=Path("full-actor"),
+        resume_replay=False,
+        resume_actor_demo=False,
+        close_option_mode=True,
+        power_close_option_mode=False,
+        demo=None,
+        actor_demo=None,
+        public_latch_arm_gate=True,
+    )
+    _expect_error(
+        ValueError,
+        validate_training_source_selection,
+        checkpoint=None,
+        actor_checkpoint=Path("absolute-hand-actor"),
+        resume_replay=False,
+        resume_actor_demo=False,
+        close_option_mode=False,
+        power_close_option_mode=False,
+        demo=None,
+        actor_demo=None,
+        coupled_teacher_residual_mode=True,
+    )
+    validate_training_source_selection(
+        checkpoint=None,
+        actor_checkpoint=None,
+        resume_replay=False,
+        resume_actor_demo=False,
+        close_option_mode=False,
+        power_close_option_mode=False,
+        demo=None,
+        actor_demo=[Path("strict-coupled-teacher.pt")],
+        coupled_teacher_residual_mode=True,
+    )
+    _expect_error(
+        ValueError,
+        validate_training_source_selection,
+        checkpoint=None,
+        actor_checkpoint=None,
+        resume_replay=False,
+        resume_actor_demo=False,
+        close_option_mode=False,
+        power_close_option_mode=False,
+        demo=[Path("absolute-transition-demo.pt")],
+        actor_demo=None,
+        coupled_teacher_residual_mode=True,
     )
     _expect_error(
         ValueError,
@@ -680,6 +884,50 @@ def test_task_mode_source_and_replay_contracts() -> None:
         },
         expected_curriculum_sha256=curriculum_sha256,
     )
+
+    teacher_sha256 = "c" * 64
+    residual_audit = {
+        "path": "strict-coupled-teacher.pt",
+        "curriculum_dataset_sha256": curriculum_sha256,
+        "teacher_artifact_sha256": teacher_sha256,
+    }
+    validate_teacher_residual_actor_demo_lineage(
+        residual_audit,
+        expected_curriculum_sha256=curriculum_sha256,
+        expected_teacher_artifact_sha256=teacher_sha256,
+    )
+    for override in (
+        {"curriculum_dataset_sha256": "b" * 64},
+        {"teacher_artifact_sha256": "d" * 64},
+        {"teacher_artifact_sha256": "not-a-sha"},
+    ):
+        _expect_error(
+            ValueError,
+            validate_teacher_residual_actor_demo_lineage,
+            {**residual_audit, **override},
+            expected_curriculum_sha256=curriculum_sha256,
+            expected_teacher_artifact_sha256=teacher_sha256,
+        )
+
+    source_observation = torch.randn(
+        5, COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM, dtype=torch.float32
+    )
+    source_action = torch.randn(5, ACTION_DIM, dtype=torch.float32).clamp(-1.0, 1.0)
+    projected = project_coupled_teacher_demo_to_zero_residual(
+        {"observation": source_observation, "action": source_action}
+    )
+    assert projected["observation"] is source_observation
+    assert projected["action"].shape == (5, HAND_ACTION_DIM)
+    assert projected["action"].dtype == torch.float32
+    assert not bool(projected["action"].any())
+    _expect_error(
+        ValueError,
+        project_coupled_teacher_demo_to_zero_residual,
+        {
+            "observation": source_observation,
+            "action": source_action[:, :HAND_ACTION_DIM],
+        },
+    )
     _expect_error(
         ValueError,
         validate_actor_demo_curriculum_lineage,
@@ -707,6 +955,17 @@ def test_task_mode_source_and_replay_contracts() -> None:
         episode_length_s=3.0,
         randomize_episode_lengths=False,
         coupled_power_align_close_option_mode=True,
+    )
+    validate_close_option_training_config(
+        close_option_mode=False,
+        power_close_option_mode=False,
+        curriculum_dataset=Path("close.pt"),
+        curriculum_boundary="close_start",
+        curriculum_probability=1.0,
+        curriculum_joint_noise=0.0,
+        episode_length_s=3.0,
+        randomize_episode_lengths=False,
+        coupled_teacher_residual_mode=True,
     )
     validate_close_option_training_config(
         close_option_mode=False,
@@ -772,6 +1031,38 @@ def test_task_mode_source_and_replay_contracts() -> None:
         **coupled_config,
     )
 
+    assert policy_action_authority_contract(False) == []
+    assert policy_action_authority_contract(True) == [
+        dict(PUBLIC_LATCH_ARM_ACTION_AUTHORITY[0])
+    ]
+    public_gate_config = {
+        "enabled": True,
+        "task_mode": FULL_TASK_MODE,
+        "curriculum_dataset": Path("close.pt"),
+        "curriculum_boundary": "close_start",
+        "curriculum_probability": 1.0,
+        "curriculum_joint_noise": 0.01,
+        "episode_length_s": 20.0,
+        "randomize_episode_lengths": False,
+    }
+    validate_public_latch_arm_gate_config(**public_gate_config)
+    for override in (
+        {"task_mode": CLOSE_OPTION_TASK_MODE},
+        {"curriculum_dataset": None},
+        {"curriculum_boundary": "default"},
+        {"curriculum_probability": 0.5},
+        {"curriculum_joint_noise": 0.021},
+        {"episode_length_s": 0.29},
+        {"randomize_episode_lengths": True},
+    ):
+        invalid_gate = dict(public_gate_config)
+        invalid_gate.update(override)
+        _expect_error(
+            ValueError,
+            validate_public_latch_arm_gate_config,
+            **invalid_gate,
+        )
+
     with tempfile.TemporaryDirectory(prefix="flashsac_task_contract_") as directory:
         checkpoint = Path(directory) / "checkpoint"
         checkpoint.mkdir()
@@ -790,6 +1081,9 @@ def test_task_mode_source_and_replay_contracts() -> None:
             "legacy_checkpoint": True,
             "replay_n_step": None,
             "replay_gamma": None,
+            "policy_action_authority": [],
+            "teacher_action_prior": None,
+            "teacher_residual_state": None,
             **runtime_contract(FULL_TASK_MODE),
         }
         _expect_error(
@@ -867,6 +1161,7 @@ def test_task_mode_source_and_replay_contracts() -> None:
             "task_mode": CLOSE_OPTION_TASK_MODE,
             "replay_n_step": 3,
             "replay_gamma": 0.99,
+            "policy_action_authority": [],
             **runtime_contract(CLOSE_OPTION_TASK_MODE),
         }
         contract = validate_replay_task_contract(
@@ -924,6 +1219,7 @@ def test_task_mode_source_and_replay_contracts() -> None:
             "task_mode": CLOSE_OPTION_TASK_MODE,
             "replay_n_step": 3,
             "replay_gamma": 0.99,
+            "policy_action_authority": [],
             **runtime_contract(CLOSE_OPTION_TASK_MODE),
         }
         invalid_values = {
@@ -1001,9 +1297,66 @@ def test_task_mode_source_and_replay_contracts() -> None:
         assert v1["replay_n_step"] is None and v1["replay_gamma"] is None
         assert v1["policy_action_dim"] == ACTION_DIM
         assert v1["action_projection"] == IDENTITY_ACTION_PROJECTION
+        assert v1["policy_action_authority"] == []
+        _expect_error(
+            ValueError,
+            validate_replay_task_contract,
+            checkpoint,
+            task_mode=FULL_TASK_MODE,
+            n_step=3,
+            gamma=0.99,
+        )
 
-        (checkpoint / "replay_buffer.pt").unlink()
-        torch.save({"observation": torch.zeros(1, 1)}, checkpoint / "replay_buffer.pt")
+        # V4 predates state-dependent policy authority and remains readable as
+        # unrestricted. V5 records the public latch gate and full/replay resume
+        # must match it exactly in both directions.
+        (checkpoint / TASK_CONTRACT_FILENAME).write_text(
+            json.dumps(
+                {
+                    "version": 4,
+                    "task_mode": FULL_TASK_MODE,
+                    "replay_n_step": 3,
+                    "replay_gamma": 0.99,
+                    **runtime_contract(FULL_TASK_MODE),
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert read_checkpoint_task_contract(checkpoint)[
+            "policy_action_authority"
+        ] == []
+        gated_authority = policy_action_authority_contract(True)
+        write_checkpoint_task_contract(
+            checkpoint,
+            task_mode=FULL_TASK_MODE,
+            replay_n_step=3,
+            replay_gamma=0.99,
+            policy_action_authority=gated_authority,
+        )
+        gated_contract = read_checkpoint_task_contract(checkpoint)
+        assert gated_contract["policy_action_authority"] == gated_authority
+        validate_checkpoint_task_contract(
+            checkpoint,
+            task_mode=FULL_TASK_MODE,
+            n_step=3,
+            gamma=0.99,
+            policy_action_authority=gated_authority,
+        )
+        validate_replay_task_contract(
+            checkpoint,
+            task_mode=FULL_TASK_MODE,
+            n_step=3,
+            gamma=0.99,
+            policy_action_authority=gated_authority,
+        )
+        _expect_error(
+            ValueError,
+            validate_checkpoint_task_contract,
+            checkpoint,
+            task_mode=FULL_TASK_MODE,
+            n_step=3,
+            gamma=0.99,
+        )
         _expect_error(
             ValueError,
             validate_replay_task_contract,
@@ -1029,6 +1382,7 @@ def test_task_mode_source_and_replay_contracts() -> None:
             "task_mode": POWER_CLOSE_OPTION_TASK_MODE,
             "replay_n_step": 3,
             "replay_gamma": 0.99,
+            "policy_action_authority": [],
             **runtime_contract(POWER_CLOSE_OPTION_TASK_MODE),
         }
         assert power_payload["policy_action_dim"] == HAND_ACTION_DIM
@@ -1084,6 +1438,7 @@ def test_task_mode_source_and_replay_contracts() -> None:
             "task_mode": COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
             "replay_n_step": 3,
             "replay_gamma": 0.99,
+            "policy_action_authority": [],
             **runtime_contract(COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE),
         }
         assert validate_checkpoint_task_contract(
@@ -1119,6 +1474,70 @@ def test_task_mode_source_and_replay_contracts() -> None:
                 n_step=3,
                 gamma=0.99,
             )
+
+        # Residual V4 binds both the immutable CEM prior and the resumable
+        # actor-authority gate. The policy action is canonical residual14,
+        # never an absolute hand14 action from another task.
+        prior_sha, state_sha, expected_state = _write_residual_sidecars(
+            checkpoint,
+            threshold=3,
+            successes=5,
+        )
+        write_checkpoint_task_contract(
+            checkpoint,
+            task_mode=COUPLED_TEACHER_RESIDUAL_TASK_MODE,
+            replay_n_step=3,
+            replay_gamma=0.99,
+            teacher_action_prior_sha256=prior_sha,
+            teacher_residual_state_sha256=state_sha,
+        )
+        residual_contract = validate_checkpoint_task_contract(
+            checkpoint,
+            task_mode=COUPLED_TEACHER_RESIDUAL_TASK_MODE,
+            n_step=3,
+            gamma=0.99,
+        )
+        assert residual_contract["teacher_residual_state"] == expected_state
+        assert residual_contract["teacher_action_prior"] == {
+            "filename": TEACHER_ACTION_PRIOR_FILENAME,
+            "sha256": prior_sha,
+        }
+        assert residual_contract["policy_action_dim"] == HAND_ACTION_DIM
+        assert (
+            residual_contract["action_projection"]
+            == COUPLED_TEACHER_RESIDUAL_ACTION_PROJECTION
+        )
+        assert validate_replay_task_contract(
+            checkpoint,
+            task_mode=COUPLED_TEACHER_RESIDUAL_TASK_MODE,
+            n_step=3,
+            gamma=0.99,
+        )["teacher_residual_state"] == expected_state
+        state_path = checkpoint / TEACHER_RESIDUAL_STATE_FILENAME
+        state_path.write_text("{}", encoding="utf-8")
+        _expect_error(ValueError, read_checkpoint_task_contract, checkpoint)
+        prior_sha, state_sha, _ = _write_residual_sidecars(
+            checkpoint,
+            threshold=3,
+            successes=5,
+        )
+        write_checkpoint_task_contract(
+            checkpoint,
+            task_mode=COUPLED_TEACHER_RESIDUAL_TASK_MODE,
+            replay_n_step=3,
+            replay_gamma=0.99,
+            teacher_action_prior_sha256=prior_sha,
+            teacher_residual_state_sha256=state_sha,
+        )
+        _expect_error(
+            ValueError,
+            write_checkpoint_task_contract,
+            checkpoint,
+            task_mode=COUPLED_TEACHER_RESIDUAL_TASK_MODE,
+            replay_n_step=3,
+            replay_gamma=0.99,
+            teacher_action_prior_sha256=prior_sha,
+        )
 
         (checkpoint / TASK_CONTRACT_FILENAME).write_text(
             json.dumps(
@@ -1171,6 +1590,7 @@ def test_actor_checkpoint_audit() -> None:
             "source_task_mode": CLOSE_OPTION_TASK_MODE,
             "source_policy_action_dim": ACTION_DIM,
             "source_policy_action_layout": FULL_POLICY_ACTION_LAYOUT,
+            "source_policy_action_authority": [],
             "target_task_mode": CLOSE_OPTION_TASK_MODE,
             "target_policy_action_dim": ACTION_DIM,
             "actor_projection": None,
@@ -1286,6 +1706,45 @@ def test_actor_checkpoint_audit() -> None:
             coupled_source,
             output_checkpoint=root / "coupled_to_full" / "checkpoint_final",
             target_task_mode=FULL_TASK_MODE,
+        )
+        residual_source = root / "residual_source"
+        _write_core_checkpoint(residual_source)
+        residual_prior_sha, residual_state_sha, _ = _write_residual_sidecars(
+            residual_source,
+            successes=1,
+        )
+        write_checkpoint_task_contract(
+            residual_source,
+            task_mode=COUPLED_TEACHER_RESIDUAL_TASK_MODE,
+            replay_n_step=3,
+            replay_gamma=0.99,
+            teacher_action_prior_sha256=residual_prior_sha,
+            teacher_residual_state_sha256=residual_state_sha,
+        )
+        residual_identity = audit_actor_checkpoint_source(
+            residual_source,
+            output_checkpoint=root / "residual_same" / "checkpoint_final",
+            target_task_mode=COUPLED_TEACHER_RESIDUAL_TASK_MODE,
+        )
+        assert residual_identity["actor_projection"] is None
+        for target_mode in (
+            FULL_TASK_MODE,
+            POWER_CLOSE_OPTION_TASK_MODE,
+            COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+        ):
+            _expect_error(
+                ValueError,
+                audit_actor_checkpoint_source,
+                residual_source,
+                output_checkpoint=root / f"residual_to_{target_mode}" / "checkpoint_final",
+                target_task_mode=target_mode,
+            )
+        _expect_error(
+            ValueError,
+            audit_actor_checkpoint_source,
+            power_source,
+            output_checkpoint=root / "absolute_to_residual" / "checkpoint_final",
+            target_task_mode=COUPLED_TEACHER_RESIDUAL_TASK_MODE,
         )
         malformed_projection = dict(projected)
         malformed_projection["actor_projection"] = "unknown_projection"
@@ -1410,8 +1869,58 @@ def test_final_checkpoint_cleanup_and_contract_order() -> None:
             "task_mode": CLOSE_OPTION_TASK_MODE,
             "replay_n_step": 3,
             "replay_gamma": 0.99,
+            "policy_action_authority": [],
             **runtime_contract(CLOSE_OPTION_TASK_MODE),
         }
+
+        residual_checkpoint = Path(directory) / "residual_checkpoint_final"
+
+        class ResidualAgent:
+            def save(self, path: str) -> None:
+                _write_core_checkpoint(Path(path))
+
+            def save_replay_buffer(self, path: str) -> None:
+                raise AssertionError("residual test did not request replay save")
+
+        residual_state = validate_teacher_residual_training_state(
+            {
+                "version": 1,
+                "task_mode": COUPLED_TEACHER_RESIDUAL_TASK_MODE,
+                "actor_unlock_successes": 2,
+                "native_strict_successes": 3,
+                "actor_unlocked": True,
+            },
+            source="final checkpoint test",
+        )
+        save_final_checkpoint(
+            residual_checkpoint,
+            agent=ResidualAgent(),
+            task_mode=COUPLED_TEACHER_RESIDUAL_TASK_MODE,
+            replay_n_step=3,
+            replay_gamma=0.99,
+            save_replay=False,
+            actor_rehearsal=None,
+            teacher_prior=_residual_prior(),
+            teacher_residual_state=residual_state,
+        )
+        residual_contract = read_checkpoint_task_contract(residual_checkpoint)
+        assert residual_contract["teacher_residual_state"] == residual_state
+        assert (residual_checkpoint / TEACHER_ACTION_PRIOR_FILENAME).is_file()
+        assert (residual_checkpoint / TEACHER_RESIDUAL_STATE_FILENAME).is_file()
+        _expect_error(
+            ValueError,
+            save_final_checkpoint,
+            Path(directory) / "invalid_residual_checkpoint",
+            agent=ResidualAgent(),
+            task_mode=COUPLED_TEACHER_RESIDUAL_TASK_MODE,
+            replay_n_step=3,
+            replay_gamma=0.99,
+            save_replay=False,
+            actor_rehearsal=None,
+            teacher_prior=_residual_prior(),
+            teacher_residual_state=None,
+        )
+        assert not (Path(directory) / "invalid_residual_checkpoint").exists()
 
         class FailingAgent:
             def save(self, path: str) -> None:
@@ -1485,6 +1994,7 @@ def test_latch_conditioned_noise_scale() -> None:
 
 def main() -> None:
     test_update_budget()
+    test_residual_actor_unlock_boundary()
     test_warmup_resolution()
     test_default_episode_horizons()
     test_environment_task_mode_overrides()

@@ -789,6 +789,10 @@ class FixedFractionDemoReplay:
     def demo_fraction(self) -> float:
         return self._demo_fraction
 
+    @property
+    def total_materialized_rows(self) -> int:
+        return int(self._online.total_materialized_rows)
+
     def add(self, transition: MutableMapping[str, Any]) -> None:
         self._online.add(transition)
 

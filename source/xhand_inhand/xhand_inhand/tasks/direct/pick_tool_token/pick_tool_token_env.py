@@ -117,6 +117,8 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             if not 0.0 <= float(cfg.curriculum_joint_noise) <= 0.02:
                 raise ValueError("coupled power close requires curriculum_joint_noise in [0, 0.02]")
             fixed_values = (
+                ("action_scale", cfg.action_scale, 0.10),
+                ("act_moving_average", cfg.act_moving_average, 0.30),
                 ("coupled_power_align_steps", cfg.coupled_power_align_steps, 24),
                 (
                     "coupled_power_arm_action_multiplier",

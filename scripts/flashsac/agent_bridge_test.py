@@ -8,6 +8,7 @@ Do not disable TorchDynamo: one test exercises a real ``torch.compile`` wrapper:
 
 from __future__ import annotations
 
+import copy
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ import torch
 import torch.nn.functional as F
 
 from agent_bridge import (
+    ActionAuthorityRule,
     ActionNoiseGroup,
     BRIDGE_STATE_FILENAME,
     FlashSACTorchBridge,
@@ -28,6 +30,10 @@ from agent_bridge import (
 OBSERVATION_DIM = 7
 ACTION_DIM = 6
 NUM_ENVS = 4
+AUTHORITY_OBSERVATION_DIM = 131
+AUTHORITY_ACTION_DIM = 14
+ALIGN_ACTIVE_OBSERVATION_INDEX = 129
+PUBLIC_LATCH_OBSERVATION_INDEX = OBSERVATION_DIM - 1
 
 
 def _spaces() -> tuple[gym.spaces.Box, gym.spaces.Box]:
@@ -72,6 +78,7 @@ def _agent_with_action_dim(
     action_dim: int,
     *,
     use_compile: bool = False,
+    unit_normalize_actor_mean_head: bool = True,
 ) -> FlashSACTorchBridge:
     observation_space = gym.spaces.Box(
         -1.0, 1.0, shape=(OBSERVATION_DIM,), dtype="float32"
@@ -83,7 +90,74 @@ def _agent_with_action_dim(
         {},
         _config(use_compile=use_compile),
         noise_groups=(ActionNoiseGroup("all", 0, action_dim),),
+        unit_normalize_actor_mean_head=unit_normalize_actor_mean_head,
     )
+
+
+def _slice_authority_agent(**config_overrides: Any) -> FlashSACTorchBridge:
+    observation_space, action_space = _spaces()
+    return FlashSACTorchBridge(
+        observation_space,
+        action_space,
+        {},
+        _config(actor_update_period=1, **config_overrides),
+        noise_groups=_groups(),
+        action_authority_rules=(
+            ActionAuthorityRule(
+                "arm_after_public_latch",
+                0,
+                2,
+                PUBLIC_LATCH_OBSERVATION_INDEX,
+                1.0,
+            ),
+        ),
+    )
+
+
+def _authority_agent(
+    *,
+    active_index: int | None = ALIGN_ACTIVE_OBSERVATION_INDEX,
+    unit_normalize_actor_mean_head: bool = False,
+) -> FlashSACTorchBridge:
+    observation_space = gym.spaces.Box(
+        -100.0,
+        100.0,
+        shape=(AUTHORITY_OBSERVATION_DIM,),
+        dtype="float32",
+    )
+    action_space = gym.spaces.Box(
+        -1.0,
+        1.0,
+        shape=(AUTHORITY_ACTION_DIM,),
+        dtype="float32",
+    )
+    return FlashSACTorchBridge(
+        observation_space,
+        action_space,
+        {},
+        _config(actor_update_period=1),
+        noise_groups=(
+            ActionNoiseGroup("token", 0, 9, scale=0.5),
+            ActionNoiseGroup("residual", 9, 14, scale=0.35),
+        ),
+        actor_action_active_observation_index=active_index,
+        unit_normalize_actor_mean_head=unit_normalize_actor_mean_head,
+    )
+
+
+def _authority_transition(
+    observation: torch.Tensor,
+    next_observation: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    num_envs = observation.shape[0]
+    return {
+        "observation": observation.clone(),
+        "action": torch.zeros(num_envs, AUTHORITY_ACTION_DIM),
+        "reward": torch.linspace(-1.0, 1.0, num_envs),
+        "terminated": torch.zeros(num_envs, dtype=torch.bool),
+        "truncated": torch.zeros(num_envs, dtype=torch.bool),
+        "next_observation": next_observation.clone(),
+    }
 
 
 def _transition(observation: torch.Tensor, action: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -165,6 +239,695 @@ def test_actions_stay_in_torch_and_group_scales_apply() -> None:
     assert torch.count_nonzero(agent._cur_noise_repeat_count) == 0  # noqa: SLF001
 
 
+def test_phase_inactive_collection_actions_are_exact_zero() -> None:
+    torch.manual_seed(205)
+    agent = _authority_agent()
+    assert (
+        agent.actor_action_active_observation_index
+        == ALIGN_ACTIVE_OBSERVATION_INDEX
+    )
+    observation = torch.randn(NUM_ENVS, AUTHORITY_OBSERVATION_DIM)
+    observation[:, ALIGN_ACTIVE_OBSERVATION_INDEX] = torch.tensor(
+        [1.0, 0.0, 0.25, 0.0]
+    )
+    active = observation[:, ALIGN_ACTIVE_OBSERVATION_INDEX] == 0.0
+    with torch.no_grad():
+        mean, _ = agent._actor.apply(  # noqa: SLF001
+            "get_mean_and_std",
+            observations=observation,
+            training=False,
+        )
+        expected_active = torch.tanh(mean)[active]
+
+    deterministic = agent.sample_actions(
+        1, {"next_observation": observation}, training=False
+    )
+    torch.testing.assert_close(
+        deterministic[active], expected_active, rtol=0.0, atol=0.0
+    )
+    torch.testing.assert_close(
+        deterministic[~active],
+        torch.zeros_like(deterministic[~active]),
+        rtol=0.0,
+        atol=0.0,
+    )
+    stochastic = agent.sample_actions(
+        2, {"next_observation": observation}, training=True
+    )
+    torch.testing.assert_close(
+        stochastic[~active],
+        torch.zeros_like(stochastic[~active]),
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert not torch.equal(stochastic[active], deterministic[active])
+
+    _expect_error(ValueError, _authority_agent, active_index=-1)
+    _expect_error(
+        ValueError,
+        _authority_agent,
+        active_index=AUTHORITY_OBSERVATION_DIM,
+    )
+    _expect_error(ValueError, _authority_agent, active_index=True)
+
+
+def test_public_slice_authority_gates_collection_random_and_replay() -> None:
+    torch.manual_seed(2050)
+    agent = _slice_authority_agent()
+    observation = torch.randn(NUM_ENVS, OBSERVATION_DIM)
+    observation[:, PUBLIC_LATCH_OBSERVATION_INDEX] = torch.tensor(
+        [0.0, 1.0, 0.0, 1.0]
+    )
+    with torch.no_grad():
+        mean, _ = agent._actor.apply(  # noqa: SLF001
+            "get_mean_and_std",
+            observations=observation,
+            training=False,
+        )
+        proposal = torch.tanh(mean)
+
+    action = agent.sample_actions(
+        1, {"next_observation": observation}, training=False
+    )
+    expected = proposal.clone()
+    expected[observation[:, PUBLIC_LATCH_OBSERVATION_INDEX] == 0.0, :2] = 0.0
+    torch.testing.assert_close(action, expected, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(action[:, 2:], proposal[:, 2:], rtol=0.0, atol=0.0)
+
+    random_proposal = torch.linspace(-1.0, 1.0, NUM_ENVS * ACTION_DIM).reshape(
+        NUM_ENVS, ACTION_DIM
+    )
+    canonical = agent.apply_action_authority(random_proposal, observation)
+    expected_random = random_proposal.clone()
+    expected_random[observation[:, PUBLIC_LATCH_OBSERVATION_INDEX] == 0.0, :2] = 0.0
+    torch.testing.assert_close(canonical, expected_random, rtol=0.0, atol=0.0)
+
+    transition = _transition(observation, canonical)
+    transition["next_observation"][:, PUBLIC_LATCH_OBSERVATION_INDEX] = 1.0
+    assert agent.process_transition(transition) == NUM_ENVS
+    invalid_transition = _transition(observation, canonical)
+    invalid_transition["action"][0, 0] = 0.25
+    _expect_error(ValueError, agent.process_transition, invalid_transition)
+
+    malformed = observation.clone()
+    malformed[0, PUBLIC_LATCH_OBSERVATION_INDEX] = 0.25
+    _expect_error(
+        ValueError,
+        agent.apply_action_authority,
+        random_proposal,
+        malformed,
+    )
+
+
+def test_public_slice_authority_masks_actor_target_entropy_and_checkpoint() -> None:
+    torch.manual_seed(2052)
+    agent = _slice_authority_agent()
+    target_entropy = agent._cfg.temp_target_entropy  # noqa: SLF001
+    observation = torch.randn(NUM_ENVS, OBSERVATION_DIM)
+    next_observation = torch.randn(NUM_ENVS, OBSERVATION_DIM)
+    observation[:, PUBLIC_LATCH_OBSERVATION_INDEX] = torch.tensor(
+        [0.0, 1.0, 0.0, 1.0]
+    )
+    next_observation[:, PUBLIC_LATCH_OBSERVATION_INDEX] = torch.tensor(
+        [1.0, 0.0, 1.0, 0.0]
+    )
+    transition = _transition(
+        observation,
+        agent.apply_action_authority(torch.zeros(NUM_ENVS, ACTION_DIM), observation),
+    )
+    transition["next_observation"] = next_observation
+    agent.process_transition(transition)
+    replay_sample = agent._replay_buffer.sample  # noqa: SLF001
+    sample_indices = torch.arange(NUM_ENVS)
+    agent._replay_buffer.sample = lambda: replay_sample(  # type: ignore[method-assign]  # noqa: SLF001
+        sample_idxs=sample_indices
+    )
+
+    actor_records: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    actor_critic_records: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    target_records: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def record_actor(_module, _args, kwargs, output):
+        actor_records.append(
+            (
+                kwargs["observations"].detach().clone(),
+                output[0].detach().clone(),
+                output[1]["log_prob_per_dim"].detach().clone(),
+            )
+        )
+
+    def record_actor_critic(_module, _args, kwargs, output):
+        if not bool(kwargs["training"]):
+            actor_critic_records.append(
+                (
+                    kwargs["observations"].detach().clone(),
+                    kwargs["actions"].detach().clone(),
+                    output[0].detach().clone(),
+                )
+            )
+
+    def record_target(_module, _args, kwargs, _output):
+        target_records.append(
+            (
+                kwargs["observations"].detach().clone(),
+                kwargs["actions"].detach().clone(),
+            )
+        )
+
+    handles = (
+        agent._actor.network.register_forward_hook(record_actor, with_kwargs=True),  # noqa: SLF001
+        agent._critic.network.register_forward_hook(  # noqa: SLF001
+            record_actor_critic, with_kwargs=True
+        ),
+        agent._target_critic.network.register_forward_hook(  # noqa: SLF001
+            record_target, with_kwargs=True
+        ),
+    )
+    temperature_before = agent._temperature().detach().clone()  # noqa: SLF001
+    try:
+        metrics = agent.update(actor_enabled=True)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert len(actor_records) == 2
+    assert len(actor_critic_records) == 1
+    assert len(target_records) == 1
+    actor_obs_all, raw_actions_all, log_prob_per_dim_all = actor_records[0]
+    current_observation = actor_obs_all[:NUM_ENVS]
+    current_mask = torch.ones(NUM_ENVS, ACTION_DIM, dtype=torch.bool)
+    current_mask[
+        current_observation[:, PUBLIC_LATCH_OBSERVATION_INDEX] == 0.0, :2
+    ] = False
+    expected_current_actions = torch.where(
+        current_mask,
+        raw_actions_all[:NUM_ENVS],
+        torch.zeros_like(raw_actions_all[:NUM_ENVS]),
+    )
+    expected_log_prob = torch.where(
+        current_mask,
+        log_prob_per_dim_all[:NUM_ENVS],
+        torch.zeros_like(log_prob_per_dim_all[:NUM_ENVS]),
+    ).sum(dim=-1)
+    critic_observation, critic_actions, critic_qs = actor_critic_records[0]
+    torch.testing.assert_close(critic_observation, current_observation)
+    torch.testing.assert_close(critic_actions, expected_current_actions)
+    q = torch.minimum(critic_qs[0], critic_qs[1])
+    expected_entropy = -expected_log_prob.mean()
+    expected_actor_loss = (expected_log_prob * temperature_before - q).mean()
+    torch.testing.assert_close(torch.tensor(metrics["actor/entropy"]), expected_entropy)
+    torch.testing.assert_close(torch.tensor(metrics["actor/loss"]), expected_actor_loss)
+    mean_active_dimensions = current_mask.sum(dim=-1).float().mean()
+    expected_temperature_loss = temperature_before * (
+        expected_entropy - target_entropy * mean_active_dimensions / ACTION_DIM
+    )
+    torch.testing.assert_close(
+        torch.tensor(metrics["temperature/loss"]), expected_temperature_loss.squeeze()
+    )
+
+    _, raw_next_actions, _ = actor_records[1]
+    target_observation, target_actions_all = target_records[0]
+    target_next_observation = target_observation[NUM_ENVS:]
+    target_next_actions = target_actions_all[NUM_ENVS:]
+    next_mask = torch.ones(NUM_ENVS, ACTION_DIM, dtype=torch.bool)
+    next_mask[
+        target_next_observation[:, PUBLIC_LATCH_OBSERVATION_INDEX] == 0.0, :2
+    ] = False
+    torch.testing.assert_close(
+        target_next_actions,
+        torch.where(next_mask, raw_next_actions, torch.zeros_like(raw_next_actions)),
+    )
+
+    with tempfile.TemporaryDirectory(prefix="flashsac_slice_authority_") as directory:
+        checkpoint = Path(directory) / "checkpoint"
+        agent.save(str(checkpoint))
+        state = torch.load(
+            checkpoint / BRIDGE_STATE_FILENAME,
+            map_location="cpu",
+            weights_only=True,
+        )
+        assert state["action_authority_rules"] == [
+            {
+                "name": "arm_after_public_latch",
+                "start": 0,
+                "stop": 2,
+                "observation_index": PUBLIC_LATCH_OBSERVATION_INDEX,
+                "active_value": 1.0,
+            }
+        ]
+        restored = _slice_authority_agent()
+        restored.load(str(checkpoint))
+        mismatched = _agent()
+        _expect_error(ValueError, mismatched.load, str(checkpoint))
+
+
+def test_demo_rehearsal_respects_public_slice_authority() -> None:
+    torch.manual_seed(2053)
+    agent = _slice_authority_agent()
+    observation = torch.randn(NUM_ENVS, OBSERVATION_DIM)
+    observation[:, PUBLIC_LATCH_OBSERVATION_INDEX] = torch.tensor(
+        [0.0, 1.0, 0.0, 1.0]
+    )
+    active = torch.ones(NUM_ENVS, ACTION_DIM, dtype=torch.bool)
+    active[observation[:, PUBLIC_LATCH_OBSERVATION_INDEX] == 0.0, :2] = False
+    target_std = 0.2
+    group_weights = {"arm": 2.0, "token": 0.5, "residual": 1.5}
+    action_weights = torch.tensor([2.0, 2.0, 0.5, 0.5, 0.5, 1.5])
+    with torch.no_grad():
+        predicted_mean, predicted_std = agent._actor.apply(  # noqa: SLF001
+            "get_mean_and_std",
+            observations=observation,
+            training=False,
+        )
+        target_action = torch.tanh(predicted_mean + 0.2)
+        target_action = torch.where(
+            active, target_action, torch.zeros_like(target_action)
+        )
+        target_mean = torch.atanh(target_action.clamp(-0.9999, 0.9999))
+        action_elements = F.smooth_l1_loss(
+            predicted_mean,
+            target_mean,
+            reduction="none",
+            beta=1.0,
+        )
+        weighted_active = active.float() * action_weights.unsqueeze(0)
+        expected_action_loss = (
+            torch.where(active, action_elements, torch.zeros_like(action_elements))
+            * action_weights.unsqueeze(0)
+        ).sum() / weighted_active.sum()
+        std_elements = (
+            predicted_std.clamp_min(1.0e-8).log() - torch.tensor(target_std).log()
+        ).square()
+        expected_std_loss = torch.where(
+            active, std_elements, torch.zeros_like(std_elements)
+        ).sum() / active.sum()
+
+    metrics = agent.demo_bc_rehearsal(
+        {"observation": observation, "action": target_action},
+        weight=1.0,
+        group_weights=group_weights,
+        target_std=target_std,
+        std_weight=0.25,
+    )
+    torch.testing.assert_close(
+        torch.tensor(metrics["demo_bc/action_loss"]), expected_action_loss
+    )
+    torch.testing.assert_close(
+        torch.tensor(metrics["demo_bc/std_loss"]), expected_std_loss
+    )
+    assert metrics["demo_bc/active_action_fraction"] == float(active.float().mean())
+    assert metrics["demo_bc/arm_active_elements"] == float(active[:, :2].sum())
+    assert metrics["demo_bc/token_active_fraction"] == 1.0
+    assert metrics["demo_bc/residual_active_fraction"] == 1.0
+
+    noncanonical = target_action.clone()
+    noncanonical[0, 0] = 0.25
+    parameters_before = _actor_parameters(agent)
+    _expect_error(
+        ValueError,
+        agent.demo_bc_rehearsal,
+        {"observation": observation, "action": noncanonical},
+    )
+    _assert_nested_equal(_actor_parameters(agent), parameters_before)
+
+    observation_space, action_space = _spaces()
+    inactive_agent = FlashSACTorchBridge(
+        observation_space,
+        action_space,
+        {},
+        _config(actor_update_period=1),
+        noise_groups=_groups(),
+        action_authority_rules=(
+            ActionAuthorityRule(
+                "all_after_public_latch",
+                0,
+                ACTION_DIM,
+                PUBLIC_LATCH_OBSERVATION_INDEX,
+                1.0,
+            ),
+        ),
+    )
+    inactive_observation = observation.clone()
+    inactive_observation[:, PUBLIC_LATCH_OBSERVATION_INDEX] = 0.0
+    inactive_before = _actor_parameters(inactive_agent)
+    inactive_metrics = inactive_agent.demo_bc_rehearsal(
+        {
+            "observation": inactive_observation,
+            "action": torch.zeros(NUM_ENVS, ACTION_DIM),
+        }
+    )
+    assert inactive_metrics["demo_bc/updated"] == 0.0
+    assert inactive_metrics["demo_bc/active_action_fraction"] == 0.0
+    _assert_nested_equal(_actor_parameters(inactive_agent), inactive_before)
+
+
+def test_initialize_zero_actor_mean_is_exact_and_fresh_only() -> None:
+    for use_compile in (False, True):
+        torch.manual_seed(2051 + int(use_compile))
+        agent = _agent_with_action_dim(
+            ACTION_DIM,
+            use_compile=use_compile,
+            unit_normalize_actor_mean_head=False,
+        )
+        observation = torch.randn(NUM_ENVS, OBSERVATION_DIM)
+        before = _canonical_network_state(agent._actor)  # noqa: SLF001
+        with torch.no_grad():
+            mean_before, std_before = agent._actor.apply(  # noqa: SLF001
+                "get_mean_and_std",
+                observations=observation,
+                training=False,
+            )
+        assert torch.count_nonzero(mean_before) > 0
+        assert agent._actor.optimizer is not None  # noqa: SLF001
+        assert not agent._actor.optimizer.state  # noqa: SLF001
+
+        agent.initialize_zero_actor_mean()
+
+        with torch.no_grad():
+            mean_after, std_after = agent._actor.apply(  # noqa: SLF001
+                "get_mean_and_std",
+                observations=observation,
+                training=False,
+            )
+        torch.testing.assert_close(
+            torch.tanh(mean_after),
+            torch.zeros_like(mean_after),
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(std_after, std_before, rtol=0.0, atol=0.0)
+        after = _canonical_network_state(agent._actor)  # noqa: SLF001
+        mean_keys = {"predictor.mean_w.w.weight", "predictor.mean_bias"}
+        assert after.keys() == before.keys()
+        for name, value in after.items():
+            if name in mean_keys:
+                torch.testing.assert_close(
+                    value, torch.zeros_like(value), rtol=0.0, atol=0.0
+                )
+            else:
+                # Covers the std head, shared trunk, and every BatchNorm
+                # parameter/running buffer.
+                torch.testing.assert_close(value, before[name], rtol=0.0, atol=0.0)
+
+        agent.process_transition(
+            _transition(
+                observation,
+                torch.zeros(NUM_ENVS, ACTION_DIM),
+            )
+        )
+        agent.update(actor_enabled=True)
+        optimizer = agent._actor.optimizer  # noqa: SLF001
+        assert optimizer.state
+        with torch.no_grad():
+            mean_after_update, _ = agent._actor.apply(  # noqa: SLF001
+                "get_mean_and_std",
+                observations=observation,
+                training=False,
+            )
+        # Regression: UnitLinear's ordinary unit projection used to amplify
+        # the first tiny gradient into near-saturated residual actions.
+        assert float(torch.tanh(mean_after_update).abs().max()) < 0.1
+        trained_state = _canonical_network_state(agent._actor)  # noqa: SLF001
+        assert bool(
+            (
+                torch.linalg.vector_norm(
+                    trained_state["predictor.mean_w.w.weight"],
+                    dim=-1,
+                )
+                <= 1.0 + 1.0e-6
+            ).all()
+        )
+        _expect_error(RuntimeError, agent.initialize_zero_actor_mean)
+        _assert_nested_equal(
+            _canonical_network_state(agent._actor),  # noqa: SLF001
+            trained_state,
+        )
+
+
+def test_phase_inactive_masks_replay_actor_and_target_updates() -> None:
+    torch.manual_seed(206)
+    agent = _authority_agent()
+    observation = torch.randn(NUM_ENVS, AUTHORITY_OBSERVATION_DIM)
+    next_observation = torch.randn(NUM_ENVS, AUTHORITY_OBSERVATION_DIM)
+    observation[:, ALIGN_ACTIVE_OBSERVATION_INDEX] = torch.tensor(
+        [1.0, 0.0, 1.0, 0.0]
+    )
+    next_observation[:, ALIGN_ACTIVE_OBSERVATION_INDEX] = torch.tensor(
+        [0.0, 1.0, 1.0, 0.0]
+    )
+    agent.process_transition(_authority_transition(observation, next_observation))
+    replay_sample = agent._replay_buffer.sample  # noqa: SLF001
+    sample_indices = torch.arange(NUM_ENVS)
+    agent._replay_buffer.sample = lambda: replay_sample(  # type: ignore[method-assign]  # noqa: SLF001
+        sample_idxs=sample_indices
+    )
+
+    actor_records: list[tuple[torch.Tensor, torch.Tensor]] = []
+    actor_critic_records: list[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ] = []
+    target_critic_records: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def record_actor(_module, _args, kwargs, output):
+        actor_records.append(
+            (
+                kwargs["observations"].detach().clone(),
+                output[1]["log_prob"].detach().clone(),
+            )
+        )
+
+    def record_actor_critic(_module, _args, kwargs, output):
+        if not bool(kwargs["training"]):
+            actor_critic_records.append(
+                (
+                    kwargs["observations"].detach().clone(),
+                    kwargs["actions"].detach().clone(),
+                    output[0].detach().clone(),
+                )
+            )
+
+    def record_target_critic(_module, _args, kwargs, _output):
+        target_critic_records.append(
+            (
+                kwargs["observations"].detach().clone(),
+                kwargs["actions"].detach().clone(),
+            )
+        )
+
+    handles = (
+        agent._actor.network.register_forward_hook(  # noqa: SLF001
+            record_actor, with_kwargs=True
+        ),
+        agent._critic.network.register_forward_hook(  # noqa: SLF001
+            record_actor_critic, with_kwargs=True
+        ),
+        agent._target_critic.network.register_forward_hook(  # noqa: SLF001
+            record_target_critic, with_kwargs=True
+        ),
+    )
+    temperature_before = agent._temperature().detach().clone()  # noqa: SLF001
+    try:
+        metrics = agent.update(actor_enabled=True)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert len(actor_records) == 2
+    assert len(actor_critic_records) == 1
+    assert len(target_critic_records) == 1
+    actor_observation, actor_log_prob = actor_records[0]
+    current_observation = actor_observation[:NUM_ENVS]
+    current_log_prob = actor_log_prob[:NUM_ENVS]
+    current_active = (
+        current_observation[:, ALIGN_ACTIVE_OBSERVATION_INDEX] == 0.0
+    )
+    critic_observation, critic_actions, critic_qs = actor_critic_records[0]
+    torch.testing.assert_close(critic_observation, current_observation)
+    torch.testing.assert_close(
+        critic_actions[~current_active],
+        torch.zeros_like(critic_actions[~current_active]),
+        rtol=0.0,
+        atol=0.0,
+    )
+    q = torch.minimum(critic_qs[0], critic_qs[1])
+    expected_actor_loss = (
+        current_log_prob[current_active] * temperature_before
+        - q[current_active]
+    ).mean()
+    expected_entropy = -current_log_prob[current_active].mean()
+    torch.testing.assert_close(
+        torch.tensor(metrics["actor/loss"]), expected_actor_loss
+    )
+    torch.testing.assert_close(
+        torch.tensor(metrics["actor/entropy"]), expected_entropy
+    )
+    assert metrics["actor/updated"] == 1.0
+
+    target_observation, target_actions = target_critic_records[0]
+    target_next_observation = target_observation[NUM_ENVS:]
+    target_next_actions = target_actions[NUM_ENVS:]
+    target_next_active = (
+        target_next_observation[:, ALIGN_ACTIVE_OBSERVATION_INDEX] == 0.0
+    )
+    torch.testing.assert_close(
+        target_next_actions[~target_next_active],
+        torch.zeros_like(target_next_actions[~target_next_active]),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+    # A fully inactive sampled batch must remain finite and contribute exactly
+    # zero actor objective, entropy, and target entropy bonus.
+    inactive_agent = _authority_agent()
+    inactive_observation = torch.randn(NUM_ENVS, AUTHORITY_OBSERVATION_DIM)
+    inactive_next_observation = torch.randn(NUM_ENVS, AUTHORITY_OBSERVATION_DIM)
+    inactive_observation[:, ALIGN_ACTIVE_OBSERVATION_INDEX] = 1.0
+    inactive_next_observation[:, ALIGN_ACTIVE_OBSERVATION_INDEX] = 1.0
+    inactive_agent.process_transition(
+        _authority_transition(inactive_observation, inactive_next_observation)
+    )
+    inactive_sample = inactive_agent._replay_buffer.sample  # noqa: SLF001
+    inactive_agent._replay_buffer.sample = lambda: inactive_sample(  # type: ignore[method-assign]  # noqa: SLF001
+        sample_idxs=sample_indices
+    )
+    _seed_optimizer_state(inactive_agent)
+    actor_before = _canonical_network_state(inactive_agent._actor)  # noqa: SLF001
+    actor_optimizer = inactive_agent._actor.optimizer  # noqa: SLF001
+    actor_scheduler = inactive_agent._actor.scheduler  # noqa: SLF001
+    assert actor_optimizer is not None and actor_optimizer.state
+    assert actor_scheduler is not None
+    actor_optimizer_before = copy.deepcopy(actor_optimizer.state_dict())
+    actor_scheduler_before = copy.deepcopy(actor_scheduler.state_dict())
+    temperature_before = {
+        name: value.detach().clone()
+        for name, value in inactive_agent._temperature.network.state_dict().items()  # noqa: SLF001
+    }
+    temperature_optimizer = inactive_agent._temperature.optimizer  # noqa: SLF001
+    temperature_scheduler = inactive_agent._temperature.scheduler  # noqa: SLF001
+    assert temperature_optimizer is not None and temperature_optimizer.state
+    assert temperature_scheduler is not None
+    temperature_optimizer_before = copy.deepcopy(temperature_optimizer.state_dict())
+    temperature_scheduler_before = copy.deepcopy(temperature_scheduler.state_dict())
+    inactive_metrics = inactive_agent.update(actor_enabled=True)
+    assert all(torch.isfinite(torch.tensor(value)) for value in inactive_metrics.values())
+    assert inactive_metrics["actor/loss"] == 0.0
+    assert inactive_metrics["actor/entropy"] == 0.0
+    assert inactive_metrics["actor/mean_action"] == 0.0
+    assert inactive_metrics["actor/updated"] == 0.0
+    assert inactive_metrics["critic/max_entropy_bonus"] == 0.0
+    assert not any(name.startswith("temperature/") for name in inactive_metrics)
+    _assert_nested_equal(
+        _canonical_network_state(inactive_agent._actor),  # noqa: SLF001
+        actor_before,
+    )
+    _assert_nested_equal(actor_optimizer.state_dict(), actor_optimizer_before)
+    _assert_nested_equal(actor_scheduler.state_dict(), actor_scheduler_before)
+    for name, expected in temperature_before.items():
+        torch.testing.assert_close(
+            inactive_agent._temperature.network.state_dict()[name],  # noqa: SLF001
+            expected,
+            rtol=0.0,
+            atol=0.0,
+        )
+    _assert_nested_equal(
+        temperature_optimizer.state_dict(), temperature_optimizer_before
+    )
+    _assert_nested_equal(
+        temperature_scheduler.state_dict(), temperature_scheduler_before
+    )
+
+
+def test_locked_policy_forces_zero_critic_targets_until_replay_unlock() -> None:
+    torch.manual_seed(207)
+    agent = _authority_agent()
+    observation = torch.randn(NUM_ENVS, AUTHORITY_OBSERVATION_DIM)
+    next_observation = torch.randn(NUM_ENVS, AUTHORITY_OBSERVATION_DIM)
+    # CLOSE rows ordinarily grant policy authority. The global exploration
+    # bridge must still withhold it until a native strict success is replayed.
+    observation[:, ALIGN_ACTIVE_OBSERVATION_INDEX] = 0.0
+    next_observation[:, ALIGN_ACTIVE_OBSERVATION_INDEX] = 0.0
+    agent.process_transition(_authority_transition(observation, next_observation))
+    replay_sample = agent._replay_buffer.sample  # noqa: SLF001
+    sample_indices = torch.arange(NUM_ENVS)
+    agent._replay_buffer.sample = lambda: replay_sample(  # type: ignore[method-assign]  # noqa: SLF001
+        sample_idxs=sample_indices
+    )
+    target_actions: list[torch.Tensor] = []
+
+    def record_target(_module, _args, kwargs, _output):
+        target_actions.append(kwargs["actions"].detach().clone())
+
+    handle = agent._target_critic.network.register_forward_hook(  # noqa: SLF001
+        record_target,
+        with_kwargs=True,
+    )
+    actor_before = _canonical_network_state(agent._actor)  # noqa: SLF001
+    try:
+        metrics = agent.update(
+            actor_enabled=False,
+            policy_actions_enabled=False,
+        )
+    finally:
+        handle.remove()
+    assert len(target_actions) == 1
+    torch.testing.assert_close(
+        target_actions[0][NUM_ENVS:],
+        torch.zeros_like(target_actions[0][NUM_ENVS:]),
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert metrics["critic/max_entropy_bonus"] == 0.0
+    _assert_nested_equal(
+        _canonical_network_state(agent._actor),  # noqa: SLF001
+        actor_before,
+    )
+    _expect_error(
+        ValueError,
+        _agent().update,
+        actor_enabled=False,
+        policy_actions_enabled=False,
+    )
+
+
+def test_action_authority_checkpoint_configuration_is_strict() -> None:
+    source = _authority_agent()
+    with tempfile.TemporaryDirectory(prefix="flashsac_action_authority_") as directory:
+        checkpoint = Path(directory) / "checkpoint"
+        source.save(str(checkpoint))
+        bridge_state = torch.load(
+            checkpoint / BRIDGE_STATE_FILENAME,
+            map_location="cpu",
+            weights_only=True,
+        )
+        assert (
+            bridge_state["actor_action_active_observation_index"]
+            == ALIGN_ACTIVE_OBSERVATION_INDEX
+        )
+        assert bridge_state["unit_normalize_actor_mean_head"] is False
+        assert (
+            "actor_action_active_observation_index"
+            not in _agent()._bridge_checkpoint_state()  # noqa: SLF001
+        )
+
+        restored = _authority_agent()
+        restored.load(str(checkpoint))
+        assert (
+            restored.actor_action_active_observation_index
+            == ALIGN_ACTIVE_OBSERVATION_INDEX
+        )
+
+        mismatched = _authority_agent(active_index=None)
+        _expect_error(ValueError, mismatched.load, str(checkpoint))
+        mismatched_normalization = _authority_agent(
+            unit_normalize_actor_mean_head=True
+        )
+        _expect_error(
+            ValueError,
+            mismatched_normalization.load,
+            str(checkpoint),
+        )
+
+
 def test_partial_reset_refreshes_only_completed_envs() -> None:
     torch.manual_seed(101)
     agent = _agent()
@@ -194,7 +957,7 @@ def test_transition_contract_and_replay_are_torch_native() -> None:
         observation_dim=OBSERVATION_DIM,
         action_dim=ACTION_DIM,
     )
-    agent.process_transition(transition)
+    assert agent.process_transition(transition) == NUM_ENVS
     assert agent.can_start_training()
     stored = agent._replay_buffer.get_observations()  # noqa: SLF001
     assert isinstance(stored, torch.Tensor)
@@ -204,6 +967,11 @@ def test_transition_contract_and_replay_are_torch_native() -> None:
     invalid = dict(transition)
     invalid["action"] = action.tolist()
     _expect_error(TypeError, agent.process_transition, invalid)
+
+    delayed = _agent(n_step=3)
+    assert delayed.process_transition(transition) == 0
+    assert delayed.process_transition(transition) == 0
+    assert delayed.process_transition(transition) == NUM_ENVS
 
 
 def test_fresh_rollout_discards_only_trajectory_local_state() -> None:
@@ -383,6 +1151,56 @@ def test_cuda_interaction_has_no_host_round_trip() -> None:
     agent.process_transition(transition)
     stored = agent._replay_buffer.get_observations()  # noqa: SLF001
     assert stored.is_cuda and stored.device == observation.device
+
+
+def test_compiled_cuda_demo_rehearsal_preserves_diagnostic_output() -> None:
+    """A later CUDA-Graph actor call must not overwrite rehearsal metrics."""
+
+    if not torch.cuda.is_available():
+        return
+    torch.manual_seed(112)
+    observation_space, action_space = _spaces()
+    agent = FlashSACTorchBridge(
+        observation_space,
+        action_space,
+        {},
+        _config(
+            device_type="cuda:0",
+            buffer_device_type="cuda:0",
+            use_compile=True,
+            compile_mode="reduce-overhead",
+            use_amp=True,
+            actor_update_period=1,
+        ),
+        noise_groups=_groups(),
+    )
+    observation = torch.randn(32, OBSERVATION_DIM, device="cuda:0")
+    with torch.no_grad():
+        mean, _ = agent._actor.apply(  # noqa: SLF001
+            "get_mean_and_std",
+            observations=observation,
+            training=False,
+        )
+        action = torch.tanh(mean.detach().clone() + 0.1)
+    metrics = agent.demo_bc_rehearsal(
+        {"observation": observation, "action": action},
+        weight=1.0,
+    )
+    assert all(torch.isfinite(torch.tensor(value)) for value in metrics.values())
+    assert metrics["demo_bc/arm_action_rmse"] >= 0.0
+    assert metrics["demo_bc/grad_overflow"] in (0.0, 1.0)
+
+    scaler_state = agent._grad_scaler.state_dict()  # noqa: SLF001
+    scaler_state["scale"] = 1.0e30
+    agent._grad_scaler.load_state_dict(scaler_state)  # noqa: SLF001
+    overflow_metrics = agent.demo_bc_rehearsal(
+        {"observation": observation, "action": action},
+        weight=2.0,
+    )
+    assert all(
+        torch.isfinite(torch.tensor(value)) for value in overflow_metrics.values()
+    )
+    assert overflow_metrics["demo_bc/grad_overflow"] == 1.0
 
 
 def test_checkpoint_exactly_restores_noise_and_rng() -> None:
@@ -689,6 +1507,21 @@ def test_group_partition_is_validated() -> None:
 def main() -> None:
     test_actions_stay_in_torch_and_group_scales_apply()
     print("[PASS] torch actions and grouped exploration")
+    test_phase_inactive_collection_actions_are_exact_zero()
+    print("[PASS] phase-inactive collection actions are exact zero")
+    test_public_slice_authority_gates_collection_random_and_replay()
+    print("[PASS] public slice authority gates collection, random warmup, and replay")
+    test_public_slice_authority_masks_actor_target_entropy_and_checkpoint()
+    print("[PASS] public slice authority masks SAC updates and checkpoints")
+    test_demo_rehearsal_respects_public_slice_authority()
+    print("[PASS] demo rehearsal respects public slice authority")
+    test_initialize_zero_actor_mean_is_exact_and_fresh_only()
+    print("[PASS] fresh residual actor starts with exact-zero deterministic mean")
+    test_phase_inactive_masks_replay_actor_and_target_updates()
+    test_locked_policy_forces_zero_critic_targets_until_replay_unlock()
+    print("[PASS] phase-inactive actor/target replay updates")
+    test_action_authority_checkpoint_configuration_is_strict()
+    print("[PASS] action-authority checkpoint configuration")
     test_transition_contract_and_replay_are_torch_native()
     print("[PASS] torch transition/replay contract")
     test_fresh_rollout_discards_only_trajectory_local_state()
@@ -703,6 +1536,12 @@ def main() -> None:
     print("[PASS] per-environment exploration reset")
     test_cuda_interaction_has_no_host_round_trip()
     print("[PASS] CUDA interaction stays on device" if torch.cuda.is_available() else "[SKIP] CUDA unavailable")
+    test_compiled_cuda_demo_rehearsal_preserves_diagnostic_output()
+    print(
+        "[PASS] compiled CUDA demo rehearsal output lifetime"
+        if torch.cuda.is_available()
+        else "[SKIP] CUDA unavailable"
+    )
     test_checkpoint_exactly_restores_noise_and_rng()
     print("[PASS] exact checkpoint continuation")
     test_checkpoint_loads_across_compile_boundary()

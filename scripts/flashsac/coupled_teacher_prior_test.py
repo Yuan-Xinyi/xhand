@@ -30,14 +30,21 @@ from coupled_teacher_prior import (  # noqa: E402
     PHASE_HOLD_LATCHED,
     POWER_LATCH_OBSERVATION_INDEX,
     HandResidualScales,
+    coupled_teacher_prior_from_payload,
     load_coupled_teacher_prior,
+    load_coupled_teacher_prior_payload,
     sha256_file,
 )
 
 
-def _expect_error(error_type: type[BaseException], fn: Callable[..., Any], *args: Any) -> None:
+def _expect_error(
+    error_type: type[BaseException],
+    fn: Callable[..., Any],
+    *args: Any,
+    **kwargs: Any,
+) -> None:
     try:
-        fn(*args)
+        fn(*args, **kwargs)
     except error_type:
         return
     raise AssertionError(f"expected {error_type.__name__}")
@@ -229,6 +236,18 @@ def test_three_phase_teacher_and_bounded_residual() -> None:
         torch.testing.assert_close(canonical[2], residual[2])
 
         environment = prior.to_environment_action(observation, residual)
+        composed_canonical, composed_environment = prior.compose_action(
+            observation, residual
+        )
+        torch.testing.assert_close(
+            composed_canonical, canonical, rtol=0.0, atol=0.0
+        )
+        torch.testing.assert_close(
+            composed_environment, environment, rtol=0.0, atol=0.0
+        )
+        assert len(prior._constant_tensor_cache) == 1
+        cached_constants = prior._constant_tensors(observation)
+        assert cached_constants is prior._constant_tensors(observation)
         torch.testing.assert_close(environment[0], teacher[0])
         assert torch.count_nonzero(environment[1:, :ARM_DIM]).item() == 0
         expected_close = expected_hand.clone()
@@ -254,6 +273,32 @@ def test_three_phase_teacher_and_bounded_residual() -> None:
         assert contract["teacher_artifact_sha256"] == sha256_file(artifact)
         assert contract["curriculum_dataset_sha256"] == sha256_file(curriculum)
         assert contract["residual_scales"] == scales.as_dict()
+        embedded = coupled_teacher_prior_from_payload(contract)
+        assert embedded.contract_payload() == contract
+        embedded_path = Path(temporary) / "teacher_action_prior.json"
+        embedded_path.write_text(
+            json.dumps(contract, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        loaded = load_coupled_teacher_prior_payload(
+            embedded_path,
+            expected_sha256=sha256_file(embedded_path),
+        )
+        assert loaded.contract_payload() == contract
+        _expect_error(
+            ValueError,
+            load_coupled_teacher_prior_payload,
+            embedded_path,
+            expected_sha256="0" * 64,
+        )
+        linked_path = Path(temporary) / "linked_teacher_action_prior.json"
+        linked_path.symlink_to(embedded_path)
+        _expect_error(
+            FileNotFoundError,
+            load_coupled_teacher_prior_payload,
+            linked_path,
+            expected_sha256=sha256_file(embedded_path),
+        )
 
 
 def test_public_arm_offset_feedback() -> None:
@@ -309,6 +354,13 @@ def test_fail_closed_lineage_and_tensor_contracts() -> None:
         bad_progress = observation.clone()
         bad_progress[0, ALIGN_PROGRESS_OBSERVATION_INDEX] = 1.0
         _expect_error(ValueError, prior.phase, bad_progress)
+        premature_close = observation.clone()
+        premature_close[1, ALIGN_PROGRESS_OBSERVATION_INDEX] = 0.5
+        _expect_error(ValueError, prior.phase, premature_close)
+        # An early latch is a real state-machine transition and remains legal.
+        early_latch = observation[2:3].clone()
+        early_latch[:, ALIGN_PROGRESS_OBSERVATION_INDEX] = 0.25
+        assert prior.phase(early_latch).item() == PHASE_HOLD_LATCHED
         nonfinite = observation.clone()
         nonfinite[0, 0] = float("nan")
         _expect_error(ValueError, prior.teacher_action, nonfinite)

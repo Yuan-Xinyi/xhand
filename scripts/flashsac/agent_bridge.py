@@ -1,8 +1,8 @@
 """Torch-only integration boundary for the pinned FlashSAC agent.
 
-The upstream agent at ``third_party/FlashSAC`` is intentionally left unchanged.
-This module reuses its networks, replay buffer, and update implementation while
-fixing the interaction boundary needed by Isaac Lab:
+The audited fork at ``third_party/FlashSAC`` retains the upstream architecture
+and adds the minimal per-action log-probability/update seam needed by this
+bridge.  This module fixes the interaction boundary needed by Isaac Lab:
 
 * actions remain tensors on the agent device (no ``cpu().numpy()`` round trip),
 * transitions must already be tensors on that device,
@@ -33,6 +33,7 @@ import torch.nn.functional as F
 
 
 FLASH_SAC_COMMIT = "87edc9061150ae9e962dd84e6544e27a1554b3ab"
+FLASH_SAC_FORK_COMMIT = "4f4daf6f08e112c5d93fd8537eb4d6095d482134"
 BRIDGE_STATE_FILENAME = "torch_bridge_state.pt"
 BRIDGE_CHECKPOINT_VERSION = 1
 _COMPILED_STATE_PREFIX = "_orig_mod."
@@ -82,6 +83,12 @@ from flash_rl.agents.flashSAC.agent import (  # noqa: E402
     FlashSACConfig,
     _update_networks,
 )
+from flash_rl.agents.flashSAC.update import (  # noqa: E402
+    update_actor,
+    update_critic,
+    update_target_network,
+    update_temperature,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -100,6 +107,114 @@ class ActionNoiseGroup:
     scale: float = 1.0
     zeta_mu: float | None = None
     zeta_max: int | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class ActionAuthorityRule:
+    """Gate one action slice from a public binary observation feature.
+
+    Dimensions not covered by a rule always remain active.  Overlapping rules
+    compose with logical AND, so every rule covering a dimension must grant
+    authority before that action can reach the environment or an SAC target.
+    """
+
+    name: str
+    start: int
+    stop: int
+    observation_index: int
+    active_value: float
+
+
+def _update_networks_with_action_authority(
+    *,
+    batch: dict[str, torch.Tensor],
+    actor: Any,
+    critic: Any,
+    target_critic: Any,
+    temperature: Any,
+    cfg: FlashSACConfig,
+    do_actor_update: bool,
+    device: torch.device,
+    grad_scaler: torch.amp.GradScaler,
+    actor_action_active: torch.Tensor,
+    actor_next_action_active: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Run the pinned update with caller-authored policy action authority.
+
+    The upstream default path remains untouched when no authority observation
+    is configured.  This explicit branch passes generic row masks into the
+    upstream actor/critic update functions; upstream never needs to know which
+    observation feature authored them.
+    """
+
+    actor_has_authority = do_actor_update and bool(actor_action_active.any())
+    if do_actor_update and actor_has_authority:
+        actor_info = update_actor(
+            actor=actor,
+            critic=critic,
+            temperature=temperature,
+            batch=batch,  # type: ignore[arg-type]
+            bc_alpha=cfg.actor_bc_alpha,
+            device=device,
+            use_amp=cfg.use_amp,
+            grad_scaler=grad_scaler,
+            action_active=actor_action_active,
+        )
+        actor_info["actor/updated"] = torch.ones(
+            (), dtype=batch["action"].dtype, device=device
+        )
+        target_entropy = cfg.temp_target_entropy
+        if actor_action_active.ndim == 2:
+            active_counts = actor_action_active.sum(dim=-1)
+            active_rows = active_counts > 0
+            mean_active_dimensions = active_counts[active_rows].float().mean()
+            target_entropy *= float(
+                mean_active_dimensions / actor_action_active.shape[1]
+            )
+        temperature_info = update_temperature(
+            temperature=temperature,
+            entropy=actor_info["actor/entropy"],
+            target_entropy=target_entropy,
+        )
+    elif do_actor_update:
+        # No policy action exists in an all-inactive batch. Report finite,
+        # exact-zero actor metrics without advancing actor/temperature
+        # parameters, Adam state, or LR schedulers.
+        zero = torch.zeros((), dtype=batch["action"].dtype, device=device)
+        actor_info = {
+            "actor/loss": zero,
+            "actor/entropy": zero,
+            "actor/mean_action": zero,
+            "actor/updated": zero,
+        }
+        temperature_info = {}
+    else:
+        actor_info = {}
+        temperature_info = {}
+
+    critic_info = update_critic(
+        actor=actor,
+        critic=critic,
+        target_critic=target_critic,
+        temperature=temperature,
+        batch=batch,  # type: ignore[arg-type]
+        min_v=cfg.critic_min_v,
+        max_v=cfg.critic_max_v,
+        num_bins=cfg.critic_num_bins,
+        gamma=cfg.gamma,
+        n_step=cfg.n_step,
+        device=device,
+        use_amp=cfg.use_amp,
+        grad_scaler=grad_scaler,
+        next_action_active=actor_next_action_active,
+    )
+    target_info = update_target_network(target_network=target_critic)
+    return {
+        **actor_info,
+        **critic_info,
+        **target_info,
+        **temperature_info,
+    }
 
 
 _REQUIRED_TRANSITION_KEYS = (
@@ -202,6 +317,55 @@ def _normalize_noise_groups(
     uncovered = [index for index, is_occupied in enumerate(occupied) if not is_occupied]
     if uncovered:
         raise ValueError(f"noise groups must cover every action dimension; uncovered indices: {uncovered}")
+    return tuple(normalized)
+
+
+def _normalize_action_authority_rules(
+    rules: Sequence[ActionAuthorityRule],
+    *,
+    action_dim: int,
+    actor_observation_dim: int,
+) -> tuple[ActionAuthorityRule, ...]:
+    normalized: list[ActionAuthorityRule] = []
+    names: set[str] = set()
+    for rule in rules:
+        if not isinstance(rule, ActionAuthorityRule):
+            raise TypeError("action authority rules must be ActionAuthorityRule instances")
+        if not rule.name or rule.name in names:
+            raise ValueError(
+                "action authority rule names must be non-empty and unique; "
+                f"got {rule.name!r}"
+            )
+        names.add(rule.name)
+        if (
+            not isinstance(rule.start, int)
+            or isinstance(rule.start, bool)
+            or not isinstance(rule.stop, int)
+            or isinstance(rule.stop, bool)
+            or not 0 <= rule.start < rule.stop <= action_dim
+        ):
+            raise ValueError(
+                f"action authority rule {rule.name!r} has invalid slice "
+                f"[{rule.start}:{rule.stop}] for action_dim={action_dim}"
+            )
+        if (
+            not isinstance(rule.observation_index, int)
+            or isinstance(rule.observation_index, bool)
+            or not 0 <= rule.observation_index < actor_observation_dim
+        ):
+            raise ValueError(
+                f"action authority rule {rule.name!r} has invalid actor-observation "
+                f"index {rule.observation_index!r}"
+            )
+        if (
+            not isinstance(rule.active_value, (int, float))
+            or isinstance(rule.active_value, bool)
+            or float(rule.active_value) not in (0.0, 1.0)
+        ):
+            raise ValueError(
+                f"action authority rule {rule.name!r} active_value must be 0.0 or 1.0"
+            )
+        normalized.append(dataclasses.replace(rule, active_value=float(rule.active_value)))
     return tuple(normalized)
 
 
@@ -487,8 +651,51 @@ class FlashSACTorchBridge(FlashSACAgent):
         *,
         noise_groups: Sequence[ActionNoiseGroup] = (),
         restore_rng_state_on_load: bool = True,
+        actor_action_active_observation_index: int | None = None,
+        action_authority_rules: Sequence[ActionAuthorityRule] = (),
+        unit_normalize_actor_mean_head: bool = True,
     ) -> None:
         super().__init__(observation_space, action_space, env_info, cfg)
+        if actor_action_active_observation_index is not None and action_authority_rules:
+            raise ValueError(
+                "legacy whole-action authority and action_authority_rules are mutually exclusive"
+            )
+        if actor_action_active_observation_index is not None and (
+            not isinstance(actor_action_active_observation_index, int)
+            or isinstance(actor_action_active_observation_index, bool)
+            or not 0
+            <= actor_action_active_observation_index
+            < self._actor_observation_dim
+        ):
+            raise ValueError(
+                "actor_action_active_observation_index must be None or a valid "
+                "actor-observation index"
+            )
+        self._actor_action_active_observation_index = (
+            actor_action_active_observation_index
+        )
+        self._action_authority_rules = _normalize_action_authority_rules(
+            action_authority_rules,
+            action_dim=self._action_dim,
+            actor_observation_dim=self._actor_observation_dim,
+        )
+        if not isinstance(unit_normalize_actor_mean_head, bool):
+            raise TypeError("unit_normalize_actor_mean_head must be bool")
+        self._unit_normalize_actor_mean_head = unit_normalize_actor_mean_head
+        mean_modules = [
+            module
+            for name, module in self._actor.network.named_modules()
+            if name.removeprefix(_COMPILED_STATE_PREFIX) == "predictor.mean_w"
+        ]
+        if len(mean_modules) != 1 or not hasattr(
+            mean_modules[0], "parameter_normalization_enabled"
+        ):
+            raise RuntimeError(
+                "FlashSAC actor must expose exactly one configurable predictor.mean_w"
+            )
+        mean_modules[0].parameter_normalization_enabled = (  # type: ignore[attr-defined]
+            unit_normalize_actor_mean_head
+        )
         self._restore_rng_state_on_load = restore_rng_state_on_load
         self._noise_groups = _normalize_noise_groups(
             noise_groups,
@@ -513,6 +720,57 @@ class FlashSACTorchBridge(FlashSACAgent):
     @property
     def noise_groups(self) -> tuple[ActionNoiseGroup, ...]:
         return self._noise_groups
+
+    @property
+    def actor_action_active_observation_index(self) -> int | None:
+        return self._actor_action_active_observation_index
+
+    @property
+    def action_authority_rules(self) -> tuple[ActionAuthorityRule, ...]:
+        return self._action_authority_rules
+
+    @property
+    def unit_normalize_actor_mean_head(self) -> bool:
+        return self._unit_normalize_actor_mean_head
+
+    @torch.no_grad()
+    def initialize_zero_actor_mean(self) -> None:
+        """Make a fresh residual actor's deterministic output exactly zero.
+
+        Only the policy mean head is changed. The operation is deliberately
+        rejected after Adam has acquired any actor state so it cannot silently
+        erase a trained policy; the standard-deviation head, shared trunk, and
+        BatchNorm state are left byte-for-byte untouched.
+        """
+
+        optimizer = self._actor.optimizer
+        if optimizer is None:
+            raise RuntimeError("actor has no optimizer")
+        if optimizer.state:
+            raise RuntimeError(
+                "initialize_zero_actor_mean requires a fresh actor optimizer "
+                "with no state"
+            )
+        if self._unit_normalize_actor_mean_head:
+            raise RuntimeError(
+                "zero actor mean requires unit_normalize_actor_mean_head=False so "
+                "the first optimizer step cannot project a tiny residual to unit norm"
+            )
+
+        parameters: dict[str, torch.nn.Parameter] = {}
+        for name, parameter in self._actor.network.named_parameters():
+            canonical_name = name.removeprefix(_COMPILED_STATE_PREFIX)
+            if canonical_name in parameters:
+                raise RuntimeError(
+                    f"actor has duplicate canonical parameter {canonical_name!r}"
+                )
+            parameters[canonical_name] = parameter
+        mean_keys = ("predictor.mean_w.w.weight", "predictor.mean_bias")
+        missing = [key for key in mean_keys if key not in parameters]
+        if missing:
+            raise RuntimeError(f"actor is missing policy mean parameters: {missing}")
+        for key in mean_keys:
+            parameters[key].zero_()
 
     @property
     def replay_size(self) -> int:
@@ -604,6 +862,74 @@ class FlashSACTorchBridge(FlashSACAgent):
             )
         return observations.to(dtype=torch.float32)
 
+    def _actor_action_active_rows(
+        self,
+        actor_observation: torch.Tensor,
+    ) -> torch.Tensor | None:
+        index = self._actor_action_active_observation_index
+        if index is None and not self._action_authority_rules:
+            return None
+        if (
+            actor_observation.ndim != 2
+            or actor_observation.shape[1] != self._actor_observation_dim
+        ):
+            raise ValueError(
+                "actor action authority requires [batch, actor_observation_dim] observations"
+            )
+        if index is not None:
+            # Legacy residual-task contract: the configured feature is an
+            # ALIGN-active bit and whole-action authority begins at zero.
+            return actor_observation[:, index] == 0.0
+
+        active = torch.ones(
+            (actor_observation.shape[0], self._action_dim),
+            dtype=torch.bool,
+            device=actor_observation.device,
+        )
+        for rule in self._action_authority_rules:
+            feature = actor_observation[:, rule.observation_index]
+            binary = (feature == 0.0) | (feature == 1.0)
+            if not bool(binary.all()):
+                invalid = feature[~binary]
+                raise ValueError(
+                    f"action authority feature {rule.observation_index} for rule "
+                    f"{rule.name!r} must be exactly binary; got "
+                    f"{invalid[:8].detach().cpu().tolist()}"
+                )
+            grants = feature == rule.active_value
+            active[:, rule.start : rule.stop] &= grants.unsqueeze(-1)
+        return active
+
+    @torch.no_grad()
+    def apply_action_authority(
+        self,
+        actions: torch.Tensor,
+        observations: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project actor or random proposals to the canonical executed action."""
+
+        observations = self._validate_observations(observations)
+        if not isinstance(actions, torch.Tensor):
+            raise TypeError("actions must be a torch.Tensor")
+        if actions.device != self._device:
+            raise ValueError(f"actions are on {actions.device}, expected {self._device}")
+        if actions.shape != (observations.shape[0], self._action_dim):
+            raise ValueError(
+                "actions must have shape [num_envs, action_dim]; "
+                f"got {tuple(actions.shape)}"
+            )
+        actor_observation = (
+            observations[:, : self._actor_observation_dim]
+            if self._cfg.asymmetric_observation
+            else observations
+        )
+        active = self._actor_action_active_rows(actor_observation)
+        if active is None:
+            return actions
+        if active.ndim == 1:
+            active = active.unsqueeze(-1)
+        return torch.where(active, actions, torch.zeros_like(actions))
+
     def _resolve_runtime_noise_scale(
         self,
         noise_scale: torch.Tensor | None,
@@ -687,24 +1013,54 @@ class FlashSACTorchBridge(FlashSACAgent):
 
         del interaction_step  # retained for the upstream BaseAgent API
         observations = self._validate_observations(prev_transition["next_observation"])
+        full_observations = observations
         if self._cfg.asymmetric_observation:
             observations = observations[:, : self._actor_observation_dim]
-        return self._sample_grouped_actions(
+        actions = self._sample_grouped_actions(
             observations,
             temperature=1.0 if training else 0.0,
             noise_scale=noise_scale,
         )
+        return self.apply_action_authority(actions, full_observations)
 
-    def process_transition(self, transition: MutableMapping[str, Any]) -> None:
+    def process_transition(self, transition: MutableMapping[str, Any]) -> int:
+        """Insert a vector transition and report newly materialized replay rows.
+
+        A positive return proves that the just-added vector batch contributed
+        to an n-step row. This is stronger than replay size, which stops
+        increasing when the circular buffer is full.
+        """
+
         assert_transition_tensors(
             transition,
             device=self._device,
             observation_dim=self._critic_observation_dim,
             action_dim=self._action_dim,
         )
+        canonical_action = self.apply_action_authority(
+            transition["action"], transition["observation"]
+        )
+        if not torch.equal(canonical_action, transition["action"]):
+            mismatch = canonical_action != transition["action"]
+            raise ValueError(
+                "transition action contains non-zero values in dimensions without "
+                f"public action authority ({int(mismatch.sum().item())} entries)"
+            )
+        before = getattr(self._replay_buffer, "total_materialized_rows", None)
+        if not isinstance(before, int) or isinstance(before, bool) or before < 0:
+            raise TypeError("replay buffer has no monotonic materialized-row counter")
         super().process_transition(transition)
+        after = getattr(self._replay_buffer, "total_materialized_rows", None)
+        if not isinstance(after, int) or isinstance(after, bool) or after < before:
+            raise RuntimeError("replay materialized-row counter is not monotonic")
+        return after - before
 
-    def update(self, *, actor_enabled: bool = True) -> dict[str, float]:
+    def update(
+        self,
+        *,
+        actor_enabled: bool = True,
+        policy_actions_enabled: bool = True,
+    ) -> dict[str, float]:
         """Run one upstream update, optionally withholding actor/temperature.
 
         A short critic-only burn-in is useful after loading a BC actor around a
@@ -712,6 +1068,19 @@ class FlashSACTorchBridge(FlashSACAgent):
         AMP behavior, schedulers, and global update counter otherwise match the
         pinned upstream implementation exactly.
         """
+
+        if not isinstance(actor_enabled, bool) or not isinstance(
+            policy_actions_enabled, bool
+        ):
+            raise TypeError("actor_enabled and policy_actions_enabled must be bool")
+        if (
+            not policy_actions_enabled
+            and self._actor_action_active_observation_index is None
+            and not self._action_authority_rules
+        ):
+            raise ValueError(
+                "policy_actions_enabled=False requires an action-authority observation"
+            )
 
         batch = self._replay_buffer.sample()
         for key, value in batch.items():
@@ -730,19 +1099,55 @@ class FlashSACTorchBridge(FlashSACAgent):
             batch["reward"] = self.reward_normalizer.normalize_rewards(batch["reward"])
 
         do_actor_update = bool(
-            actor_enabled and self._update_step % self._cfg.actor_update_period == 0
+            actor_enabled
+            and policy_actions_enabled
+            and self._update_step % self._cfg.actor_update_period == 0
         )
-        raw_info = _update_networks(
-            batch=batch,
-            actor=self._actor,
-            critic=self._critic,
-            target_critic=self._target_critic,
-            temperature=self._temperature,
-            cfg=self._cfg,
-            do_actor_update=do_actor_update,
-            device=self._device,
-            grad_scaler=self._grad_scaler,
+        actor_action_active = self._actor_action_active_rows(
+            batch["actor_observation"]
         )
+        actor_next_action_active = self._actor_action_active_rows(
+            batch["actor_next_observation"]
+        )
+        if not policy_actions_enabled:
+            if actor_action_active is None or actor_next_action_active is None:
+                raise RuntimeError(
+                    "disabled policy actions require current and next authority masks"
+                )
+            actor_action_active = torch.zeros_like(actor_action_active)
+            actor_next_action_active = torch.zeros_like(actor_next_action_active)
+        if actor_action_active is None:
+            if actor_next_action_active is not None:
+                raise RuntimeError("current and next actor action authority disagree")
+            # Preserve the pinned upstream call bit-for-bit when the optional
+            # authority observation is not configured.
+            raw_info = _update_networks(
+                batch=batch,
+                actor=self._actor,
+                critic=self._critic,
+                target_critic=self._target_critic,
+                temperature=self._temperature,
+                cfg=self._cfg,
+                do_actor_update=do_actor_update,
+                device=self._device,
+                grad_scaler=self._grad_scaler,
+            )
+        else:
+            if actor_next_action_active is None:
+                raise RuntimeError("current and next actor action authority disagree")
+            raw_info = _update_networks_with_action_authority(
+                batch=batch,
+                actor=self._actor,
+                critic=self._critic,
+                target_critic=self._target_critic,
+                temperature=self._temperature,
+                cfg=self._cfg,
+                do_actor_update=do_actor_update,
+                device=self._device,
+                grad_scaler=self._grad_scaler,
+                actor_action_active=actor_action_active,
+                actor_next_action_active=actor_next_action_active,
+            )
         self._update_step += 1
         return {
             key: float(value.detach().item()) if isinstance(value, torch.Tensor) else float(value)
@@ -811,6 +1216,25 @@ class FlashSACTorchBridge(FlashSACAgent):
             if self._cfg.asymmetric_observation
             else observation
         )
+        action_active = self._actor_action_active_rows(actor_observation)
+        active_actions: torch.Tensor | None
+        if action_active is None:
+            active_actions = None
+        elif action_active.ndim == 1:
+            active_actions = action_active.unsqueeze(-1).expand(
+                -1, self._action_dim
+            )
+        else:
+            active_actions = action_active
+        if active_actions is not None:
+            canonical_action = torch.where(
+                active_actions, action, torch.zeros_like(action)
+            )
+            if not torch.equal(canonical_action, action):
+                raise ValueError(
+                    "demo BC action is not canonical under the current public "
+                    "action-authority rules"
+                )
         limit = 1.0 - atanh_epsilon
         target_mean = torch.atanh(action.clamp(-limit, limit))
         action_weights = torch.ones(
@@ -822,6 +1246,22 @@ class FlashSACTorchBridge(FlashSACAgent):
         optimizer = self._actor.optimizer
         if optimizer is None:
             raise RuntimeError("FlashSAC actor has no optimizer")
+        if active_actions is not None and not bool(active_actions.any()):
+            optimizer.zero_grad(set_to_none=True)
+            metrics = {
+                "demo_bc/loss": 0.0,
+                "demo_bc/action_loss": 0.0,
+                "demo_bc/std_loss": 0.0,
+                "demo_bc/grad_norm": 0.0,
+                "demo_bc/grad_overflow": 0.0,
+                "demo_bc/updated": 0.0,
+                "demo_bc/active_action_fraction": 0.0,
+            }
+            for group in self._noise_groups:
+                metrics[f"demo_bc/{group.name}_action_rmse"] = 0.0
+                metrics[f"demo_bc/{group.name}_active_elements"] = 0.0
+                metrics[f"demo_bc/{group.name}_active_fraction"] = 0.0
+            return metrics
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(
             device_type=self._device.type,
@@ -836,20 +1276,58 @@ class FlashSACTorchBridge(FlashSACAgent):
                 # transient batch statistics to its fixed deployment buffers.
                 training=False,
             )
+            # ``reduce-overhead`` may return CUDA-Graph-backed output storage
+            # which is reused by the next compiled actor invocation (including
+            # the parameter-normalization path below). Materialize the
+            # pre-update prediction now; retaining ``predicted_mean`` until
+            # after ``optimizer.step()`` can otherwise raise an overwritten-
+            # CUDAGraph-output error while computing diagnostics.
+            predicted_action_for_metrics = torch.tanh(
+                predicted_mean.detach().float()
+            ).clone()
             action_loss_elementwise = F.smooth_l1_loss(
                 predicted_mean,
                 target_mean,
                 reduction="none",
                 beta=1.0,
             )
-            action_loss = (
-                action_loss_elementwise.float() * action_weights.unsqueeze(0)
-            ).sum() / (observation.shape[0] * action_weight_sum)
             predicted_log_std = predicted_std.float().clamp_min(1.0e-8).log()
-            std_loss = (predicted_log_std - math.log(target_std)).square().mean()
+            std_loss_elementwise = (
+                predicted_log_std - math.log(target_std)
+            ).square()
+            if active_actions is None:
+                # Preserve the pre-authority reduction order exactly on the
+                # unrestricted path.
+                action_loss = (
+                    action_loss_elementwise.float()
+                    * action_weights.unsqueeze(0)
+                ).sum() / (observation.shape[0] * action_weight_sum)
+                std_loss = std_loss_elementwise.mean()
+            else:
+                weighted_active = (
+                    active_actions.to(dtype=torch.float32)
+                    * action_weights.unsqueeze(0)
+                )
+                active_weight_sum = weighted_active.sum()
+                action_loss = (
+                    torch.where(
+                        active_actions,
+                        action_loss_elementwise,
+                        torch.zeros_like(action_loss_elementwise),
+                    ).float()
+                    * action_weights.unsqueeze(0)
+                ).sum() / active_weight_sum.clamp_min(1.0)
+                std_loss = torch.where(
+                    active_actions,
+                    std_loss_elementwise,
+                    torch.zeros_like(std_loss_elementwise),
+                ).sum() / active_actions.sum().to(
+                    dtype=std_loss_elementwise.dtype
+                )
             loss = weight * (action_loss + std_weight * std_loss)
 
         if self._cfg.use_amp:
+            scale_before = float(self._grad_scaler.get_scale())
             self._grad_scaler.scale(loss).backward()
             self._grad_scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -857,34 +1335,82 @@ class FlashSACTorchBridge(FlashSACAgent):
             )
             self._grad_scaler.step(optimizer)
             self._grad_scaler.update()
+            scale_after = float(self._grad_scaler.get_scale())
+            grad_overflow = (not bool(torch.isfinite(grad_norm).item())) or (
+                scale_after < scale_before
+            )
         else:
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self._actor.network.parameters(), gradient_clip
             )
+            if not bool(torch.isfinite(grad_norm).item()):
+                raise FloatingPointError(
+                    f"demo BC gradient norm is not finite without AMP: {float(grad_norm)}"
+                )
             optimizer.step()
+            grad_overflow = False
         # The SAC scheduler advances once for the corresponding environment
         # update.  Rehearsal is a correction within that update, not a second
         # unit of the global learning-rate schedule.
         self._actor.normalize_parameters()
         with torch.no_grad():
-            squared_action_error = (torch.tanh(predicted_mean.float()) - action.float()).square()
+            if active_actions is None:
+                squared_action_error = (
+                    predicted_action_for_metrics - action.float()
+                ).square()
+            else:
+                squared_action_error = torch.where(
+                    active_actions,
+                    (predicted_action_for_metrics - action.float()).square(),
+                    torch.zeros_like(predicted_action_for_metrics),
+                )
+        # AMP overflow is a recoverable GradScaler event: ``step`` is skipped
+        # and the scale is reduced. Keep strict-JSON telemetry finite while
+        # surfacing the event explicitly instead of hiding it or aborting the
+        # entire curriculum run before the scaler can adapt.
+        reported_grad_norm = (
+            float(grad_norm.detach())
+            if bool(torch.isfinite(grad_norm).item())
+            else float(gradient_clip)
+        )
         metrics = {
             "demo_bc/loss": float(loss.detach()),
             "demo_bc/action_loss": float(action_loss.detach()),
             "demo_bc/std_loss": float(std_loss.detach()),
-            "demo_bc/grad_norm": float(grad_norm.detach()),
+            "demo_bc/grad_norm": reported_grad_norm,
+            "demo_bc/grad_overflow": float(grad_overflow),
+            "demo_bc/updated": float(not grad_overflow),
         }
-        for group in self._noise_groups:
-            metrics[f"demo_bc/{group.name}_action_rmse"] = float(
-                squared_action_error[:, group.start : group.stop].mean().sqrt()
+        if active_actions is not None:
+            metrics["demo_bc/active_action_fraction"] = float(
+                active_actions.float().mean()
             )
+        for group in self._noise_groups:
+            group_error = squared_action_error[:, group.start : group.stop]
+            if active_actions is None:
+                group_rmse = group_error.mean().sqrt()
+            else:
+                group_active = active_actions[:, group.start : group.stop]
+                group_active_count = group_active.sum()
+                group_rmse = (
+                    group_error.sum()
+                    / group_active_count.clamp_min(1).to(dtype=group_error.dtype)
+                ).sqrt()
+                metrics[f"demo_bc/{group.name}_active_elements"] = float(
+                    group_active_count
+                )
+                metrics[f"demo_bc/{group.name}_active_fraction"] = float(
+                    group_active.float().mean()
+                )
+            metrics[f"demo_bc/{group.name}_action_rmse"] = float(group_rmse)
         return metrics
 
     def _bridge_checkpoint_state(self) -> dict[str, Any]:
         state: dict[str, Any] = {
             "version": BRIDGE_CHECKPOINT_VERSION,
             "upstream_commit": FLASH_SAC_COMMIT,
+            "fork_commit": FLASH_SAC_FORK_COMMIT,
             "action_dim": self._action_dim,
             "noise_groups": [_group_dict(group) for group in self._noise_groups],
             "group_noise_scale": self._group_noise_scale,
@@ -893,6 +1419,16 @@ class FlashSACTorchBridge(FlashSACAgent):
             "noise_repeat_n": self._cur_noise_repeat_n,
             "cpu_rng_state": torch.get_rng_state(),
         }
+        if self._actor_action_active_observation_index is not None:
+            state["actor_action_active_observation_index"] = (
+                self._actor_action_active_observation_index
+            )
+        if self._action_authority_rules:
+            state["action_authority_rules"] = [
+                dataclasses.asdict(rule) for rule in self._action_authority_rules
+            ]
+        if not self._unit_normalize_actor_mean_head:
+            state["unit_normalize_actor_mean_head"] = False
         if self._device.type == "cuda":
             state["device_rng_state"] = torch.cuda.get_rng_state(self._device)
         return state
@@ -1015,9 +1551,52 @@ class FlashSACTorchBridge(FlashSACAgent):
                 f"checkpoint targets upstream commit {state.get('upstream_commit')!r}, "
                 f"expected {FLASH_SAC_COMMIT}"
             )
+        checkpoint_fork_commit = state.get("fork_commit")
+        if checkpoint_fork_commit not in (None, FLASH_SAC_FORK_COMMIT):
+            raise ValueError(
+                f"checkpoint targets FlashSAC fork {checkpoint_fork_commit!r}, "
+                f"expected {FLASH_SAC_FORK_COMMIT}"
+            )
+        if self._action_authority_rules and checkpoint_fork_commit != FLASH_SAC_FORK_COMMIT:
+            raise ValueError(
+                "per-action authority requires a checkpoint created by the audited "
+                f"FlashSAC fork {FLASH_SAC_FORK_COMMIT}"
+            )
         if state.get("action_dim") != self._action_dim:
             raise ValueError(
                 f"checkpoint action_dim={state.get('action_dim')}, current action_dim={self._action_dim}"
+            )
+        checkpoint_active_index = state.get(
+            "actor_action_active_observation_index"
+        )
+        if checkpoint_active_index != self._actor_action_active_observation_index:
+            raise ValueError(
+                "checkpoint actor action authority differs from the current bridge "
+                "configuration; "
+                f"checkpoint={checkpoint_active_index}, "
+                f"current={self._actor_action_active_observation_index}"
+            )
+        checkpoint_authority_rules = state.get("action_authority_rules", [])
+        current_authority_rules = [
+            dataclasses.asdict(rule) for rule in self._action_authority_rules
+        ]
+        if checkpoint_authority_rules != current_authority_rules:
+            raise ValueError(
+                "checkpoint action authority rules differ from the current bridge "
+                "configuration; "
+                f"checkpoint={checkpoint_authority_rules}, "
+                f"current={current_authority_rules}"
+            )
+        checkpoint_unit_normalize_mean = state.get(
+            "unit_normalize_actor_mean_head",
+            True,
+        )
+        if checkpoint_unit_normalize_mean != self._unit_normalize_actor_mean_head:
+            raise ValueError(
+                "checkpoint actor mean-head normalization differs from the current "
+                "bridge configuration; "
+                f"checkpoint={checkpoint_unit_normalize_mean}, "
+                f"current={self._unit_normalize_actor_mean_head}"
             )
         checkpoint_groups = state.get("noise_groups")
         current_groups = [_group_dict(group) for group in self._noise_groups]
@@ -1102,10 +1681,12 @@ def build_agent_config(**overrides: Any) -> FlashSACConfig:
 
 
 __all__ = [
+    "ActionAuthorityRule",
     "ActionNoiseGroup",
     "BRIDGE_CHECKPOINT_VERSION",
     "BRIDGE_STATE_FILENAME",
     "FLASH_SAC_COMMIT",
+    "FLASH_SAC_FORK_COMMIT",
     "FlashSACTorchBridge",
     "assert_transition_tensors",
     "build_agent_config",

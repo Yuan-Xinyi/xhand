@@ -44,6 +44,7 @@ COUPLED_OBSERVATION_DIM = 131
 ACTION_DIM = 21
 ARM_ACTION_DIM = 7
 HAND_ACTION_DIM = 14
+FULL_TASK_GRASP_LATCH_OBSERVATION_INDEX = 106
 PRODUCTION_ACTOR_BLOCKS = 2
 PRODUCTION_ACTOR_HIDDEN = 128
 PRODUCTION_CRITIC_BLOCKS = 2
@@ -58,22 +59,35 @@ FULL_TASK_MODE = "full_task"
 CLOSE_OPTION_MODE = "close_option"
 POWER_CLOSE_OPTION_MODE = "power_close_option_v1"
 COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE = "coupled_power_align_close_option_v1"
+COUPLED_TEACHER_RESIDUAL_MODE = "coupled_power_teacher_residual_v1"
 TASK_MODES = (
     FULL_TASK_MODE,
     CLOSE_OPTION_MODE,
     POWER_CLOSE_OPTION_MODE,
     COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+    COUPLED_TEACHER_RESIDUAL_MODE,
 )
 POWER_CLOSE_TASK_MODES = (
     POWER_CLOSE_OPTION_MODE,
     COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+    COUPLED_TEACHER_RESIDUAL_MODE,
+)
+COUPLED_TASK_MODES = (
+    COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+    COUPLED_TEACHER_RESIDUAL_MODE,
 )
 CLOSE_OPTION_TASK_MODES = (CLOSE_OPTION_MODE, *POWER_CLOSE_TASK_MODES)
 
 FULL_POLICY_ACTION_LAYOUT = "arm_delta7|crossdex_token9|distal_residual5"
 HAND_POLICY_ACTION_LAYOUT = "crossdex_token9|distal_residual5"
+TEACHER_RESIDUAL_POLICY_ACTION_LAYOUT = (
+    "crossdex_token_residual9|distal_action_residual5"
+)
 IDENTITY_ACTION_PROJECTION = "identity_v1"
 HAND_ACTION_PROJECTION = "prepend_zero_arm7_v1"
+COUPLED_TEACHER_RESIDUAL_ACTION_PROJECTION = (
+    "coupled_cem_teacher_prior_plus_bounded_hand_residual_v1"
+)
 STANDARD_OBSERVATION_CONTRACT = "pick_tool_markov115_v1"
 POWER_OBSERVATION_CONTRACT = "pick_tool_power_close_markov115_v1"
 COUPLED_POWER_OBSERVATION_CONTRACT = (
@@ -174,6 +188,7 @@ def task_mode_from_option_flags(
     close_option_mode: bool,
     power_close_option_mode: bool,
     coupled_power_align_close_option_mode: bool = False,
+    coupled_teacher_residual_mode: bool = False,
 ) -> str:
     """Resolve mutually exclusive user-facing task flags."""
 
@@ -183,12 +198,15 @@ def task_mode_from_option_flags(
             close_option_mode,
             power_close_option_mode,
             coupled_power_align_close_option_mode,
+            coupled_teacher_residual_mode,
         )
     )
     if enabled > 1:
         raise ValueError(
             "close-option mode flags are mutually exclusive"
         )
+    if coupled_teacher_residual_mode:
+        return COUPLED_TEACHER_RESIDUAL_MODE
     if coupled_power_align_close_option_mode:
         return COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE
     if power_close_option_mode:
@@ -227,6 +245,52 @@ def apply_coupled_controller_ablation(
     raise ValueError(f"unsupported coupled controller ablation {mode!r}")
 
 
+def apply_public_latch_arm_gate(
+    action: torch.Tensor,
+    observation: torch.Tensor,
+    *,
+    latched_arm_scale: float = 1.0,
+) -> torch.Tensor:
+    """Zero arm actions until the actor-visible full-task grasp latch is set.
+
+    This is a memoryless policy transform: feature 106 is part of the same
+    115-D observation consumed by the actor. It deliberately does not use the
+    evaluator's hidden stable-step counter or any privileged simulator state.
+    """
+
+    if not isinstance(action, torch.Tensor) or not isinstance(
+        observation, torch.Tensor
+    ):
+        raise TypeError("public latch arm gate requires torch tensors")
+    if action.ndim != 2 or action.shape[1] != ACTION_DIM:
+        raise ValueError(f"public latch arm gate requires [batch, {ACTION_DIM}] actions")
+    if (
+        observation.ndim != 2
+        or observation.shape[0] != action.shape[0]
+        or observation.shape[1] != OBSERVATION_DIM
+    ):
+        raise ValueError(
+            f"public latch arm gate requires matching [batch, {OBSERVATION_DIM}] observations"
+        )
+    if action.device != observation.device:
+        raise ValueError("public latch arm gate action and observation must share a device")
+    if (
+        not math.isfinite(latched_arm_scale)
+        or not 0.0 < latched_arm_scale <= 1.0
+    ):
+        raise ValueError("latched_arm_scale must be finite and in (0, 1]")
+    latch = observation[:, FULL_TASK_GRASP_LATCH_OBSERVATION_INDEX]
+    if not bool(((latch == 0.0) | (latch == 1.0)).all().item()):
+        raise RuntimeError("actor-visible grasp latch must be exactly binary")
+    gated = action.clone()
+    gated[:, :ARM_ACTION_DIM] = torch.where(
+        (latch == 1.0).unsqueeze(-1),
+        action[:, :ARM_ACTION_DIM] * latched_arm_scale,
+        torch.zeros_like(action[:, :ARM_ACTION_DIM]),
+    )
+    return gated
+
+
 def requested_policy_action_contract(task_mode: str) -> dict[str, Any]:
     """Return the evaluator-side policy/environment action boundary."""
 
@@ -239,6 +303,15 @@ def requested_policy_action_contract(task_mode: str) -> dict[str, Any]:
             "action_projection": HAND_ACTION_PROJECTION,
             "observation_dim": OBSERVATION_DIM,
             "observation_contract": POWER_OBSERVATION_CONTRACT,
+        }
+    if task_mode == COUPLED_TEACHER_RESIDUAL_MODE:
+        return {
+            "policy_action_dim": HAND_ACTION_DIM,
+            "policy_action_layout": TEACHER_RESIDUAL_POLICY_ACTION_LAYOUT,
+            "environment_action_dim": ACTION_DIM,
+            "action_projection": COUPLED_TEACHER_RESIDUAL_ACTION_PROJECTION,
+            "observation_dim": COUPLED_OBSERVATION_DIM,
+            "observation_contract": COUPLED_POWER_OBSERVATION_CONTRACT,
         }
     if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE:
         return {
@@ -283,6 +356,7 @@ def checkpoint_policy_action_contract(contract: Mapping[str, Any]) -> dict[str, 
         requested_policy_action_contract(FULL_TASK_MODE),
         requested_policy_action_contract(POWER_CLOSE_OPTION_MODE),
         requested_policy_action_contract(COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE),
+        requested_policy_action_contract(COUPLED_TEACHER_RESIDUAL_MODE),
     )
     if result not in allowed:
         raise ValueError(f"unsupported checkpoint policy action contract: {result}")
@@ -312,6 +386,14 @@ def validate_checkpoint_evaluation_contract(
         raise ValueError(
             "checkpoint task mode and policy/observation contract disagree: "
             f"task_mode={checkpoint_task_mode!r}, policy={source}"
+        )
+    if COUPLED_TEACHER_RESIDUAL_MODE in (
+        checkpoint_task_mode,
+        requested_task_mode,
+    ) and checkpoint_task_mode != requested_task_mode:
+        raise ValueError(
+            "teacher-residual actor semantics cannot be projected across task modes; "
+            f"checkpoint={checkpoint_task_mode!r}, requested={requested_task_mode!r}"
         )
     # Cross-mode use is independently gated by ``allow_cross_task_actor``.
     # Preserve historical full/legacy-close exact loads because their tensor
@@ -584,7 +666,7 @@ def validate_terminal_events(
             | power_events["close_option_lost_window"]
         )
         coupled_events: dict[str, torch.Tensor] = {}
-        if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE:
+        if task_mode in COUPLED_TASK_MODES:
             coupled_events = validate_coupled_power_telemetry(
                 info,
                 num_envs=num_envs,
@@ -650,6 +732,10 @@ def validate_terminal_events(
             torch.isfinite(max_force).all()
         ):
             raise FloatingPointError("power-close hold quality or force is not finite")
+        if bool(((hold_quality < 0.0) | (hold_quality > 1.0)).any()):
+            raise RuntimeError("power-close hold quality must be in [0, 1]")
+        if bool((max_force < 0.0).any()):
+            raise RuntimeError("power-close max force must be non-negative")
         invalid_success = power_success & (
             (~power_events["power_is_grasped"])
             | (~power_events["power_thumb_contact"])
@@ -675,9 +761,10 @@ def validate_terminal_events(
                 "power-close success violates thumb+three, power-quality, 15-frame, "
                 "hold, or force safety contract"
             )
-        if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE:
+        if task_mode in COUPLED_TASK_MODES:
             invalid_coupled_success = power_success & (
                 coupled_events["coupled_power_pose_escape"]
+                | coupled_events["coupled_power_arm_target_saturated"]
                 | coupled_events["coupled_power_align_active"]
                 | (
                     coupled_events["coupled_power_arm_target_offset_abs_max"]
@@ -687,10 +774,16 @@ def validate_terminal_events(
             )
             if bool(invalid_coupled_success.any()):
                 raise RuntimeError(
-                    "coupled power-close success violates pose escape, completed-ALIGN, "
-                    "or bounded arm-offset contract"
+                    "coupled power-close success violates pose escape, arm-target "
+                    "saturation, completed-ALIGN, or bounded arm-offset contract"
                 )
-        return {**events, **power_events, **coupled_events}
+        return {
+            **events,
+            **power_events,
+            **coupled_events,
+            "hold_quality": hold_quality,
+            "max_force": max_force,
+        }
 
     close_events = {
         name: _require_vector(
@@ -963,6 +1056,14 @@ def physical_truth_from_terminal_info(
             device=device,
             dtype=torch.float32,
         )
+        if not bool(torch.isfinite(hold_quality).all()) or not bool(
+            torch.isfinite(max_force).all()
+        ):
+            raise FloatingPointError("power-close physical hold/force truth is not finite")
+        if bool(((hold_quality < 0.0) | (hold_quality > 1.0)).any()):
+            raise RuntimeError("power-close physical hold quality must be in [0, 1]")
+        if bool((max_force < 0.0).any()):
+            raise RuntimeError("power-close physical max force must be non-negative")
         dropped = _require_vector(
             "pick_tool_terminal['dropped']",
             raw.get("dropped"),
@@ -999,7 +1100,7 @@ def physical_truth_from_terminal_info(
         )
         if bool(invalid_power.any()):
             raise RuntimeError("power-close success violates its physical latch contract")
-        if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE:
+        if task_mode in COUPLED_TASK_MODES:
             coupled = validate_coupled_power_telemetry(
                 info,
                 num_envs=num_envs,
@@ -1016,6 +1117,7 @@ def physical_truth_from_terminal_info(
                 )
             invalid_coupled = power_success & (
                 coupled["coupled_power_pose_escape"]
+                | coupled["coupled_power_arm_target_saturated"]
                 | coupled["coupled_power_align_active"]
                 | (
                     coupled["coupled_power_arm_target_offset_abs_max"]
@@ -1025,8 +1127,8 @@ def physical_truth_from_terminal_info(
             )
             if bool(invalid_coupled.any()):
                 raise RuntimeError(
-                    "coupled power-close success violates pose, completed-ALIGN, "
-                    "or arm-offset truth"
+                    "coupled power-close success violates pose, arm-target saturation, "
+                    "completed-ALIGN, or arm-offset truth"
                 )
         return truth
 
@@ -1193,6 +1295,9 @@ class StrictEpisodeTracker:
         self.max_power_close_option_stable_steps = torch.zeros(
             num_envs, dtype=torch.long, device=device
         )
+        self.max_power_force = torch.zeros(
+            num_envs, dtype=torch.float32, device=device
+        )
         self.ever_coupled_pose_escape = torch.zeros(
             num_envs, dtype=torch.bool, device=device
         )
@@ -1298,7 +1403,18 @@ class StrictEpisodeTracker:
                         else torch.bool
                     ),
                 )
-            if self.task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE:
+            if self.task_mode in POWER_CLOSE_TASK_MODES:
+                for name in ("hold_quality", "max_force"):
+                    value = _require_vector(
+                        f"events[{name!r}]",
+                        events.get(name),
+                        num_envs=self.num_envs,
+                        device=self.device,
+                        dtype=torch.float32,
+                    )
+                    if not bool(torch.isfinite(value).all()):
+                        raise FloatingPointError(f"events[{name!r}] is not finite")
+            if self.task_mode in COUPLED_TASK_MODES:
                 for name in COUPLED_POWER_TELEMETRY_KEYS:
                     _require_vector(
                         f"events[{name!r}]",
@@ -1356,6 +1472,11 @@ class StrictEpisodeTracker:
             self.ever_power_thumb_contact |= active & thumb_contact
             self.ever_power_thumb_plus_three |= active & thumb_contact & (legal_other >= 3)
             self.ever_power_grasp_latched |= active & events["power_is_grasped"]
+            self.max_power_force = torch.where(
+                active,
+                torch.maximum(self.max_power_force, events["max_force"]),
+                self.max_power_force,
+            )
             for accumulator, event_name in (
                 (self.max_power_staged_close_quality, "power_close_quality"),
                 (self.max_power_wrap_quality, "power_wrap_quality"),
@@ -1376,7 +1497,7 @@ class StrictEpisodeTracker:
                         accumulator,
                     )
                 )
-        if self.task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE:
+        if self.task_mode in COUPLED_TASK_MODES:
             self.ever_coupled_pose_escape |= (
                 active & events["coupled_power_pose_escape"]
             )
@@ -1521,6 +1642,12 @@ class StrictEpisodeTracker:
                         "power_grasp_latch_confirm_steps": int(
                             events["power_grasp_latch_confirm_steps"][env_id].item()
                         ),
+                        "terminal_power_hold_quality": float(
+                            events["hold_quality"][env_id].item()
+                        ),
+                        "terminal_power_max_force_n": float(
+                            events["max_force"][env_id].item()
+                        ),
                         # Explicit terminal aliases preserve the old fields
                         # above while making their reset-before/last-frame
                         # semantics unambiguous to downstream analysis.
@@ -1575,9 +1702,12 @@ class StrictEpisodeTracker:
                         "max_power_close_option_stable_steps": int(
                             self.max_power_close_option_stable_steps[env_id].item()
                         ),
+                        "episode_max_power_force_n": float(
+                            self.max_power_force[env_id].item()
+                        ),
                     }
                 )
-                if self.task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE:
+                if self.task_mode in COUPLED_TASK_MODES:
                     record.update(
                         {
                             "terminal_coupled_power_pose_escape": bool(
@@ -1691,6 +1821,7 @@ class StrictEpisodeTracker:
         self.max_power_grasp_quality.masked_fill_(accepted_done, 0.0)
         self.max_power_latch_confirm_steps.masked_fill_(accepted_done, 0)
         self.max_power_close_option_stable_steps.masked_fill_(accepted_done, 0)
+        self.max_power_force.masked_fill_(accepted_done, 0.0)
         self.ever_coupled_pose_escape.masked_fill_(accepted_done, False)
         self.ever_coupled_arm_target_saturated.masked_fill_(accepted_done, False)
         self.ever_coupled_align_active.masked_fill_(accepted_done, False)
@@ -1769,6 +1900,22 @@ def build_strict_metrics(
         raise ValueError("strict evaluation completed no episodes")
     task_mode = _validate_task_mode(task_mode)
     checkpoint_task_mode = _validate_task_mode(checkpoint_task_mode)
+    if (
+        not math.isfinite(close_option_safe_force_limit)
+        or close_option_safe_force_limit <= 0.0
+    ):
+        raise ValueError("close_option_safe_force_limit must be finite and positive")
+    # Work on copies so the emitted per-episode conservative verdict is derived
+    # from the exact threshold published by this metrics contract.
+    records = [dict(record) for record in records]
+    if task_mode in COUPLED_TASK_MODES:
+        for record in records:
+            record["conservative_teacher_compatible_success"] = (
+                bool(record["power_close_option_success"])
+                and not bool(record["ever_coupled_power_arm_target_saturated"])
+                and float(record["episode_max_power_force_n"])
+                <= close_option_safe_force_limit
+            )
     expected_policy = requested_policy_action_contract(task_mode)
     reported_policy = {
         "policy_action_dim": policy_action_dim,
@@ -1971,8 +2118,26 @@ def build_strict_metrics(
                     for record in records
                 ]
             ),
+            "episode_max_force_n": summarize(
+                [float(record["episode_max_power_force_n"]) for record in records]
+            ),
         }
-    if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE:
+    if task_mode in COUPLED_TASK_MODES:
+        conservative_successes = sum(
+            bool(record["conservative_teacher_compatible_success"])
+            for record in records
+        )
+        metrics["conservative_teacher_compatible_success_count"] = (
+            conservative_successes
+        )
+        metrics["conservative_teacher_compatible_success_rate"] = (
+            conservative_successes / episodes
+        )
+        metrics["conservative_teacher_compatible_contract"] = {
+            "requires_native_close_option_success": True,
+            "arm_target_saturation_ever_required_false": True,
+            "episode_max_force_limit_n": close_option_safe_force_limit,
+        }
         metrics["coupled_power_telemetry"] = {
             "episodes_ever_pose_escape": sum(
                 bool(record["ever_coupled_power_pose_escape"]) for record in records
@@ -2057,14 +2222,23 @@ def build_strict_metrics(
             "unsafe_force_or_drop": True,
         }
     else:
-        metrics["coupled_power_align_close_option_success_rate"] = (
+        success_rate_key = (
+            "coupled_teacher_residual_close_option_success_rate"
+            if task_mode == COUPLED_TEACHER_RESIDUAL_MODE
+            else "coupled_power_align_close_option_success_rate"
+        )
+        metrics[success_rate_key] = (
             event_counts["power_close_option_success"] / episodes
         )
         metrics["evaluation_scope"] = (
             "close_option_only; full-task 20 cm lift success is not evaluated"
         )
         metrics["success_contract"] = {
-            "name": "stable_coupled_power_align_close_option_v1",
+            "name": (
+                "stable_coupled_teacher_residual_close_option_v1"
+                if task_mode == COUPLED_TEACHER_RESIDUAL_MODE
+                else "stable_coupled_power_align_close_option_v1"
+            ),
             "confirm_steps": close_option_confirm_steps,
             "thumb_contact_required": True,
             "required_legal_other_contacts": power_required_other_contacts,
@@ -2072,6 +2246,7 @@ def build_strict_metrics(
             "min_hold_quality": close_option_min_hold_quality,
             "safe_force_limit_n": close_option_safe_force_limit,
             "pose_escape_required_false": True,
+            "arm_target_saturation_ever_required_false": True,
             "max_arm_target_offset_rad": COUPLED_POWER_ARM_TARGET_OFFSET_LIMIT,
             "arm_target_offset_tolerance_rad": (
                 COUPLED_POWER_ARM_TARGET_OFFSET_TOLERANCE
@@ -2316,6 +2491,60 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def load_checkpoint_teacher_prior(
+    *,
+    checkpoint: Path,
+    checkpoint_contract: Mapping[str, Any],
+    curriculum_dataset: Path,
+) -> tuple[Any, str]:
+    """Load and bind the V4 embedded prior to the evaluated curriculum bytes."""
+
+    if checkpoint_contract.get("task_mode") != COUPLED_TEACHER_RESIDUAL_MODE:
+        raise ValueError("embedded teacher prior requires a residual-mode checkpoint")
+    entry = checkpoint_contract.get("teacher_action_prior")
+    if not isinstance(entry, Mapping) or set(entry) != {"filename", "sha256"}:
+        raise ValueError("residual checkpoint has no closed teacher_action_prior contract")
+    if entry.get("filename") != "teacher_action_prior.json":
+        raise ValueError("residual checkpoint names an unsupported teacher prior file")
+    expected_sha256 = entry.get("sha256")
+    if (
+        not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_sha256)
+    ):
+        raise ValueError("residual checkpoint has an invalid teacher prior SHA256")
+    prior_path = checkpoint / str(entry["filename"])
+    if not prior_path.is_file() or prior_path.is_symlink():
+        raise FileNotFoundError(
+            f"checkpoint teacher prior is missing or not a regular file: {prior_path}"
+        )
+    if not curriculum_dataset.is_file():
+        raise FileNotFoundError(curriculum_dataset)
+
+    from coupled_teacher_prior import load_coupled_teacher_prior_payload
+
+    prior = load_coupled_teacher_prior_payload(
+        prior_path,
+        expected_sha256=expected_sha256,
+    )
+    curriculum_sha256 = _sha256(curriculum_dataset)
+    if prior.curriculum_dataset_sha256 != curriculum_sha256:
+        raise ValueError(
+            "embedded teacher prior curriculum lineage disagrees with "
+            "--curriculum_dataset bytes"
+        )
+    prior_payload = prior.contract_payload()
+    expected_policy = requested_policy_action_contract(
+        COUPLED_TEACHER_RESIDUAL_MODE
+    )
+    for key, expected in expected_policy.items():
+        if prior_payload.get(key) != expected:
+            raise ValueError(
+                f"embedded teacher prior {key} disagrees with residual policy contract"
+            )
+    return prior, expected_sha256
+
+
 def _seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -2367,6 +2596,15 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
             "stable near-table close latch, never full-task 20 cm lift success."
         ),
     )
+    option_group.add_argument(
+        "--coupled_teacher_residual_mode",
+        action="store_true",
+        help=(
+            "Evaluate the checkpoint-embedded coupled CEM teacher prior plus its native "
+            "14-D bounded hand-residual policy. The physical objective remains the strict "
+            "coupled POWER close option."
+        ),
+    )
     parser.add_argument(
         "--coupled_controller_ablation",
         choices=(
@@ -2395,11 +2633,37 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         ),
     )
     parser.add_argument(
+        "--prior_only",
+        action="store_true",
+        help=(
+            "Residual mode only: execute an exact zero 14-D residual so the embedded "
+            "teacher prior is evaluated without learned-policy corrections."
+        ),
+    )
+    arm_gate_group = parser.add_mutually_exclusive_group()
+    arm_gate_group.add_argument(
         "--hold_arm_until_stable_grasp",
         action="store_true",
         help=(
             "On a full-task close_start evaluation, mask the seven arm actions until the strict "
             "grasp contract is stable for 15 frames, then release the same actor in-place."
+        ),
+    )
+    parser.add_argument(
+        "--latched_arm_action_scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Multiplier for arm7 after public latch release; requires "
+            "--gate_arm_until_grasp_latch and must be in (0, 1]."
+        ),
+    )
+    arm_gate_group.add_argument(
+        "--gate_arm_until_grasp_latch",
+        action="store_true",
+        help=(
+            "Zero arm7 while actor-visible full-task latch[106] is 0 and restore the "
+            "same actor when it is 1; this policy transform is memoryless and Markov."
         ),
     )
     parser.add_argument("--arm_hold_confirm_steps", type=int, default=15)
@@ -2533,6 +2797,40 @@ def validate_hierarchical_arm_hold_evaluation_config(
         raise ValueError("--arm_hold_safe_force_limit must be finite and positive")
 
 
+def validate_public_latch_arm_gate_evaluation_config(
+    *,
+    enabled: bool,
+    task_mode: str,
+    curriculum_dataset: Path | None,
+    curriculum_boundary: str,
+    curriculum_probability: float,
+    curriculum_joint_noise: float,
+    episode_length_s: float | None,
+) -> None:
+    """Restrict the zero-memory latch gate to a comparable full-task reset."""
+
+    if not enabled:
+        return
+    if task_mode != FULL_TASK_MODE:
+        raise ValueError("--gate_arm_until_grasp_latch requires full-task mode")
+    if curriculum_dataset is None:
+        raise ValueError(
+            "--gate_arm_until_grasp_latch requires a close-start curriculum dataset"
+        )
+    if curriculum_boundary != "close_start" or curriculum_probability != 1.0:
+        raise ValueError(
+            "--gate_arm_until_grasp_latch requires close_start resets with probability 1"
+        )
+    if not 0.0 <= curriculum_joint_noise <= 0.02:
+        raise ValueError(
+            "--gate_arm_until_grasp_latch requires curriculum joint noise in [0, 0.02]"
+        )
+    if episode_length_s is not None and episode_length_s < 0.30:
+        raise ValueError(
+            "--gate_arm_until_grasp_latch requires --episode_length_s >= 0.30"
+        )
+
+
 def _validate_args(args: argparse.Namespace) -> None:
     task_mode = task_mode_from_option_flags(
         close_option_mode=args.close_option_mode,
@@ -2540,6 +2838,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         coupled_power_align_close_option_mode=(
             args.coupled_power_align_close_option_mode
         ),
+        coupled_teacher_residual_mode=args.coupled_teacher_residual_mode,
     )
     if args.episodes < 1 or args.num_envs < 1:
         raise ValueError("--episodes and --num_envs must be positive")
@@ -2562,7 +2861,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         curriculum_joint_noise=args.curriculum_joint_noise,
         episode_length_s=args.episode_length_s,
         coupled_power_align_close_option_mode=(
-            task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE
+            task_mode in COUPLED_TASK_MODES
         ),
     )
     validate_hierarchical_arm_hold_evaluation_config(
@@ -2578,8 +2877,31 @@ def _validate_args(args: argparse.Namespace) -> None:
         min_hold_quality=args.arm_hold_min_hold_quality,
         safe_force_limit=args.arm_hold_safe_force_limit,
     )
+    validate_public_latch_arm_gate_evaluation_config(
+        enabled=args.gate_arm_until_grasp_latch,
+        task_mode=task_mode,
+        curriculum_dataset=args.curriculum_dataset,
+        curriculum_boundary=args.curriculum_boundary,
+        curriculum_probability=args.curriculum_probability,
+        curriculum_joint_noise=args.curriculum_joint_noise,
+        episode_length_s=args.episode_length_s,
+    )
+    if (
+        not math.isfinite(args.latched_arm_action_scale)
+        or not 0.0 < args.latched_arm_action_scale <= 1.0
+    ):
+        raise ValueError("--latched_arm_action_scale must be finite and in (0, 1]")
+    if (
+        not args.gate_arm_until_grasp_latch
+        and args.latched_arm_action_scale != 1.0
+    ):
+        raise ValueError(
+            "--latched_arm_action_scale requires --gate_arm_until_grasp_latch"
+        )
     controller_ablation = getattr(args, "coupled_controller_ablation", None)
     teacher_artifact = getattr(args, "coupled_teacher_artifact", None)
+    if args.prior_only and task_mode != COUPLED_TEACHER_RESIDUAL_MODE:
+        raise ValueError("--prior_only requires --coupled_teacher_residual_mode")
     if controller_ablation is None:
         if teacher_artifact is not None:
             raise ValueError(
@@ -2614,14 +2936,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         coupled_power_align_close_option_mode=(
             args.coupled_power_align_close_option_mode
         ),
+        coupled_teacher_residual_mode=args.coupled_teacher_residual_mode,
     )
     if task_mode in CLOSE_OPTION_TASK_MODES and args.episode_length_s is None:
         args.episode_length_s = 5.0
     _validate_args(args)
     _seed_everything(args.seed)
+    curriculum_dataset_sha256: str | None = None
+    if args.curriculum_dataset is not None:
+        if args.curriculum_dataset.is_symlink() or not args.curriculum_dataset.is_file():
+            raise FileNotFoundError(
+                "strict evaluation curriculum must be a regular non-symlink file: "
+                f"{args.curriculum_dataset}"
+            )
+        curriculum_dataset_sha256 = _sha256(args.curriculum_dataset)
 
     controller_ablation = getattr(args, "coupled_controller_ablation", None)
     teacher_prior = None
+    teacher_prior_sha256: str | None = None
     if controller_ablation is not None:
         from coupled_teacher_prior import load_coupled_teacher_prior
 
@@ -2637,6 +2969,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     from adapter import make_pick_tool_env
     from agent_bridge import (
         FLASH_SAC_COMMIT,
+        FLASH_SAC_FORK_COMMIT,
+        ActionAuthorityRule,
         ActionNoiseGroup,
         FlashSACTorchBridge,
         build_agent_config,
@@ -2650,6 +2984,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     checkpoint = resolve_checkpoint_directory(args.checkpoint)
     checkpoint_contract = read_checkpoint_task_contract(checkpoint)
     checkpoint_task_mode = str(checkpoint_contract["task_mode"])
+    checkpoint_authority = checkpoint_contract.get("policy_action_authority", [])
+    expected_public_latch_authority = [
+        {
+            "name": "arm_after_public_latch",
+            "start": 0,
+            "stop": ARM_ACTION_DIM,
+            "observation_index": FULL_TASK_GRASP_LATCH_OBSERVATION_INDEX,
+            "active_value": 1.0,
+        }
+    ]
+    checkpoint_native_public_latch_gate = bool(
+        checkpoint_task_mode == FULL_TASK_MODE
+        and task_mode == FULL_TASK_MODE
+        and checkpoint_authority == expected_public_latch_authority
+    )
     cross_task_actor_evaluation = resolve_cross_task_actor_evaluation(
         checkpoint_task_mode=checkpoint_task_mode,
         requested_task_mode=task_mode,
@@ -2664,6 +3013,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             actor_action_dim=checkpoint_actor_action_dim,
         )
     )
+    if task_mode == COUPLED_TEACHER_RESIDUAL_MODE:
+        assert args.curriculum_dataset is not None
+        teacher_prior, teacher_prior_sha256 = load_checkpoint_teacher_prior(
+            checkpoint=checkpoint,
+            checkpoint_contract=checkpoint_contract,
+            curriculum_dataset=args.curriculum_dataset,
+        )
     checkpoint_architecture = infer_checkpoint_architecture(
         checkpoint,
         expected_action_dim=int(source_policy_contract["policy_action_dim"]),
@@ -2680,11 +3036,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "close_option_mode": task_mode in CLOSE_OPTION_TASK_MODES,
         "power_close_option_mode": task_mode in POWER_CLOSE_TASK_MODES,
         "coupled_power_align_close_option_mode": (
-            task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE
+            task_mode in COUPLED_TASK_MODES
         ),
         "hold_arm_until_stable_grasp": bool(args.hold_arm_until_stable_grasp),
     }
-    if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE:
+    if task_mode in COUPLED_TASK_MODES:
         cfg_overrides.update(
             {
                 "observation_space": COUPLED_OBSERVATION_DIM,
@@ -2720,6 +3076,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         cfg_overrides=cfg_overrides,
         validate_finite=args.validate_finite,
         hand_only_actions=task_mode == POWER_CLOSE_OPTION_MODE,
+        action_transform=(
+            teacher_prior
+            if task_mode == COUPLED_TEACHER_RESIDUAL_MODE
+            else None
+        ),
     )
     task_cfg = env.unwrapped.cfg
     close_option_confirm_steps = int(task_cfg.close_option_confirm_steps)
@@ -2797,6 +3158,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         agent_cfg,
         noise_groups=noise_groups,
         restore_rng_state_on_load=False,
+        action_authority_rules=(
+            tuple(
+                ActionAuthorityRule(**rule)
+                for rule in expected_public_latch_authority
+            )
+            if checkpoint_native_public_latch_gate
+            else ()
+        ),
+        unit_normalize_actor_mean_head=(
+            task_mode != COUPLED_TEACHER_RESIDUAL_MODE
+        ),
     )
     full_to_coupled_transfer = (
         checkpoint_task_mode == FULL_TASK_MODE
@@ -2835,11 +3207,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     try:
         while not tracker.complete and vector_steps < max_vector_steps:
             vector_steps += 1
-            action = agent.sample_actions(
-                vector_steps,
-                {"next_observation": observation},
-                training=False,
-            )
+            if args.prior_only:
+                action = observation.new_zeros(
+                    (args.num_envs, int(target_policy_contract["policy_action_dim"]))
+                )
+            else:
+                action = agent.sample_actions(
+                    vector_steps,
+                    {"next_observation": observation},
+                    training=False,
+                )
             if controller_ablation is not None:
                 assert teacher_prior is not None
                 teacher_action = teacher_prior.teacher_action(observation)
@@ -2847,6 +3224,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     action,
                     teacher_action,
                     controller_ablation,
+                )
+            if args.gate_arm_until_grasp_latch:
+                action = apply_public_latch_arm_gate(
+                    action,
+                    observation,
+                    latched_arm_scale=args.latched_arm_action_scale,
                 )
             # Slots whose deterministic quota is complete continue simulating
             # independently but cannot contribute additional events.
@@ -2901,6 +3284,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 f"completed {len(tracker.records)}/{args.episodes} episodes after "
                 f"--max_vector_steps={max_vector_steps}"
             )
+        if args.curriculum_dataset is not None:
+            assert curriculum_dataset_sha256 is not None
+            if _sha256(args.curriculum_dataset) != curriculum_dataset_sha256:
+                raise RuntimeError(
+                    "curriculum dataset changed during strict evaluation; refusing metrics"
+                )
         metrics = build_strict_metrics(
             tracker.records,
             checkpoint=checkpoint,
@@ -2912,11 +3301,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             episode_length_s=float(env.unwrapped.cfg.episode_length_s),
             max_episode_steps=env.max_episode_steps,
             curriculum_dataset=args.curriculum_dataset,
-            curriculum_dataset_sha256=(
-                _sha256(args.curriculum_dataset)
-                if args.curriculum_dataset is not None
-                else None
-            ),
+            curriculum_dataset_sha256=curriculum_dataset_sha256,
             curriculum_boundary=args.curriculum_boundary,
             curriculum_probability=args.curriculum_probability,
             curriculum_joint_noise=args.curriculum_joint_noise,
@@ -2943,6 +3328,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             power_required_other_contacts=power_required_other_contacts,
         )
         metrics["checkpoint_policy_contract"] = source_policy_contract
+        metrics["flashsac_fork_commit"] = FLASH_SAC_FORK_COMMIT
         metrics["actor_action_projection_indices"] = (
             list(source_action_indices) if source_action_indices is not None else None
         )
@@ -2954,8 +3340,30 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         metrics["hold_arm_until_stable_grasp"] = bool(
             args.hold_arm_until_stable_grasp
         )
+        metrics["gate_arm_until_grasp_latch"] = bool(
+            args.gate_arm_until_grasp_latch
+        )
+        metrics["checkpoint_policy_action_authority"] = checkpoint_authority
+        metrics["checkpoint_native_public_latch_arm_gate"] = bool(
+            checkpoint_native_public_latch_gate
+        )
         metrics["coupled_controller_ablation"] = controller_ablation
-        if teacher_prior is not None:
+        metrics["prior_only"] = bool(args.prior_only)
+        if task_mode == COUPLED_TEACHER_RESIDUAL_MODE:
+            assert teacher_prior is not None
+            assert teacher_prior_sha256 is not None
+            prior_payload = teacher_prior.contract_payload()
+            metrics["teacher_action_prior"] = prior_payload
+            metrics["teacher_action_prior_sha256"] = teacher_prior_sha256
+            # Keep the established coupled-prior field as a compatibility
+            # alias while making the checkpoint provenance explicit above.
+            metrics["coupled_teacher_prior"] = prior_payload
+            metrics["policy"] = (
+                "embedded_teacher_prior+exact_zero_hand_residual"
+                if args.prior_only
+                else "embedded_teacher_prior+deterministic_tanh_hand_residual"
+            )
+        elif teacher_prior is not None:
             metrics["coupled_teacher_prior"] = teacher_prior.contract_payload()
             metrics["coupled_teacher_artifact"] = teacher_prior.teacher_artifact_path
             metrics["policy"] = (
@@ -2975,6 +3383,34 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "safe_force_limit_n": arm_hold_safe_force_limit,
                 "release_semantics": (
                     "first unmasked arm action after the confirmed stable-close window"
+                ),
+            }
+        elif args.gate_arm_until_grasp_latch:
+            metrics["policy"] = (
+                "deterministic_tanh_actor_mean+public_latch_arm_gate"
+            )
+            metrics["public_latch_arm_gate"] = {
+                "arm_action_width": ARM_ACTION_DIM,
+                "latch_observation_index": (
+                    FULL_TASK_GRASP_LATCH_OBSERVATION_INDEX
+                ),
+                "latched_arm_action_scale": args.latched_arm_action_scale,
+                "semantics": (
+                    "arm7=0 iff actor-visible latch[106]=0; no hidden state"
+                ),
+            }
+        elif checkpoint_native_public_latch_gate:
+            metrics["policy"] = (
+                "deterministic_tanh_actor_mean+checkpoint_public_latch_arm_gate"
+            )
+            metrics["public_latch_arm_gate"] = {
+                "arm_action_width": ARM_ACTION_DIM,
+                "latch_observation_index": (
+                    FULL_TASK_GRASP_LATCH_OBSERVATION_INDEX
+                ),
+                "latched_arm_action_scale": 1.0,
+                "semantics": (
+                    "checkpoint V5 authority: arm7=0 iff actor-visible latch[106]=0"
                 ),
             }
         _atomic_write_json(args.output.resolve(), metrics)
