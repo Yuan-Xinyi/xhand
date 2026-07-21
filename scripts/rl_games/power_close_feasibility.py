@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Search hybrid14 hand actions for a strict thumb-plus-three power close.
+"""Search arm7 plus hybrid14 actions for a strict thumb-plus-three power close.
 
 The input is a recoverable fixed-pregrasp artifact emitted by
 ``hand_space_feasibility.py``.  Unlike the historical benchmark, this search
@@ -8,7 +8,9 @@ non-thumb contacts, rigid hold, a 30 N force ceiling, and a 15-frame stable
 window after the four-frame power latch.  Arm commands are zero by default.
 An optional bounded seven-joint arm-target search is a reachability oracle only;
 its winner must reproduce through the public incremental controller before use
-as a teacher.  Every CEM iteration restores the same robot/object state.
+as a teacher.  With ``--coupled_power_contract``, candidates execute through the
+native 131-D ALIGN->CLOSE task, its phase shields and its terminal telemetry.
+Every CEM iteration restores the same native reset boundary.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ parser.add_argument("--input", required=True, help="artifact supplying the fixed
 parser.add_argument(
     "--initial_action_input",
     default=None,
-    help="optional artifact supplying the initial results.hybrid14 latent",
+    help="optional artifact supplying the initial coupled or legacy hybrid14 latent",
 )
 parser.add_argument("--population", type=int, default=512)
 parser.add_argument(
@@ -61,6 +63,20 @@ parser.add_argument(
         "controller, including EMA, slew and tactile shields"
     ),
 )
+parser.add_argument(
+    "--coupled_power_contract",
+    action="store_true",
+    help=(
+        "run through the native 131-D coupled ALIGN->CLOSE environment contract; "
+        "requires --public_controller and a one-state static curriculum"
+    ),
+)
+parser.add_argument(
+    "--curriculum_dataset",
+    type=Path,
+    default=None,
+    help="coupled_power_static_close_start_v1 dataset used for exact native resets",
+)
 parser.add_argument("--close_steps", type=int, default=48)
 parser.add_argument("--eval_steps", type=int, default=24)
 parser.add_argument("--elite_frac", type=float, default=0.10)
@@ -93,6 +109,17 @@ if args_cli.public_controller and args_cli.arm_delta_limit_rad <= 0.0:
     parser.error("--public_controller currently requires a positive arm micro-adjustment limit")
 if not 0.02 <= args_cli.elite_frac <= 0.5:
     parser.error("--elite_frac must lie in [0.02, 0.5]")
+if args_cli.coupled_power_contract:
+    if not args_cli.public_controller:
+        parser.error("--coupled_power_contract requires --public_controller")
+    if args_cli.curriculum_dataset is None:
+        parser.error("--coupled_power_contract requires --curriculum_dataset")
+    if args_cli.align_steps != 24:
+        parser.error("coupled power v1 requires --align_steps 24")
+    if not 0.0 < args_cli.arm_delta_limit_rad <= 0.12:
+        parser.error("coupled power v1 requires --arm_delta_limit_rad in (0, 0.12]")
+elif args_cli.curriculum_dataset is not None:
+    parser.error("--curriculum_dataset is only valid with --coupled_power_contract")
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -118,8 +145,10 @@ from power_close_search_contract import (
     POWER_STABLE_FRAMES,
     POWER_XY_DRIFT_LIMIT,
     aggregate_replicated_candidates,
+    conservative_coupled_teacher_pass,
     power_close_candidate_score,
     power_close_stable_frame,
+    simultaneous_power_contact_stages,
     strict_power_close_pass,
     update_power_grasp_latch,
     update_stable_streak,
@@ -156,9 +185,16 @@ def _quat_angle(reference: torch.Tensor, current: torch.Tensor) -> torch.Tensor:
 def main() -> None:
     input_path = Path(args_cli.input).resolve()
     artifact = json.loads(input_path.read_text(encoding="utf-8"))
-    pregrasp = artifact.get("pregrasp")
+    pregrasp = (
+        artifact.get("effective_static_pregrasp")
+        if args_cli.coupled_power_contract
+        else artifact.get("pregrasp")
+    )
+    if pregrasp is None:
+        pregrasp = artifact.get("pregrasp")
     if not isinstance(pregrasp, dict):
         raise ValueError("input artifact has no pregrasp mapping")
+    source_pregrasp = artifact.get("source_pregrasp", artifact.get("pregrasp", pregrasp))
     joint_pos = _require_list(pregrasp, "joint_pos", 19)
     object_local_pos = _require_list(pregrasp, "object_local_pos", 3)
     object_quat = _require_list(pregrasp, "object_quat", 4)
@@ -170,12 +206,81 @@ def main() -> None:
     )
     initial_artifact = json.loads(initial_path.read_text(encoding="utf-8"))
     try:
-        initial_result = initial_artifact["results"]["hybrid14"]
+        initial_results = initial_artifact["results"]
+        initial_result = (
+            initial_results.get("coupled_align_close21")
+            if args_cli.coupled_power_contract
+            else None
+        )
+        if initial_result is None:
+            initial_result = initial_results["hybrid14"]
         initial_latent = initial_result["latent"]
-    except (KeyError, TypeError) as exc:
-        raise ValueError("initial action artifact has no results.hybrid14.latent") from exc
+    except (AttributeError, KeyError, TypeError) as exc:
+        raise ValueError(
+            "initial action artifact has no coupled/legacy hybrid14 latent"
+        ) from exc
     if not isinstance(initial_latent, list) or len(initial_latent) != HAND_DIM:
         raise ValueError("initial hybrid14 latent must contain 14 values")
+
+    curriculum_path: Path | None = None
+    curriculum_sha256: str | None = None
+    curriculum_boundary: dict[str, torch.Tensor] | None = None
+    if args_cli.coupled_power_contract:
+        assert args_cli.curriculum_dataset is not None
+        curriculum_path = args_cli.curriculum_dataset.expanduser().resolve()
+        if not curriculum_path.is_file():
+            raise FileNotFoundError(f"curriculum dataset does not exist: {curriculum_path}")
+        curriculum = torch.load(curriculum_path, map_location="cpu", weights_only=False)
+        if not isinstance(curriculum, dict):
+            raise TypeError("coupled curriculum must be a dictionary")
+        metadata = curriculum.get("meta")
+        if not isinstance(metadata, dict) or metadata.get("contract") != (
+            "coupled_power_static_close_start_v1"
+        ):
+            raise ValueError(
+                "coupled curriculum must use coupled_power_static_close_start_v1"
+            )
+        try:
+            curriculum_boundary = curriculum["boundaries"]["close_start"]
+        except (KeyError, TypeError) as exc:
+            raise ValueError("coupled curriculum lacks boundaries.close_start") from exc
+        if not isinstance(curriculum_boundary, dict):
+            raise TypeError("coupled curriculum close_start boundary must be a dictionary")
+        boundary_joint = curriculum_boundary.get("joint_pos")
+        if not isinstance(boundary_joint, torch.Tensor) or boundary_joint.shape != (1, 19):
+            shape = tuple(boundary_joint.shape) if isinstance(boundary_joint, torch.Tensor) else None
+            raise ValueError(f"coupled CEM requires exactly one joint state, got {shape}")
+        for name, expected in (
+            ("object_local_pos", (1, 3)),
+            ("object_quat", (1, 4)),
+        ):
+            value = curriculum_boundary.get(name)
+            if not isinstance(value, torch.Tensor) or tuple(value.shape) != expected:
+                shape = tuple(value.shape) if isinstance(value, torch.Tensor) else None
+                raise ValueError(f"coupled curriculum {name} expected {expected}, got {shape}")
+        artifact_joint = torch.tensor(joint_pos, dtype=torch.float32)
+        artifact_object_pos = torch.tensor(object_local_pos, dtype=torch.float32)
+        artifact_object_quat = torch.tensor(object_quat, dtype=torch.float32)
+        joint_error = float((boundary_joint[0].float() - artifact_joint).abs().max())
+        object_pos_error = float(
+            (curriculum_boundary["object_local_pos"][0].float() - artifact_object_pos)
+            .abs()
+            .max()
+        )
+        curriculum_quat = curriculum_boundary["object_quat"][0].float()
+        quat_error = float(
+            torch.minimum(
+                (curriculum_quat - artifact_object_quat).abs().max(),
+                (curriculum_quat + artifact_object_quat).abs().max(),
+            )
+        )
+        if max(joint_error, object_pos_error, quat_error) > 1.0e-5:
+            raise ValueError(
+                "input pregrasp does not match the one-state coupled curriculum: "
+                f"joint={joint_error:.3g} object_pos={object_pos_error:.3g} "
+                f"quat={quat_error:.3g}"
+            )
+        curriculum_sha256 = _sha256(curriculum_path)
 
     torch.manual_seed(args_cli.seed)
     num_envs = args_cli.population
@@ -185,14 +290,44 @@ def main() -> None:
         "Pick-Tool-Token-Direct-v0", device=args_cli.device, num_envs=num_envs
     )
     cfg.seed = args_cli.seed
-    cfg.episode_length_s = 120.0
-    cfg.terminate_on_drop = False
-    cfg.success_hold_steps = 100000
+    if args_cli.coupled_power_contract:
+        assert curriculum_path is not None
+        cfg.close_option_mode = True
+        cfg.power_close_option_mode = True
+        cfg.coupled_power_align_close_option_mode = True
+        cfg.observation_space = 131
+        cfg.state_space = 131
+        cfg.episode_length_s = 3.0
+        cfg.curriculum_dataset = str(curriculum_path)
+        cfg.curriculum_boundary = "close_start"
+        cfg.curriculum_reset_probability = 1.0
+        cfg.curriculum_joint_noise = 0.0
+    else:
+        cfg.episode_length_s = 120.0
+        cfg.terminate_on_drop = False
+        cfg.success_hold_steps = 100000
     env = gym.make("Pick-Tool-Token-Direct-v0", cfg=cfg)
     u = env.unwrapped
-    env.reset()
+    observations, _ = env.reset()
     dev = u.device
     all_ids = u.robot._ALL_INDICES
+
+    expected_observation_dim = 131 if args_cli.coupled_power_contract else cfg.observation_space
+    policy_observation = observations.get("policy")
+    if not isinstance(policy_observation, torch.Tensor) or policy_observation.shape != (
+        num_envs,
+        expected_observation_dim,
+    ):
+        shape = (
+            tuple(policy_observation.shape)
+            if isinstance(policy_observation, torch.Tensor)
+            else None
+        )
+        raise RuntimeError(
+            f"expected policy observation {(num_envs, expected_observation_dim)}, got {shape}"
+        )
+    if args_cli.coupled_power_contract and not bool(u._curriculum_reset_mask.all()):
+        raise RuntimeError("one or more coupled environments missed the mandatory curriculum reset")
 
     if cfg.action_space != ARM_DIM + HAND_DIM:
         raise RuntimeError(f"expected formal 21-D action space, got {cfg.action_space}")
@@ -206,11 +341,198 @@ def main() -> None:
         num_envs, dtype=torch.bool, device=dev
     )
     native_timeout_seen = torch.zeros_like(native_terminated_seen)
+    native_success_seen = torch.zeros_like(native_terminated_seen)
+    native_failure_seen = torch.zeros_like(native_terminated_seen)
+    native_terminal_seen = torch.zeros_like(native_terminated_seen)
+    native_first_terminal_step = torch.full(
+        (num_envs,), -1, dtype=torch.long, device=dev
+    )
+    native_terminal_stable_steps = torch.zeros(
+        num_envs, dtype=torch.long, device=dev
+    )
+    native_terminal_power_is_grasped = torch.zeros_like(native_terminated_seen)
+    native_terminal_thumb_contact = torch.zeros_like(native_terminated_seen)
+    native_terminal_legal_other = torch.zeros(
+        num_envs, dtype=torch.long, device=dev
+    )
+    native_terminal_latch_confirm_steps = torch.zeros(
+        num_envs, dtype=torch.long, device=dev
+    )
+    native_terminal_power_grasp_quality = torch.zeros(num_envs, device=dev)
+    native_terminal_hold_quality = torch.zeros(num_envs, device=dev)
+    native_terminal_max_force = torch.zeros(num_envs, device=dev)
+    native_terminal_align_active = torch.zeros_like(native_terminated_seen)
+    rollout_active = torch.ones_like(native_terminated_seen)
+    native_reason_keys = (
+        "dropped",
+        "unsafe_force",
+        "power_close_option_failure",
+        "power_close_option_timeout",
+        "close_option_unlatched_lift",
+        "close_option_horizontal_escape",
+        "close_option_lost_window",
+        "coupled_power_pose_escape",
+        "coupled_power_arm_target_saturated",
+    )
+    native_terminal_reasons = {
+        key: torch.zeros_like(native_terminated_seen) for key in native_reason_keys
+    }
 
     def no_auto_reset(self):
         terminated, time_out = native_get_dones()
-        native_terminated_seen.logical_or_(terminated)
-        native_timeout_seen.logical_or_(time_out)
+        if args_cli.coupled_power_contract:
+            terminal = self.extras.get("pick_tool_terminal")
+            if not isinstance(terminal, dict):
+                raise RuntimeError("native coupled dones omitted pick_tool_terminal")
+
+            def require_terminal_tensor(name: str, dtype: torch.dtype) -> torch.Tensor:
+                value = terminal.get(name)
+                if not isinstance(value, torch.Tensor) or value.shape != (num_envs,):
+                    shape = tuple(value.shape) if isinstance(value, torch.Tensor) else None
+                    raise RuntimeError(f"invalid native terminal field {name!r}: {shape}")
+                if value.dtype != dtype or value.device != torch.device(dev):
+                    raise RuntimeError(
+                        f"invalid native terminal field {name!r}: "
+                        f"dtype={value.dtype} device={value.device}"
+                    )
+                return value
+
+            success = require_terminal_tensor(
+                "power_close_option_success", torch.bool
+            )
+            failure = require_terminal_tensor(
+                "power_close_option_failure", torch.bool
+            )
+            timeout = require_terminal_tensor(
+                "power_close_option_timeout", torch.bool
+            )
+            stable_steps = require_terminal_tensor(
+                "power_close_option_stable_steps", torch.long
+            )
+            terminal_power_is_grasped = require_terminal_tensor(
+                "power_is_grasped", torch.bool
+            )
+            terminal_thumb_contact = require_terminal_tensor(
+                "power_thumb_contact", torch.bool
+            )
+            terminal_legal_other = require_terminal_tensor(
+                "power_legal_other_contact_count", torch.long
+            )
+            terminal_latch_confirm_steps = require_terminal_tensor(
+                "power_grasp_latch_confirm_steps", torch.long
+            )
+            terminal_power_grasp_quality = require_terminal_tensor(
+                "power_grasp_quality", torch.float32
+            )
+            terminal_hold_quality = require_terminal_tensor(
+                "hold_quality", torch.float32
+            )
+            terminal_max_force = require_terminal_tensor("max_force", torch.float32)
+            terminal_align_active = require_terminal_tensor(
+                "coupled_power_align_active", torch.bool
+            )
+            generic_success = require_terminal_tensor("success", torch.bool)
+            generic_failure = require_terminal_tensor("failure", torch.bool)
+            generic_timeout = require_terminal_tensor("time_out", torch.bool)
+            dropped = require_terminal_tensor("dropped", torch.bool)
+            unsafe_force = require_terminal_tensor("unsafe_force", torch.bool)
+            pose_escape = require_terminal_tensor(
+                "coupled_power_pose_escape", torch.bool
+            )
+            if not torch.equal(terminated, success | failure):
+                raise RuntimeError("native coupled terminated classification is inconsistent")
+            if not torch.equal(time_out, timeout):
+                raise RuntimeError("native coupled timeout classification is inconsistent")
+            if not (
+                torch.equal(generic_success, success)
+                and torch.equal(generic_failure, failure)
+                and torch.equal(generic_timeout, timeout)
+            ):
+                raise RuntimeError("native coupled generic terminal aliases are inconsistent")
+            if bool(((success & failure) | (success & timeout) | (failure & timeout)).any()):
+                raise RuntimeError("native coupled terminal classes are not mutually exclusive")
+            if bool((success & (dropped | unsafe_force | pose_escape)).any()):
+                raise RuntimeError("native coupled success violated safety precedence")
+            done = terminated | time_out
+            newly_done = done & (~native_terminal_seen)
+            native_terminated_seen.logical_or_(terminated & newly_done)
+            native_timeout_seen.logical_or_(time_out & newly_done)
+            native_success_seen.logical_or_(success & newly_done)
+            native_failure_seen.logical_or_(failure & newly_done)
+            native_terminal_stable_steps.copy_(
+                torch.where(newly_done, stable_steps, native_terminal_stable_steps)
+            )
+            native_first_terminal_step.copy_(
+                torch.where(
+                    newly_done,
+                    self.episode_length_buf,
+                    native_first_terminal_step,
+                )
+            )
+            native_terminal_power_is_grasped.copy_(
+                torch.where(
+                    newly_done,
+                    terminal_power_is_grasped,
+                    native_terminal_power_is_grasped,
+                )
+            )
+            native_terminal_thumb_contact.copy_(
+                torch.where(
+                    newly_done,
+                    terminal_thumb_contact,
+                    native_terminal_thumb_contact,
+                )
+            )
+            native_terminal_legal_other.copy_(
+                torch.where(
+                    newly_done,
+                    terminal_legal_other,
+                    native_terminal_legal_other,
+                )
+            )
+            native_terminal_latch_confirm_steps.copy_(
+                torch.where(
+                    newly_done,
+                    terminal_latch_confirm_steps,
+                    native_terminal_latch_confirm_steps,
+                )
+            )
+            native_terminal_power_grasp_quality.copy_(
+                torch.where(
+                    newly_done,
+                    terminal_power_grasp_quality,
+                    native_terminal_power_grasp_quality,
+                )
+            )
+            native_terminal_hold_quality.copy_(
+                torch.where(
+                    newly_done,
+                    terminal_hold_quality,
+                    native_terminal_hold_quality,
+                )
+            )
+            native_terminal_max_force.copy_(
+                torch.where(
+                    newly_done,
+                    terminal_max_force,
+                    native_terminal_max_force,
+                )
+            )
+            native_terminal_align_active.copy_(
+                torch.where(
+                    newly_done,
+                    terminal_align_active,
+                    native_terminal_align_active,
+                )
+            )
+            for key, captured in native_terminal_reasons.items():
+                value = require_terminal_tensor(key, torch.bool)
+                captured.logical_or_(value & newly_done)
+            native_terminal_seen.logical_or_(done)
+            rollout_active.logical_and_(~done)
+        else:
+            native_terminated_seen.logical_or_(terminated)
+            native_timeout_seen.logical_or_(time_out)
         zeros = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         return zeros, zeros
 
@@ -243,27 +565,57 @@ def main() -> None:
 
     @torch.inference_mode()
     def restore_snapshot() -> None:
-        u._reset_idx(all_ids)
-        u.robot.write_joint_state_to_sim(
-            repeated_joint, torch.zeros_like(repeated_joint), env_ids=all_ids
-        )
-        u.robot.set_joint_position_target(repeated_joint, env_ids=all_ids)
-        u.dof_targets.copy_(repeated_joint)
-        search_joint_target.copy_(repeated_joint)
-        pose = torch.zeros((num_envs, 7), dtype=torch.float32, device=dev)
-        pose[:, :3] = snapshot_object_local + u.scene.env_origins
-        pose[:, 3:7] = snapshot_object_quat
-        u.object.write_root_pose_to_sim(pose, env_ids=all_ids)
-        u.object.write_root_velocity_to_sim(
-            torch.zeros((num_envs, 6), device=dev), env_ids=all_ids
-        )
-        u.episode_length_buf.zero_()
-        u.actions.zero_()
-        u.prev_actions.zero_()
-        u._compute_intermediate_values()
-        start_com_xy.copy_(u._object_com_position_w()[:, :2])
+        if args_cli.coupled_power_contract:
+            reset_observations, _ = env.reset()
+            policy = reset_observations.get("policy")
+            if not isinstance(policy, torch.Tensor) or policy.shape != (num_envs, 131):
+                raise RuntimeError("native coupled reset changed the 131-D observation contract")
+            if not bool(u._curriculum_reset_mask.all()):
+                raise RuntimeError("native coupled reset missed a curriculum row")
+            if bool((u.episode_length_buf != 0).any()):
+                raise RuntimeError("native coupled reset did not clear the episode clock")
+            repeated_joint.copy_(u.dof_targets)
+            search_joint_target.copy_(u.dof_targets)
+            start_com_xy.copy_(u._close_option_start_xy)
+            snapshot_quat_batch.copy_(u._close_option_start_quat)
+        else:
+            u._reset_idx(all_ids)
+            u.robot.write_joint_state_to_sim(
+                repeated_joint, torch.zeros_like(repeated_joint), env_ids=all_ids
+            )
+            u.robot.set_joint_position_target(repeated_joint, env_ids=all_ids)
+            u.dof_targets.copy_(repeated_joint)
+            search_joint_target.copy_(repeated_joint)
+            pose = torch.zeros((num_envs, 7), dtype=torch.float32, device=dev)
+            pose[:, :3] = snapshot_object_local + u.scene.env_origins
+            pose[:, 3:7] = snapshot_object_quat
+            u.object.write_root_pose_to_sim(pose, env_ids=all_ids)
+            u.object.write_root_velocity_to_sim(
+                torch.zeros((num_envs, 6), device=dev), env_ids=all_ids
+            )
+            u.episode_length_buf.zero_()
+            u.actions.zero_()
+            u.prev_actions.zero_()
+            u._compute_intermediate_values()
+            start_com_xy.copy_(u._object_com_position_w()[:, :2])
         native_terminated_seen.zero_()
         native_timeout_seen.zero_()
+        native_success_seen.zero_()
+        native_failure_seen.zero_()
+        native_terminal_seen.zero_()
+        native_first_terminal_step.fill_(-1)
+        native_terminal_stable_steps.zero_()
+        native_terminal_power_is_grasped.zero_()
+        native_terminal_thumb_contact.zero_()
+        native_terminal_legal_other.zero_()
+        native_terminal_latch_confirm_steps.zero_()
+        native_terminal_power_grasp_quality.zero_()
+        native_terminal_hold_quality.zero_()
+        native_terminal_max_force.zero_()
+        native_terminal_align_active.zero_()
+        rollout_active.fill_(True)
+        for captured in native_terminal_reasons.values():
+            captured.zero_()
 
     hand_lower = u.dof_lower[:, u._hand_ids_t]
     hand_upper = u.dof_upper[:, u._hand_ids_t]
@@ -283,7 +635,7 @@ def main() -> None:
 
     initial_hold_action: torch.Tensor | None = None
     initial_hold_decode_error = 0.0
-    if args_cli.public_controller:
+    if args_cli.public_controller and not args_cli.coupled_power_contract:
         pregrasp_token = pregrasp.get("token")
         if not isinstance(pregrasp_token, list) or len(pregrasp_token) != u._n_tokens:
             raise ValueError("public-controller alignment requires pregrasp.token[9]")
@@ -384,6 +736,13 @@ def main() -> None:
     )
     best_any: dict | None = None
     best_pass: dict | None = None
+    best_native: dict | None = None
+    search_trace: list[dict] = []
+    controller_label = (
+        "coupled-native"
+        if args_cli.coupled_power_contract
+        else ("public" if args_cli.public_controller else "oracle")
+    )
 
     print(
         f"POWER CEM envs={num_envs} candidates={num_candidates} "
@@ -391,7 +750,7 @@ def main() -> None:
         f"align={args_cli.align_steps} close={args_cli.close_steps} "
         f"eval={args_cli.eval_steps} elites={elite_count} "
         f"arm_delta_limit={args_cli.arm_delta_limit_rad:.3f}rad "
-        f"controller={'public' if args_cli.public_controller else 'oracle'} "
+        f"controller={controller_label} "
         f"initial_hold_error={initial_hold_decode_error:.4f}rad",
         flush=True,
     )
@@ -415,6 +774,10 @@ def main() -> None:
         action = torch.zeros((num_envs, ARM_DIM + HAND_DIM), device=dev)
         action[:, ARM_DIM:] = hand_latent
 
+        # Coupled search must rebuild every candidate rollout from the environment's native
+        # close-start reset.  This initializes the phase clock, latch counters, potentials and
+        # target anchors that a hand-written joint/object restore cannot reproduce.
+        restore_snapshot()
         candidate_joint_target = repeated_joint.clone()
         candidate_hand_target = decode_hybrid14(hand_latent)
         candidate_joint_target[:, u._hand_ids_t] = candidate_hand_target
@@ -434,15 +797,22 @@ def main() -> None:
         else:
             arm_delta_actual = torch.zeros((num_envs, ARM_DIM), device=dev)
 
-        restore_snapshot()
         q_close_sum = torch.zeros(num_envs, device=dev)
         q_wrap_sum = torch.zeros(num_envs, device=dev)
         q_grasp_sum = torch.zeros(num_envs, device=dev)
+        q_close_peak = torch.zeros(num_envs, device=dev)
+        q_wrap_peak = torch.zeros(num_envs, device=dev)
+        q_grasp_peak = torch.zeros(num_envs, device=dev)
         hold_sum = torch.zeros(num_envs, device=dev)
+        hold_peak = torch.zeros(num_envs, device=dev)
         thumb_sum = torch.zeros(num_envs, device=dev)
         legal_other_sum = torch.zeros(num_envs, device=dev)
-        third_other_sum = torch.zeros(num_envs, device=dev)
-        fourth_other_sum = torch.zeros(num_envs, device=dev)
+        legal_other_peak = torch.zeros(num_envs, dtype=torch.long, device=dev)
+        thumb_and_third_sum = torch.zeros(num_envs, device=dev)
+        thumb_and_fourth_sum = torch.zeros(num_envs, device=dev)
+        thumb_and_three_seen = torch.zeros(
+            num_envs, dtype=torch.bool, device=dev
+        )
         stable_sum = torch.zeros(num_envs, device=dev)
         stable_streak = torch.zeros(num_envs, dtype=torch.long, device=dev)
         stable_streak_peak = torch.zeros_like(stable_streak)
@@ -462,14 +832,60 @@ def main() -> None:
             (num_envs,), float("inf"), device=dev
         )
         arm_tracking_error_peak = torch.zeros(num_envs, device=dev)
-        eval_count = 0
+        arm_target_saturated_seen = torch.zeros(
+            num_envs, dtype=torch.bool, device=dev
+        )
+        native_stable_streak_peak = torch.zeros(
+            num_envs, dtype=torch.long, device=dev
+        )
+        native_power_latched_seen = torch.zeros(
+            num_envs, dtype=torch.bool, device=dev
+        )
+        native_latch_confirm_steps_peak = torch.zeros(
+            num_envs, dtype=torch.long, device=dev
+        )
+        eval_count = torch.zeros(num_envs, device=dev)
 
-        eval_start = args_cli.align_steps + args_cli.close_steps
-        total_steps = eval_start + args_cli.eval_steps
+        # Teacher safety is trajectory-wide, including the reset boundary before action 1.
+        initial_signals = u._compute_grasp_signals()
+        force_peak.copy_(initial_signals["force_magnitude"])
+        initial_clearance = u._object_true_min_z() - u._table_surface_z
+        clearance_peak.copy_(initial_clearance)
+        clearance_min.copy_(initial_clearance)
+        initial_com_xy = u._object_com_position_w()[:, :2]
+        xy_drift_peak.copy_((initial_com_xy - start_com_xy).norm(dim=-1))
+        rotation_drift_peak.copy_(
+            _quat_angle(snapshot_quat_batch, u.object.data.root_quat_w)
+        )
+        initial_arm_clearance = (
+            u.robot.data.body_pos_w[:, u._arm_body_ids, 2]
+            - u.scene.env_origins[:, 2].unsqueeze(-1)
+            - u._table_surface_z
+        ).min(dim=-1).values
+        arm_table_clearance_min.copy_(initial_arm_clearance)
+
+        eval_start = (
+            args_cli.align_steps
+            if args_cli.coupled_power_contract
+            else args_cli.align_steps + args_cli.close_steps
+        )
+        total_steps = (
+            int(u.max_episode_length)
+            if args_cli.coupled_power_contract
+            else args_cli.align_steps + args_cli.close_steps + args_cli.eval_steps
+        )
+        rollout_steps_executed = 0
         for step in range(total_steps):
+            if args_cli.coupled_power_contract and not bool(rollout_active.any()):
+                break
+            rollout_steps_executed = step + 1
+            step_active = (
+                rollout_active.clone()
+                if args_cli.coupled_power_contract
+                else torch.ones(num_envs, dtype=torch.bool, device=dev)
+            )
             desired_arm_target = candidate_joint_target[:, u._arm_ids_t]
             if args_cli.public_controller:
-                assert initial_hold_action is not None
                 step_action = torch.zeros_like(action)
                 if step < args_cli.align_steps:
                     x = float(step + 1) / float(args_cli.align_steps)
@@ -477,23 +893,40 @@ def main() -> None:
                     desired_arm_target = repeated_joint[:, u._arm_ids_t] + (
                         arm_blend * arm_delta_actual
                     )
-                    step_action[:, ARM_DIM:] = initial_hold_action
+                    if args_cli.coupled_power_contract:
+                        # The native phase shield holds the captured hand target during ALIGN.
+                        # Supplying the candidate throughout also handles an early power latch:
+                        # the environment then atomically removes arm authority and enables hand.
+                        step_action[:, ARM_DIM:] = hand_latent
+                    else:
+                        assert initial_hold_action is not None
+                        step_action[:, ARM_DIM:] = initial_hold_action
                 else:
                     step_action[:, ARM_DIM:] = hand_latent
                 current_arm_target = u.dof_targets[:, u._arm_ids_t]
+                arm_multiplier = (
+                    cfg.coupled_power_arm_action_multiplier
+                    if args_cli.coupled_power_contract
+                    else 1.0
+                )
                 step_action[:, :ARM_DIM] = torch.clamp(
                     (desired_arm_target - current_arm_target)
-                    / (cfg.action_scale * cfg.act_moving_average),
+                    / (cfg.action_scale * cfg.act_moving_average * arm_multiplier),
                     -1.0,
                     1.0,
                 )
+                step_action[~step_active] = 0.0
                 env.step(step_action)
-                arm_tracking_error_peak = torch.maximum(
-                    arm_tracking_error_peak,
+                tracking_error = (
                     (u.dof_targets[:, u._arm_ids_t] - desired_arm_target)
                     .abs()
                     .max(dim=-1)
-                    .values,
+                    .values
+                )
+                arm_tracking_error_peak = torch.where(
+                    step_active,
+                    torch.maximum(arm_tracking_error_peak, tracking_error),
+                    arm_tracking_error_peak,
                 )
             elif search_arm_micro:
                 search_joint_target.copy_(repeated_joint)
@@ -523,27 +956,80 @@ def main() -> None:
                 env.step(action)
             signals = u._compute_grasp_signals()
             max_force = signals["force_magnitude"].max(dim=-1).values
-            force_peak = torch.maximum(force_peak, signals["force_magnitude"])
+            force_peak = torch.where(
+                step_active.unsqueeze(-1),
+                torch.maximum(force_peak, signals["force_magnitude"]),
+                force_peak,
+            )
             clearance = u._object_true_min_z() - u._table_surface_z
-            clearance_peak = torch.maximum(clearance_peak, clearance)
-            clearance_min = torch.minimum(clearance_min, clearance)
+            clearance_peak = torch.where(
+                step_active,
+                torch.maximum(clearance_peak, clearance),
+                clearance_peak,
+            )
+            clearance_min = torch.where(
+                step_active,
+                torch.minimum(clearance_min, clearance),
+                clearance_min,
+            )
             object_com_xy = u._object_com_position_w()[:, :2]
             xy_drift = (object_com_xy - start_com_xy).norm(dim=-1)
-            xy_drift_peak = torch.maximum(xy_drift_peak, xy_drift)
+            xy_drift_peak = torch.where(
+                step_active, torch.maximum(xy_drift_peak, xy_drift), xy_drift_peak
+            )
             rotation_drift = _quat_angle(
                 snapshot_quat_batch, u.object.data.root_quat_w
             )
-            rotation_drift_peak = torch.maximum(
-                rotation_drift_peak, rotation_drift
+            rotation_drift_peak = torch.where(
+                step_active,
+                torch.maximum(rotation_drift_peak, rotation_drift),
+                rotation_drift_peak,
             )
             arm_clearance = (
                 u.robot.data.body_pos_w[:, u._arm_body_ids, 2]
                 - u.scene.env_origins[:, 2].unsqueeze(-1)
                 - u._table_surface_z
             ).min(dim=-1).values
-            arm_table_clearance_min = torch.minimum(
-                arm_table_clearance_min, arm_clearance
+            arm_table_clearance_min = torch.where(
+                step_active,
+                torch.minimum(arm_table_clearance_min, arm_clearance),
+                arm_table_clearance_min,
             )
+            if args_cli.coupled_power_contract:
+                arm_target_saturated_seen.logical_or_(
+                    step_active & u._coupled_arm_target_saturated_ever
+                )
+                native_stable_streak_peak.copy_(
+                    torch.where(
+                        step_active,
+                        torch.maximum(
+                            native_stable_streak_peak,
+                            u._close_option_stable_steps,
+                        ),
+                        native_stable_streak_peak,
+                    )
+                )
+                native_latch_state = torch.where(
+                    native_terminal_seen,
+                    native_terminal_power_is_grasped,
+                    u._power_is_grasped,
+                )
+                native_confirm_steps = torch.where(
+                    native_terminal_seen,
+                    native_terminal_latch_confirm_steps,
+                    u._power_contact_steps,
+                )
+                native_power_latched_seen.logical_or_(step_active & native_latch_state)
+                native_latch_confirm_steps_peak.copy_(
+                    torch.where(
+                        step_active,
+                        torch.maximum(
+                            native_latch_confirm_steps_peak,
+                            native_confirm_steps,
+                        ),
+                        native_latch_confirm_steps_peak,
+                    )
+                )
 
             stable = power_close_stable_frame(
                 power_is_grasped,
@@ -553,12 +1039,18 @@ def main() -> None:
                 signals["hold_quality"],
                 max_force,
             )
-            stable_streak, stable_streak_peak = update_stable_streak(
+            next_stable_streak, next_stable_streak_peak = update_stable_streak(
                 stable_streak, stable_streak_peak, stable
+            )
+            stable_streak = torch.where(
+                step_active, next_stable_streak, stable_streak
+            )
+            stable_streak_peak = torch.where(
+                step_active, next_stable_streak_peak, stable_streak_peak
             )
             newly_successful = (stable_streak >= POWER_STABLE_FRAMES) & (
                 first_success_step < 0
-            )
+            ) & step_active
             first_success_step = torch.where(
                 newly_successful,
                 torch.full_like(first_success_step, step + 1),
@@ -568,56 +1060,138 @@ def main() -> None:
             # DirectRLEnv's dones-before-reward ordering and preserves action 19 as the earliest
             # possible strict completion.
             (
-                power_is_grasped,
-                power_latch_confirm,
-                power_latch_release,
+                next_power_is_grasped,
+                next_power_latch_confirm,
+                next_power_latch_release,
             ) = update_power_grasp_latch(
                 signals["power_grasp_quality"],
                 power_is_grasped,
                 power_latch_confirm,
                 power_latch_release,
             )
+            power_is_grasped = torch.where(
+                step_active, next_power_is_grasped, power_is_grasped
+            )
+            power_latch_confirm = torch.where(
+                step_active, next_power_latch_confirm, power_latch_confirm
+            )
+            power_latch_release = torch.where(
+                step_active, next_power_latch_release, power_latch_release
+            )
             power_latch_confirm_peak = torch.maximum(
                 power_latch_confirm_peak, power_latch_confirm
             )
 
-            if step >= eval_start:
-                q_close_sum += signals["power_close_quality"]
-                q_wrap_sum += signals["power_wrap_quality"]
-                q_grasp_sum += signals["power_grasp_quality"]
-                hold_sum += signals["hold_quality"]
-                thumb_sum += signals["power_thumb_contact"].float()
-                legal_other_sum += signals["power_legal_other_contact_count"].float()
+            if args_cli.coupled_power_contract:
+                eval_mask = step_active & (~u._coupled_align_active)
+            else:
+                eval_mask = step_active & (step >= eval_start)
+            if bool(eval_mask.any()):
+                q_close_sum[eval_mask] += signals["power_close_quality"][eval_mask]
+                q_wrap_sum[eval_mask] += signals["power_wrap_quality"][eval_mask]
+                q_grasp_sum[eval_mask] += signals["power_grasp_quality"][eval_mask]
+                hold_sum[eval_mask] += signals["hold_quality"][eval_mask]
+                q_close_peak[eval_mask] = torch.maximum(
+                    q_close_peak[eval_mask],
+                    signals["power_close_quality"][eval_mask],
+                )
+                q_wrap_peak[eval_mask] = torch.maximum(
+                    q_wrap_peak[eval_mask],
+                    signals["power_wrap_quality"][eval_mask],
+                )
+                q_grasp_peak[eval_mask] = torch.maximum(
+                    q_grasp_peak[eval_mask],
+                    signals["power_grasp_quality"][eval_mask],
+                )
+                hold_peak[eval_mask] = torch.maximum(
+                    hold_peak[eval_mask], signals["hold_quality"][eval_mask]
+                )
+                thumb_sum[eval_mask] += signals["power_thumb_contact"][eval_mask].float()
+                legal_other_sum[eval_mask] += signals[
+                    "power_legal_other_contact_count"
+                ][eval_mask].float()
                 legal_other = signals["power_legal_other_contact_count"]
-                third_other_sum += (legal_other >= 3).float()
-                fourth_other_sum += (legal_other >= 4).float()
-                stable_sum += stable.float()
-                eval_count += 1
+                legal_other_peak[eval_mask] = torch.maximum(
+                    legal_other_peak[eval_mask], legal_other[eval_mask]
+                )
+                thumb_and_third, thumb_and_fourth = simultaneous_power_contact_stages(
+                    signals["power_thumb_contact"], legal_other
+                )
+                thumb_and_third_sum[eval_mask] += thumb_and_third[eval_mask].float()
+                thumb_and_fourth_sum[eval_mask] += thumb_and_fourth[eval_mask].float()
+                thumb_and_three_seen.logical_or_(eval_mask & thumb_and_third)
+                stable_sum[eval_mask] += stable[eval_mask].float()
+                eval_count[eval_mask] += 1
 
-        q_close_mean = q_close_sum / eval_count
-        q_wrap_mean = q_wrap_sum / eval_count
-        q_grasp_mean = q_grasp_sum / eval_count
-        hold_mean = hold_sum / eval_count
-        thumb_frac = thumb_sum / eval_count
-        legal_other_mean = legal_other_sum / eval_count
-        third_other_frac = third_other_sum / eval_count
-        fourth_other_frac = fourth_other_sum / eval_count
-        stable_frac = stable_sum / eval_count
+        if args_cli.coupled_power_contract and not bool(native_terminal_seen.all()):
+            missing = int((~native_terminal_seen).sum().item())
+            raise RuntimeError(
+                f"native coupled rollout ended without a terminal classification for {missing} rows"
+            )
+
+        eval_denominator = eval_count.clamp_min(1.0)
+        q_close_mean = q_close_sum / eval_denominator
+        q_wrap_mean = q_wrap_sum / eval_denominator
+        q_grasp_mean = q_grasp_sum / eval_denominator
+        hold_mean = hold_sum / eval_denominator
+        thumb_frac = thumb_sum / eval_denominator
+        legal_other_mean = legal_other_sum / eval_denominator
+        thumb_and_third_frac = thumb_and_third_sum / eval_denominator
+        thumb_and_fourth_frac = thumb_and_fourth_sum / eval_denominator
+        stable_frac = stable_sum / eval_denominator
         force_peak_max = force_peak.max(dim=-1).values
-        unexpected_done = native_terminated_seen | native_timeout_seen
-        strict_env_pass = strict_power_close_pass(
-            stable_streak,
-            force_peak_max,
-            xy_drift_peak,
-            rotation_drift_peak,
-            clearance_peak,
-            unexpected_done,
-        )
+        if args_cli.coupled_power_contract:
+            native_stable_at_end = torch.where(
+                native_terminal_seen,
+                native_terminal_stable_steps,
+                u._close_option_stable_steps,
+            )
+            first_success_step = torch.where(
+                native_success_seen,
+                native_first_terminal_step,
+                torch.full_like(native_first_terminal_step, -1),
+            )
+            stable_streak = native_stable_at_end
+            stable_streak_peak = native_stable_streak_peak
+            power_is_grasped = torch.where(
+                native_terminal_seen,
+                native_terminal_power_is_grasped,
+                u._power_is_grasped,
+            )
+            unexpected_done = native_failure_seen | native_timeout_seen
+            strict_env_pass = conservative_coupled_teacher_pass(
+                native_success=native_success_seen,
+                native_failure=native_failure_seen,
+                native_timeout=native_timeout_seen,
+                terminal_stable_steps=native_terminal_stable_steps,
+                terminal_power_is_grasped=native_terminal_power_is_grasped,
+                terminal_thumb_contact=native_terminal_thumb_contact,
+                terminal_legal_other_contacts=native_terminal_legal_other,
+                terminal_power_grasp_quality=native_terminal_power_grasp_quality,
+                terminal_hold_quality=native_terminal_hold_quality,
+                terminal_max_force=native_terminal_max_force,
+                terminal_align_active=native_terminal_align_active,
+                trajectory_force_peak=force_peak_max,
+                trajectory_xy_drift_peak=xy_drift_peak,
+                trajectory_rotation_drift_peak=rotation_drift_peak,
+                trajectory_clearance_peak=clearance_peak,
+                arm_target_saturated=arm_target_saturated_seen,
+            )
+        else:
+            unexpected_done = native_terminated_seen | native_timeout_seen
+            strict_env_pass = strict_power_close_pass(
+                stable_streak,
+                force_peak_max,
+                xy_drift_peak,
+                rotation_drift_peak,
+                clearance_peak,
+                unexpected_done,
+            )
         env_score = power_close_candidate_score(
             power_close_mean=q_close_mean,
             thumb_fraction=thumb_frac,
-            third_other_fraction=third_other_frac,
-            fourth_other_fraction=fourth_other_frac,
+            thumb_and_third_fraction=thumb_and_third_frac,
+            thumb_and_fourth_fraction=thumb_and_fourth_frac,
             power_wrap_mean=q_wrap_mean,
             power_grasp_mean=q_grasp_mean,
             hold_mean=hold_mean,
@@ -640,6 +1214,20 @@ def main() -> None:
             env_score -= (
                 args_cli.arm_delta_penalty
                 * normalized_actual_arm_delta.square().mean(dim=-1)
+            )
+        if args_cli.coupled_power_contract:
+            # Drop and tactile-force termination are irrecoverable hard rejects.  Pose-window
+            # failures retain the continuous drift/rotation/clearance penalties above: otherwise
+            # a nearly stable grasp just beyond the boundary is exactly tied at -1e6 and CEM cannot
+            # move back toward the safe side.  Native/teacher success gates remain unchanged.
+            irrecoverable_failure = (
+                native_terminal_reasons["dropped"]
+                | native_terminal_reasons["unsafe_force"]
+            )
+            env_score = torch.where(
+                irrecoverable_failure,
+                -1.0e6 + torch.clamp(env_score, -1000.0, 1000.0),
+                env_score,
             )
         finite = torch.stack(
             (
@@ -669,6 +1257,138 @@ def main() -> None:
                 env_score, strict_env_pass, finite, replicates
             )
         )
+        native_group_pass = (
+            native_success_seen.reshape(num_candidates, replicates).all(dim=1)
+            & finite_group
+            if args_cli.coupled_power_contract
+            else strict_group_pass
+        )
+
+        legal_peak_matrix = legal_other_peak.reshape(num_candidates, replicates)
+        q_grasp_peak_matrix = q_grasp_peak.reshape(num_candidates, replicates)
+        native_latch_matrix = native_power_latched_seen.reshape(
+            num_candidates, replicates
+        )
+        thumb_three_matrix = thumb_and_three_seen.reshape(
+            num_candidates, replicates
+        )
+        progress_env_score = (
+            100.0 * native_stable_streak_peak.float()
+            + 20.0 * native_power_latched_seen.float()
+            + 12.0 * thumb_and_three_seen.float()
+            + 2.0 * legal_other_peak.float()
+            + q_grasp_peak
+        )
+        progress_matrix = progress_env_score.reshape(num_candidates, replicates)
+        progress_candidate_score = (
+            0.5 * progress_matrix.mean(dim=1) + 0.5 * progress_matrix.amin(dim=1)
+        )
+        progress_index = int(torch.argmax(progress_candidate_score).item())
+        progress_slice = slice(
+            progress_index * replicates, (progress_index + 1) * replicates
+        )
+        search_trace.append(
+            {
+                "iteration": iteration + 1,
+                "strict_teacher_pass_candidates": int(
+                    strict_group_pass.sum().item()
+                ),
+                "native_success_candidates": int(native_group_pass.sum().item()),
+                "legal_other_contact_peak_max": int(legal_other_peak.max().item()),
+                "environments_reaching_three_legal_contacts": int(
+                    (legal_other_peak >= POWER_REQUIRED_OTHER_CONTACTS).sum().item()
+                ),
+                "environments_reaching_simultaneous_thumb_and_three": int(
+                    thumb_and_three_seen.sum().item()
+                ),
+                "candidates_reaching_thumb_and_three_any_replicate": int(
+                    thumb_three_matrix.any(dim=1).sum().item()
+                ),
+                "candidates_reaching_thumb_and_three_all_replicates": int(
+                    thumb_three_matrix.all(dim=1).sum().item()
+                ),
+                "candidates_reaching_three_contacts_any_replicate": int(
+                    (legal_peak_matrix.amax(dim=1) >= POWER_REQUIRED_OTHER_CONTACTS)
+                    .sum()
+                    .item()
+                ),
+                "candidates_reaching_three_contacts_all_replicates": int(
+                    (legal_peak_matrix.amin(dim=1) >= POWER_REQUIRED_OTHER_CONTACTS)
+                    .sum()
+                    .item()
+                ),
+                "power_grasp_quality_peak_max": float(q_grasp_peak.max().item()),
+                "power_grasp_quality_peak_robust_max": float(
+                    q_grasp_peak_matrix.amin(dim=1).max().item()
+                ),
+                "native_latch_environments": int(
+                    native_power_latched_seen.sum().item()
+                ),
+                "candidates_with_native_latch_any_replicate": int(
+                    native_latch_matrix.any(dim=1).sum().item()
+                ),
+                "candidates_with_native_latch_all_replicates": int(
+                    native_latch_matrix.all(dim=1).sum().item()
+                ),
+                "native_stable_streak_peak_max": int(
+                    native_stable_streak_peak.max().item()
+                ),
+                "native_latch_confirm_steps_peak_max": int(
+                    native_latch_confirm_steps_peak.max().item()
+                ),
+                "native_failure_reason_counts": {
+                    key: int(value.sum().item())
+                    for key, value in native_terminal_reasons.items()
+                },
+                "native_failure_reason_counts_after_latch": {
+                    key: int((value & native_power_latched_seen).sum().item())
+                    for key, value in native_terminal_reasons.items()
+                },
+                "best_progress_candidate": {
+                    "candidate_index": progress_index,
+                    "progress_score": float(
+                        progress_candidate_score[progress_index].item()
+                    ),
+                    "search_parameter": candidate_parameter[progress_index]
+                    .detach()
+                    .cpu()
+                    .tolist(),
+                    "native_stable_streak_peak_per_replicate": (
+                        native_stable_streak_peak[progress_slice].cpu().tolist()
+                    ),
+                    "native_power_latched_seen_per_replicate": (
+                        native_power_latched_seen[progress_slice].cpu().tolist()
+                    ),
+                    "native_latch_confirm_steps_peak_per_replicate": (
+                        native_latch_confirm_steps_peak[progress_slice]
+                        .cpu()
+                        .tolist()
+                    ),
+                    "legal_other_contact_peak_per_replicate": (
+                        legal_other_peak[progress_slice].cpu().tolist()
+                    ),
+                    "thumb_and_three_seen_per_replicate": (
+                        thumb_and_three_seen[progress_slice].cpu().tolist()
+                    ),
+                    "power_grasp_quality_peak_per_replicate": (
+                        q_grasp_peak[progress_slice].cpu().tolist()
+                    ),
+                    "native_failure_per_replicate": (
+                        native_failure_seen[progress_slice].cpu().tolist()
+                    ),
+                    "native_timeout_per_replicate": (
+                        native_timeout_seen[progress_slice].cpu().tolist()
+                    ),
+                    "dense_score_per_replicate": (
+                        env_score[progress_slice].cpu().tolist()
+                    ),
+                    "native_terminal_reasons": {
+                        key: value[progress_slice].cpu().tolist()
+                        for key, value in native_terminal_reasons.items()
+                    },
+                },
+            }
+        )
 
         top = torch.topk(candidate_score, k=elite_count, largest=True)
         elite = candidate_parameter[top.indices]
@@ -686,7 +1406,7 @@ def main() -> None:
                 else -1
             )
             robust_force_peak = force_peak[sl].amax(dim=0)
-            return {
+            record = {
                 "iteration": iteration + 1,
                 "score": float(candidate_score[index].item()),
                 "replicates": replicates,
@@ -724,14 +1444,40 @@ def main() -> None:
                 "power_latched_at_end": bool(power_is_grasped[sl].all().item()),
                 "stable_fraction": float(stable_frac[sl].mean().item()),
                 "q_close": float(q_close_mean[sl].mean().item()),
+                "q_close_peak_per_replicate": q_close_peak[sl].cpu().tolist(),
                 "q_wrap": float(q_wrap_mean[sl].mean().item()),
+                "q_wrap_peak_per_replicate": q_wrap_peak[sl].cpu().tolist(),
                 "q_grasp": float(q_grasp_mean[sl].mean().item()),
                 "q_grasp_per_replicate": q_grasp_mean[sl].cpu().tolist(),
+                "q_grasp_peak_min_replicate": float(
+                    q_grasp_peak[sl].min().item()
+                ),
+                "q_grasp_peak_max_replicate": float(
+                    q_grasp_peak[sl].max().item()
+                ),
+                "q_grasp_peak_per_replicate": q_grasp_peak[sl].cpu().tolist(),
                 "hold_quality": float(hold_mean[sl].mean().item()),
+                "hold_quality_peak_per_replicate": hold_peak[sl].cpu().tolist(),
                 "thumb_fraction": float(thumb_frac[sl].mean().item()),
                 "legal_other_mean": float(legal_other_mean[sl].mean().item()),
-                "third_other_fraction": float(third_other_frac[sl].mean().item()),
-                "fourth_other_fraction": float(fourth_other_frac[sl].mean().item()),
+                "legal_other_contact_peak_min_replicate": int(
+                    legal_other_peak[sl].min().item()
+                ),
+                "legal_other_contact_peak_max_replicate": int(
+                    legal_other_peak[sl].max().item()
+                ),
+                "legal_other_contact_peak_per_replicate": (
+                    legal_other_peak[sl].cpu().tolist()
+                ),
+                "thumb_and_third_fraction": float(
+                    thumb_and_third_frac[sl].mean().item()
+                ),
+                "thumb_and_fourth_fraction": float(
+                    thumb_and_fourth_frac[sl].mean().item()
+                ),
+                "thumb_and_three_seen_per_replicate": (
+                    thumb_and_three_seen[sl].cpu().tolist()
+                ),
                 "clearance_peak": float(clearance_peak[sl].max().item()),
                 "clearance_min": float(clearance_min[sl].min().item()),
                 "xy_drift_peak": float(xy_drift_peak[sl].max().item()),
@@ -750,6 +1496,83 @@ def main() -> None:
                 "native_timeout_seen": bool(native_timeout_seen[sl].any().item()),
                 "force_peak": robust_force_peak.detach().cpu().tolist(),
             }
+            if args_cli.coupled_power_contract:
+                record.update(
+                    {
+                        "pass_authority": (
+                            "conservative_coupled_teacher_audit_v1"
+                        ),
+                        "native_option_success_all_replicates": bool(
+                            native_success_seen[sl].all().item()
+                        ),
+                        "conservative_teacher_audit_pass": bool(
+                            strict_group_pass[index].item()
+                        ),
+                        "native_success_replicates": int(
+                            native_success_seen[sl].sum().item()
+                        ),
+                        "native_success_per_replicate": (
+                            native_success_seen[sl].cpu().tolist()
+                        ),
+                        "native_power_latched_seen_per_replicate": (
+                            native_power_latched_seen[sl].cpu().tolist()
+                        ),
+                        "native_latch_confirm_steps_peak_per_replicate": (
+                            native_latch_confirm_steps_peak[sl].cpu().tolist()
+                        ),
+                        "native_failure_per_replicate": (
+                            native_failure_seen[sl].cpu().tolist()
+                        ),
+                        "native_timeout_per_replicate": (
+                            native_timeout_seen[sl].cpu().tolist()
+                        ),
+                        "native_terminal_seen_per_replicate": (
+                            native_terminal_seen[sl].cpu().tolist()
+                        ),
+                        "native_first_terminal_step_per_replicate": (
+                            native_first_terminal_step[sl].cpu().tolist()
+                        ),
+                        "native_terminal_stable_steps_per_replicate": (
+                            native_terminal_stable_steps[sl].cpu().tolist()
+                        ),
+                        "native_terminal_power_is_grasped_per_replicate": (
+                            native_terminal_power_is_grasped[sl].cpu().tolist()
+                        ),
+                        "native_terminal_thumb_contact_per_replicate": (
+                            native_terminal_thumb_contact[sl].cpu().tolist()
+                        ),
+                        "native_terminal_legal_other_per_replicate": (
+                            native_terminal_legal_other[sl].cpu().tolist()
+                        ),
+                        "native_terminal_latch_confirm_steps_per_replicate": (
+                            native_terminal_latch_confirm_steps[sl].cpu().tolist()
+                        ),
+                        "native_terminal_power_grasp_quality_per_replicate": (
+                            native_terminal_power_grasp_quality[sl].cpu().tolist()
+                        ),
+                        "native_terminal_hold_quality_per_replicate": (
+                            native_terminal_hold_quality[sl].cpu().tolist()
+                        ),
+                        "native_terminal_max_force_per_replicate": (
+                            native_terminal_max_force[sl].cpu().tolist()
+                        ),
+                        "native_terminal_align_active_per_replicate": (
+                            native_terminal_align_active[sl].cpu().tolist()
+                        ),
+                        "evaluation_frames_per_replicate": (
+                            eval_count[sl].long().cpu().tolist()
+                        ),
+                        "rollout_steps_executed": rollout_steps_executed,
+                        "arm_target_saturated_per_replicate": (
+                            arm_target_saturated_seen[sl].cpu().tolist()
+                        ),
+                        "native_terminal_reasons": {
+                            key: value[sl].cpu().tolist()
+                            for key, value in native_terminal_reasons.items()
+                        },
+                    }
+                )
+            return record
 
         best_index = int(torch.argmax(candidate_score).item())
         current_any = candidate_record(best_index)
@@ -761,15 +1584,24 @@ def main() -> None:
             current_pass = candidate_record(int(pass_ids[local].item()))
             if best_pass is None or current_pass["score"] > best_pass["score"]:
                 best_pass = current_pass
+        native_ids = native_group_pass.nonzero(as_tuple=False).squeeze(-1)
+        if args_cli.coupled_power_contract and native_ids.numel() > 0:
+            local = int(torch.argmax(candidate_score[native_ids]).item())
+            current_native = candidate_record(int(native_ids[local].item()))
+            if best_native is None or current_native["score"] > best_native["score"]:
+                best_native = current_native
 
         report = best_pass if best_pass is not None else best_any
         assert report is not None
         print(
             f"iter {iteration + 1:02d}: pass={int(strict_group_pass.sum().item())}/"
+            f"{num_candidates} native={int(native_group_pass.sum().item())}/"
             f"{num_candidates} "
             f"best_score={report['score']:.3f} stable={report['stable_streak_peak']} "
             f"legal={report['legal_other_mean']:.2f} q={report['q_grasp']:.3f} "
-            f"third={report['third_other_fraction']:.3f} "
+            f"thumb+3={report['thumb_and_third_fraction']:.3f} "
+            f"pop_legal_peak={search_trace[-1]['legal_other_contact_peak_max']} "
+            f"latch_envs={search_trace[-1]['native_latch_environments']} "
             f"F={max(report['force_peak']):.2f}N "
             f"xy={report['xy_drift_peak']:.4f}m "
             f"rot={report['rotation_drift_peak_rad']:.3f}rad "
@@ -778,27 +1610,89 @@ def main() -> None:
             flush=True,
         )
 
-    selected = best_pass if best_pass is not None else best_any
-    assert selected is not None
+    search_seed_result = best_pass or best_native or best_any
+    assert search_seed_result is not None
+    authoritative_result = (
+        best_pass if args_cli.coupled_power_contract else search_seed_result
+    )
+    effective_static_pregrasp = None
+    if args_cli.coupled_power_contract:
+        assert curriculum_boundary is not None
+        effective_static_pregrasp = {}
+        for key, value in curriculum_boundary.items():
+            if not isinstance(value, torch.Tensor) or value.shape[0] != 1:
+                continue
+            row = value[0]
+            effective_static_pregrasp[key] = (
+                row.item() if row.ndim == 0 else row.tolist()
+            )
     output = {
         "format_version": 1,
         "contract": (
-            "strict_power_close_arm_micro7_hybrid14_public_v1"
-            if args_cli.public_controller
+            "strict_power_close_coupled_teacher_v1"
+            if args_cli.coupled_power_contract
             else (
-                "strict_power_close_arm_micro7_hybrid14_oracle_v1"
-                if search_arm_micro
-                else "strict_power_close_hybrid14_v1"
+                "strict_power_close_arm_micro7_hybrid14_public_v1"
+                if args_cli.public_controller
+                else (
+                    "strict_power_close_arm_micro7_hybrid14_oracle_v1"
+                    if search_arm_micro
+                    else "strict_power_close_hybrid14_v1"
+                )
             )
         ),
         "controller": (
-            "public_incremental_arm_hybrid14_with_runtime_shields"
-            if args_cli.public_controller
+            "coupled_native_align_close_with_runtime_shields"
+            if args_cli.coupled_power_contract
             else (
-                "oracle_direct_joint_target_requires_public_replay"
-                if search_arm_micro
-                else "public_hybrid14_zero_arm"
+                "public_incremental_arm_hybrid14_with_runtime_shields"
+                if args_cli.public_controller
+                else (
+                    "oracle_direct_joint_target_requires_public_replay"
+                    if search_arm_micro
+                    else "public_hybrid14_zero_arm"
+                )
             )
+        ),
+        "task_mode": (
+            "coupled_power_align_close_option_v1"
+            if args_cli.coupled_power_contract
+            else None
+        ),
+        "observation_contract": (
+            "pick_tool_coupled_power_align_close_state131_v1"
+            if args_cli.coupled_power_contract
+            else None
+        ),
+        "observation_dim": expected_observation_dim,
+        "action_dim": ARM_DIM + HAND_DIM,
+        "action_layout": "arm_delta7|crossdex_token9|distal_residual5",
+        "action_projection": "identity_v1",
+        "pass_authority": (
+            "conservative_coupled_teacher_audit_v1"
+            if args_cli.coupled_power_contract
+            else "power_close_search_contract.strict_power_close_pass"
+        ),
+        "native_success_authority": (
+            "pick_tool_terminal.power_close_option_success"
+            if args_cli.coupled_power_contract
+            else None
+        ),
+        "search_parameter_layout": (
+            "normalized_arm_target_offset7|hybrid14"
+            if search_arm_micro
+            else "hybrid14"
+        ),
+        "search_parameter_is_environment_action": False,
+        "search_parameter_projection": (
+            "time_varying_arm_feedback_plus_hybrid14"
+            if search_arm_micro
+            else "prepend_zero_arm7"
+        ),
+        "arm_feedback_formula": (
+            "clip((smoothstep_target-current_target)/(action_scale*ema*0.2),-1,1)"
+            if args_cli.coupled_power_contract
+            else None
         ),
         "seed": args_cli.seed,
         "population": num_envs,
@@ -816,11 +1710,47 @@ def main() -> None:
         "initial_hold_decode_error_rad": initial_hold_decode_error,
         "close_steps": args_cli.close_steps,
         "eval_steps": args_cli.eval_steps,
+        "rollout_step_limit": (
+            int(u.max_episode_length)
+            if args_cli.coupled_power_contract
+            else args_cli.align_steps + args_cli.close_steps + args_cli.eval_steps
+        ),
+        "coupled_dense_score_phase": (
+            "all_native_close_frames_until_first_terminal"
+            if args_cli.coupled_power_contract
+            else None
+        ),
+        "coupled_failure_ranking": (
+            "drop_or_unsafe_force_hard_reject_pose_escape_soft_rank_v1"
+            if args_cli.coupled_power_contract
+            else None
+        ),
+        "coupled_close_eval_args_control_rollout": (
+            False if args_cli.coupled_power_contract else None
+        ),
+        "episode_length_s": cfg.episode_length_s,
+        "coupled_phase_contract": (
+            {
+                "align_steps": cfg.coupled_power_align_steps,
+                "arm_action_multiplier": cfg.coupled_power_arm_action_multiplier,
+                "arm_target_limit_rad": cfg.coupled_power_arm_target_limit,
+                "align_hand_action": "masked_hold_target",
+                "close_arm_action": "masked_frozen_target",
+            }
+            if args_cli.coupled_power_contract
+            else None
+        ),
+        "curriculum_dataset": (
+            str(curriculum_path) if curriculum_path is not None else None
+        ),
+        "curriculum_sha256": curriculum_sha256,
         "input": str(input_path),
         "input_sha256": _sha256(input_path),
         "initial_action_input": str(initial_path),
         "initial_action_sha256": _sha256(initial_path),
-        "pregrasp": pregrasp,
+        "pregrasp": pregrasp if not args_cli.coupled_power_contract else None,
+        "source_pregrasp": source_pregrasp if args_cli.coupled_power_contract else None,
+        "effective_static_pregrasp": effective_static_pregrasp,
         "hand_joint_names": [u.robot.joint_names[i] for i in u._hand_ids_t.tolist()],
         "arm_joint_names": [u.robot.joint_names[i] for i in u._arm_ids_t.tolist()],
         "fingertip_force_order": list(u.ee_names),
@@ -836,19 +1766,33 @@ def main() -> None:
             "horizontal_drift_m": POWER_XY_DRIFT_LIMIT,
             "rotation_drift_rad": POWER_ROTATION_DRIFT_LIMIT,
         },
-        "result": selected,
-        # Compatibility alias for the replay tool and downstream teacher collectors.
-        "results": {"hybrid14": selected},
+        "search_trace": search_trace,
+        # Coupled ``result`` is deliberately fail-closed: only a conservative teacher pass may
+        # occupy it.  Native-only success is retained separately, while ``search_seed_result`` may
+        # continue CEM but must never be promoted to behavioral-cloning supervision.
+        "result": authoritative_result,
+        "teacher_result": best_pass if args_cli.coupled_power_contract else None,
+        "native_result": best_native,
+        "search_seed_result": (
+            search_seed_result if args_cli.coupled_power_contract else None
+        ),
+        # Coupled parameters require a time-varying arm feedback controller and must never be
+        # consumed by the legacy hybrid14 replay path.
+        "results": (
+            {"coupled_align_close21": search_seed_result}
+            if args_cli.coupled_power_contract
+            else {"hybrid14": search_seed_result}
+        ),
     }
     output_path = Path(args_cli.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
     print(
-        f"wrote {output_path} strict_pass={selected['strict_power_close_pass']}",
+        f"wrote {output_path} strict_pass={best_pass is not None}",
         flush=True,
     )
     env.close()
-    if args_cli.require_pass and not selected["strict_power_close_pass"]:
+    if args_cli.require_pass and best_pass is None:
         raise RuntimeError("CEM did not find a strict power-close action")
 
 

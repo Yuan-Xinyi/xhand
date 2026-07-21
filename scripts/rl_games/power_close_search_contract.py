@@ -110,6 +110,20 @@ def power_close_stable_frame(
     )
 
 
+def simultaneous_power_contact_stages(
+    thumb_contact: torch.Tensor, legal_other_contacts: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return simultaneous thumb-plus-three and thumb-plus-four contact stages."""
+
+    if thumb_contact.shape != legal_other_contacts.shape:
+        raise ValueError("thumb and legal-other contact tensors must share shape")
+    thumb = thumb_contact.bool()
+    return (
+        thumb & (legal_other_contacts >= POWER_REQUIRED_OTHER_CONTACTS),
+        thumb & (legal_other_contacts >= 4),
+    )
+
+
 def update_stable_streak(
     streak: torch.Tensor, peak: torch.Tensor, stable: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -139,12 +153,58 @@ def strict_power_close_pass(
     )
 
 
+def conservative_coupled_teacher_pass(
+    *,
+    native_success: torch.Tensor,
+    native_failure: torch.Tensor,
+    native_timeout: torch.Tensor,
+    terminal_stable_steps: torch.Tensor,
+    terminal_power_is_grasped: torch.Tensor,
+    terminal_thumb_contact: torch.Tensor,
+    terminal_legal_other_contacts: torch.Tensor,
+    terminal_power_grasp_quality: torch.Tensor,
+    terminal_hold_quality: torch.Tensor,
+    terminal_max_force: torch.Tensor,
+    terminal_align_active: torch.Tensor,
+    trajectory_force_peak: torch.Tensor,
+    trajectory_xy_drift_peak: torch.Tensor,
+    trajectory_rotation_drift_peak: torch.Tensor,
+    trajectory_clearance_peak: torch.Tensor,
+    arm_target_saturated: torch.Tensor,
+) -> torch.Tensor:
+    """Audit native option success before a rollout may supervise the coupled actor.
+
+    Native success remains the task-state authority.  This stricter promotion gate additionally
+    rejects trajectories that ever relied on transient >30 N contact or the arm-target envelope;
+    those behaviors may be recoverable online, but are unsuitable behavioral-cloning labels.
+    """
+
+    return (
+        native_success.bool()
+        & (~native_failure.bool())
+        & (~native_timeout.bool())
+        & (terminal_stable_steps >= POWER_STABLE_FRAMES)
+        & terminal_power_is_grasped.bool()
+        & terminal_thumb_contact.bool()
+        & (terminal_legal_other_contacts >= POWER_REQUIRED_OTHER_CONTACTS)
+        & (terminal_power_grasp_quality >= POWER_GRASP_QUALITY_MIN)
+        & (terminal_hold_quality >= POWER_HOLD_QUALITY_MIN)
+        & (terminal_max_force <= POWER_FORCE_LIMIT)
+        & (~terminal_align_active.bool())
+        & (trajectory_force_peak <= POWER_FORCE_LIMIT)
+        & (trajectory_xy_drift_peak <= POWER_XY_DRIFT_LIMIT)
+        & (trajectory_rotation_drift_peak <= POWER_ROTATION_DRIFT_LIMIT)
+        & (trajectory_clearance_peak <= POWER_CLEARANCE_LIMIT)
+        & (~arm_target_saturated.bool())
+    )
+
+
 def power_close_candidate_score(
     *,
     power_close_mean: torch.Tensor,
     thumb_fraction: torch.Tensor,
-    third_other_fraction: torch.Tensor,
-    fourth_other_fraction: torch.Tensor,
+    thumb_and_third_fraction: torch.Tensor,
+    thumb_and_fourth_fraction: torch.Tensor,
     power_wrap_mean: torch.Tensor,
     power_grasp_mean: torch.Tensor,
     hold_mean: torch.Tensor,
@@ -158,7 +218,7 @@ def power_close_candidate_score(
     strict_pass: torch.Tensor,
     unexpected_done: torch.Tensor,
 ) -> torch.Tensor:
-    """Dense CEM ranking with explicit third/fourth-pad credit and safety costs.
+    """Dense CEM ranking with simultaneous thumb-plus-third/fourth-pad credit.
 
     The large strict-pass offset makes an already feasible sample lexicographically preferable,
     but cannot manufacture feasibility: the saved artifact records the independent boolean verdict.
@@ -190,11 +250,11 @@ def power_close_candidate_score(
     return (
         2.0 * power_close_mean
         + 1.0 * thumb_fraction
-        + 3.0 * third_other_fraction
-        + 1.5 * fourth_other_fraction
+        + 3.0 * thumb_and_third_fraction
+        + 1.5 * thumb_and_fourth_fraction
         + 2.0 * power_wrap_mean
         + 3.0 * power_grasp_mean
-        + 1.0 * hold_mean * third_other_fraction
+        + 1.0 * hold_mean * thumb_and_third_fraction
         + 2.0 * stable_fraction
         + 6.0 * end_streak_progress
         + 2.0 * peak_streak_progress

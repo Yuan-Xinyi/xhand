@@ -7,8 +7,10 @@ import torch
 
 from power_close_search_contract import (
     aggregate_replicated_candidates,
+    conservative_coupled_teacher_pass,
     power_close_candidate_score,
     power_close_stable_frame,
+    simultaneous_power_contact_stages,
     strict_power_close_pass,
     update_power_grasp_latch,
     update_stable_streak,
@@ -21,8 +23,8 @@ def _score(*, third: float, fourth: float, force: float = 20.0, xy: float = 0.0,
     return power_close_candidate_score(
         power_close_mean=scalar(0.5),
         thumb_fraction=scalar(1.0),
-        third_other_fraction=scalar(third),
-        fourth_other_fraction=scalar(fourth),
+        thumb_and_third_fraction=scalar(third),
+        thumb_and_fourth_fraction=scalar(fourth),
         power_wrap_mean=scalar(0.4),
         power_grasp_mean=scalar(0.4),
         hold_mean=scalar(0.8),
@@ -72,6 +74,13 @@ def main() -> None:
         False,
         False,
     ]
+    third_stage, fourth_stage = simultaneous_power_contact_stages(
+        torch.tensor([True, False, True, True]),
+        torch.tensor([2, 4, 3, 4]),
+    )
+    # The second row deliberately alternates thumb and finger contact; it must receive no stage.
+    assert third_stage.tolist() == [False, False, True, True]
+    assert fourth_stage.tolist() == [False, False, False, True]
 
     # Match DirectRLEnv's dones-before-reward ordering: the fourth high-quality frame latches for
     # the next action, so fifteen post-latch stable frames first complete on action 19.
@@ -123,6 +132,48 @@ def main() -> None:
         torch.tensor([0.015]),
         torch.tensor([False]),
     ).item()
+
+    teacher_args = {
+        "native_success": torch.tensor([True]),
+        "native_failure": torch.tensor([False]),
+        "native_timeout": torch.tensor([False]),
+        "terminal_stable_steps": torch.tensor([15]),
+        "terminal_power_is_grasped": torch.tensor([True]),
+        "terminal_thumb_contact": torch.tensor([True]),
+        "terminal_legal_other_contacts": torch.tensor([3]),
+        "terminal_power_grasp_quality": torch.tensor([0.35]),
+        "terminal_hold_quality": torch.tensor([0.50]),
+        "terminal_max_force": torch.tensor([30.0]),
+        "terminal_align_active": torch.tensor([False]),
+        "trajectory_force_peak": torch.tensor([30.0]),
+        "trajectory_xy_drift_peak": torch.tensor([0.03]),
+        "trajectory_rotation_drift_peak": torch.tensor([0.35]),
+        "trajectory_clearance_peak": torch.tensor([0.015]),
+        "arm_target_saturated": torch.tensor([False]),
+    }
+    assert conservative_coupled_teacher_pass(**teacher_args).item()
+    rejected_values = {
+        "native_success": False,
+        "native_failure": True,
+        "native_timeout": True,
+        "terminal_stable_steps": 14,
+        "terminal_power_is_grasped": False,
+        "terminal_thumb_contact": False,
+        "terminal_legal_other_contacts": 2,
+        "terminal_power_grasp_quality": 0.349,
+        "terminal_hold_quality": 0.499,
+        "terminal_max_force": 30.01,
+        "terminal_align_active": True,
+        "trajectory_force_peak": 30.01,
+        "trajectory_xy_drift_peak": 0.0301,
+        "trajectory_rotation_drift_peak": 0.351,
+        "trajectory_clearance_peak": 0.0151,
+        "arm_target_saturated": True,
+    }
+    for name, value in rejected_values.items():
+        rejected = dict(teacher_args)
+        rejected[name] = torch.tensor([value], dtype=teacher_args[name].dtype)
+        assert not conservative_coupled_teacher_pass(**rejected).item(), name
 
     no_third = _score(third=0.0, fourth=0.0)
     with_third = _score(third=1.0, fourth=0.0)
