@@ -2015,6 +2015,16 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         ),
     )
     parser.add_argument(
+        "--actor_lr_scale",
+        type=float,
+        default=None,
+        help=(
+            "Absolute actor-only multiplier on the FlashSAC LR schedule. Fresh runs "
+            "default to 1; routed resumes retain the checkpoint value unless explicitly "
+            "overridden. Critic and temperature learning rates are unchanged."
+        ),
+    )
+    parser.add_argument(
         "--lr_decay_updates",
         type=int,
         default=None,
@@ -2344,6 +2354,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--critic_burnin_updates must be non-negative")
     if args.actor_update_period < 1:
         raise ValueError("--actor_update_period must be positive")
+    if args.actor_lr_scale is not None and (
+        not math.isfinite(args.actor_lr_scale) or args.actor_lr_scale <= 0.0
+    ):
+        raise ValueError("--actor_lr_scale must be finite and positive")
     for name in ("lr_decay_updates", "lr_warmup_updates"):
         value = getattr(args, name)
         if value is not None and value < 1:
@@ -3723,6 +3737,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise RuntimeError(
                 "public latch arm-gate actor-only initialization must start with fresh replay"
             )
+    if args.actor_lr_scale is not None:
+        agent.set_actor_learning_rate_scale(args.actor_lr_scale)
+    actor_lr_scale = agent.actor_learning_rate_scale
     if demo_max_abs_reward is not None:
         if agent.reward_normalizer is None:
             raise RuntimeError("demonstration replay requires the configured reward normalizer")
@@ -3921,6 +3938,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "gradient_updates": update_count,
                     "actor_updates": actor_update_count,
                     "actor_update_period": args.actor_update_period,
+                    "actor_lr_scale": actor_lr_scale,
                     "critic_burnin_updates": args.critic_burnin_updates,
                     "residual_actor_unlocked": residual_actor_unlocked,
                     "residual_actor_unlock_successes": (

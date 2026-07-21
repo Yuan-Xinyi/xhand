@@ -9,6 +9,7 @@ Do not disable TorchDynamo: one test exercises a real ``torch.compile`` wrapper:
 from __future__ import annotations
 
 import copy
+import math
 import shutil
 import tempfile
 from pathlib import Path
@@ -1579,6 +1580,57 @@ def test_checkpoint_exactly_restores_noise_and_rng() -> None:
         assert restored._update_step == 7  # noqa: SLF001
 
 
+def test_actor_learning_rate_scale_is_absolute_and_checkpointed() -> None:
+    agent = _agent()
+    actor_optimizer = agent._actor.optimizer  # noqa: SLF001
+    actor_scheduler = agent._actor.scheduler  # noqa: SLF001
+    critic_optimizer = agent._critic.optimizer  # noqa: SLF001
+    assert actor_optimizer is not None and actor_scheduler is not None
+    assert critic_optimizer is not None
+    original_critic_lr = float(critic_optimizer.param_groups[0]["lr"])
+
+    agent.set_actor_learning_rate_scale(1.0e-3)
+    assert agent.actor_learning_rate_scale == 1.0e-3
+    assert math.isclose(float(actor_optimizer.param_groups[0]["lr"]), 3.0e-7)
+    assert len(actor_scheduler.base_lrs) == 1
+    assert math.isclose(float(actor_scheduler.base_lrs[0]), 3.0e-7)
+    assert float(critic_optimizer.param_groups[0]["lr"]) == original_critic_lr
+
+    # The setter is absolute: changing 1e-3 -> 1e-2 must not multiply the
+    # already-scaled LR by another 1e-2.
+    agent.set_actor_learning_rate_scale(1.0e-2)
+    assert agent.actor_learning_rate_scale == 1.0e-2
+    assert math.isclose(float(actor_optimizer.param_groups[0]["lr"]), 3.0e-6)
+    assert len(actor_scheduler.base_lrs) == 1
+    assert math.isclose(float(actor_scheduler.base_lrs[0]), 3.0e-6)
+    _expect_error(ValueError, agent.set_actor_learning_rate_scale, 0.0)
+    _expect_error(ValueError, agent.set_actor_learning_rate_scale, float("nan"))
+    _expect_error(TypeError, agent.set_actor_learning_rate_scale, True)
+
+    with tempfile.TemporaryDirectory(prefix="flashsac_actor_lr_scale_") as directory:
+        checkpoint = Path(directory) / "checkpoint"
+        agent.save(str(checkpoint))
+        bridge_state = torch.load(
+            checkpoint / BRIDGE_STATE_FILENAME,
+            map_location="cpu",
+            weights_only=True,
+        )
+        assert bridge_state["actor_learning_rate_scale"] == 1.0e-2
+
+        restored = _agent()
+        restored.load(str(checkpoint))
+        assert restored.actor_learning_rate_scale == 1.0e-2
+        assert restored._actor.optimizer is not None  # noqa: SLF001
+        assert restored._actor.scheduler is not None  # noqa: SLF001
+        assert math.isclose(  # noqa: SLF001
+            float(restored._actor.optimizer.param_groups[0]["lr"]), 3.0e-6
+        )
+        assert len(restored._actor.scheduler.base_lrs) == 1  # noqa: SLF001
+        assert math.isclose(  # noqa: SLF001
+            float(restored._actor.scheduler.base_lrs[0]), 3.0e-6
+        )
+
+
 def _canonical_network_state(bundle) -> dict[str, torch.Tensor]:
     prefix = "_orig_mod."
     return {
@@ -1897,6 +1949,8 @@ def main() -> None:
     )
     test_checkpoint_exactly_restores_noise_and_rng()
     print("[PASS] exact checkpoint continuation")
+    test_actor_learning_rate_scale_is_absolute_and_checkpointed()
+    print("[PASS] absolute actor-only LR scale and checkpoint continuation")
     test_checkpoint_loads_across_compile_boundary()
     print("[PASS] compiled/uncompiled checkpoint portability (both directions)")
     test_checkpoint_loads_across_amp_boundary()

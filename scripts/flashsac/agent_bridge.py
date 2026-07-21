@@ -834,6 +834,7 @@ class FlashSACTorchBridge(FlashSACAgent):
         if not isinstance(unit_normalize_actor_mean_head, bool):
             raise TypeError("unit_normalize_actor_mean_head must be bool")
         self._unit_normalize_actor_mean_head = unit_normalize_actor_mean_head
+        self._actor_learning_rate_scale = 1.0
         mean_modules = [
             module
             for name, module in self._actor.network.named_modules()
@@ -896,6 +897,61 @@ class FlashSACTorchBridge(FlashSACAgent):
     @property
     def frozen_lift_actor_source_sha256(self) -> str | None:
         return self._frozen_lift_actor_source_sha256
+
+    @property
+    def actor_learning_rate_scale(self) -> float:
+        """Return the absolute multiplier applied to the actor LR schedule."""
+
+        return self._actor_learning_rate_scale
+
+    def set_actor_learning_rate_scale(self, scale: float) -> None:
+        """Set an absolute actor-only LR multiplier without changing critic LR.
+
+        FlashSAC constructs actor and critic schedulers from one shared learning-
+        rate configuration.  Conservative actor fine-tuning needs a smaller
+        actor step while retaining the critic schedule, so update both the
+        actor optimizer's current LR and the scheduler base LR atomically.
+        Repeated calls are absolute rather than multiplicative.
+        """
+
+        if isinstance(scale, bool) or not isinstance(scale, (int, float)):
+            raise TypeError("actor learning-rate scale must be a real number")
+        scale = float(scale)
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError("actor learning-rate scale must be finite and positive")
+        optimizer = self._actor.optimizer
+        scheduler = self._actor.scheduler
+        if optimizer is None or scheduler is None:
+            raise RuntimeError("FlashSAC actor requires an optimizer and LR scheduler")
+        if len(optimizer.param_groups) != len(scheduler.base_lrs):
+            raise RuntimeError("actor optimizer and scheduler parameter groups disagree")
+        peak_lr = float(self._cfg.learning_rate_peak)
+        if not math.isfinite(peak_lr) or peak_lr <= 0.0:
+            raise RuntimeError("FlashSAC actor peak learning rate is invalid")
+        new_base_lrs: list[float] = []
+        new_current_lrs: list[float] = []
+        for group, old_base_lr in zip(
+            optimizer.param_groups, scheduler.base_lrs, strict=True
+        ):
+            old_base_lr = float(old_base_lr)
+            current_lr = float(group["lr"])
+            if (
+                not math.isfinite(old_base_lr)
+                or old_base_lr <= 0.0
+                or not math.isfinite(current_lr)
+                or current_lr < 0.0
+            ):
+                raise RuntimeError("actor optimizer contains an invalid LR schedule state")
+            schedule_fraction = current_lr / old_base_lr
+            new_base_lr = peak_lr * scale
+            new_current_lr = new_base_lr * schedule_fraction
+            group["initial_lr"] = new_base_lr
+            group["lr"] = new_current_lr
+            new_base_lrs.append(new_base_lr)
+            new_current_lrs.append(new_current_lr)
+        scheduler.base_lrs = new_base_lrs
+        scheduler._last_lr = new_current_lrs  # noqa: SLF001 - PyTorch scheduler state
+        self._actor_learning_rate_scale = scale
 
     @property
     def unit_normalize_actor_mean_head(self) -> bool:
@@ -1804,6 +1860,7 @@ class FlashSACTorchBridge(FlashSACAgent):
             "upstream_commit": FLASH_SAC_COMMIT,
             "fork_commit": FLASH_SAC_FORK_COMMIT,
             "action_dim": self._action_dim,
+            "actor_learning_rate_scale": self._actor_learning_rate_scale,
             "noise_groups": [_group_dict(group) for group in self._noise_groups],
             "group_noise_scale": self._group_noise_scale,
             "cached_noise": self._cached_noise,
@@ -2165,6 +2222,34 @@ class FlashSACTorchBridge(FlashSACAgent):
                 "checkpoint noise groups differ from the current bridge configuration; "
                 f"checkpoint={checkpoint_groups}, current={current_groups}"
             )
+
+        checkpoint_actor_lr_scale = state.get("actor_learning_rate_scale", 1.0)
+        if (
+            isinstance(checkpoint_actor_lr_scale, bool)
+            or not isinstance(checkpoint_actor_lr_scale, (int, float))
+            or not math.isfinite(float(checkpoint_actor_lr_scale))
+            or float(checkpoint_actor_lr_scale) <= 0.0
+        ):
+            raise ValueError("checkpoint actor learning-rate scale is invalid")
+        checkpoint_actor_lr_scale = float(checkpoint_actor_lr_scale)
+        if load_optimizer:
+            scheduler = self._actor.scheduler
+            if scheduler is None or any(
+                not math.isclose(
+                    float(base_lr),
+                    float(self._cfg.learning_rate_peak) * checkpoint_actor_lr_scale,
+                    rel_tol=1.0e-12,
+                    abs_tol=0.0,
+                )
+                for base_lr in scheduler.base_lrs
+            ):
+                raise ValueError(
+                    "checkpoint actor optimizer LR schedule disagrees with its "
+                    "actor_learning_rate_scale metadata"
+                )
+            self._actor_learning_rate_scale = checkpoint_actor_lr_scale
+        else:
+            self.set_actor_learning_rate_scale(checkpoint_actor_lr_scale)
 
         cached_noise = state["cached_noise"].to(device=self._device, dtype=torch.float32)
         counts = state["noise_repeat_count"].to(device=self._device, dtype=torch.int32)
