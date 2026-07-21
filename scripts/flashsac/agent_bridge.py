@@ -29,11 +29,13 @@ from typing import Any
 
 import gymnasium as gym
 import torch
+import torch.nn.functional as F
 
 
 FLASH_SAC_COMMIT = "87edc9061150ae9e962dd84e6544e27a1554b3ab"
 BRIDGE_STATE_FILENAME = "torch_bridge_state.pt"
 BRIDGE_CHECKPOINT_VERSION = 1
+_COMPILED_STATE_PREFIX = "_orig_mod."
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _UPSTREAM_ROOT = _PROJECT_ROOT / "third_party" / "FlashSAC"
@@ -72,6 +74,7 @@ _install_types_only_jax_fallback()
 from flash_rl.agents.flashSAC.agent import (  # noqa: E402
     FlashSACAgent,
     FlashSACConfig,
+    _update_networks,
 )
 
 
@@ -206,6 +209,123 @@ def _group_dict(group: ActionNoiseGroup) -> dict[str, Any]:
     return dataclasses.asdict(group)
 
 
+def _portable_network_state_dict(
+    checkpoint_state: Mapping[str, torch.Tensor],
+    target_state: Mapping[str, torch.Tensor],
+    *,
+    path: str,
+) -> dict[str, torch.Tensor]:
+    """Map root ``torch.compile`` prefixes without weakening strict loading.
+
+    ``torch.compile(module)`` exposes the same parameters under
+    ``_orig_mod.<name>``.  FlashSAC saves that wrapper state verbatim, which
+    otherwise makes a checkpoint depend on whether the loading process enabled
+    compilation.  Only this known, root-level prefix is translated; missing,
+    extra, mixed-prefix, or structurally different keys still fail loudly.
+    """
+
+    source_keys = set(checkpoint_state)
+    target_keys = set(target_state)
+    if source_keys == target_keys:
+        return dict(checkpoint_state)
+
+    has_prefixed = [key.startswith(_COMPILED_STATE_PREFIX) for key in checkpoint_state]
+    if all(has_prefixed):
+        translated = {
+            key.removeprefix(_COMPILED_STATE_PREFIX): value
+            for key, value in checkpoint_state.items()
+        }
+    elif not any(has_prefixed):
+        translated = {
+            f"{_COMPILED_STATE_PREFIX}{key}": value
+            for key, value in checkpoint_state.items()
+        }
+    else:
+        raise RuntimeError(
+            f"network checkpoint {path} mixes compiled and uncompiled parameter keys; "
+            "refusing an ambiguous translation"
+        )
+
+    if set(translated) != target_keys:
+        missing = sorted(target_keys - set(translated))
+        unexpected = sorted(set(translated) - target_keys)
+        raise RuntimeError(
+            f"network checkpoint {path} is structurally incompatible after translating the "
+            f"root {_COMPILED_STATE_PREFIX!r} prefix; missing={missing}, unexpected={unexpected}"
+        )
+    return translated
+
+
+def _load_network_portably(bundle: Any, path: str, *, load_optimizer: bool) -> None:
+    """Load an upstream ``Network`` checkpoint across compile boundaries."""
+
+    device = next(bundle.network.parameters()).device
+    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    if not isinstance(checkpoint, Mapping):
+        raise TypeError(f"network checkpoint {path} must contain a mapping")
+    checkpoint_state = checkpoint.get("network_state_dict")
+    if not isinstance(checkpoint_state, Mapping):
+        raise TypeError(f"network checkpoint {path} has no mapping network_state_dict")
+
+    target_state = bundle.network.state_dict()
+    state = _portable_network_state_dict(checkpoint_state, target_state, path=path)
+    bundle.network.load_state_dict(state, strict=True)
+
+    if not load_optimizer:
+        return
+
+    optimizer_state = checkpoint.get("optimizer_state_dict")
+    if bundle.optimizer is not None and optimizer_state is not None:
+        bundle.optimizer.load_state_dict(optimizer_state)
+        bundle.update_step = checkpoint["update_step"]
+    else:
+        print(
+            "[Warning] load_optimizer=True but optimizer is None or checkpoint has no optimizer state."
+            f" Skipping optimizer load for {path}."
+        )
+
+    scheduler_state = checkpoint.get("scheduler_state_dict")
+    if bundle.scheduler is not None and scheduler_state is not None:
+        bundle.scheduler.load_state_dict(scheduler_state)
+    else:
+        print(
+            "[Warning] load_optimizer=True but scheduler is None or checkpoint has no scheduler state."
+            f" Skipping scheduler load for {path}."
+        )
+
+
+def _load_grad_scaler_portably(
+    scaler: torch.amp.GradScaler,
+    state: Any,
+    *,
+    path: str,
+) -> None:
+    """Restore AMP state when possible, otherwise keep the target's fresh state.
+
+    A disabled ``GradScaler`` serializes to ``{}``, and PyTorch intentionally
+    rejects loading that empty mapping into an enabled scaler.  BC checkpoints
+    have exactly this shape because export performs no mixed-precision update.
+    Conversely, an enabled scaler's dynamics are irrelevant to a target process
+    that disabled AMP.  Both transitions retain the target's freshly initialized
+    scaler; equal enabled states are restored exactly.
+    """
+
+    if not isinstance(state, Mapping):
+        raise TypeError(f"grad_scaler_state_dict in {path} must be a mapping")
+    if scaler.is_enabled() and state:
+        scaler.load_state_dict(dict(state))
+    elif scaler.is_enabled():
+        warnings.warn(
+            f"checkpoint {path} has disabled/empty AMP scaler state; keeping a fresh enabled scaler",
+            stacklevel=2,
+        )
+    elif state:
+        warnings.warn(
+            f"checkpoint {path} has enabled AMP scaler state but AMP is disabled; ignoring scaler state",
+            stacklevel=2,
+        )
+
+
 class FlashSACTorchBridge(FlashSACAgent):
     """Pinned FlashSAC agent with a Torch-native Isaac interaction boundary."""
 
@@ -248,6 +368,34 @@ class FlashSACTorchBridge(FlashSACAgent):
     @property
     def replay_size(self) -> int:
         return len(self._replay_buffer)
+
+    @torch.no_grad()
+    def start_fresh_rollout(self, batch_size: int) -> None:
+        """Reset state that is local to the live simulator trajectory.
+
+        Network, optimizer, completed replay rows, reward RMS, and the observed
+        maximum return are deliberately preserved.  Pending n-step rows and
+        the reward normalizer's per-environment unfinished return cannot be
+        carried across a fresh ``env.reset()`` because no simulator state is
+        restored with the checkpoint.
+        """
+
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        discard_pending = getattr(self._replay_buffer, "discard_pending_n_step", None)
+        if discard_pending is not None:
+            discard_pending()
+        elif hasattr(self._replay_buffer, "_n_step_transitions"):
+            self._replay_buffer._n_step_transitions.clear()
+        else:
+            raise TypeError("replay buffer cannot discard pending n-step transitions")
+        if self.reward_normalizer is not None:
+            self.reward_normalizer.G_r = torch.zeros(
+                batch_size,
+                dtype=torch.float32,
+                device=self._device,
+            )
+        self.reset_exploration(batch_size=batch_size)
 
     @torch.no_grad()
     def reset_exploration(
@@ -407,6 +555,148 @@ class FlashSACTorchBridge(FlashSACAgent):
         )
         super().process_transition(transition)
 
+    def update(self, *, actor_enabled: bool = True) -> dict[str, float]:
+        """Run one upstream update, optionally withholding actor/temperature.
+
+        A short critic-only burn-in is useful after loading a BC actor around a
+        fresh critic.  The replay, reward normalization, critic/target update,
+        AMP behavior, schedulers, and global update counter otherwise match the
+        pinned upstream implementation exactly.
+        """
+
+        batch = self._replay_buffer.sample()
+        for key, value in batch.items():
+            batch[key] = value.to(self._device, non_blocking=True)
+        if self._cfg.asymmetric_observation:
+            batch["actor_observation"] = batch["observation"][:, : self._actor_observation_dim]
+            batch["actor_next_observation"] = batch["next_observation"][
+                :, : self._actor_observation_dim
+            ]
+        else:
+            batch["actor_observation"] = batch["observation"]
+            batch["actor_next_observation"] = batch["next_observation"]
+        if self._cfg.normalize_reward:
+            if self.reward_normalizer is None:
+                raise RuntimeError("normalize_reward=True without a reward normalizer")
+            batch["reward"] = self.reward_normalizer.normalize_rewards(batch["reward"])
+
+        do_actor_update = bool(
+            actor_enabled and self._update_step % self._cfg.actor_update_period == 0
+        )
+        raw_info = _update_networks(
+            batch=batch,
+            actor=self._actor,
+            critic=self._critic,
+            target_critic=self._target_critic,
+            temperature=self._temperature,
+            cfg=self._cfg,
+            do_actor_update=do_actor_update,
+            device=self._device,
+            grad_scaler=self._grad_scaler,
+        )
+        self._update_step += 1
+        return {
+            key: float(value.detach().item()) if isinstance(value, torch.Tensor) else float(value)
+            for key, value in raw_info.items()
+        }
+
+    def demo_bc_rehearsal(
+        self,
+        batch: Mapping[str, torch.Tensor],
+        *,
+        weight: float = 1.0,
+        target_std: float = 0.15,
+        std_weight: float = 0.05,
+        atanh_epsilon: float = 1.0e-4,
+        gradient_clip: float = 10.0,
+    ) -> dict[str, float]:
+        """Apply one explicit demo-only actor correction after a SAC actor step.
+
+        This intentionally does not use upstream ``actor_bc_alpha`` because
+        that term also clones noisy online actions.  Demo actions supervise the
+        FlashSAC pre-tanh mean, and the distribution head is softly retained at
+        the same explicit standard-deviation prior used by BC bootstrap.
+        """
+
+        for name, value in {
+            "weight": weight,
+            "target_std": target_std,
+            "std_weight": std_weight,
+            "atanh_epsilon": atanh_epsilon,
+            "gradient_clip": gradient_clip,
+        }.items():
+            if not math.isfinite(value):
+                raise ValueError(f"demo BC {name} must be finite")
+        if weight <= 0.0 or target_std <= 0.0 or std_weight < 0.0:
+            raise ValueError("demo BC requires weight>0, target_std>0, and std_weight>=0")
+        if not 0.0 < atanh_epsilon < 0.1 or gradient_clip <= 0.0:
+            raise ValueError("invalid demo BC atanh epsilon or gradient clip")
+        observation = batch.get("observation")
+        action = batch.get("action")
+        if not isinstance(observation, torch.Tensor) or not isinstance(action, torch.Tensor):
+            raise TypeError("demo BC batch requires tensor observation and action")
+        if observation.device != self._device or action.device != self._device:
+            raise ValueError("demo BC tensors must already be on the agent device")
+        if observation.ndim != 2 or observation.shape[1] != self._critic_observation_dim:
+            raise ValueError("demo BC observation shape does not match the agent")
+        if action.shape != (observation.shape[0], self._action_dim):
+            raise ValueError("demo BC action shape does not match the agent")
+        actor_observation = (
+            observation[:, : self._actor_observation_dim]
+            if self._cfg.asymmetric_observation
+            else observation
+        )
+        limit = 1.0 - atanh_epsilon
+        target_mean = torch.atanh(action.clamp(-limit, limit))
+        optimizer = self._actor.optimizer
+        if optimizer is None:
+            raise RuntimeError("FlashSAC actor has no optimizer")
+        optimizer.zero_grad(set_to_none=True)
+        with torch.autocast(
+            device_type=self._device.type,
+            dtype=torch.float16,
+            enabled=self._cfg.use_amp,
+        ):
+            predicted_mean, predicted_std = self._actor.apply(
+                "get_mean_and_std",
+                observations=actor_observation,
+                training=True,
+            )
+            action_loss = F.smooth_l1_loss(
+                predicted_mean,
+                target_mean,
+                reduction="mean",
+                beta=1.0,
+            )
+            predicted_log_std = predicted_std.float().clamp_min(1.0e-8).log()
+            std_loss = (predicted_log_std - math.log(target_std)).square().mean()
+            loss = weight * (action_loss + std_weight * std_loss)
+
+        if self._cfg.use_amp:
+            self._grad_scaler.scale(loss).backward()
+            self._grad_scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self._actor.network.parameters(), gradient_clip
+            )
+            self._grad_scaler.step(optimizer)
+            self._grad_scaler.update()
+        else:
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self._actor.network.parameters(), gradient_clip
+            )
+            optimizer.step()
+        # The SAC scheduler advances once for the corresponding environment
+        # update.  Rehearsal is a correction within that update, not a second
+        # unit of the global learning-rate schedule.
+        self._actor.normalize_parameters()
+        return {
+            "demo_bc/loss": float(loss.detach()),
+            "demo_bc/action_loss": float(action_loss.detach()),
+            "demo_bc/std_loss": float(std_loss.detach()),
+            "demo_bc/grad_norm": float(grad_norm.detach()),
+        }
+
     def _bridge_checkpoint_state(self) -> dict[str, Any]:
         state: dict[str, Any] = {
             "version": BRIDGE_CHECKPOINT_VERSION,
@@ -428,7 +718,49 @@ class FlashSACTorchBridge(FlashSACAgent):
         torch.save(self._bridge_checkpoint_state(), os.path.join(path, BRIDGE_STATE_FILENAME))
 
     def load(self, path: str) -> None:
-        super().load(path)
+        load_optimizer = self._cfg.load_optimizer
+        _load_network_portably(
+            self._actor,
+            os.path.join(path, "actor.pt"),
+            load_optimizer=load_optimizer,
+        )
+        _load_network_portably(
+            self._critic,
+            os.path.join(path, "critic.pt"),
+            load_optimizer=load_optimizer,
+        )
+        _load_network_portably(
+            self._target_critic,
+            os.path.join(path, "target_critic.pt"),
+            load_optimizer=False,
+        )
+        _load_network_portably(
+            self._temperature,
+            os.path.join(path, "temperature.pt"),
+            load_optimizer=load_optimizer,
+        )
+
+        if load_optimizer:
+            agent_state_path = os.path.join(path, "agent_state.pt")
+            if not os.path.exists(agent_state_path):
+                raise FileNotFoundError(f"missing FlashSAC agent state: {agent_state_path}")
+            agent_state = torch.load(agent_state_path, map_location=self._device, weights_only=True)
+            self._update_step = agent_state["update_step"]
+            _load_grad_scaler_portably(
+                self._grad_scaler,
+                agent_state["grad_scaler_state_dict"],
+                path=agent_state_path,
+            )
+
+        if self._cfg.load_reward_normalizer:
+            if self.reward_normalizer is None:
+                raise RuntimeError(
+                    "load_reward_normalizer=True but this agent was constructed without reward normalization"
+                )
+            self.reward_normalizer.load(os.path.join(path, "reward_normalizer.pt"))
+
+        print(f"\033[32m[FlashSAC]\033[0m Successfully loaded checkpoint from {path}.")
+
         bridge_path = os.path.join(path, BRIDGE_STATE_FILENAME)
         if not os.path.exists(bridge_path):
             warnings.warn(

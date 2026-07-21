@@ -16,6 +16,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import sys
 
 from isaaclab.app import AppLauncher
 
@@ -111,6 +112,14 @@ parser.add_argument(
 )
 parser.add_argument("--output", default="/tmp/pick_tool_base_handoff_close.pt")
 parser.add_argument("--metrics", default="/tmp/pick_tool_base_handoff_close.json")
+parser.add_argument(
+    "--transition_output",
+    default=None,
+    help=(
+        "optional FlashSAC one-step transition dataset; uses the normal task horizon/termination "
+        "and retains only strict, latched 20 cm successes"
+    ),
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -194,6 +203,8 @@ if args_cli.post_close_mode == "learned_lift" and not args_cli.lift_checkpoint:
     parser.error("--post_close_mode learned_lift requires --lift_checkpoint")
 if args_cli.lift_checkpoint and args_cli.post_close_mode != "learned_lift":
     parser.error("--lift_checkpoint requires --post_close_mode learned_lift")
+if args_cli.transition_output and args_cli.post_close_mode == "verify_only":
+    parser.error("--transition_output requires a full 20 cm post-close mode")
 if args_cli.post_hand_mode == "close" and not args_cli.close_checkpoint:
     parser.error("--post_hand_mode close requires --close_checkpoint")
 if (
@@ -222,6 +233,11 @@ from xhand_inhand.tasks.direct.pick_tool_token.hybrid_action import (
     apply_asymmetric_joint_residual,
     invert_asymmetric_joint_residual,
 )
+
+_FLASHSAC_SCRIPT_DIR = Path(__file__).resolve().parents[1] / "flashsac"
+if str(_FLASHSAC_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_FLASHSAC_SCRIPT_DIR))
+from adapter import PickToolIsaacLabAdapter, build_replay_transition  # noqa: E402
 
 
 SEARCH, CLOSE, VERIFY, POST_BASE, SUCCESS, FAILURE = range(6)
@@ -366,20 +382,35 @@ def main() -> None:
         "Pick-Tool-Token-Direct-v0", device=args_cli.device, num_envs=args_cli.num_envs
     )
     cfg.seed = args_cli.seed
-    cfg.episode_length_s = 120.0
-    cfg.terminate_on_drop = False
-    cfg.success_hold_steps = 100000
     total_max_steps = (
         args_cli.approach_max_steps + args_cli.close_max_steps + args_cli.verify_max_steps
     )
     if args_cli.post_close_mode != "verify_only":
         total_max_steps += args_cli.post_base_max_steps
-    # Measure terminal states ourselves.  An auto-reset would splice a new episode into a close row.
-    cfg.tactile_hard_terminate_steps = total_max_steps + 1
-    cfg.tactile_terminate_steps = total_max_steps + 1
+    if args_cli.transition_output is None:
+        # The option-label collector measures terminal states itself.  A reset
+        # would splice a new episode into one option row.  FlashSAC transition
+        # collection takes the other branch and intentionally keeps the target
+        # MDP's normal 20 s/drop/force/success semantics.
+        cfg.episode_length_s = 120.0
+        cfg.terminate_on_drop = False
+        cfg.success_hold_steps = 100000
+        cfg.tactile_hard_terminate_steps = total_max_steps + 1
+        cfg.tactile_terminate_steps = total_max_steps + 1
     env = gym.make("Pick-Tool-Token-Direct-v0", cfg=cfg)
     u = env.unwrapped
-    obs, _ = env.reset()
+    transition_adapter = None
+    if args_cli.transition_output is None:
+        obs, _ = env.reset()
+    else:
+        transition_adapter = PickToolIsaacLabAdapter(
+            env,
+            strict=True,
+            require_cuda=True,
+            validate_finite=True,
+        )
+        policy_obs, _ = transition_adapter.reset()
+        obs = {"policy": policy_obs}
     dev = u.device
     n = u.num_envs
 
@@ -555,6 +586,33 @@ def main() -> None:
     executed_teacher_rows = 0
     executed_close_rows = 0
 
+    # Full MDP transition rows are recorded step-major and filtered by strict
+    # final outcome only after every parallel trajectory is complete.  The
+    # adapter supplies reset-before terminal observations for done rows.
+    transition_open = torch.ones(n, dtype=torch.bool, device=dev)
+    transition_unlatched_seen = torch.zeros(n, dtype=torch.bool, device=dev)
+    transition_strict_success = torch.zeros(n, dtype=torch.bool, device=dev)
+    transition_assisted_success = torch.zeros(n, dtype=torch.bool, device=dev)
+    transition_terminal_snapshot = {
+        "true_clearance": torch.full((n,), float("nan"), device=dev),
+        "is_grasped": torch.zeros(n, dtype=torch.bool, device=dev),
+        "grasp_quality": torch.full((n,), float("nan"), device=dev),
+        "hold_quality": torch.full((n,), float("nan"), device=dev),
+        "max_force": torch.full((n,), float("nan"), device=dev),
+        "object_lin_speed": torch.full((n,), float("nan"), device=dev),
+        "object_ang_speed": torch.full((n,), float("nan"), device=dev),
+        "success_steps": torch.zeros(n, dtype=torch.long, device=dev),
+    }
+    transition_env: list[torch.Tensor] = []
+    transition_observation: list[torch.Tensor] = []
+    transition_action: list[torch.Tensor] = []
+    transition_reward: list[torch.Tensor] = []
+    transition_next_observation: list[torch.Tensor] = []
+    transition_terminated: list[torch.Tensor] = []
+    transition_truncated: list[torch.Tensor] = []
+    transition_phase: list[torch.Tensor] = []
+    transition_step: list[torch.Tensor] = []
+
     print(
         f"online base->close collector: envs={n} score>={args_cli.handoff_score:.3f} "
         f"x{args_cli.handoff_hold_steps} after step {args_cli.handoff_min_step}, "
@@ -709,7 +767,103 @@ def main() -> None:
             ):
                 raise RuntimeError("close teacher emitted a non-zero arm action")
 
-        obs, _, terminated, truncated, _ = env.step(action)
+        transition_mask = active & transition_open
+        transition_ids = transition_mask.nonzero(as_tuple=False).squeeze(-1)
+        if transition_adapter is None:
+            obs, reward, terminated, truncated, step_info = env.step(action)
+            transition_values = None
+            terminal_failure_now = active & (terminated | truncated)
+        else:
+            next_policy_obs, reward, terminated, truncated, step_info = transition_adapter.step(action)
+            replay_transition = build_replay_transition(
+                policy_obs,
+                action,
+                reward,
+                terminated,
+                truncated,
+                step_info,
+            )
+            if transition_ids.numel() > 0:
+                transition_env.append(transition_ids.cpu())
+                transition_observation.append(
+                    replay_transition["observation"][transition_ids].cpu()
+                )
+                transition_action.append(replay_transition["action"][transition_ids].cpu())
+                transition_reward.append(replay_transition["reward"][transition_ids].cpu())
+                transition_next_observation.append(
+                    replay_transition["next_observation"][transition_ids].cpu()
+                )
+                transition_terminated.append(
+                    replay_transition["terminated"][transition_ids].cpu()
+                )
+                transition_truncated.append(
+                    replay_transition["truncated"][transition_ids].cpu()
+                )
+                transition_phase.append(state[transition_ids].to(torch.uint8).cpu())
+                transition_step.append(
+                    torch.full(
+                        (transition_ids.numel(),),
+                        global_step,
+                        dtype=torch.int32,
+                    )
+                )
+            transition_values = step_info.get("pick_tool_terminal")
+            if not isinstance(transition_values, dict):
+                raise KeyError("adapter step has no pick_tool_terminal ground truth")
+            required_terminal_values = (
+                "success",
+                "failure",
+                "time_out",
+                "unlatched_clearance_ge_5cm",
+                "true_clearance",
+                "is_grasped",
+                "grasp_quality",
+                "hold_quality",
+                "max_force",
+                "object_lin_speed",
+                "object_ang_speed",
+                "success_steps",
+            )
+            for name in required_terminal_values:
+                value = transition_values.get(name)
+                if not isinstance(value, torch.Tensor) or value.shape != (n,):
+                    raise RuntimeError(
+                        f"pick_tool_terminal[{name!r}] must be a tensor with shape ({n},)"
+                    )
+            transition_unlatched_seen |= transition_mask & transition_values[
+                "unlatched_clearance_ge_5cm"
+            ]
+            done_now = terminated | truncated
+            strict_success_now = (
+                transition_mask
+                & done_now
+                & transition_values["success"]
+                & ~transition_values["failure"]
+                & ~transition_values["time_out"]
+            )
+            terminal_failure_now = transition_mask & done_now & ~strict_success_now
+            assisted_success_now = strict_success_now & post_base_mask
+            base_success_now = strict_success_now & base_search_mask
+            transition_strict_success |= strict_success_now
+            transition_assisted_success |= assisted_success_now
+            for name, storage in transition_terminal_snapshot.items():
+                storage[strict_success_now] = transition_values[name][strict_success_now]
+            final_success_step[assisted_success_now] = global_step
+            base_only_success_step[base_success_now] = global_step
+            state[strict_success_now] = SUCCESS
+            state[terminal_failure_now] = FAILURE
+            transition_open &= ~done_now
+            # Done rows have already auto-reset.  Their replay next observation
+            # is correct, but reset-state physics must not enter the hierarchy's
+            # post-step controller diagnostics or overwrite the terminal route.
+            continuing = ~done_now
+            active &= continuing
+            searching &= continuing
+            close_mask &= continuing
+            verify_mask &= continuing
+            post_base_mask &= continuing
+            base_search_mask &= continuing
+            obs = {"policy": next_policy_obs}
         done = terminated | truncated
         u._compute_intermediate_values()
         signals = u._compute_grasp_signals()
@@ -725,10 +879,10 @@ def main() -> None:
         overforce_steps = torch.where(
             active & overforce, overforce_steps + 1, torch.zeros_like(overforce_steps)
         )
-        unsafe = (overforce_steps >= 2) | done
+        unsafe = (overforce_steps >= 2) | terminal_failure_now
         dropped = clearance < -0.03
-        environment_failure |= active & done
-        search_environment_failure = searching & done
+        environment_failure |= terminal_failure_now
+        search_environment_failure = searching & terminal_failure_now
         state[search_environment_failure] = FAILURE
 
         close_age[close_mask] += 1
@@ -1104,6 +1258,7 @@ def main() -> None:
         "learned_lift_stop_clearance": args_cli.learned_lift_stop_clearance,
         "dataset_phase": args_cli.dataset_phase,
         "dataset": None,
+        "transition_dataset": None,
         "close_checkpoint": str(close_checkpoint_path.resolve()) if close_checkpoint_path else None,
         "close_checkpoint_sha256": _sha256(close_checkpoint_path) if close_checkpoint_path else None,
         "lift_checkpoint": str(lift_checkpoint_path.resolve()) if lift_checkpoint_path else None,
@@ -1280,6 +1435,174 @@ def main() -> None:
         metrics["transitions"] = int(dataset["obs"].shape[0])
         metrics["continuity_max_error"] = float(continuity_error)
 
+    transition_dataset_success_ids = torch.empty(0, dtype=torch.long, device=dev)
+    if args_cli.transition_output is not None:
+        terminal = transition_terminal_snapshot
+        qualified_transition_success = (
+            transition_assisted_success
+            & ~transition_unlatched_seen
+            & terminal["is_grasped"]
+            & (terminal["true_clearance"] >= cfg.lift_success_height)
+            & (terminal["grasp_quality"] >= cfg.grasp_quality_high)
+            & (terminal["hold_quality"] >= cfg.close_option_min_hold_quality)
+            & (terminal["max_force"] <= cfg.grasp_bonus_max_force)
+            & (terminal["object_lin_speed"] < cfg.success_max_obj_lin_speed)
+            & (terminal["object_ang_speed"] < cfg.success_max_obj_ang_speed)
+            & (terminal["success_steps"] >= cfg.success_hold_steps)
+        )
+        transition_dataset_success_ids = qualified_transition_success.nonzero(
+            as_tuple=False
+        ).squeeze(-1)
+        metrics["transition_strict_success_count"] = int(transition_strict_success.sum())
+        metrics["transition_assisted_success_count"] = int(transition_assisted_success.sum())
+        metrics["transition_qualified_success_count"] = int(
+            transition_dataset_success_ids.numel()
+        )
+        metrics["transition_rejected_unlatched_count"] = int(
+            (transition_assisted_success & transition_unlatched_seen).sum()
+        )
+
+        if transition_dataset_success_ids.numel() > 0:
+            if not transition_env:
+                raise RuntimeError("strict transition successes have no recorded MDP rows")
+            all_transition_env = torch.cat(transition_env)
+            all_transition_observation = torch.cat(transition_observation)
+            all_transition_action = torch.cat(transition_action)
+            all_transition_reward = torch.cat(transition_reward)
+            all_transition_next_observation = torch.cat(transition_next_observation)
+            all_transition_terminated = torch.cat(transition_terminated)
+            all_transition_truncated = torch.cat(transition_truncated)
+            all_transition_phase = torch.cat(transition_phase)
+            all_transition_step = torch.cat(transition_step)
+
+            output_transition: dict[str, list[torch.Tensor]] = {
+                "observation": [],
+                "action": [],
+                "reward": [],
+                "next_observation": [],
+                "terminated": [],
+                "truncated": [],
+                "phase": [],
+                "episode_id": [],
+                "step": [],
+            }
+            transition_offsets = [0]
+            for episode, env_id in enumerate(
+                transition_dataset_success_ids.cpu().tolist()
+            ):
+                selected = all_transition_env == env_id
+                episode_fields = {
+                    "observation": all_transition_observation[selected],
+                    "action": all_transition_action[selected],
+                    "reward": all_transition_reward[selected],
+                    "next_observation": all_transition_next_observation[selected],
+                    "terminated": all_transition_terminated[selected],
+                    "truncated": all_transition_truncated[selected],
+                    "phase": all_transition_phase[selected],
+                    "source_step": all_transition_step[selected],
+                }
+                length = episode_fields["observation"].shape[0]
+                expected_step = torch.arange(length, dtype=torch.int32)
+                if length < 1 or not torch.equal(episode_fields["source_step"], expected_step):
+                    raise RuntimeError(
+                        f"successful env {env_id} has missing/non-contiguous transition rows"
+                    )
+                terminated_rows = episode_fields["terminated"].nonzero(
+                    as_tuple=False
+                ).squeeze(-1)
+                if terminated_rows.tolist() != [length - 1]:
+                    raise RuntimeError(
+                        f"successful env {env_id} must have exactly one final MDP termination, "
+                        f"got {terminated_rows.tolist()}"
+                    )
+                if bool(episode_fields["truncated"].any()):
+                    raise RuntimeError(f"successful env {env_id} contains a timeout transition")
+                if not bool((episode_fields["phase"] == CLOSE).any()) or not bool(
+                    (episode_fields["phase"] == POST_BASE).any()
+                ):
+                    raise RuntimeError(
+                        f"successful env {env_id} did not traverse both close and lift phases"
+                    )
+                for name in (
+                    "observation",
+                    "action",
+                    "reward",
+                    "next_observation",
+                    "terminated",
+                    "truncated",
+                    "phase",
+                ):
+                    output_transition[name].append(episode_fields[name])
+                output_transition["episode_id"].append(
+                    torch.full((length,), episode, dtype=torch.int64)
+                )
+                output_transition["step"].append(expected_step)
+                transition_offsets.append(transition_offsets[-1] + length)
+
+            transition_dataset = {
+                name: torch.cat(parts) for name, parts in output_transition.items()
+            }
+            transition_dataset.update(
+                {
+                    "episode_offsets": torch.tensor(transition_offsets, dtype=torch.int64),
+                    "episode_route": torch.ones(
+                        transition_dataset_success_ids.numel(), dtype=torch.uint8
+                    ),
+                    "episode_success": torch.ones(
+                        transition_dataset_success_ids.numel(), dtype=torch.bool
+                    ),
+                    "episode_source_env_id": transition_dataset_success_ids.cpu(),
+                    **{
+                        f"episode_terminal_{name}": value[
+                            transition_dataset_success_ids
+                        ].cpu()
+                        for name, value in transition_terminal_snapshot.items()
+                    },
+                    "meta": {
+                        "format_version": 1,
+                        "transition_horizon": 1,
+                        "terminal_observation": "adapter_captured_pre_reset",
+                        "normal_task_termination": True,
+                        "observation_dim": 115,
+                        "action_dim": 21,
+                        "action_layout": "arm_delta7|crossdex_token9|distal_residual5",
+                        "phase_names": ["search", "close", "verify", "post_base"],
+                        "episode_route_names": ["base_only", "close_assisted"],
+                        "collector": "base_close_lift_hierarchy_strict_success",
+                        "reject_unlatched_clearance_ge_5cm": True,
+                        "base_checkpoint": str(checkpoint_path.resolve()),
+                        "base_checkpoint_sha256": _sha256(checkpoint_path),
+                        "close_checkpoint": (
+                            str(close_checkpoint_path.resolve()) if close_checkpoint_path else None
+                        ),
+                        "close_checkpoint_sha256": (
+                            _sha256(close_checkpoint_path) if close_checkpoint_path else None
+                        ),
+                        "lift_checkpoint": (
+                            str(lift_checkpoint_path.resolve()) if lift_checkpoint_path else None
+                        ),
+                        "lift_checkpoint_sha256": (
+                            _sha256(lift_checkpoint_path) if lift_checkpoint_path else None
+                        ),
+                        "feasibility_json": str(artifact_path.resolve()),
+                        "feasibility_sha256": _sha256(artifact_path),
+                        "seed": args_cli.seed,
+                    },
+                }
+            )
+            for name in ("observation", "action", "reward", "next_observation"):
+                if not bool(torch.isfinite(transition_dataset[name]).all()):
+                    raise RuntimeError(f"transition dataset contains non-finite {name}")
+            if float(transition_dataset["action"].abs().max()) > 1.0001:
+                raise RuntimeError("transition dataset contains an action outside [-1, 1]")
+            if transition_dataset["episode_offsets"][-1] != transition_dataset["observation"].shape[0]:
+                raise RuntimeError("transition episode offsets do not cover all rows")
+            transition_output_path = Path(args_cli.transition_output)
+            transition_output_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(transition_dataset, transition_output_path)
+            metrics["transition_dataset"] = str(transition_output_path.resolve())
+            metrics["transition_rows"] = int(transition_dataset["observation"].shape[0])
+
     metrics_path.write_text(json.dumps(metrics, indent=2, allow_nan=False), encoding="utf-8")
     print(
         f"handoff={handoff_ids.numel()}/{n}, close={close_success_ids.numel()}, "
@@ -1290,9 +1613,13 @@ def main() -> None:
     )
     env.close()
     required_success_ids = (
-        dataset_success_ids
-        if can_write_dataset or args_cli.post_close_mode == "verify_only"
-        else assisted_success_ids
+        transition_dataset_success_ids
+        if args_cli.transition_output is not None
+        else (
+            dataset_success_ids
+            if can_write_dataset or args_cli.post_close_mode == "verify_only"
+            else assisted_success_ids
+        )
     )
     if required_success_ids.numel() < args_cli.min_successes:
         raise RuntimeError(

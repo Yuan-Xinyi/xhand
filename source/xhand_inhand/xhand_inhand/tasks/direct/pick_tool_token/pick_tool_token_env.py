@@ -331,6 +331,11 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             "object_velocity": 6,
             "last_action": self.cfg.action_space,
         }
+        required_vectors = {
+            "contact_steps": torch.long,
+            "lost_contact_steps": torch.long,
+            "is_grasped": torch.bool,
+        }
         states: dict[str, torch.Tensor] = {}
         state_count = None
         for key, width in required.items():
@@ -343,6 +348,14 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             elif value.shape[0] != state_count:
                 raise ValueError(f"Curriculum {boundary_name} tensors have inconsistent episode counts")
             states[key] = value.to(device=self.device, dtype=torch.float32)
+        for key, dtype in required_vectors.items():
+            value = source.get(key)
+            if not isinstance(value, torch.Tensor) or value.ndim != 1:
+                shape = tuple(value.shape) if isinstance(value, torch.Tensor) else None
+                raise ValueError(f"Curriculum {boundary_name}.{key} expected [K], got {shape}")
+            if value.shape[0] != state_count:
+                raise ValueError(f"Curriculum {boundary_name} tensors have inconsistent episode counts")
+            states[key] = value.to(device=self.device, dtype=dtype)
         if not state_count:
             raise ValueError(f"Curriculum boundary {boundary_name!r} is empty")
         print(
@@ -389,6 +402,31 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self.object.write_root_velocity_to_sim(states["object_velocity"][state_ids], env_ids=selected_envs)
         self.actions[selected_envs] = states["last_action"][state_ids]
         self.prev_actions[selected_envs] = states["last_action"][state_ids]
+        # These are part of the Markov task state, not diagnostics.  In
+        # particular every lift_start snapshot is already latched.  Dropping
+        # the latch at reset makes the public observation contradict the
+        # captured hand/object state and lets the grasp disappear while contact
+        # sensors repopulate after scene.reset().
+        restored_grasp = states["is_grasped"][state_ids]
+        restored_contact_steps = states["contact_steps"][state_ids]
+        restored_lost_steps = states["lost_contact_steps"][state_ids]
+        self._is_grasped[selected_envs] = restored_grasp
+        self._contact_steps[selected_envs] = restored_contact_steps
+        self._lost_contact_steps[selected_envs] = restored_lost_steps
+        # A boundary that begins after a stable grasp must not repay the
+        # one-shot grasp bonus.  Preserve enough age/safety history for latch
+        # hysteresis while leaving success and lift potentials freshly seeded.
+        self._grasp_bonus_given[selected_envs] = restored_grasp
+        self._safe_grasp_steps[selected_envs] = torch.where(
+            restored_grasp,
+            restored_contact_steps,
+            torch.zeros_like(restored_contact_steps),
+        )
+        self._grasp_age[selected_envs] = torch.where(
+            restored_grasp,
+            restored_contact_steps,
+            torch.zeros_like(restored_contact_steps),
+        )
         self._curriculum_reset_mask[selected_envs] = True
         self._compute_intermediate_values()
 
@@ -1309,6 +1347,16 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             | (self._overforce_steps >= cfg.tactile_terminate_steps)
         )
         self._tactile_terminate_fraction.copy_(unsafe_force.float().mean())
+        terminal_state = {
+            "true_clearance": clearance.clone(),
+            "is_grasped": self._is_grasped.clone(),
+            "grasp_quality": signals["grasp_quality"].clone(),
+            "hold_quality": signals["hold_quality"].clone(),
+            "max_force": max_force.clone(),
+            "object_lin_speed": obj_lin.clone(),
+            "object_ang_speed": obj_ang.clone(),
+            "success_steps": self._success_steps.clone(),
+        }
 
         if cfg.close_option_mode:
             horizontal_drift = (
@@ -1364,6 +1412,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 "unlatched_clearance_ge_5cm": (
                     (clearance >= 0.05) & (~self._is_grasped)
                 ).clone(),
+                **terminal_state,
             }
             return terminated, time_out
 
@@ -1377,6 +1426,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             "unlatched_clearance_ge_5cm": (
                 (clearance >= 0.05) & (~self._is_grasped)
             ).clone(),
+            **terminal_state,
         }
         return terminated, time_out
 
