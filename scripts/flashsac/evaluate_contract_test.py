@@ -38,6 +38,7 @@ from evaluate import (
     _atomic_write_json,
     apply_coupled_controller_ablation,
     apply_public_latch_arm_gate,
+    apply_public_latch_hand_hold,
     build_strict_metrics,
     episode_quotas,
     infer_actor_architecture_from_state,
@@ -1456,6 +1457,39 @@ def test_public_latch_arm_gate_is_memoryless_and_exact() -> None:
     )
 
 
+def test_public_latch_hand_hold_uses_observed_previous_action() -> None:
+    action = torch.arange(42, dtype=torch.float32).reshape(2, 21) / 42.0
+    observation = torch.zeros(2, 115)
+    observation[:, 77:86] = torch.arange(18, dtype=torch.float32).reshape(2, 9) / 20.0
+    observation[:, 87:92] = torch.arange(10, dtype=torch.float32).reshape(2, 5) / 12.0
+    observation[1, 106] = 1.0
+    original = action.clone()
+
+    held = apply_public_latch_hand_hold(action, observation)
+    assert torch.equal(held[0], action[0])
+    assert torch.equal(held[1, :7], action[1, :7])
+    assert torch.equal(held[1, 7:16], observation[1, 77:86])
+    assert torch.equal(held[1, 16:21], observation[1, 87:92])
+    assert torch.equal(action, original)
+    assert held.data_ptr() != action.data_ptr()
+
+    malformed = observation.clone()
+    malformed[0, 106] = 0.5
+    _expect_error(RuntimeError, apply_public_latch_hand_hold, action, malformed)
+    _expect_error(
+        ValueError,
+        apply_public_latch_hand_hold,
+        action[:, :14],
+        observation,
+    )
+    _expect_error(
+        TypeError,
+        apply_public_latch_hand_hold,
+        action.to(dtype=torch.float64),
+        observation,
+    )
+
+
 def test_curriculum_argument_contract() -> None:
     assert task_mode_from_option_flags(
         close_option_mode=False, power_close_option_mode=False
@@ -2065,6 +2099,7 @@ def main() -> None:
     test_power_close_tracker_metrics_and_hand_action_contract()
     test_coupled_controller_ablation_composition()
     test_public_latch_arm_gate_is_memoryless_and_exact()
+    test_public_latch_hand_hold_uses_observed_previous_action()
     test_curriculum_argument_contract()
     test_checkpoint_architecture_and_path_contract()
     test_checkpoint_task_mode_evaluation_contract()

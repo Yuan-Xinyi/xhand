@@ -45,6 +45,10 @@ ACTION_DIM = 21
 ARM_ACTION_DIM = 7
 HAND_ACTION_DIM = 14
 FULL_TASK_GRASP_LATCH_OBSERVATION_INDEX = 106
+FULL_TASK_LAST_ARM_TOKEN_ACTION_START = 70
+FULL_TASK_LAST_ARM_TOKEN_ACTION_STOP = 86
+FULL_TASK_LAST_RESIDUAL_ACTION_START = 87
+FULL_TASK_LAST_RESIDUAL_ACTION_STOP = 92
 PRODUCTION_ACTOR_BLOCKS = 2
 PRODUCTION_ACTOR_HIDDEN = 128
 PRODUCTION_CRITIC_BLOCKS = 2
@@ -289,6 +293,64 @@ def apply_public_latch_arm_gate(
         torch.zeros_like(action[:, :ARM_ACTION_DIM]),
     )
     return gated
+
+
+def apply_public_latch_hand_hold(
+    action: torch.Tensor,
+    observation: torch.Tensor,
+) -> torch.Tensor:
+    """Hold the last executed hand action while the public grasp latch is set.
+
+    The standard 115-D observation already contains the previous executed
+    ``arm7|token9`` action at indices 70:86 and the previous distal residual at
+    87:92.  Reusing those public features is therefore a memoryless Markov
+    policy transform; it does not consult simulator state or an evaluator-side
+    latch history.
+    """
+
+    if not isinstance(action, torch.Tensor) or not isinstance(
+        observation, torch.Tensor
+    ):
+        raise TypeError("public latch hand hold requires torch tensors")
+    if action.ndim != 2 or action.shape[1] != ACTION_DIM:
+        raise ValueError(f"public latch hand hold requires [batch, {ACTION_DIM}] actions")
+    if (
+        observation.ndim != 2
+        or observation.shape[0] != action.shape[0]
+        or observation.shape[1] != OBSERVATION_DIM
+    ):
+        raise ValueError(
+            f"public latch hand hold requires matching [batch, {OBSERVATION_DIM}] observations"
+        )
+    if action.device != observation.device:
+        raise ValueError("public latch hand hold action and observation must share a device")
+    if action.dtype != observation.dtype:
+        raise TypeError("public latch hand hold action and observation must share a dtype")
+    latch = observation[:, FULL_TASK_GRASP_LATCH_OBSERVATION_INDEX]
+    if not bool(((latch == 0.0) | (latch == 1.0)).all().item()):
+        raise RuntimeError("actor-visible grasp latch must be exactly binary")
+    latched = latch == 1.0
+    held = action.clone()
+    previous_token = observation[
+        :,
+        FULL_TASK_LAST_ARM_TOKEN_ACTION_START + ARM_ACTION_DIM :
+        FULL_TASK_LAST_ARM_TOKEN_ACTION_STOP,
+    ]
+    previous_residual = observation[
+        :,
+        FULL_TASK_LAST_RESIDUAL_ACTION_START:FULL_TASK_LAST_RESIDUAL_ACTION_STOP,
+    ]
+    held[:, ARM_ACTION_DIM : ARM_ACTION_DIM + 9] = torch.where(
+        latched.unsqueeze(-1),
+        previous_token,
+        action[:, ARM_ACTION_DIM : ARM_ACTION_DIM + 9],
+    )
+    held[:, ARM_ACTION_DIM + 9 :] = torch.where(
+        latched.unsqueeze(-1),
+        previous_residual,
+        action[:, ARM_ACTION_DIM + 9 :],
+    )
+    return held
 
 
 def requested_policy_action_contract(task_mode: str) -> dict[str, Any]:
@@ -2666,6 +2728,15 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
             "same actor when it is 1; this policy transform is memoryless and Markov."
         ),
     )
+    parser.add_argument(
+        "--hold_hand_after_grasp_latch",
+        action="store_true",
+        help=(
+            "Diagnostic public-observation transform: while latch[106]=1, retain the "
+            "previous token9/residual5 action exposed at observation[77:86,87:92]. "
+            "Requires --gate_arm_until_grasp_latch."
+        ),
+    )
     parser.add_argument("--arm_hold_confirm_steps", type=int, default=15)
     parser.add_argument(
         "--arm_hold_grasp_quality_threshold", type=float, default=0.35
@@ -2886,6 +2957,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         curriculum_joint_noise=args.curriculum_joint_noise,
         episode_length_s=args.episode_length_s,
     )
+    if args.hold_hand_after_grasp_latch and not args.gate_arm_until_grasp_latch:
+        raise ValueError(
+            "--hold_hand_after_grasp_latch requires --gate_arm_until_grasp_latch"
+        )
     if (
         not math.isfinite(args.latched_arm_action_scale)
         or not 0.0 < args.latched_arm_action_scale <= 1.0
@@ -3231,6 +3306,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     observation,
                     latched_arm_scale=args.latched_arm_action_scale,
                 )
+            if args.hold_hand_after_grasp_latch:
+                action = apply_public_latch_hand_hold(action, observation)
             # Slots whose deterministic quota is complete continue simulating
             # independently but cannot contribute additional events.
             action = torch.where(tracker.active.unsqueeze(-1), action, torch.zeros_like(action))
@@ -3343,6 +3420,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         metrics["gate_arm_until_grasp_latch"] = bool(
             args.gate_arm_until_grasp_latch
         )
+        metrics["hold_hand_after_grasp_latch"] = bool(
+            args.hold_hand_after_grasp_latch
+        )
         metrics["checkpoint_policy_action_authority"] = checkpoint_authority
         metrics["checkpoint_native_public_latch_arm_gate"] = bool(
             checkpoint_native_public_latch_gate
@@ -3388,6 +3468,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         elif args.gate_arm_until_grasp_latch:
             metrics["policy"] = (
                 "deterministic_tanh_actor_mean+public_latch_arm_gate"
+                + (
+                    "+public_latch_hand_hold"
+                    if args.hold_hand_after_grasp_latch
+                    else ""
+                )
             )
             metrics["public_latch_arm_gate"] = {
                 "arm_action_width": ARM_ACTION_DIM,
@@ -3399,6 +3484,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "arm7=0 iff actor-visible latch[106]=0; no hidden state"
                 ),
             }
+            if args.hold_hand_after_grasp_latch:
+                metrics["public_latch_hand_hold"] = {
+                    "latch_observation_index": (
+                        FULL_TASK_GRASP_LATCH_OBSERVATION_INDEX
+                    ),
+                    "token_observation_slice": [77, 86],
+                    "residual_observation_slice": [87, 92],
+                    "semantics": (
+                        "while latch[106]=1, hand14 equals the previous executed "
+                        "hand action already present in the public observation"
+                    ),
+                }
         elif checkpoint_native_public_latch_gate:
             metrics["policy"] = (
                 "deterministic_tanh_actor_mean+checkpoint_public_latch_arm_gate"

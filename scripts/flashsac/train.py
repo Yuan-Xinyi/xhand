@@ -1671,6 +1671,15 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         help="Initial local updates that train critic/target only and preserve the loaded BC actor.",
     )
     parser.add_argument(
+        "--actor_update_period",
+        type=int,
+        default=2,
+        help=(
+            "Run one actor/temperature update every N critic updates. The upstream "
+            "default is 2; larger values permit conservative fine-tuning of a proven actor."
+        ),
+    )
+    parser.add_argument(
         "--lr_decay_updates",
         type=int,
         default=None,
@@ -1977,6 +1986,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--updates must be finite and non-negative")
     if args.critic_burnin_updates < 0:
         raise ValueError("--critic_burnin_updates must be non-negative")
+    if args.actor_update_period < 1:
+        raise ValueError("--actor_update_period must be positive")
     for name in ("lr_decay_updates", "lr_warmup_updates"):
         value = getattr(args, name)
         if value is not None and value < 1:
@@ -2877,6 +2888,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         gamma=FLASH_SAC_GAMMA,
         actor_num_blocks=1 if args.smoke else args.actor_blocks,
         actor_hidden_dim=32 if args.smoke else args.actor_hidden,
+        actor_update_period=args.actor_update_period,
         critic_num_blocks=1 if args.smoke else args.critic_blocks,
         critic_hidden_dim=64 if args.smoke else args.critic_hidden,
         critic_num_bins=51 if args.smoke else args.critic_bins,
@@ -3438,6 +3450,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "environment_steps": interaction_step * env.num_envs,
                     "gradient_updates": update_count,
                     "actor_updates": actor_update_count,
+                    "actor_update_period": args.actor_update_period,
                     "critic_burnin_updates": args.critic_burnin_updates,
                     "residual_actor_unlocked": residual_actor_unlocked,
                     "residual_actor_unlock_successes": (
