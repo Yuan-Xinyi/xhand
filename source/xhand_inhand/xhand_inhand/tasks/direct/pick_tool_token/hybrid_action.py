@@ -10,6 +10,111 @@ from __future__ import annotations
 import torch
 
 
+def coupled_align_phase_state(
+    episode_step: torch.Tensor,
+    power_latched: torch.Tensor,
+    *,
+    align_steps: int = 24,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the coupled-option ALIGN mask and normalized phase progress.
+
+    The progress scalar is part of the policy observation.  An active bit alone is insufficient:
+    otherwise identical pregrasp states at ALIGN steps zero and twenty-three would have different
+    next-step action authority despite appearing identical to a memoryless actor.
+    """
+
+    if episode_step.ndim != 1:
+        raise ValueError("episode_step must be one-dimensional")
+    if power_latched.shape != episode_step.shape or power_latched.dtype != torch.bool:
+        raise ValueError("power_latched must be a boolean vector matching episode_step")
+    if power_latched.device != episode_step.device:
+        raise ValueError("phase tensors must share a device")
+    if align_steps < 1:
+        raise ValueError("align_steps must be positive")
+
+    align_active = (episode_step < align_steps) & (~power_latched)
+    align_progress = torch.clamp(episode_step.float() / float(align_steps), 0.0, 1.0)
+    return align_active, align_progress
+
+
+def phase_coupled_align_close_action(
+    actions: torch.Tensor,
+    episode_step: torch.Tensor,
+    power_latched: torch.Tensor,
+    *,
+    arm_width: int = 7,
+    align_steps: int = 24,
+    arm_multiplier: float = 0.2,
+) -> torch.Tensor:
+    """Apply the mutually exclusive arm-align and hand-close action phases.
+
+    Before ``align_steps``, an unlatched environment may use a reduced arm action while its hand
+    action is held at exact zero.  At the phase boundary, or immediately after an early power
+    latch, arm authority is withdrawn and the hand action passes through unchanged.  The input
+    action tensor is never modified in place.
+    """
+
+    if actions.ndim != 2:
+        raise ValueError("actions must have shape (N, A)")
+    if episode_step.ndim != 1 or episode_step.shape[0] != actions.shape[0]:
+        raise ValueError("episode_step must be a vector matching the action batch")
+    if power_latched.ndim != 1 or power_latched.shape[0] != actions.shape[0]:
+        raise ValueError("power_latched must be a vector matching the action batch")
+    if power_latched.dtype != torch.bool:
+        raise ValueError("power_latched must be boolean")
+    if episode_step.device != actions.device or power_latched.device != actions.device:
+        raise ValueError("phase tensors and actions must share a device")
+    if not 0 <= arm_width <= actions.shape[1]:
+        raise ValueError("arm_width must be within the action dimension")
+    align_phase, _ = coupled_align_phase_state(
+        episode_step,
+        power_latched,
+        align_steps=align_steps,
+    )
+    phase_mask = align_phase.unsqueeze(-1)
+    arm_action = torch.where(
+        phase_mask,
+        actions[:, :arm_width] * arm_multiplier,
+        torch.zeros_like(actions[:, :arm_width]),
+    )
+    hand_action = torch.where(
+        phase_mask,
+        torch.zeros_like(actions[:, arm_width:]),
+        actions[:, arm_width:],
+    )
+    return torch.cat((arm_action, hand_action), dim=-1)
+
+
+def clamp_arm_target_to_anchor(
+    target: torch.Tensor,
+    anchor: torch.Tensor,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    *,
+    limit: float = 0.12,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Clamp arm targets to the intersection of joint limits and an anchor envelope.
+
+    Returns the bounded target and a boolean vector indicating whether any joint in each row was
+    saturated.  All source tensors remain unchanged.
+    """
+
+    if target.ndim != 2 or anchor.shape != target.shape:
+        raise ValueError("target and anchor must have the same (N, J) shape")
+    if lower.shape != target.shape or upper.shape != target.shape:
+        raise ValueError("lower and upper must match the target shape")
+    if anchor.device != target.device or lower.device != target.device or upper.device != target.device:
+        raise ValueError("arm target tensors must share a device")
+    if limit < 0.0:
+        raise ValueError("limit must be non-negative")
+
+    effective_lower = torch.maximum(lower, anchor - limit)
+    effective_upper = torch.minimum(upper, anchor + limit)
+    bounded = torch.maximum(torch.minimum(target, effective_upper), effective_lower)
+    saturated = torch.any(bounded != target, dim=-1)
+    return bounded, saturated
+
+
 def zero_action_prefix(actions: torch.Tensor, prefix_width: int) -> torch.Tensor:
     """Return actions with a leading control group replaced by exact zeros."""
 

@@ -10,6 +10,7 @@ import torch
 from adapter import (
     ACTION_DIM,
     ARM_ACTION_DIM,
+    COUPLED_POLICY_OBSERVATION_DIM,
     HAND_ACTION_DIM,
     POLICY_OBSERVATION_DIM,
     PickToolIsaacLabAdapter,
@@ -26,19 +27,26 @@ class _Cfg:
     action_space: int = ACTION_DIM
     observation_noise_model: object | None = None
     close_option_mode: bool = False
+    power_close_option_mode: bool = False
+    coupled_power_align_close_option_mode: bool = False
 
 
 class _FakeDirectEnv:
     """Minimal auto-reset environment with the ordering used by DirectRLEnv."""
 
-    def __init__(self, *, call_reset_for_done: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        call_reset_for_done: bool = True,
+        observation_dim: int = POLICY_OBSERVATION_DIM,
+    ) -> None:
         self.num_envs = 3
         self.device = "cpu"
-        self.cfg = _Cfg()
+        self.cfg = _Cfg(observation_space=observation_dim, state_space=observation_dim)
         self.max_episode_length = 100
         self.episode_length_buf = torch.zeros(self.num_envs, dtype=torch.long)
         self.call_reset_for_done = call_reset_for_done
-        self.state = torch.zeros(self.num_envs, POLICY_OBSERVATION_DIM)
+        self.state = torch.zeros(self.num_envs, observation_dim)
         self.last_action: torch.Tensor | None = None
         self.last_extras: dict[str, object] = {}
         self.closed = False
@@ -216,6 +224,33 @@ def test_hand_only_actions_expand_at_environment_boundary_and_stay_14d_in_replay
         raise AssertionError("14D replay action was accepted under the default 21D contract")
 
 
+def test_coupled_actions_and_observations_use_native_identity_boundary() -> None:
+    raw = _FakeDirectEnv(observation_dim=COUPLED_POLICY_OBSERVATION_DIM)
+    raw.cfg.close_option_mode = True
+    raw.cfg.power_close_option_mode = True
+    raw.cfg.coupled_power_align_close_option_mode = True
+    env = PickToolIsaacLabAdapter(raw, require_cuda=False)
+    observation, _ = env.reset()
+    assert observation.shape == (raw.num_envs, COUPLED_POLICY_OBSERVATION_DIM)
+    assert env.observation_dim == COUPLED_POLICY_OBSERVATION_DIM
+    assert env.action_dim == ACTION_DIM
+
+    action = torch.linspace(
+        -0.9, 0.9, raw.num_envs * ACTION_DIM, dtype=torch.float32
+    ).reshape(raw.num_envs, ACTION_DIM)
+    env.step(action)
+    assert raw.last_action is not None
+    torch.testing.assert_close(raw.last_action, action, rtol=0.0, atol=0.0)
+    assert torch.count_nonzero(raw.last_action[:, :ARM_ACTION_DIM]).item() > 0
+
+    try:
+        PickToolIsaacLabAdapter(raw, require_cuda=False, hand_only_actions=True)
+    except ValueError as exc:
+        assert "native 21-D identity" in str(exc)
+    else:
+        raise AssertionError("coupled environment accepted the hand-only projection")
+
+
 def test_done_logic() -> None:
     terminated = torch.tensor([False, True, False, True])
     truncated = torch.tensor([False, False, True, True])
@@ -306,6 +341,7 @@ def main() -> None:
         test_policy_only_and_spaces,
         test_terminal_capture_and_replay_semantics,
         test_hand_only_actions_expand_at_environment_boundary_and_stay_14d_in_replay,
+        test_coupled_actions_and_observations_use_native_identity_boundary,
         test_done_logic,
         test_contract_failures,
         test_episode_length_randomization_and_close,

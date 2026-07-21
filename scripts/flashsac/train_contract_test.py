@@ -19,9 +19,13 @@ if str(HERE) not in sys.path:
 from adapter import ACTION_DIM, HAND_ACTION_DIM, build_replay_transition  # noqa: E402
 from train import (  # noqa: E402
     CLOSE_OPTION_TASK_MODE,
+    COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_CONTRACT,
+    COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM,
+    COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
     CORE_CHECKPOINT_FILENAMES,
     EpisodeAccumulator,
     FULL21_TO_HAND14_ACTOR_PROJECTION,
+    FULL115_TO_COUPLED131_ACTOR_PROJECTION,
     FULL_ACTION_NOISE_GROUP_SPECS,
     FULL_POLICY_ACTION_LAYOUT,
     FULL_TASK_MODE,
@@ -42,10 +46,14 @@ from train import (  # noqa: E402
     audit_actor_checkpoint_source,
     atomic_write_json,
     build_latch_conditioned_noise_scale,
+    environment_task_mode_overrides,
     policy_action_contract,
+    project_full_actor_to_coupled_observation_state,
     clear_stale_checkpoint_optional_artifacts,
     load_audited_actor_checkpoint,
     read_checkpoint_task_contract,
+    resolve_default_episode_length_s,
+    resolve_smoke_interaction_steps,
     resolve_warmup_transitions,
     runtime_contract,
     save_final_checkpoint,
@@ -89,6 +97,64 @@ def test_warmup_resolution() -> None:
     assert resolve_warmup_transitions(buffer=1_000_000, batch=2048, smoke=False, requested=None) == 10_000
     assert resolve_warmup_transitions(buffer=8192, batch=256, smoke=False, requested=None) == 8192
     assert resolve_warmup_transitions(buffer=8192, batch=256, smoke=False, requested=512) == 512
+
+
+def test_default_episode_horizons() -> None:
+    assert resolve_default_episode_length_s(
+        task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+        smoke=True,
+    ) == 3.0
+    assert resolve_default_episode_length_s(
+        task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+        smoke=False,
+    ) == 5.0
+    assert resolve_default_episode_length_s(
+        task_mode=POWER_CLOSE_OPTION_TASK_MODE,
+        smoke=True,
+    ) == 0.5
+    assert resolve_default_episode_length_s(
+        task_mode=FULL_TASK_MODE,
+        smoke=True,
+    ) == 0.12
+    assert resolve_default_episode_length_s(
+        task_mode=FULL_TASK_MODE,
+        smoke=False,
+    ) is None
+    assert resolve_smoke_interaction_steps(
+        requested=1_000,
+        task_mode=FULL_TASK_MODE,
+    ) == 8
+    assert resolve_smoke_interaction_steps(
+        requested=1,
+        task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+    ) == 64
+
+
+def test_environment_task_mode_overrides() -> None:
+    assert environment_task_mode_overrides(FULL_TASK_MODE) == {
+        "close_option_mode": False,
+        "power_close_option_mode": False,
+        "coupled_power_align_close_option_mode": False,
+    }
+    assert environment_task_mode_overrides(CLOSE_OPTION_TASK_MODE) == {
+        "close_option_mode": True,
+        "power_close_option_mode": False,
+        "coupled_power_align_close_option_mode": False,
+    }
+    assert environment_task_mode_overrides(POWER_CLOSE_OPTION_TASK_MODE) == {
+        "close_option_mode": True,
+        "power_close_option_mode": True,
+        "coupled_power_align_close_option_mode": False,
+    }
+    assert environment_task_mode_overrides(
+        COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE
+    ) == {
+        "close_option_mode": True,
+        "power_close_option_mode": True,
+        "coupled_power_align_close_option_mode": True,
+        "observation_space": COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM,
+        "state_space": COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM,
+    }
 
 
 def test_auto_reset_replay_boundary() -> None:
@@ -259,6 +325,30 @@ def test_terminal_event_accumulator() -> None:
         "pick_tool_terminal/close_option_lost_window": 0,
     }
 
+    coupled = TerminalEventAccumulator(
+        num_envs=2,
+        device=torch.device("cpu"),
+        task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+    )
+    coupled.step(
+        {
+            "pick_tool_terminal": {
+                "power_close_option_success": torch.tensor([True, False]),
+                "power_close_option_failure": torch.tensor([False, True]),
+                "power_close_option_timeout": torch.tensor([False, False]),
+                "dropped": torch.tensor([False, False]),
+                "unsafe_force": torch.tensor([False, False]),
+                "close_option_unlatched_lift": torch.tensor([False, False]),
+                "close_option_horizontal_escape": torch.tensor([False, False]),
+                "close_option_lost_window": torch.tensor([False, False]),
+                "coupled_power_pose_escape": torch.tensor([False, True]),
+            }
+        }
+    )
+    assert coupled.metrics()["pick_tool_terminal/power_close_option_success"] == 1
+    assert coupled.metrics()["pick_tool_terminal/power_close_option_failure"] == 1
+    assert coupled.metrics()["pick_tool_terminal/coupled_power_pose_escape"] == 1
+
 
 def test_power_close_strict_metrics_are_power_specific() -> None:
     info = {
@@ -318,6 +408,48 @@ def test_power_close_strict_metrics_are_power_specific() -> None:
         task_mode=POWER_CLOSE_OPTION_TASK_MODE,
     )
 
+    coupled_terminal = dict(info["pick_tool_terminal"])
+    coupled_terminal.update(
+        {
+            "coupled_power_pose_escape": torch.tensor([False, True, False]),
+            "coupled_power_rotation_drift": torch.tensor([0.01, 0.20, 0.05]),
+            "coupled_power_xy_drift": torch.tensor([0.001, 0.02, 0.005]),
+            "coupled_power_true_clearance": torch.tensor([-0.001, 0.002, 0.0]),
+            "coupled_power_arm_target_offset_abs_max": torch.tensor(
+                [0.01, 0.12, 0.04]
+            ),
+            "coupled_power_arm_target_saturated": torch.tensor(
+                [False, True, False]
+            ),
+            "coupled_power_align_active": torch.tensor([True, False, True]),
+        }
+    )
+    coupled_metrics = _strict_metrics(
+        {
+            "strict_metrics": info["strict_metrics"],
+            "pick_tool_terminal": coupled_terminal,
+        },
+        task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+    )
+    assert "success_frac" not in coupled_metrics
+    assert coupled_metrics["power_q_close_max"] == metrics["power_q_close_max"]
+    assert abs(coupled_metrics["coupled_power_pose_escape_frac"] - 1.0 / 3.0) < 1e-6
+    assert abs(coupled_metrics["coupled_power_align_active_frac"] - 2.0 / 3.0) < 1e-6
+    assert abs(coupled_metrics["coupled_power_rotation_drift_max"] - 0.20) < 1e-6
+    assert abs(coupled_metrics["coupled_power_xy_drift_max"] - 0.02) < 1e-6
+    assert abs(coupled_metrics["coupled_power_true_clearance_min"] + 0.001) < 1e-6
+    assert abs(
+        coupled_metrics["coupled_power_arm_target_offset_abs_max_max"] - 0.12
+    ) < 1e-6
+    missing_coupled = dict(coupled_terminal)
+    del missing_coupled["coupled_power_align_active"]
+    _expect_error(
+        TypeError,
+        _strict_metrics,
+        {"strict_metrics": {}, "pick_tool_terminal": missing_coupled},
+        task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+    )
+
 
 def test_atomic_json() -> None:
     with tempfile.TemporaryDirectory() as directory:
@@ -338,7 +470,13 @@ def test_task_mode_source_and_replay_contracts() -> None:
         task_mode_from_close_option(False, True)
         == POWER_CLOSE_OPTION_TASK_MODE
     )
+    assert (
+        task_mode_from_close_option(False, False, True)
+        == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE
+    )
     _expect_error(ValueError, task_mode_from_close_option, True, True)
+    _expect_error(ValueError, task_mode_from_close_option, True, False, True)
+    _expect_error(ValueError, task_mode_from_close_option, False, True, True)
     assert policy_action_contract(FULL_TASK_MODE) == {
         "policy_action_dim": ACTION_DIM,
         "policy_action_layout": FULL_POLICY_ACTION_LAYOUT,
@@ -354,6 +492,22 @@ def test_task_mode_source_and_replay_contracts() -> None:
         "environment_action_dim": ACTION_DIM,
         "action_projection": PREPEND_ZERO_ARM_ACTION_PROJECTION,
     }
+    assert policy_action_contract(
+        COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE
+    ) == {
+        "policy_action_dim": ACTION_DIM,
+        "policy_action_layout": FULL_POLICY_ACTION_LAYOUT,
+        "environment_action_dim": ACTION_DIM,
+        "action_projection": IDENTITY_ACTION_PROJECTION,
+    }
+    assert runtime_contract(COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE) == {
+        "observation_dim": COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM,
+        "observation_contract": COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_CONTRACT,
+        "policy_action_dim": ACTION_DIM,
+        "policy_action_layout": FULL_POLICY_ACTION_LAYOUT,
+        "environment_action_dim": ACTION_DIM,
+        "action_projection": IDENTITY_ACTION_PROJECTION,
+    }
     assert action_noise_group_specs(FULL_TASK_MODE) == FULL_ACTION_NOISE_GROUP_SPECS
     assert (
         action_noise_group_specs(CLOSE_OPTION_TASK_MODE)
@@ -362,6 +516,10 @@ def test_task_mode_source_and_replay_contracts() -> None:
     assert (
         action_noise_group_specs(POWER_CLOSE_OPTION_TASK_MODE)
         == POWER_ACTION_NOISE_GROUP_SPECS
+    )
+    assert (
+        action_noise_group_specs(COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE)
+        == FULL_ACTION_NOISE_GROUP_SPECS
     )
 
     validate_training_source_selection(
@@ -383,6 +541,18 @@ def test_task_mode_source_and_replay_contracts() -> None:
         power_close_option_mode=True,
         demo=None,
         actor_demo=None,
+    )
+    validate_training_source_selection(
+        checkpoint=None,
+        actor_checkpoint=Path("full-actor"),
+        resume_replay=False,
+        resume_actor_demo=False,
+        close_option_mode=False,
+        power_close_option_mode=False,
+        demo=None,
+        actor_demo=None,
+        coupled_power_align_close_option_mode=True,
+        allow_cross_task_actor=True,
     )
     _expect_error(
         ValueError,
@@ -427,6 +597,33 @@ def test_task_mode_source_and_replay_contracts() -> None:
         actor_checkpoint=None,
         resume_replay=False,
         resume_actor_demo=False,
+        close_option_mode=False,
+        power_close_option_mode=False,
+        demo=None,
+        actor_demo=[Path("uncontracted-coupled-actor.pt")],
+        coupled_power_align_close_option_mode=True,
+    )
+    _expect_error(
+        ValueError,
+        validate_training_source_selection,
+        checkpoint=None,
+        actor_checkpoint=None,
+        resume_replay=False,
+        resume_actor_demo=False,
+        close_option_mode=False,
+        power_close_option_mode=False,
+        demo=None,
+        actor_demo=None,
+        coupled_power_align_close_option_mode=True,
+        allow_cross_task_actor=True,
+    )
+    _expect_error(
+        ValueError,
+        validate_training_source_selection,
+        checkpoint=None,
+        actor_checkpoint=None,
+        resume_replay=False,
+        resume_actor_demo=False,
         close_option_mode=True,
         power_close_option_mode=True,
         demo=None,
@@ -452,6 +649,17 @@ def test_task_mode_source_and_replay_contracts() -> None:
         curriculum_joint_noise=0.005,
         episode_length_s=0.40,
         randomize_episode_lengths=False,
+    )
+    validate_close_option_training_config(
+        close_option_mode=False,
+        power_close_option_mode=False,
+        curriculum_dataset=Path("close.pt"),
+        curriculum_boundary="close_start",
+        curriculum_probability=1.0,
+        curriculum_joint_noise=0.02,
+        episode_length_s=3.0,
+        randomize_episode_lengths=False,
+        coupled_power_align_close_option_mode=True,
     )
     validate_close_option_training_config(
         close_option_mode=False,
@@ -499,6 +707,22 @@ def test_task_mode_source_and_replay_contracts() -> None:
         ValueError,
         validate_close_option_training_config,
         **power_too_short,
+    )
+    coupled_config = {
+        "close_option_mode": False,
+        "power_close_option_mode": False,
+        "curriculum_dataset": Path("close.pt"),
+        "curriculum_boundary": "close_start",
+        "curriculum_probability": 1.0,
+        "curriculum_joint_noise": 0.005,
+        "episode_length_s": 2.99,
+        "randomize_episode_lengths": False,
+        "coupled_power_align_close_option_mode": True,
+    }
+    _expect_error(
+        ValueError,
+        validate_close_option_training_config,
+        **coupled_config,
     )
 
     with tempfile.TemporaryDirectory(prefix="flashsac_task_contract_") as directory:
@@ -797,6 +1021,71 @@ def test_task_mode_source_and_replay_contracts() -> None:
                 gamma=0.99,
             )
 
+        # Coupled power is a separate 131D/21D identity contract. Full-agent
+        # and replay restore remain strictly same-task despite actor-only transfer.
+        write_checkpoint_task_contract(
+            checkpoint,
+            task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+            replay_n_step=3,
+            replay_gamma=0.99,
+        )
+        coupled_payload = json.loads(
+            (checkpoint / TASK_CONTRACT_FILENAME).read_text(encoding="utf-8")
+        )
+        assert coupled_payload == {
+            "version": TASK_CONTRACT_VERSION,
+            "task_mode": COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+            "replay_n_step": 3,
+            "replay_gamma": 0.99,
+            **runtime_contract(COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE),
+        }
+        assert validate_checkpoint_task_contract(
+            checkpoint,
+            task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+            n_step=3,
+            gamma=0.99,
+        )["observation_dim"] == COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM
+        assert validate_replay_task_contract(
+            checkpoint,
+            task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+            n_step=3,
+            gamma=0.99,
+        )["action_projection"] == IDENTITY_ACTION_PROJECTION
+        for incompatible_mode in (
+            FULL_TASK_MODE,
+            CLOSE_OPTION_TASK_MODE,
+            POWER_CLOSE_OPTION_TASK_MODE,
+        ):
+            _expect_error(
+                ValueError,
+                validate_checkpoint_task_contract,
+                checkpoint,
+                task_mode=incompatible_mode,
+                n_step=3,
+                gamma=0.99,
+            )
+            _expect_error(
+                ValueError,
+                validate_replay_task_contract,
+                checkpoint,
+                task_mode=incompatible_mode,
+                n_step=3,
+                gamma=0.99,
+            )
+
+        (checkpoint / TASK_CONTRACT_FILENAME).write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "task_mode": COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+                    "replay_n_step": 3,
+                    "replay_gamma": 0.99,
+                }
+            ),
+            encoding="utf-8",
+        )
+        _expect_error(ValueError, read_checkpoint_task_contract, checkpoint)
+
         (checkpoint / TASK_CONTRACT_FILENAME).write_text(
             json.dumps(
                 {
@@ -860,6 +1149,34 @@ def test_actor_checkpoint_audit() -> None:
         assert projected["source_policy_action_dim"] == ACTION_DIM
         assert projected["target_policy_action_dim"] == HAND_ACTION_DIM
         assert projected["actor_projection"] == FULL21_TO_HAND14_ACTOR_PROJECTION
+        _expect_error(
+            ValueError,
+            audit_actor_checkpoint_source,
+            legacy_source,
+            output_checkpoint=root / "coupled_default_reject" / "checkpoint_final",
+            target_task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+        )
+        coupled_projected = audit_actor_checkpoint_source(
+            legacy_source,
+            output_checkpoint=root / "coupled" / "checkpoint_final",
+            target_task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+            allow_cross_task_actor=True,
+        )
+        assert coupled_projected["source_task_mode"] == FULL_TASK_MODE
+        assert coupled_projected["source_policy_action_dim"] == ACTION_DIM
+        assert coupled_projected["target_policy_action_dim"] == ACTION_DIM
+        assert (
+            coupled_projected["actor_projection"]
+            == FULL115_TO_COUPLED131_ACTOR_PROJECTION
+        )
+        _expect_error(
+            ValueError,
+            audit_actor_checkpoint_source,
+            source,
+            output_checkpoint=root / "close_to_coupled" / "checkpoint_final",
+            target_task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+            allow_cross_task_actor=True,
+        )
 
         class FakeAgent:
             def __init__(self) -> None:
@@ -902,6 +1219,27 @@ def test_actor_checkpoint_audit() -> None:
             output_checkpoint=root / "full" / "checkpoint_final",
             target_task_mode=FULL_TASK_MODE,
         )
+        coupled_source = root / "coupled_source"
+        _write_core_checkpoint(coupled_source)
+        write_checkpoint_task_contract(
+            coupled_source,
+            task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+            replay_n_step=3,
+            replay_gamma=0.99,
+        )
+        coupled_identity = audit_actor_checkpoint_source(
+            coupled_source,
+            output_checkpoint=root / "coupled_same" / "checkpoint_final",
+            target_task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+        )
+        assert coupled_identity["actor_projection"] is None
+        _expect_error(
+            ValueError,
+            audit_actor_checkpoint_source,
+            coupled_source,
+            output_checkpoint=root / "coupled_to_full" / "checkpoint_final",
+            target_task_mode=FULL_TASK_MODE,
+        )
         malformed_projection = dict(projected)
         malformed_projection["actor_projection"] = "unknown_projection"
         _expect_error(
@@ -910,6 +1248,67 @@ def test_actor_checkpoint_audit() -> None:
             FakeAgent(),
             malformed_projection,
         )
+
+
+def test_full_actor_coupled_observation_projection() -> None:
+    source = {
+        "embedder.norm.weight": torch.arange(115, dtype=torch.float32),
+        "embedder.norm.bias": torch.arange(115, dtype=torch.float32) + 100.0,
+        "embedder.norm.running_mean": torch.arange(115, dtype=torch.float32) + 200.0,
+        "embedder.norm.running_var": torch.arange(115, dtype=torch.float32) + 300.0,
+        "embedder.w.w.weight": torch.arange(4 * 115, dtype=torch.float32).reshape(4, 115),
+        "encoder.0.w1.w.weight": torch.arange(16, dtype=torch.float32).reshape(4, 4),
+    }
+    target = {
+        "_orig_mod.embedder.norm.weight": torch.full((131,), 1.0),
+        "_orig_mod.embedder.norm.bias": torch.full((131,), 2.0),
+        "_orig_mod.embedder.norm.running_mean": torch.full((131,), 3.0),
+        "_orig_mod.embedder.norm.running_var": torch.full((131,), 4.0),
+        "_orig_mod.embedder.w.w.weight": torch.full((4, 131), 5.0),
+        "_orig_mod.encoder.0.w1.w.weight": torch.full((4, 4), 6.0),
+    }
+    projected = project_full_actor_to_coupled_observation_state(source, target)
+    assert set(projected) == set(target)
+    torch.testing.assert_close(
+        projected["_orig_mod.embedder.w.w.weight"][:, :115],
+        source["embedder.w.w.weight"],
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert torch.equal(
+        projected["_orig_mod.embedder.w.w.weight"][:, 115:],
+        torch.zeros(4, 16),
+    )
+    for key, default in (
+        ("weight", 1.0),
+        ("bias", 2.0),
+        ("running_mean", 3.0),
+        ("running_var", 4.0),
+    ):
+        target_key = f"_orig_mod.embedder.norm.{key}"
+        torch.testing.assert_close(
+            projected[target_key][:115],
+            source[f"embedder.norm.{key}"],
+            rtol=0.0,
+            atol=0.0,
+        )
+        assert torch.equal(
+            projected[target_key][115:],
+            torch.full((16,), default),
+        )
+    assert torch.equal(
+        projected["_orig_mod.encoder.0.w1.w.weight"],
+        source["encoder.0.w1.w.weight"],
+    )
+
+    malformed = dict(target)
+    malformed["_orig_mod.encoder.0.w1.w.weight"] = torch.zeros(5, 4)
+    _expect_error(
+        ValueError,
+        project_full_actor_to_coupled_observation_state,
+        source,
+        malformed,
+    )
 
 
 def test_final_checkpoint_cleanup_and_contract_order() -> None:
@@ -1040,6 +1439,8 @@ def test_latch_conditioned_noise_scale() -> None:
 def main() -> None:
     test_update_budget()
     test_warmup_resolution()
+    test_default_episode_horizons()
+    test_environment_task_mode_overrides()
     test_auto_reset_replay_boundary()
     test_episode_accumulator()
     test_terminal_event_accumulator()
@@ -1047,6 +1448,7 @@ def main() -> None:
     test_atomic_json()
     test_task_mode_source_and_replay_contracts()
     test_actor_checkpoint_audit()
+    test_full_actor_coupled_observation_projection()
     test_final_checkpoint_cleanup_and_contract_order()
     test_latch_conditioned_noise_scale()
     print("train contract tests passed")

@@ -9,7 +9,7 @@ bootstrap from the real time-limit state, never from the next episode's reset
 state.
 
 This adapter temporarily intercepts ``_reset_idx`` during one call to
-``step``.  Immediately before the reset it captures the 115-dimensional
+``step``.  Immediately before the reset it captures the declared 115- or 131-dimensional
 ``policy`` observation, then lets the original reset proceed unchanged.  The
 rollout observation returned by ``step`` remains the reset observation, while
 ``info["transition_next_observation"]`` contains the correct replay-buffer
@@ -18,7 +18,8 @@ path.
 
 The adapter is deliberately task-specific:
 
-* policy observation: 115 floats (the duplicate ``critic`` group is ignored)
+* policy observation: 115 floats for existing modes or 131 for coupled power close
+  (the duplicate ``critic`` group is ignored)
 * ordinary action: 21 normalized values in [-1, 1]
 * opt-in close-option action: 14 hand values, expanded to seven zero arm
   values plus the hand action immediately before the underlying environment
@@ -44,6 +45,7 @@ import torch
 
 PICK_TOOL_ENV_ID = "Pick-Tool-Token-Direct-v0"
 POLICY_OBSERVATION_DIM = 115
+COUPLED_POLICY_OBSERVATION_DIM = 131
 ACTION_DIM = 21
 ARM_ACTION_DIM = 7
 HAND_ACTION_DIM = ACTION_DIM - ARM_ACTION_DIM
@@ -294,6 +296,15 @@ class PickToolIsaacLabAdapter:
         self.hand_only_actions = bool(hand_only_actions)
         self.action_dim = HAND_ACTION_DIM if self.hand_only_actions else ACTION_DIM
         self.max_episode_steps = int(getattr(self.unwrapped, "max_episode_length", 0))
+        cfg = getattr(self.unwrapped, "cfg", None)
+        declared_obs = (
+            _declared_dimension(getattr(cfg, "observation_space", None))
+            if cfg is not None
+            else None
+        )
+        self.observation_dim = (
+            POLICY_OBSERVATION_DIM if declared_obs is None else declared_obs
+        )
 
         if self.num_envs < 1:
             raise ValueError("environment must contain at least one sub-environment")
@@ -304,13 +315,18 @@ class PickToolIsaacLabAdapter:
         if not callable(getattr(self.unwrapped, "_get_observations", None)):
             raise TypeError("environment does not expose DirectRLEnv._get_observations")
 
-        cfg = getattr(self.unwrapped, "cfg", None)
         if cfg is not None:
-            declared_obs = _declared_dimension(getattr(cfg, "observation_space", None))
             declared_action = _declared_dimension(getattr(cfg, "action_space", None))
-            if declared_obs is not None and declared_obs != self.observation_dim:
+            coupled = bool(
+                getattr(cfg, "coupled_power_align_close_option_mode", False)
+            )
+            expected_obs = (
+                COUPLED_POLICY_OBSERVATION_DIM if coupled else POLICY_OBSERVATION_DIM
+            )
+            if declared_obs is not None and declared_obs != expected_obs:
                 raise ValueError(
-                    f"environment declares {declared_obs} policy observations, expected {self.observation_dim}"
+                    f"environment declares {declared_obs} policy observations, expected "
+                    f"{expected_obs} for coupled={coupled}"
                 )
             if declared_action is not None and declared_action != self.environment_action_dim:
                 raise ValueError(
@@ -320,6 +336,11 @@ class PickToolIsaacLabAdapter:
             if self.hand_only_actions and getattr(cfg, "close_option_mode", False) is not True:
                 raise ValueError(
                     "hand_only_actions is restricted to an environment with close_option_mode=True"
+                )
+            if self.hand_only_actions and coupled:
+                raise ValueError(
+                    "coupled power close requires the native 21-D identity action boundary; "
+                    "hand_only_actions is invalid"
                 )
             if strict and getattr(cfg, "observation_noise_model", None) is not None:
                 raise ValueError(
@@ -359,6 +380,7 @@ class PickToolIsaacLabAdapter:
     def _validate_policy(self, observations: Mapping[str, Any]) -> torch.Tensor:
         policy = extract_policy_observation(
             observations,
+            expected_dim=self.observation_dim,
             expected_num_envs=self.num_envs,
             expected_device=self.device,
         )
@@ -612,6 +634,7 @@ def make_pick_tool_env(
 __all__ = [
     "ACTION_DIM",
     "ARM_ACTION_DIM",
+    "COUPLED_POLICY_OBSERVATION_DIM",
     "HAND_ACTION_DIM",
     "PICK_TOOL_ENV_ID",
     "POLICY_OBSERVATION_DIM",

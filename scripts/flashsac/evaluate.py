@@ -22,6 +22,7 @@ contract: a stable latch near the table is never reported as 20 cm success.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
@@ -30,14 +31,16 @@ import os
 from pathlib import Path
 import random
 import re
+import tempfile
 import traceback
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 import numpy as np
 import torch
 
 
 OBSERVATION_DIM = 115
+COUPLED_OBSERVATION_DIM = 131
 ACTION_DIM = 21
 ARM_ACTION_DIM = 7
 HAND_ACTION_DIM = 14
@@ -54,7 +57,18 @@ SMOKE_CRITIC_BINS = 51
 FULL_TASK_MODE = "full_task"
 CLOSE_OPTION_MODE = "close_option"
 POWER_CLOSE_OPTION_MODE = "power_close_option_v1"
-TASK_MODES = (FULL_TASK_MODE, CLOSE_OPTION_MODE, POWER_CLOSE_OPTION_MODE)
+COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE = "coupled_power_align_close_option_v1"
+TASK_MODES = (
+    FULL_TASK_MODE,
+    CLOSE_OPTION_MODE,
+    POWER_CLOSE_OPTION_MODE,
+    COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+)
+POWER_CLOSE_TASK_MODES = (
+    POWER_CLOSE_OPTION_MODE,
+    COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+)
+CLOSE_OPTION_TASK_MODES = (CLOSE_OPTION_MODE, *POWER_CLOSE_TASK_MODES)
 
 FULL_POLICY_ACTION_LAYOUT = "arm_delta7|crossdex_token9|distal_residual5"
 HAND_POLICY_ACTION_LAYOUT = "crossdex_token9|distal_residual5"
@@ -62,6 +76,17 @@ IDENTITY_ACTION_PROJECTION = "identity_v1"
 HAND_ACTION_PROJECTION = "prepend_zero_arm7_v1"
 STANDARD_OBSERVATION_CONTRACT = "pick_tool_markov115_v1"
 POWER_OBSERVATION_CONTRACT = "pick_tool_power_close_markov115_v1"
+COUPLED_POWER_OBSERVATION_CONTRACT = (
+    "pick_tool_coupled_power_align_close_state131_v1"
+)
+COUPLED_POWER_ARM_TARGET_OFFSET_LIMIT = 0.12
+COUPLED_POWER_ARM_TARGET_OFFSET_TOLERANCE = 1.0e-6
+COUPLED_POWER_ROTATION_DRIFT_LIMIT = 0.35
+COUPLED_POWER_XY_DRIFT_LIMIT = 0.03
+COUPLED_POWER_TRUE_CLEARANCE_LIMIT = 0.015
+FULL115_TO_COUPLED131_OBSERVATION_TRANSFER = (
+    "full115_to_coupled131_zero_pad_input_v1"
+)
 
 # This is checkpoint metadata as well as interaction behavior.  Bridge loading
 # intentionally rejects a different grouping, so keep the evaluator contract
@@ -118,6 +143,16 @@ POWER_CLOSE_OPTION_EVENT_KEYS = (
     "power_grasp_latch_confirm_steps",
 )
 
+COUPLED_POWER_TELEMETRY_KEYS = (
+    "coupled_power_pose_escape",
+    "coupled_power_rotation_drift",
+    "coupled_power_xy_drift",
+    "coupled_power_true_clearance",
+    "coupled_power_arm_target_offset_abs_max",
+    "coupled_power_arm_target_saturated",
+    "coupled_power_align_active",
+)
+
 ARM_HOLD_HANDOFF_KEYS = (
     "arm_hold_released",
     "arm_hold_stable_steps",
@@ -135,14 +170,27 @@ def _validate_task_mode(task_mode: str) -> str:
 
 
 def task_mode_from_option_flags(
-    *, close_option_mode: bool, power_close_option_mode: bool
+    *,
+    close_option_mode: bool,
+    power_close_option_mode: bool,
+    coupled_power_align_close_option_mode: bool = False,
 ) -> str:
     """Resolve mutually exclusive user-facing task flags."""
 
-    if close_option_mode and power_close_option_mode:
-        raise ValueError(
-            "--close_option_mode and --power_close_option_mode are mutually exclusive"
+    enabled = sum(
+        bool(value)
+        for value in (
+            close_option_mode,
+            power_close_option_mode,
+            coupled_power_align_close_option_mode,
         )
+    )
+    if enabled > 1:
+        raise ValueError(
+            "close-option mode flags are mutually exclusive"
+        )
+    if coupled_power_align_close_option_mode:
+        return COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE
     if power_close_option_mode:
         return POWER_CLOSE_OPTION_MODE
     if close_option_mode:
@@ -162,6 +210,15 @@ def requested_policy_action_contract(task_mode: str) -> dict[str, Any]:
             "action_projection": HAND_ACTION_PROJECTION,
             "observation_dim": OBSERVATION_DIM,
             "observation_contract": POWER_OBSERVATION_CONTRACT,
+        }
+    if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE:
+        return {
+            "policy_action_dim": ACTION_DIM,
+            "policy_action_layout": FULL_POLICY_ACTION_LAYOUT,
+            "environment_action_dim": ACTION_DIM,
+            "action_projection": IDENTITY_ACTION_PROJECTION,
+            "observation_dim": COUPLED_OBSERVATION_DIM,
+            "observation_contract": COUPLED_POWER_OBSERVATION_CONTRACT,
         }
     return {
         "policy_action_dim": ACTION_DIM,
@@ -196,6 +253,7 @@ def checkpoint_policy_action_contract(contract: Mapping[str, Any]) -> dict[str, 
     allowed = (
         requested_policy_action_contract(FULL_TASK_MODE),
         requested_policy_action_contract(POWER_CLOSE_OPTION_MODE),
+        requested_policy_action_contract(COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE),
     )
     if result not in allowed:
         raise ValueError(f"unsupported checkpoint policy action contract: {result}")
@@ -209,7 +267,7 @@ def validate_checkpoint_evaluation_contract(
     requested_task_mode: str,
     actor_action_dim: int,
 ) -> tuple[dict[str, Any], dict[str, Any], tuple[int, ...] | None]:
-    """Resolve exact-load versus the sole supported full21-to-power14 projection."""
+    """Resolve exact-load and the two explicit full-task actor transfers."""
 
     checkpoint_task_mode = _validate_task_mode(checkpoint_task_mode)
     requested_task_mode = _validate_task_mode(requested_task_mode)
@@ -226,6 +284,9 @@ def validate_checkpoint_evaluation_contract(
             "checkpoint task mode and policy/observation contract disagree: "
             f"task_mode={checkpoint_task_mode!r}, policy={source}"
         )
+    # Cross-mode use is independently gated by ``allow_cross_task_actor``.
+    # Preserve historical full/legacy-close exact loads because their tensor
+    # contracts are identical.
     if source == target:
         return source, target, None
     if (
@@ -233,6 +294,16 @@ def validate_checkpoint_evaluation_contract(
         and requested_task_mode == POWER_CLOSE_OPTION_MODE
     ):
         return source, target, tuple(range(ARM_ACTION_DIM, ACTION_DIM))
+    if (
+        checkpoint_task_mode == FULL_TASK_MODE
+        and requested_task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE
+        and source == requested_policy_action_contract(FULL_TASK_MODE)
+        and target
+        == requested_policy_action_contract(COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE)
+    ):
+        # The action map is identity.  Runtime loading separately zero-expands
+        # the observation embedder from 115 to 131 features.
+        return source, target, None
     if source["policy_action_dim"] == HAND_ACTION_DIM:
         raise ValueError(
             "a hand-only checkpoint cannot control the full 21-D task in a single-policy "
@@ -289,6 +360,56 @@ def _terminal_mapping(info: Mapping[str, Any]) -> Mapping[str, Any]:
     if not isinstance(raw, Mapping):
         raise KeyError("adapter info has no pick_tool_terminal ground truth")
     return raw
+
+
+def validate_coupled_power_telemetry(
+    info: Mapping[str, Any],
+    *,
+    num_envs: int,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Read every coupled pose/arm signal; missing telemetry is always fatal."""
+
+    raw = _terminal_mapping(info)
+    bool_keys = {
+        "coupled_power_pose_escape",
+        "coupled_power_arm_target_saturated",
+        "coupled_power_align_active",
+    }
+    telemetry = {
+        name: _require_vector(
+            f"pick_tool_terminal[{name!r}]",
+            raw.get(name),
+            num_envs=num_envs,
+            device=device,
+            dtype=torch.bool if name in bool_keys else torch.float32,
+        )
+        for name in COUPLED_POWER_TELEMETRY_KEYS
+    }
+    for name in COUPLED_POWER_TELEMETRY_KEYS:
+        value = telemetry[name]
+        if value.dtype == torch.float32 and not bool(torch.isfinite(value).all()):
+            raise FloatingPointError(f"{name} contains NaN or infinity")
+    for name in (
+        "coupled_power_rotation_drift",
+        "coupled_power_xy_drift",
+        "coupled_power_arm_target_offset_abs_max",
+    ):
+        if bool((telemetry[name] < 0.0).any()):
+            raise RuntimeError(f"{name} must be non-negative")
+    derived_pose_escape = (
+        (telemetry["coupled_power_rotation_drift"] > COUPLED_POWER_ROTATION_DRIFT_LIMIT)
+        | (telemetry["coupled_power_xy_drift"] > COUPLED_POWER_XY_DRIFT_LIMIT)
+        | (
+            telemetry["coupled_power_true_clearance"]
+            > COUPLED_POWER_TRUE_CLEARANCE_LIMIT
+        )
+    )
+    if not torch.equal(telemetry["coupled_power_pose_escape"], derived_pose_escape):
+        raise RuntimeError(
+            "coupled_power_pose_escape disagrees with rotation/xy/true-clearance ground truth"
+        )
+    return telemetry
 
 
 def validate_terminal_events(
@@ -376,7 +497,7 @@ def validate_terminal_events(
         # Preserve the established full-task return schema exactly.
         return events
 
-    if task_mode == POWER_CLOSE_OPTION_MODE:
+    if task_mode in POWER_CLOSE_TASK_MODES:
         long_keys = {
             "close_option_stable_steps",
             "power_close_option_stable_steps",
@@ -432,7 +553,32 @@ def validate_terminal_events(
             | power_events["close_option_unlatched_lift"]
             | power_events["close_option_horizontal_escape"]
             | power_events["close_option_lost_window"]
-        ) & ~power_success
+        )
+        coupled_events: dict[str, torch.Tensor] = {}
+        if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE:
+            coupled_events = validate_coupled_power_telemetry(
+                info,
+                num_envs=num_envs,
+                device=terminated.device,
+            )
+            power_failure_sources |= coupled_events["coupled_power_pose_escape"]
+            true_clearance = _require_vector(
+                "pick_tool_terminal['true_clearance']",
+                raw.get("true_clearance"),
+                num_envs=num_envs,
+                device=terminated.device,
+                dtype=torch.float32,
+            )
+            if not torch.allclose(
+                coupled_events["coupled_power_true_clearance"],
+                true_clearance,
+                rtol=0.0,
+                atol=1.0e-6,
+            ):
+                raise RuntimeError(
+                    "coupled true-clearance telemetry disagrees with mesh ground truth"
+                )
+        power_failure_sources &= ~power_success
         if not torch.equal(
             power_events["power_close_option_failure"], power_failure_sources
         ):
@@ -500,7 +646,22 @@ def validate_terminal_events(
                 "power-close success violates thumb+three, power-quality, 15-frame, "
                 "hold, or force safety contract"
             )
-        return {**events, **power_events}
+        if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE:
+            invalid_coupled_success = power_success & (
+                coupled_events["coupled_power_pose_escape"]
+                | coupled_events["coupled_power_align_active"]
+                | (
+                    coupled_events["coupled_power_arm_target_offset_abs_max"]
+                    > COUPLED_POWER_ARM_TARGET_OFFSET_LIMIT
+                    + COUPLED_POWER_ARM_TARGET_OFFSET_TOLERANCE
+                )
+            )
+            if bool(invalid_coupled_success.any()):
+                raise RuntimeError(
+                    "coupled power-close success violates pose escape, completed-ALIGN, "
+                    "or bounded arm-offset contract"
+                )
+        return {**events, **power_events, **coupled_events}
 
     close_events = {
         name: _require_vector(
@@ -681,7 +842,7 @@ def physical_truth_from_terminal_info(
             device=device,
             dtype=torch.bool,
         )
-        if task_mode == POWER_CLOSE_OPTION_MODE
+        if task_mode in POWER_CLOSE_TASK_MODES
         else legacy_grasped
     )
     truth = PhysicalTruth(
@@ -723,7 +884,7 @@ def physical_truth_from_terminal_info(
             raise RuntimeError("full-task generic success alias is inconsistent")
         return truth
 
-    if task_mode == POWER_CLOSE_OPTION_MODE:
+    if task_mode in POWER_CLOSE_TASK_MODES:
         power_success = _require_vector(
             "pick_tool_terminal['power_close_option_success']",
             raw.get("power_close_option_success"),
@@ -809,6 +970,35 @@ def physical_truth_from_terminal_info(
         )
         if bool(invalid_power.any()):
             raise RuntimeError("power-close success violates its physical latch contract")
+        if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE:
+            coupled = validate_coupled_power_telemetry(
+                info,
+                num_envs=num_envs,
+                device=device,
+            )
+            if not torch.allclose(
+                coupled["coupled_power_true_clearance"],
+                truth.clearance,
+                rtol=0.0,
+                atol=1.0e-6,
+            ):
+                raise RuntimeError(
+                    "coupled true-clearance telemetry disagrees with physical truth"
+                )
+            invalid_coupled = power_success & (
+                coupled["coupled_power_pose_escape"]
+                | coupled["coupled_power_align_active"]
+                | (
+                    coupled["coupled_power_arm_target_offset_abs_max"]
+                    > COUPLED_POWER_ARM_TARGET_OFFSET_LIMIT
+                    + COUPLED_POWER_ARM_TARGET_OFFSET_TOLERANCE
+                )
+            )
+            if bool(invalid_coupled.any()):
+                raise RuntimeError(
+                    "coupled power-close success violates pose, completed-ALIGN, "
+                    "or arm-offset truth"
+                )
         return truth
 
     close_success = _require_vector(
@@ -884,7 +1074,7 @@ def _read_physical_truth(
     clearance = (unwrapped._object_true_min_z() - unwrapped._table_surface_z).detach().clone()
     grasped = (
         unwrapped._power_is_grasped.detach().clone()
-        if task_mode == POWER_CLOSE_OPTION_MODE
+        if task_mode in POWER_CLOSE_TASK_MODES
         else unwrapped._is_grasped.detach().clone()
     )
     truth = PhysicalTruth(clearance.to(dtype=torch.float32), grasped.to(dtype=torch.bool))
@@ -974,6 +1164,25 @@ class StrictEpisodeTracker:
         self.max_power_close_option_stable_steps = torch.zeros(
             num_envs, dtype=torch.long, device=device
         )
+        self.ever_coupled_pose_escape = torch.zeros(
+            num_envs, dtype=torch.bool, device=device
+        )
+        self.ever_coupled_arm_target_saturated = torch.zeros(
+            num_envs, dtype=torch.bool, device=device
+        )
+        self.ever_coupled_align_active = torch.zeros(
+            num_envs, dtype=torch.bool, device=device
+        )
+        self.max_coupled_rotation_drift = torch.zeros(
+            num_envs, dtype=torch.float32, device=device
+        )
+        self.max_coupled_xy_drift = torch.zeros(
+            num_envs, dtype=torch.float32, device=device
+        )
+        self.max_coupled_true_clearance = initial_truth.clearance.clone()
+        self.max_coupled_arm_target_offset = torch.zeros(
+            num_envs, dtype=torch.float32, device=device
+        )
         self.records: list[dict[str, Any]] = []
 
     @property
@@ -1029,7 +1238,7 @@ class StrictEpisodeTracker:
                 device=self.device,
                 dtype=torch.bool,
             )
-        if self.task_mode in (CLOSE_OPTION_MODE, POWER_CLOSE_OPTION_MODE):
+        if self.task_mode in CLOSE_OPTION_TASK_MODES:
             option_keys = (
                 CLOSE_OPTION_EVENT_KEYS
                 if self.task_mode == CLOSE_OPTION_MODE
@@ -1060,6 +1269,24 @@ class StrictEpisodeTracker:
                         else torch.bool
                     ),
                 )
+            if self.task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE:
+                for name in COUPLED_POWER_TELEMETRY_KEYS:
+                    _require_vector(
+                        f"events[{name!r}]",
+                        events.get(name),
+                        num_envs=self.num_envs,
+                        device=self.device,
+                        dtype=(
+                            torch.bool
+                            if name
+                            in {
+                                "coupled_power_pose_escape",
+                                "coupled_power_arm_target_saturated",
+                                "coupled_power_align_active",
+                            }
+                            else torch.float32
+                        ),
+                    )
         if self.track_arm_hold_handoff:
             for name, dtype in (
                 ("arm_hold_released", torch.bool),
@@ -1089,7 +1316,7 @@ class StrictEpisodeTracker:
         self.ever_5cm |= active & (transition_truth.clearance >= 0.05)
         self.ever_20cm |= active & (transition_truth.clearance >= 0.20)
         self.ever_unlatched_5cm |= active & events["unlatched_clearance_ge_5cm"]
-        if self.task_mode == POWER_CLOSE_OPTION_MODE:
+        if self.task_mode in POWER_CLOSE_TASK_MODES:
             thumb_contact = events["power_thumb_contact"]
             legal_other = events["power_legal_other_contact_count"]
             self.max_power_legal_other_contact_count = torch.where(
@@ -1111,6 +1338,32 @@ class StrictEpisodeTracker:
                 (
                     self.max_power_close_option_stable_steps,
                     "power_close_option_stable_steps",
+                ),
+            ):
+                accumulator.copy_(
+                    torch.where(
+                        active,
+                        torch.maximum(accumulator, events[event_name]),
+                        accumulator,
+                    )
+                )
+        if self.task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE:
+            self.ever_coupled_pose_escape |= (
+                active & events["coupled_power_pose_escape"]
+            )
+            self.ever_coupled_arm_target_saturated |= (
+                active & events["coupled_power_arm_target_saturated"]
+            )
+            self.ever_coupled_align_active |= (
+                active & events["coupled_power_align_active"]
+            )
+            for accumulator, event_name in (
+                (self.max_coupled_rotation_drift, "coupled_power_rotation_drift"),
+                (self.max_coupled_xy_drift, "coupled_power_xy_drift"),
+                (self.max_coupled_true_clearance, "coupled_power_true_clearance"),
+                (
+                    self.max_coupled_arm_target_offset,
+                    "coupled_power_arm_target_offset_abs_max",
                 ),
             ):
                 accumulator.copy_(
@@ -1295,6 +1548,57 @@ class StrictEpisodeTracker:
                         ),
                     }
                 )
+                if self.task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE:
+                    record.update(
+                        {
+                            "terminal_coupled_power_pose_escape": bool(
+                                events["coupled_power_pose_escape"][env_id].item()
+                            ),
+                            "terminal_coupled_power_rotation_drift_rad": float(
+                                events["coupled_power_rotation_drift"][env_id].item()
+                            ),
+                            "terminal_coupled_power_xy_drift_m": float(
+                                events["coupled_power_xy_drift"][env_id].item()
+                            ),
+                            "terminal_coupled_power_true_clearance_m": float(
+                                events["coupled_power_true_clearance"][env_id].item()
+                            ),
+                            "terminal_coupled_power_arm_target_offset_abs_max_rad": float(
+                                events[
+                                    "coupled_power_arm_target_offset_abs_max"
+                                ][env_id].item()
+                            ),
+                            "terminal_coupled_power_arm_target_saturated": bool(
+                                events[
+                                    "coupled_power_arm_target_saturated"
+                                ][env_id].item()
+                            ),
+                            "terminal_coupled_power_align_active": bool(
+                                events["coupled_power_align_active"][env_id].item()
+                            ),
+                            "ever_coupled_power_pose_escape": bool(
+                                self.ever_coupled_pose_escape[env_id].item()
+                            ),
+                            "ever_coupled_power_arm_target_saturated": bool(
+                                self.ever_coupled_arm_target_saturated[env_id].item()
+                            ),
+                            "ever_coupled_power_align_active": bool(
+                                self.ever_coupled_align_active[env_id].item()
+                            ),
+                            "max_coupled_power_rotation_drift_rad": float(
+                                self.max_coupled_rotation_drift[env_id].item()
+                            ),
+                            "max_coupled_power_xy_drift_m": float(
+                                self.max_coupled_xy_drift[env_id].item()
+                            ),
+                            "max_coupled_power_true_clearance_m": float(
+                                self.max_coupled_true_clearance[env_id].item()
+                            ),
+                            "max_coupled_power_arm_target_offset_abs_max_rad": float(
+                                self.max_coupled_arm_target_offset[env_id].item()
+                            ),
+                        }
+                    )
             if self.track_arm_hold_handoff:
                 record.update(
                     {
@@ -1358,6 +1662,17 @@ class StrictEpisodeTracker:
         self.max_power_grasp_quality.masked_fill_(accepted_done, 0.0)
         self.max_power_latch_confirm_steps.masked_fill_(accepted_done, 0)
         self.max_power_close_option_stable_steps.masked_fill_(accepted_done, 0)
+        self.ever_coupled_pose_escape.masked_fill_(accepted_done, False)
+        self.ever_coupled_arm_target_saturated.masked_fill_(accepted_done, False)
+        self.ever_coupled_align_active.masked_fill_(accepted_done, False)
+        self.max_coupled_rotation_drift.masked_fill_(accepted_done, 0.0)
+        self.max_coupled_xy_drift.masked_fill_(accepted_done, 0.0)
+        self.max_coupled_true_clearance = torch.where(
+            accepted_done,
+            post_reset_truth.clearance,
+            self.max_coupled_true_clearance,
+        )
+        self.max_coupled_arm_target_offset.masked_fill_(accepted_done, 0.0)
 
         if len(self.records) > self.episodes:
             raise RuntimeError("episode tracker exceeded its exact episode quota")
@@ -1416,6 +1731,7 @@ def build_strict_metrics(
     environment_action_dim: int = ACTION_DIM,
     policy_action_layout: str = FULL_POLICY_ACTION_LAYOUT,
     action_projection: str = IDENTITY_ACTION_PROJECTION,
+    observation_dim: int = OBSERVATION_DIM,
     observation_contract: str = STANDARD_OBSERVATION_CONTRACT,
     noise_group_specs: Sequence[tuple[str, int, int, float, float, int]] = NOISE_GROUP_SPECS,
     power_required_other_contacts: int = 3,
@@ -1430,7 +1746,7 @@ def build_strict_metrics(
         "policy_action_layout": policy_action_layout,
         "environment_action_dim": environment_action_dim,
         "action_projection": action_projection,
-        "observation_dim": OBSERVATION_DIM,
+        "observation_dim": observation_dim,
         "observation_contract": observation_contract,
     }
     if reported_policy != expected_policy:
@@ -1530,7 +1846,7 @@ def build_strict_metrics(
             "probability": curriculum_probability,
             "joint_noise": curriculum_joint_noise,
         },
-        "observation_dim": OBSERVATION_DIM,
+        "observation_dim": observation_dim,
         "observation_contract": observation_contract,
         "action_dim": policy_action_dim,
         "policy_action_dim": policy_action_dim,
@@ -1586,7 +1902,7 @@ def build_strict_metrics(
                     ),
                 }
         metrics["arm_hold_release_topology"] = topology
-    if task_mode == POWER_CLOSE_OPTION_MODE:
+    if task_mode in POWER_CLOSE_TASK_MODES:
         ever_thumb = sum(bool(record["ever_power_thumb_contact"]) for record in records)
         ever_thumb_plus_three = sum(
             bool(record["ever_power_thumb_plus_three"]) for record in records
@@ -1627,6 +1943,48 @@ def build_strict_metrics(
                 ]
             ),
         }
+    if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE:
+        metrics["coupled_power_telemetry"] = {
+            "episodes_ever_pose_escape": sum(
+                bool(record["ever_coupled_power_pose_escape"]) for record in records
+            ),
+            "episodes_ever_arm_target_saturated": sum(
+                bool(record["ever_coupled_power_arm_target_saturated"])
+                for record in records
+            ),
+            "episodes_ever_align_active": sum(
+                bool(record["ever_coupled_power_align_active"])
+                for record in records
+            ),
+            "episode_max_rotation_drift_rad": summarize(
+                [
+                    float(record["max_coupled_power_rotation_drift_rad"])
+                    for record in records
+                ]
+            ),
+            "episode_max_xy_drift_m": summarize(
+                [
+                    float(record["max_coupled_power_xy_drift_m"])
+                    for record in records
+                ]
+            ),
+            "episode_max_true_clearance_m": summarize(
+                [
+                    float(record["max_coupled_power_true_clearance_m"])
+                    for record in records
+                ]
+            ),
+            "episode_max_arm_target_offset_abs_max_rad": summarize(
+                [
+                    float(
+                        record[
+                            "max_coupled_power_arm_target_offset_abs_max_rad"
+                        ]
+                    )
+                    for record in records
+                ]
+            ),
+        }
     if task_mode == FULL_TASK_MODE:
         metrics["strict_success_rate"] = event_counts["success"] / episodes
     elif task_mode == CLOSE_OPTION_MODE:
@@ -1648,7 +2006,7 @@ def build_strict_metrics(
             "lost_window_steps": close_option_lost_window_steps,
             "unsafe_force_or_drop": True,
         }
-    else:
+    elif task_mode == POWER_CLOSE_OPTION_MODE:
         metrics["power_close_option_success_rate"] = (
             event_counts["power_close_option_success"] / episodes
         )
@@ -1667,6 +2025,36 @@ def build_strict_metrics(
             "horizontal_drift_limit_m": close_option_horizontal_drift_limit,
             "min_proximity": close_option_min_proximity,
             "lost_window_steps": close_option_lost_window_steps,
+            "unsafe_force_or_drop": True,
+        }
+    else:
+        metrics["coupled_power_align_close_option_success_rate"] = (
+            event_counts["power_close_option_success"] / episodes
+        )
+        metrics["evaluation_scope"] = (
+            "close_option_only; full-task 20 cm lift success is not evaluated"
+        )
+        metrics["success_contract"] = {
+            "name": "stable_coupled_power_align_close_option_v1",
+            "confirm_steps": close_option_confirm_steps,
+            "thumb_contact_required": True,
+            "required_legal_other_contacts": power_required_other_contacts,
+            "min_power_grasp_quality": close_option_grasp_quality_threshold,
+            "min_hold_quality": close_option_min_hold_quality,
+            "safe_force_limit_n": close_option_safe_force_limit,
+            "pose_escape_required_false": True,
+            "max_arm_target_offset_rad": COUPLED_POWER_ARM_TARGET_OFFSET_LIMIT,
+            "arm_target_offset_tolerance_rad": (
+                COUPLED_POWER_ARM_TARGET_OFFSET_TOLERANCE
+            ),
+            "full_task_20cm_success": "not_evaluated",
+        }
+        metrics["failure_contract"] = {
+            "unlatched_lift_limit_m": close_option_unlatched_lift_limit,
+            "horizontal_drift_limit_m": close_option_horizontal_drift_limit,
+            "min_proximity": close_option_min_proximity,
+            "lost_window_steps": close_option_lost_window_steps,
+            "coupled_pose_escape": True,
             "unsafe_force_or_drop": True,
         }
     return metrics
@@ -1717,7 +2105,10 @@ def infer_actor_action_dim_from_state(state: Mapping[str, Any]) -> int:
 
 
 def infer_actor_architecture_from_state(
-    state: Mapping[str, Any], *, expected_action_dim: int | None = None
+    state: Mapping[str, Any],
+    *,
+    expected_action_dim: int | None = None,
+    expected_observation_dim: int | None = None,
 ) -> str:
     """Recognize the production and smoke architectures saved by train.py."""
 
@@ -1732,10 +2123,20 @@ def infer_actor_architecture_from_state(
             "actor checkpoint action dimension disagrees with the expected contract: "
             f"actor={action_dim}, expected={expected_action_dim}"
         )
-    if tuple(embed.shape)[1] != OBSERVATION_DIM:
+    observation_dim = int(embed.shape[1])
+    allowed_observation_dims = (OBSERVATION_DIM, COUPLED_OBSERVATION_DIM)
+    if observation_dim not in allowed_observation_dims:
         raise RuntimeError(
-            f"actor checkpoint observation dimension is not PickTool {OBSERVATION_DIM}: "
+            "actor checkpoint observation dimension is not a supported PickTool contract: "
             f"embed={tuple(embed.shape)}, mean={tuple(mean.shape)}"
+        )
+    if (
+        expected_observation_dim is not None
+        and observation_dim != expected_observation_dim
+    ):
+        raise RuntimeError(
+            "actor checkpoint observation dimension disagrees with the expected contract: "
+            f"actor={observation_dim}, expected={expected_observation_dim}"
         )
     hidden = int(embed.shape[0])
     if int(mean.shape[1]) != hidden:
@@ -1782,12 +2183,89 @@ def infer_checkpoint_actor_action_dim(checkpoint: Path) -> int:
 
 
 def infer_checkpoint_architecture(
-    checkpoint: Path, *, expected_action_dim: int | None = None
+    checkpoint: Path,
+    *,
+    expected_action_dim: int | None = None,
+    expected_observation_dim: int | None = None,
 ) -> str:
     return infer_actor_architecture_from_state(
         _checkpoint_actor_state(checkpoint),
         expected_action_dim=expected_action_dim,
+        expected_observation_dim=expected_observation_dim,
     )
+
+
+def zero_expand_actor_observation_state(
+    state: Mapping[str, Any],
+    *,
+    source_observation_dim: int = OBSERVATION_DIM,
+    target_observation_dim: int = COUPLED_OBSERVATION_DIM,
+) -> dict[str, torch.Tensor]:
+    """Expand the actor input layer while initially ignoring all 16 new features."""
+
+    if source_observation_dim < 1 or target_observation_dim <= source_observation_dim:
+        raise ValueError("observation expansion requires 0 < source_dim < target_dim")
+    canonical = _canonical_actor_state(state)
+    embed = canonical.get("embedder.w.w.weight")
+    if embed is None or embed.ndim != 2:
+        raise RuntimeError("actor checkpoint is missing a compatible observation embedder")
+    if int(embed.shape[1]) != source_observation_dim:
+        raise RuntimeError(
+            "actor checkpoint observation embedder cannot be zero-expanded: "
+            f"source={tuple(embed.shape)}, expected input={source_observation_dim}"
+        )
+    expanded = dict(state)
+    raw_key_by_canonical = {
+        raw_key.removeprefix(_COMPILED_PREFIX): raw_key for raw_key in state
+    }
+    embed_key = raw_key_by_canonical["embedder.w.w.weight"]
+    expanded_embed = embed.new_zeros((int(embed.shape[0]), target_observation_dim))
+    expanded_embed[:, :source_observation_dim].copy_(embed)
+    expanded[embed_key] = expanded_embed
+    vector_fill = {
+        "embedder.norm.weight": 1.0,
+        "embedder.norm.bias": 0.0,
+        "embedder.norm.running_mean": 0.0,
+        "embedder.norm.running_var": 1.0,
+    }
+    for canonical_key, fill_value in vector_fill.items():
+        raw_key = raw_key_by_canonical.get(canonical_key)
+        if raw_key is None:
+            continue
+        source_value = state[raw_key]
+        if source_value.shape != (source_observation_dim,):
+            raise RuntimeError(
+                f"actor input-normalizer tensor {canonical_key!r} cannot be expanded: "
+                f"source={tuple(source_value.shape)}"
+            )
+        target_value = source_value.new_full(
+            (target_observation_dim,), fill_value
+        )
+        target_value[:source_observation_dim].copy_(source_value)
+        expanded[raw_key] = target_value
+    return expanded
+
+
+@contextmanager
+def zero_expanded_actor_checkpoint(
+    checkpoint: Path,
+) -> Iterator[Path]:
+    """Create a short-lived actor-only full115-to-coupled131 transfer bundle."""
+
+    actor_path = checkpoint / "actor.pt"
+    payload = torch.load(actor_path, map_location="cpu", weights_only=True)
+    if not isinstance(payload, Mapping) or not isinstance(
+        payload.get("network_state_dict"), Mapping
+    ):
+        raise TypeError("actor.pt must contain a mapping network_state_dict")
+    transferred_payload = dict(payload)
+    transferred_payload["network_state_dict"] = zero_expand_actor_observation_state(
+        payload["network_state_dict"]
+    )
+    with tempfile.TemporaryDirectory(prefix="flashsac_coupled_actor_") as directory:
+        transfer_dir = Path(directory)
+        torch.save(transferred_payload, transfer_dir / "actor.pt")
+        yield transfer_dir
 
 
 def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -1850,6 +2328,14 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         help=(
             "Evaluate the POWER close v1 thumb+three topology with a native 14-D hand policy. "
             "This is distinct from the legacy close-option objective."
+        ),
+    )
+    option_group.add_argument(
+        "--coupled_power_align_close_option_mode",
+        action="store_true",
+        help=(
+            "Evaluate the 21-D coupled arm+hand POWER align-close option. Success is a "
+            "stable near-table close latch, never full-task 20 cm lift success."
         ),
     )
     parser.add_argument(
@@ -1919,6 +2405,7 @@ def validate_close_option_evaluation_config(
     curriculum_probability: float,
     curriculum_joint_noise: float,
     episode_length_s: float | None,
+    coupled_power_align_close_option_mode: bool = False,
 ) -> None:
     """Reject close-option evaluations outside the captured pregrasp MDP."""
 
@@ -1934,10 +2421,16 @@ def validate_close_option_evaluation_config(
         raise ValueError(
             "--close_option_mode requires --curriculum_joint_noise in [0, 0.02]"
         )
-    if episode_length_s is None or not 0.40 <= episode_length_s <= 5.0:
+    minimum_episode_length_s = (
+        3.0 if coupled_power_align_close_option_mode else 0.40
+    )
+    if (
+        episode_length_s is None
+        or not minimum_episode_length_s <= episode_length_s <= 5.0
+    ):
         raise ValueError(
-            "close-option evaluation requires --episode_length_s in [0.40, 5] so the "
-            "4-frame latch plus 15-frame confirmation window is physically reachable"
+            "close-option evaluation requires --episode_length_s in "
+            f"[{minimum_episode_length_s:.2f}, 5] so its physical contract is reachable"
         )
 
 
@@ -1996,6 +2489,9 @@ def _validate_args(args: argparse.Namespace) -> None:
     task_mode = task_mode_from_option_flags(
         close_option_mode=args.close_option_mode,
         power_close_option_mode=args.power_close_option_mode,
+        coupled_power_align_close_option_mode=(
+            args.coupled_power_align_close_option_mode
+        ),
     )
     if args.episodes < 1 or args.num_envs < 1:
         raise ValueError("--episodes and --num_envs must be positive")
@@ -2011,16 +2507,19 @@ def _validate_args(args: argparse.Namespace) -> None:
         joint_noise=args.curriculum_joint_noise,
     )
     validate_close_option_evaluation_config(
-        close_option_mode=task_mode in (CLOSE_OPTION_MODE, POWER_CLOSE_OPTION_MODE),
+        close_option_mode=task_mode in CLOSE_OPTION_TASK_MODES,
         curriculum_dataset=args.curriculum_dataset,
         curriculum_boundary=args.curriculum_boundary,
         curriculum_probability=args.curriculum_probability,
         curriculum_joint_noise=args.curriculum_joint_noise,
         episode_length_s=args.episode_length_s,
+        coupled_power_align_close_option_mode=(
+            task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE
+        ),
     )
     validate_hierarchical_arm_hold_evaluation_config(
         enabled=args.hold_arm_until_stable_grasp,
-        close_option_mode=task_mode in (CLOSE_OPTION_MODE, POWER_CLOSE_OPTION_MODE),
+        close_option_mode=task_mode in CLOSE_OPTION_TASK_MODES,
         curriculum_dataset=args.curriculum_dataset,
         curriculum_boundary=args.curriculum_boundary,
         curriculum_probability=args.curriculum_probability,
@@ -2037,8 +2536,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     task_mode = task_mode_from_option_flags(
         close_option_mode=args.close_option_mode,
         power_close_option_mode=args.power_close_option_mode,
+        coupled_power_align_close_option_mode=(
+            args.coupled_power_align_close_option_mode
+        ),
     )
-    if task_mode in (CLOSE_OPTION_MODE, POWER_CLOSE_OPTION_MODE) and args.episode_length_s is None:
+    if task_mode in CLOSE_OPTION_TASK_MODES and args.episode_length_s is None:
         args.episode_length_s = 5.0
     _validate_args(args)
     _seed_everything(args.seed)
@@ -2080,6 +2582,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     checkpoint_architecture = infer_checkpoint_architecture(
         checkpoint,
         expected_action_dim=int(source_policy_contract["policy_action_dim"]),
+        expected_observation_dim=int(source_policy_contract["observation_dim"]),
     )
     architecture = checkpoint_architecture if args.architecture == "auto" else args.architecture
     if architecture != checkpoint_architecture:
@@ -2089,10 +2592,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     cfg_overrides: dict[str, Any] = {
-        "close_option_mode": task_mode in (CLOSE_OPTION_MODE, POWER_CLOSE_OPTION_MODE),
-        "power_close_option_mode": task_mode == POWER_CLOSE_OPTION_MODE,
+        "close_option_mode": task_mode in CLOSE_OPTION_TASK_MODES,
+        "power_close_option_mode": task_mode in POWER_CLOSE_TASK_MODES,
+        "coupled_power_align_close_option_mode": (
+            task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE
+        ),
         "hold_arm_until_stable_grasp": bool(args.hold_arm_until_stable_grasp),
     }
+    if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE:
+        cfg_overrides.update(
+            {
+                "observation_space": COUPLED_OBSERVATION_DIM,
+                "state_space": COUPLED_OBSERVATION_DIM,
+            }
+        )
     if args.hold_arm_until_stable_grasp:
         cfg_overrides.update(
             {
@@ -2128,7 +2641,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     close_option_min_hold_quality = float(task_cfg.close_option_min_hold_quality)
     grasp_quality_threshold = float(
         task_cfg.power_grasp_quality_high
-        if task_mode == POWER_CLOSE_OPTION_MODE
+        if task_mode in POWER_CLOSE_TASK_MODES
         else task_cfg.grasp_quality_high
     )
     power_required_other_contacts = int(task_cfg.power_grasp_required_other_contacts)
@@ -2200,7 +2713,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         noise_groups=noise_groups,
         restore_rng_state_on_load=False,
     )
-    if source_action_indices is None:
+    full_to_coupled_transfer = (
+        checkpoint_task_mode == FULL_TASK_MODE
+        and task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE
+    )
+    if full_to_coupled_transfer:
+        with zero_expanded_actor_checkpoint(checkpoint) as transfer_checkpoint:
+            agent.load_actor(str(transfer_checkpoint))
+    elif source_action_indices is None:
         agent.load_actor(str(checkpoint))
     else:
         agent.load_actor(
@@ -2324,6 +2844,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             environment_action_dim=int(target_policy_contract["environment_action_dim"]),
             policy_action_layout=str(target_policy_contract["policy_action_layout"]),
             action_projection=str(target_policy_contract["action_projection"]),
+            observation_dim=int(target_policy_contract["observation_dim"]),
             observation_contract=str(target_policy_contract["observation_contract"]),
             noise_group_specs=noise_group_specs,
             power_required_other_contacts=power_required_other_contacts,
@@ -2331,6 +2852,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         metrics["checkpoint_policy_contract"] = source_policy_contract
         metrics["actor_action_projection_indices"] = (
             list(source_action_indices) if source_action_indices is not None else None
+        )
+        metrics["actor_observation_transfer"] = (
+            FULL115_TO_COUPLED131_OBSERVATION_TRANSFER
+            if full_to_coupled_transfer
+            else None
         )
         metrics["hold_arm_until_stable_grasp"] = bool(
             args.hold_arm_until_stable_grasp

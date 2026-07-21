@@ -489,6 +489,89 @@ def test_asymmetric_joint_residual() -> None:
     print("PASS hybrid action: full asymmetric range, zero identity, shuffled joints and rows")
 
 
+def test_coupled_align_close_action() -> None:
+    actions = torch.arange(84, dtype=torch.float32).reshape(4, 21) / 10.0
+    original = actions.clone()
+    episode_step = torch.tensor((23, 24, 3, 23), dtype=torch.long)
+    power_latched = torch.tensor((False, False, False, True))
+    phased = hybrid_action.phase_coupled_align_close_action(
+        actions,
+        episode_step,
+        power_latched,
+        arm_width=7,
+        align_steps=24,
+        arm_multiplier=0.2,
+    )
+
+    check(
+        torch.equal(phased[0, :7], actions[0, :7] * 0.2),
+        "step 23 did not apply the arm multiplier",
+    )
+    check(torch.count_nonzero(phased[0, 7:]).item() == 0, "step 23 hand action is nonzero")
+    check(torch.count_nonzero(phased[1, :7]).item() == 0, "step 24 retained arm authority")
+    check(torch.equal(phased[1, 7:], actions[1, 7:]), "step 24 changed the hand action")
+    check(
+        torch.count_nonzero(phased[2, 7:]).item() == 0,
+        "unlatched align phase passed through hand actions",
+    )
+    check(torch.count_nonzero(phased[3, :7]).item() == 0, "early latch retained arm authority")
+    check(torch.equal(phased[3, 7:], actions[3, 7:]), "early latch did not enable the hand")
+    check(torch.equal(actions, original), "phase helper mutated its input")
+    align_active, align_progress = hybrid_action.coupled_align_phase_state(
+        episode_step,
+        power_latched,
+        align_steps=24,
+    )
+    check(
+        torch.equal(align_active, torch.tensor((True, False, True, False))),
+        "observed ALIGN-active state disagrees with action authority",
+    )
+    check(
+        torch.allclose(
+            align_progress,
+            torch.tensor((23.0 / 24.0, 1.0, 3.0 / 24.0, 23.0 / 24.0)),
+        ),
+        "normalized ALIGN progress does not expose the timed phase transition",
+    )
+    check(
+        align_progress[0].item() != align_progress[2].item(),
+        "different hidden ALIGN times collapsed to the same phase observation",
+    )
+    print(
+        "PASS coupled phase: step 23 aligns; step 24/early latch close; "
+        "timed transition observable"
+    )
+
+
+def test_arm_anchor_clamp() -> None:
+    anchor = torch.tensor(((0.0, 0.5, -0.2), (0.2, -0.3, 0.8)))
+    target = torch.tensor(((0.20, 0.30, -0.08), (0.00, -0.18, 0.81)))
+    lower = torch.tensor(((-1.0, 0.45, -1.0), (-1.0, -1.0, 0.0)))
+    upper = torch.tensor(((1.0, 1.00, -0.10), (1.00, -0.22, 1.0)))
+    originals = tuple(tensor.clone() for tensor in (target, anchor, lower, upper))
+    bounded, saturated = hybrid_action.clamp_arm_target_to_anchor(
+        target, anchor, lower, upper, limit=0.12
+    )
+
+    expected = torch.tensor(((0.12, 0.45, -0.10), (0.08, -0.22, 0.81)))
+    check(torch.allclose(bounded, expected), f"anchor/joint clamp changed: {bounded}")
+    check(torch.equal(saturated, torch.tensor((True, True))), "row saturation flags are wrong")
+    check(
+        torch.all((bounded - anchor).abs() <= 0.120001).item(),
+        "bounded target escaped the +/-0.12 anchor envelope",
+    )
+    for tensor, original in zip((target, anchor, lower, upper), originals):
+        check(torch.equal(tensor, original), "anchor clamp mutated an input tensor")
+
+    inside = anchor.clone()
+    unchanged, inside_saturated = hybrid_action.clamp_arm_target_to_anchor(
+        inside, anchor, lower, upper, limit=0.12
+    )
+    check(torch.equal(unchanged, inside), "in-envelope target changed")
+    check(not inside_saturated.any().item(), "in-envelope target reported saturation")
+    print("PASS arm anchor: +/-0.12 envelope intersects joint limits; saturation is per row")
+
+
 def test_close_option_arm_hold() -> None:
     actions = torch.arange(42, dtype=torch.float32).reshape(2, 21)
     constrained = hybrid_action.zero_action_prefix(actions, 7)
@@ -541,5 +624,7 @@ if __name__ == "__main__":
     test_close_option_state()
     test_power_close_step_order_contract()
     test_asymmetric_joint_residual()
+    test_coupled_align_close_action()
+    test_arm_anchor_clamp()
     test_close_option_arm_hold()
     print("ALL GRASP SIGNAL TESTS PASSED")

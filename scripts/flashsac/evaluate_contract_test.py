@@ -14,7 +14,12 @@ import torch
 from evaluate import (
     ACTION_DIM,
     CLOSE_OPTION_MODE,
+    COUPLED_OBSERVATION_DIM,
+    COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+    COUPLED_POWER_ARM_TARGET_OFFSET_LIMIT,
+    COUPLED_POWER_OBSERVATION_CONTRACT,
     FULL_TASK_MODE,
+    FULL115_TO_COUPLED131_OBSERVATION_TRANSFER,
     HAND_ACTION_DIM,
     HAND_ACTION_PROJECTION,
     HAND_NOISE_GROUP_SPECS,
@@ -43,6 +48,7 @@ from evaluate import (
     validate_arm_hold_handoff_state,
     validate_terminal_events,
     validate_checkpoint_evaluation_contract,
+    zero_expand_actor_observation_state,
     run,
 )
 
@@ -93,9 +99,18 @@ def _events(
     power_wrap_quality=(0.0, 0.0),
     power_grasp_quality=(0.0, 0.0),
     power_latch_confirm_steps=(0, 0),
+    coupled_pose_escape=(False, False),
+    coupled_rotation_drift=(0.0, 0.0),
+    coupled_xy_drift=(0.0, 0.0),
+    coupled_true_clearance=None,
+    coupled_arm_target_offset=(0.0, 0.0),
+    coupled_arm_target_saturated=(False, False),
+    coupled_align_active=(False, False),
 ) -> dict[str, torch.Tensor]:
     if full_task_success is None:
         full_task_success = success
+    if coupled_true_clearance is None:
+        coupled_true_clearance = clearance
     return {
         "success": torch.tensor(success, dtype=torch.bool),
         "failure": torch.tensor(failure, dtype=torch.bool),
@@ -152,6 +167,27 @@ def _events(
         "power_grasp_quality": torch.tensor(power_grasp_quality, dtype=torch.float32),
         "power_grasp_latch_confirm_steps": torch.tensor(
             power_latch_confirm_steps, dtype=torch.long
+        ),
+        "coupled_power_pose_escape": torch.tensor(
+            coupled_pose_escape, dtype=torch.bool
+        ),
+        "coupled_power_rotation_drift": torch.tensor(
+            coupled_rotation_drift, dtype=torch.float32
+        ),
+        "coupled_power_xy_drift": torch.tensor(
+            coupled_xy_drift, dtype=torch.float32
+        ),
+        "coupled_power_true_clearance": torch.tensor(
+            coupled_true_clearance, dtype=torch.float32
+        ),
+        "coupled_power_arm_target_offset_abs_max": torch.tensor(
+            coupled_arm_target_offset, dtype=torch.float32
+        ),
+        "coupled_power_arm_target_saturated": torch.tensor(
+            coupled_arm_target_saturated, dtype=torch.bool
+        ),
+        "coupled_power_align_active": torch.tensor(
+            coupled_align_active, dtype=torch.bool
         ),
     }
 
@@ -573,6 +609,205 @@ def test_power_close_terminal_and_physical_contract() -> None:
         task_mode=POWER_CLOSE_OPTION_MODE,
     )
 
+
+def _valid_coupled_power_events() -> dict[str, torch.Tensor]:
+    raw = _valid_power_events()
+    raw.update(
+        {
+            "coupled_power_pose_escape": torch.tensor(
+                [False, True], dtype=torch.bool
+            ),
+            "coupled_power_rotation_drift": torch.tensor(
+                [0.10, 0.36], dtype=torch.float32
+            ),
+            "coupled_power_xy_drift": torch.tensor(
+                [0.01, 0.04], dtype=torch.float32
+            ),
+            "coupled_power_true_clearance": torch.tensor(
+                [0.003, 0.002], dtype=torch.float32
+            ),
+            "coupled_power_arm_target_offset_abs_max": torch.tensor(
+                [0.119, 0.12], dtype=torch.float32
+            ),
+            "coupled_power_arm_target_saturated": torch.tensor(
+                [False, True], dtype=torch.bool
+            ),
+            "coupled_power_align_active": torch.tensor(
+                [False, False], dtype=torch.bool
+            ),
+        }
+    )
+    return raw
+
+
+def test_coupled_power_terminal_physical_and_metrics_contract() -> None:
+    raw = _valid_coupled_power_events()
+    info = {"pick_tool_terminal": raw}
+    events = validate_terminal_events(
+        info,
+        torch.tensor([True, True]),
+        torch.tensor([False, False]),
+        task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+    )
+    assert events["power_close_option_success"].tolist() == [True, False]
+    assert events["coupled_power_pose_escape"].tolist() == [False, True]
+    truth = physical_truth_from_terminal_info(
+        info,
+        num_envs=2,
+        device=torch.device("cpu"),
+        task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+    )
+    assert truth.grasped.tolist() == [True, False]
+
+    for missing_key in (
+        "coupled_power_pose_escape",
+        "coupled_power_rotation_drift",
+        "coupled_power_xy_drift",
+        "coupled_power_true_clearance",
+        "coupled_power_arm_target_offset_abs_max",
+        "coupled_power_arm_target_saturated",
+        "coupled_power_align_active",
+    ):
+        missing = dict(raw)
+        del missing[missing_key]
+        _expect_error(
+            TypeError,
+            validate_terminal_events,
+            {"pick_tool_terminal": missing},
+            torch.tensor([True, True]),
+            torch.tensor([False, False]),
+            task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+        )
+
+    escaped_success = dict(raw)
+    escaped_success["coupled_power_pose_escape"] = torch.tensor([True, True])
+    _expect_error(
+        RuntimeError,
+        validate_terminal_events,
+        {"pick_tool_terminal": escaped_success},
+        torch.tensor([True, True]),
+        torch.tensor([False, False]),
+        task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+    )
+    hidden_rotation_escape = dict(raw)
+    hidden_rotation_escape["coupled_power_rotation_drift"] = torch.tensor(
+        [0.50, 0.36], dtype=torch.float32
+    )
+    _expect_error(
+        RuntimeError,
+        validate_terminal_events,
+        {"pick_tool_terminal": hidden_rotation_escape},
+        torch.tensor([True, True]),
+        torch.tensor([False, False]),
+        task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+    )
+    active_success = dict(raw)
+    active_success["coupled_power_align_active"] = torch.tensor(
+        [True, False], dtype=torch.bool
+    )
+    _expect_error(
+        RuntimeError,
+        validate_terminal_events,
+        {"pick_tool_terminal": active_success},
+        torch.tensor([True, True]),
+        torch.tensor([False, False]),
+        task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+    )
+    _expect_error(
+        RuntimeError,
+        physical_truth_from_terminal_info,
+        {"pick_tool_terminal": active_success},
+        num_envs=2,
+        device=torch.device("cpu"),
+        task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+    )
+    excessive_arm_offset = dict(raw)
+    excessive_arm_offset["coupled_power_arm_target_offset_abs_max"] = torch.tensor(
+        [COUPLED_POWER_ARM_TARGET_OFFSET_LIMIT + 2.0e-6, 0.12],
+        dtype=torch.float32,
+    )
+    _expect_error(
+        RuntimeError,
+        physical_truth_from_terminal_info,
+        {"pick_tool_terminal": excessive_arm_offset},
+        num_envs=2,
+        device=torch.device("cpu"),
+        task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+    )
+    inconsistent_clearance = dict(raw)
+    inconsistent_clearance["coupled_power_true_clearance"] = torch.tensor(
+        [0.004, 0.002], dtype=torch.float32
+    )
+    _expect_error(
+        RuntimeError,
+        validate_terminal_events,
+        {"pick_tool_terminal": inconsistent_clearance},
+        torch.tensor([True, True]),
+        torch.tensor([False, False]),
+        task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+    )
+
+    tracker = StrictEpisodeTracker(
+        episodes=2,
+        num_envs=2,
+        device=torch.device("cpu"),
+        initial_truth=_truth((-0.001, -0.001), (False, False)),
+        task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+    )
+    tracker.step(
+        reward=torch.tensor([100.0, -100.0]),
+        terminated=torch.tensor([True, True]),
+        truncated=torch.tensor([False, False]),
+        events=events,
+        transition_truth=truth,
+        post_reset_truth=_truth((-0.001, -0.001), (False, False)),
+    )
+    assert tracker.records[0]["terminal_coupled_power_pose_escape"] is False
+    assert tracker.records[1]["ever_coupled_power_pose_escape"] is True
+    policy = requested_policy_action_contract(
+        COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE
+    )
+    metrics = build_strict_metrics(
+        tracker.records,
+        checkpoint=Path("/tmp/coupled-close-checkpoint"),
+        architecture="production",
+        seed=17,
+        num_envs=2,
+        vector_steps=1,
+        max_vector_steps=10,
+        episode_length_s=3.0,
+        max_episode_steps=150,
+        curriculum_dataset=Path("/tmp/coupled-close.pt"),
+        curriculum_dataset_sha256="test-coupled-close-dataset-sha256",
+        curriculum_boundary="close_start",
+        curriculum_probability=1.0,
+        curriculum_joint_noise=0.0,
+        use_compile=False,
+        upstream_commit="test-commit",
+        task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+        checkpoint_task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+        policy_action_dim=policy["policy_action_dim"],
+        environment_action_dim=policy["environment_action_dim"],
+        policy_action_layout=policy["policy_action_layout"],
+        action_projection=policy["action_projection"],
+        observation_dim=policy["observation_dim"],
+        observation_contract=policy["observation_contract"],
+    )
+    assert metrics["coupled_power_align_close_option_success_rate"] == 0.5
+    assert "strict_success_rate" not in metrics
+    assert metrics["observation_dim"] == COUPLED_OBSERVATION_DIM
+    assert metrics["observation_contract"] == COUPLED_POWER_OBSERVATION_CONTRACT
+    assert metrics["action_dim"] == ACTION_DIM
+    assert metrics["action_projection"] == "identity_v1"
+    assert metrics["success_contract"]["full_task_20cm_success"] == "not_evaluated"
+    assert metrics["success_contract"]["pose_escape_required_false"] is True
+    assert metrics["success_contract"]["max_arm_target_offset_rad"] == 0.12
+    assert "close_option_only" in metrics["evaluation_scope"]
+    coupled_telemetry = metrics["coupled_power_telemetry"]
+    assert coupled_telemetry["episodes_ever_pose_escape"] == 1
+    assert coupled_telemetry["episodes_ever_arm_target_saturated"] == 1
+    assert coupled_telemetry["episode_max_rotation_drift_rad"]["max"] > 0.35
+
 def test_exact_episode_quotas_and_strict_tracker() -> None:
     assert torch.equal(episode_quotas(3, 2, device=torch.device("cpu")), torch.tensor([2, 1]))
     assert torch.equal(episode_quotas(2, 4, device=torch.device("cpu")), torch.tensor([1, 1, 0, 0]))
@@ -951,11 +1186,23 @@ def test_curriculum_argument_contract() -> None:
     assert task_mode_from_option_flags(
         close_option_mode=False, power_close_option_mode=True
     ) == POWER_CLOSE_OPTION_MODE
+    assert task_mode_from_option_flags(
+        close_option_mode=False,
+        power_close_option_mode=False,
+        coupled_power_align_close_option_mode=True,
+    ) == COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE
     _expect_error(
         ValueError,
         task_mode_from_option_flags,
         close_option_mode=True,
         power_close_option_mode=True,
+    )
+    _expect_error(
+        ValueError,
+        task_mode_from_option_flags,
+        close_option_mode=False,
+        power_close_option_mode=True,
+        coupled_power_align_close_option_mode=True,
     )
     validate_curriculum_config(dataset=None, probability=0.0, joint_noise=0.0)
     _expect_error(
@@ -983,6 +1230,26 @@ def test_curriculum_argument_contract() -> None:
             curriculum_probability=1.0,
             curriculum_joint_noise=0.005,
             episode_length_s=0.40,
+        )
+        validate_close_option_evaluation_config(
+            close_option_mode=True,
+            curriculum_dataset=dataset,
+            curriculum_boundary="close_start",
+            curriculum_probability=1.0,
+            curriculum_joint_noise=0.005,
+            episode_length_s=3.0,
+            coupled_power_align_close_option_mode=True,
+        )
+        _expect_error(
+            ValueError,
+            validate_close_option_evaluation_config,
+            close_option_mode=True,
+            curriculum_dataset=dataset,
+            curriculum_boundary="close_start",
+            curriculum_probability=1.0,
+            curriculum_joint_noise=0.005,
+            episode_length_s=2.99,
+            coupled_power_align_close_option_mode=True,
         )
         validate_hierarchical_arm_hold_evaluation_config(
             enabled=True,
@@ -1068,11 +1335,20 @@ def test_curriculum_argument_contract() -> None:
 
 
 def _actor_state(
-    *, blocks: int, hidden: int, compiled: bool, action_dim: int = ACTION_DIM
+    *,
+    blocks: int,
+    hidden: int,
+    compiled: bool,
+    action_dim: int = ACTION_DIM,
+    observation_dim: int = 115,
 ) -> dict[str, torch.Tensor]:
     prefix = "_orig_mod." if compiled else ""
     state = {
-        f"{prefix}embedder.w.w.weight": torch.zeros(hidden, 115),
+        f"{prefix}embedder.norm.weight": torch.ones(observation_dim),
+        f"{prefix}embedder.norm.bias": torch.zeros(observation_dim),
+        f"{prefix}embedder.norm.running_mean": torch.zeros(observation_dim),
+        f"{prefix}embedder.norm.running_var": torch.ones(observation_dim),
+        f"{prefix}embedder.w.w.weight": torch.zeros(hidden, observation_dim),
         f"{prefix}predictor.mean_w.w.weight": torch.zeros(action_dim, hidden),
     }
     for index in range(blocks):
@@ -1122,6 +1398,56 @@ def test_checkpoint_architecture_and_path_contract() -> None:
                     ACTION_DIM if action_dim == HAND_ACTION_DIM else HAND_ACTION_DIM
                 ),
             )
+    coupled = _actor_state(
+        blocks=2,
+        hidden=128,
+        compiled=False,
+        observation_dim=COUPLED_OBSERVATION_DIM,
+    )
+    assert (
+        infer_actor_architecture_from_state(
+            coupled,
+            expected_action_dim=ACTION_DIM,
+            expected_observation_dim=COUPLED_OBSERVATION_DIM,
+        )
+        == "production"
+    )
+    _expect_error(
+        RuntimeError,
+        infer_actor_architecture_from_state,
+        coupled,
+        expected_observation_dim=115,
+    )
+    source = _actor_state(blocks=2, hidden=128, compiled=False)
+    source["embedder.w.w.weight"] = torch.arange(
+        128 * 115, dtype=torch.float32
+    ).reshape(128, 115)
+    expanded = zero_expand_actor_observation_state(source)
+    assert expanded["embedder.w.w.weight"].shape == (128, COUPLED_OBSERVATION_DIM)
+    assert torch.equal(
+        expanded["embedder.w.w.weight"][:, :115],
+        source["embedder.w.w.weight"],
+    )
+    assert torch.count_nonzero(expanded["embedder.w.w.weight"][:, 115:]) == 0
+    expanded_vector_keys = {
+        "embedder.norm.weight",
+        "embedder.norm.bias",
+        "embedder.norm.running_mean",
+        "embedder.norm.running_var",
+    }
+    for key in expanded_vector_keys:
+        assert expanded[key].shape == (COUPLED_OBSERVATION_DIM,)
+        assert torch.equal(expanded[key][:115], source[key])
+    assert torch.all(expanded["embedder.norm.weight"][115:] == 1.0)
+    assert torch.all(expanded["embedder.norm.bias"][115:] == 0.0)
+    assert torch.all(expanded["embedder.norm.running_mean"][115:] == 0.0)
+    assert torch.all(expanded["embedder.norm.running_var"][115:] == 1.0)
+    for key in source.keys() - expanded_vector_keys - {"embedder.w.w.weight"}:
+        assert expanded[key] is source[key]
+    assert (
+        FULL115_TO_COUPLED131_OBSERVATION_TRANSFER
+        == "full115_to_coupled131_zero_pad_input_v1"
+    )
     mixed = _actor_state(blocks=2, hidden=128, compiled=False)
     mixed["_orig_mod.predictor.std_bias"] = torch.zeros(21)
     _expect_error(RuntimeError, infer_actor_architecture_from_state, mixed)
@@ -1163,6 +1489,11 @@ def test_checkpoint_task_mode_evaluation_contract() -> None:
         requested_task_mode=POWER_CLOSE_OPTION_MODE,
         allow_cross_task_actor=False,
     )
+    assert not resolve_cross_task_actor_evaluation(
+        checkpoint_task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+        requested_task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+        allow_cross_task_actor=False,
+    )
     _expect_error(
         ValueError,
         resolve_cross_task_actor_evaluation,
@@ -1197,6 +1528,18 @@ def test_checkpoint_task_mode_evaluation_contract() -> None:
         requested_task_mode=FULL_TASK_MODE,
         allow_cross_task_actor=True,
     )
+    _expect_error(
+        ValueError,
+        resolve_cross_task_actor_evaluation,
+        checkpoint_task_mode=FULL_TASK_MODE,
+        requested_task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+        allow_cross_task_actor=False,
+    )
+    assert resolve_cross_task_actor_evaluation(
+        checkpoint_task_mode=FULL_TASK_MODE,
+        requested_task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+        allow_cross_task_actor=True,
+    )
 
     full_contract = {
         "version": 3,
@@ -1208,6 +1551,21 @@ def test_checkpoint_task_mode_evaluation_contract() -> None:
         "task_mode": POWER_CLOSE_OPTION_MODE,
         **requested_policy_action_contract(POWER_CLOSE_OPTION_MODE),
     }
+    coupled_contract = {
+        "version": 3,
+        "task_mode": COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+        **requested_policy_action_contract(COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE),
+    }
+    source, target, indices = validate_checkpoint_evaluation_contract(
+        checkpoint_task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+        checkpoint_contract=coupled_contract,
+        requested_task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+        actor_action_dim=ACTION_DIM,
+    )
+    assert source == target == requested_policy_action_contract(
+        COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE
+    )
+    assert indices is None
     source, target, indices = validate_checkpoint_evaluation_contract(
         checkpoint_task_mode=POWER_CLOSE_OPTION_MODE,
         checkpoint_contract=power_contract,
@@ -1236,6 +1594,18 @@ def test_checkpoint_task_mode_evaluation_contract() -> None:
     assert legacy_source == requested_policy_action_contract(FULL_TASK_MODE)
     assert legacy_indices == tuple(range(7, 21))
 
+    source, target, indices = validate_checkpoint_evaluation_contract(
+        checkpoint_task_mode=FULL_TASK_MODE,
+        checkpoint_contract=full_contract,
+        requested_task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+        actor_action_dim=ACTION_DIM,
+    )
+    assert source == requested_policy_action_contract(FULL_TASK_MODE)
+    assert target == requested_policy_action_contract(
+        COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE
+    )
+    assert indices is None
+
     _expect_error(
         ValueError,
         validate_checkpoint_evaluation_contract,
@@ -1251,6 +1621,14 @@ def test_checkpoint_task_mode_evaluation_contract() -> None:
         checkpoint_contract=full_contract,
         requested_task_mode=FULL_TASK_MODE,
         actor_action_dim=HAND_ACTION_DIM,
+    )
+    _expect_error(
+        ValueError,
+        validate_checkpoint_evaluation_contract,
+        checkpoint_task_mode=COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+        checkpoint_contract=coupled_contract,
+        requested_task_mode=FULL_TASK_MODE,
+        actor_action_dim=ACTION_DIM,
     )
     mismatched_contract = dict(power_contract)
     mismatched_contract["observation_contract"] = "wrong_observation_contract"
@@ -1270,6 +1648,8 @@ def test_local_train_contract_import_precedes_upstream_path_mutation() -> None:
     upstream_bridge_import = source.index("from agent_bridge import")
     assert local_contract_import < upstream_bridge_import
     assert "hand_only_actions=task_mode == POWER_CLOSE_OPTION_MODE" in source
+    assert '"coupled_power_align_close_option_mode"' in source
+    assert "zero_expanded_actor_checkpoint(checkpoint)" in source
     assert "source_action_indices=source_action_indices" in source
     assert "agent.load_actor(" in source
     assert "agent.load(str(checkpoint))" not in source
@@ -1299,6 +1679,7 @@ def main() -> None:
     test_reset_before_terminal_physical_truth()
     test_close_option_physical_truth_is_not_20cm_success()
     test_power_close_terminal_and_physical_contract()
+    test_coupled_power_terminal_physical_and_metrics_contract()
     test_exact_episode_quotas_and_strict_tracker()
     test_close_option_tracker_and_metrics_are_separate_from_full_success()
     test_power_close_tracker_metrics_and_hand_action_contract()

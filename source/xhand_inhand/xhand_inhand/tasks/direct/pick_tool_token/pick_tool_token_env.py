@@ -25,7 +25,13 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.sensors import ContactSensor, ContactSensorCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.utils.math import quat_apply, quat_conjugate, sample_uniform
+from isaaclab.utils.math import (
+    axis_angle_from_quat,
+    quat_apply,
+    quat_conjugate,
+    quat_mul,
+    sample_uniform,
+)
 
 from ..pick_cube_token.pick_cube_token_env import PickCubeTokenEnv
 from .grasp_signals import (
@@ -39,7 +45,10 @@ from .grasp_signals import (
 )
 from .hybrid_action import (
     apply_asymmetric_joint_residual,
+    clamp_arm_target_to_anchor,
+    coupled_align_phase_state,
     hold_arm_reset_state,
+    phase_coupled_align_close_action,
     update_arm_hold_release,
     zero_action_prefix,
 )
@@ -50,6 +59,13 @@ class PickToolTokenEnv(PickCubeTokenEnv):
     cfg: PickToolTokenEnvCfg
 
     def __init__(self, cfg: PickToolTokenEnvCfg, render_mode: str | None = None, **kwargs):
+        if cfg.coupled_power_align_close_option_mode and not (
+            cfg.close_option_mode and cfg.power_close_option_mode
+        ):
+            raise ValueError(
+                "coupled_power_align_close_option_mode requires both "
+                "close_option_mode=True and power_close_option_mode=True"
+            )
         if cfg.power_close_option_mode and not cfg.close_option_mode:
             raise ValueError("power_close_option_mode requires close_option_mode=True")
         if cfg.close_option_mode and cfg.hold_arm_until_stable_grasp:
@@ -85,6 +101,52 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 raise ValueError(
                     "power_close_option_mode v1 requires power grasp thresholds low=0.20, high=0.35"
                 )
+        if cfg.coupled_power_align_close_option_mode:
+            if not cfg.enable_grasp_observations:
+                raise ValueError("coupled power close requires grasp observations")
+            if cfg.observation_space != 131 or cfg.state_space != 131:
+                raise ValueError(
+                    "coupled power close requires the independent 131-D observation/state contract"
+                )
+            if not cfg.curriculum_dataset:
+                raise ValueError("coupled power close requires a close_start curriculum dataset")
+            if cfg.curriculum_boundary != "close_start":
+                raise ValueError("coupled power close requires curriculum_boundary='close_start'")
+            if float(cfg.curriculum_reset_probability) != 1.0:
+                raise ValueError("coupled power close requires curriculum_reset_probability=1")
+            if not 0.0 <= float(cfg.curriculum_joint_noise) <= 0.02:
+                raise ValueError("coupled power close requires curriculum_joint_noise in [0, 0.02]")
+            fixed_values = (
+                ("coupled_power_align_steps", cfg.coupled_power_align_steps, 24),
+                (
+                    "coupled_power_arm_action_multiplier",
+                    cfg.coupled_power_arm_action_multiplier,
+                    0.20,
+                ),
+                ("coupled_power_arm_target_limit", cfg.coupled_power_arm_target_limit, 0.12),
+                (
+                    "coupled_power_rotation_drift_limit",
+                    cfg.coupled_power_rotation_drift_limit,
+                    0.35,
+                ),
+                ("close_option_unlatched_lift_limit", cfg.close_option_unlatched_lift_limit, 0.015),
+                (
+                    "close_option_horizontal_drift_limit",
+                    cfg.close_option_horizontal_drift_limit,
+                    0.03,
+                ),
+            )
+            for name, value, expected in fixed_values:
+                if float(value) != float(expected):
+                    raise ValueError(f"coupled power close v1 requires {name}={expected}")
+            if int(cfg.coupled_power_align_steps) != 24:
+                raise ValueError("coupled power close v1 requires coupled_power_align_steps=24")
+            if float(cfg.episode_length_s) < 3.0:
+                raise ValueError("coupled power close requires episode_length_s>=3.0")
+        elif cfg.enable_grasp_observations and (
+            cfg.observation_space != 115 or cfg.state_space != 115
+        ):
+            raise ValueError("non-coupled PickTool contracts require 115-D observations/states")
         if cfg.hold_arm_until_stable_grasp:
             if not cfg.curriculum_dataset:
                 raise ValueError(
@@ -284,6 +346,16 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._power_is_grasped = torch.zeros(N, dtype=torch.bool, device=dev)
         self._power_grasp_bonus_given = torch.zeros(N, dtype=torch.bool, device=dev)
         self._power_safe_grasp_steps = torch.zeros(N, dtype=torch.long, device=dev)
+        self._coupled_arm_anchor = torch.zeros((N, self._n_arm), device=dev)
+        self._coupled_hand_hold_target = torch.zeros((N, len(hand_joint_names)), device=dev)
+        self._coupled_align_active = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._coupled_arm_target_saturated = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._coupled_arm_target_saturated_ever = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._coupled_arm_target_offset_abs_max = torch.zeros(N, device=dev)
+        self._coupled_pose_escape = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._coupled_rotation_drift = torch.zeros(N, device=dev)
+        self._coupled_xy_drift = torch.zeros(N, device=dev)
+        self._coupled_true_clearance = torch.zeros(N, device=dev)
         self._grasp_age = torch.zeros(N, dtype=torch.long, device=dev)           # steps since is_grasped became True (unused mvp20)
         self._success_paid = torch.zeros(N, dtype=torch.bool, device=dev)        # one-shot stable-success bonus latch (unused mvp20)
         self._unlatched_lift_failure = torch.zeros(N, dtype=torch.bool, device=dev)
@@ -308,6 +380,8 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._arm_hold_release_power_grasp_quality = torch.zeros(N, device=dev)
         self._arm_hold_release_max_force = torch.zeros(N, device=dev)
         self._close_option_start_xy = torch.zeros((N, 2), device=dev)
+        self._close_option_start_quat = torch.zeros((N, 4), device=dev)
+        self._close_option_start_quat[:, 0] = 1.0
         self._close_option_episode_total = torch.zeros((), dtype=torch.long, device=dev)
         self._close_option_success_total = torch.zeros((), dtype=torch.long, device=dev)
         self._close_option_failure_total = torch.zeros((), dtype=torch.long, device=dev)
@@ -319,6 +393,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._prev_close_quality = torch.zeros(N, device=dev)
         self._prev_wrap_quality = torch.zeros(N, device=dev)
         self._prev_lift_potential = torch.zeros(N, device=dev)
+        self._prev_close_option_stable_potential = torch.zeros(N, device=dev)
         self._potential_initialized = torch.zeros(N, dtype=torch.bool, device=dev)
         # task-space arm control (mvp27): palm EEF Jacobian row index (fixed base -> body_idx - 1) and a
         # cached 6x6 identity for the damped-least-squares pseudo-inverse.
@@ -400,12 +475,29 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             self.object.data.body_com_pos_b[:, 0],
         )
 
+    def _close_option_rotation_vector(self) -> torch.Tensor:
+        """Return object rotation from the post-reset close anchor as an axis-angle vector."""
+
+        delta = quat_mul(
+            self.object.data.root_quat_w,
+            quat_conjugate(self._close_option_start_quat),
+        )
+        return axis_angle_from_quat(delta)
+
     def _load_curriculum_boundary(self, dataset_path: Path, boundary_name: str) -> dict[str, torch.Tensor]:
         if not dataset_path.is_file():
             raise FileNotFoundError(f"Curriculum dataset does not exist: {dataset_path}")
         dataset = torch.load(dataset_path, map_location="cpu", weights_only=False)
         if not isinstance(dataset, dict) or not isinstance(dataset.get("boundaries"), dict):
             raise TypeError("Curriculum dataset must contain a boundaries dictionary")
+        if self.cfg.coupled_power_align_close_option_mode:
+            metadata = dataset.get("meta")
+            if not isinstance(metadata, dict) or metadata.get("contract") != (
+                "coupled_power_static_close_start_v1"
+            ):
+                raise ValueError(
+                    "coupled power close requires a coupled_power_static_close_start_v1 dataset"
+                )
         boundaries = dataset["boundaries"]
         if boundary_name not in boundaries or not isinstance(boundaries[boundary_name], dict):
             raise KeyError(
@@ -448,6 +540,21 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             states[key] = value.to(device=self.device, dtype=dtype)
         if not state_count:
             raise ValueError(f"Curriculum boundary {boundary_name!r} is empty")
+        if self.cfg.coupled_power_align_close_option_mode:
+            static_contract = (
+                torch.count_nonzero(states["joint_vel"]).item() == 0
+                and torch.equal(states["dof_targets"], states["joint_pos"])
+                and torch.count_nonzero(states["object_velocity"]).item() == 0
+                and torch.count_nonzero(states["last_action"]).item() == 0
+                and torch.count_nonzero(states["contact_steps"]).item() == 0
+                and torch.count_nonzero(states["lost_contact_steps"]).item() == 0
+                and not states["is_grasped"].any().item()
+            )
+            if not static_contract:
+                raise ValueError(
+                    "coupled power curriculum must have zero velocity/action/latches and "
+                    "dof_targets == joint_pos"
+                )
         print(
             f"[PickToolTokenEnv] loaded {state_count} curriculum states "
             f"from {dataset_path} boundary={boundary_name}",
@@ -489,6 +596,12 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 self._arm_ids_t,
                 self._n_arm,
             )
+        if self.cfg.coupled_power_align_close_option_mode:
+            # Match the public-controller feasibility contract exactly: no captured momentum,
+            # controller preload or inherited action history may help the new option.
+            joint_vel.zero_()
+            dof_targets.copy_(joint_pos)
+            last_action.zero_()
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=selected_envs)
         self.robot.set_joint_position_target(dof_targets, env_ids=selected_envs)
         self.dof_targets[selected_envs] = dof_targets
@@ -517,6 +630,11 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         restored_grasp = states["is_grasped"][state_ids]
         restored_contact_steps = states["contact_steps"][state_ids]
         restored_lost_steps = states["lost_contact_steps"][state_ids]
+        if self.cfg.coupled_power_align_close_option_mode:
+            # A coupled close reset is a static pregrasp, never an already-paid/latching boundary.
+            restored_grasp = torch.zeros_like(restored_grasp)
+            restored_contact_steps = torch.zeros_like(restored_contact_steps)
+            restored_lost_steps = torch.zeros_like(restored_lost_steps)
         self._is_grasped[selected_envs] = restored_grasp
         self._contact_steps[selected_envs] = restored_contact_steps
         self._lost_contact_steps[selected_envs] = restored_lost_steps
@@ -1041,7 +1159,10 @@ class PickToolTokenEnv(PickCubeTokenEnv):
     def _get_observations(self) -> dict:
         # Preserve the old 87-dimensional observation as an exact prefix.  This permits an explicit
         # old-checkpoint migration without shifting its learned lift-feature column:
-        # core70 | arm+token16 | lift1 | residual5 | close/contact/phase/transport23.
+        # core70 | arm+token16 | lift1 | residual5 | close/contact/phase/transport23.  The coupled
+        # task appends an independent 16-D state suffix instead of changing any old slot semantics:
+        # arm-target offset7 | anchored object xy2/rotation3 | stable/lost progress2 |
+        # ALIGN-active1/progress1.  ALIGN progress exposes the otherwise hidden timed transition.
         d = super()._get_observations()
         clearance = self._object_true_min_z() - self._table_surface_z
         lift_progress = torch.clamp(clearance / self.cfg.lift_success_height, 0.0, 1.0).unsqueeze(-1)
@@ -1099,6 +1220,49 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             obs = torch.cat(
                 (core, old_action, lift_progress, residual_action, phase), dim=-1
             )
+            if self.cfg.coupled_power_align_close_option_mode:
+                arm_offset = (
+                    self.dof_targets[:, self._arm_ids_t] - self._coupled_arm_anchor
+                ) / self.cfg.coupled_power_arm_target_limit
+                xy_delta = (
+                    self._object_com_position_w()[:, :2] - self._close_option_start_xy
+                ) / self.cfg.close_option_horizontal_drift_limit
+                rotation_vector = (
+                    self._close_option_rotation_vector()
+                    / self.cfg.coupled_power_rotation_drift_limit
+                )
+                stable_progress = torch.clamp(
+                    self._close_option_stable_steps.float()
+                    / self.cfg.close_option_confirm_steps,
+                    0.0,
+                    1.0,
+                ).unsqueeze(-1)
+                lost_window_progress = torch.clamp(
+                    self._close_option_lost_window_steps.float()
+                    / self.cfg.close_option_lost_window_steps,
+                    0.0,
+                    1.0,
+                ).unsqueeze(-1)
+                align_active, align_progress = coupled_align_phase_state(
+                    self.episode_length_buf,
+                    self._power_is_grasped,
+                    align_steps=self.cfg.coupled_power_align_steps,
+                )
+                phase_bits = torch.stack(
+                    (align_active.float(), align_progress), dim=-1
+                )
+                coupled_state = torch.cat(
+                    (
+                        torch.clamp(arm_offset, -1.0, 1.0),
+                        torch.clamp(xy_delta, -2.0, 2.0),
+                        torch.clamp(rotation_vector, -2.0, 2.0),
+                        stable_progress,
+                        lost_window_progress,
+                        phase_bits,
+                    ),
+                    dim=-1,
+                )
+                obs = torch.cat((obs, coupled_state), dim=-1)
         if obs.shape[1] != self.cfg.observation_space:
             raise RuntimeError(
                 f"Built {obs.shape[1]} observations, cfg declares {self.cfg.observation_space}."
@@ -1116,7 +1280,24 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         # contract: otherwise an inherited full-task actor immediately continues reach/lift,
         # shoves the hammer out of the 3 cm option window and prevents learning the missing bridge.
         shielded = actions.clone()
-        if self.cfg.close_option_mode:
+        self._coupled_align_active.zero_()
+        self._coupled_arm_target_saturated.zero_()
+        if self.cfg.coupled_power_align_close_option_mode:
+            align_active, _ = coupled_align_phase_state(
+                self.episode_length_buf,
+                self._power_is_grasped,
+                align_steps=self.cfg.coupled_power_align_steps,
+            )
+            self._coupled_align_active.copy_(align_active)
+            shielded = phase_coupled_align_close_action(
+                shielded,
+                self.episode_length_buf,
+                self._power_is_grasped,
+                arm_width=self._n_arm,
+                align_steps=self.cfg.coupled_power_align_steps,
+                arm_multiplier=self.cfg.coupled_power_arm_action_multiplier,
+            )
+        elif self.cfg.close_option_mode:
             shielded = zero_action_prefix(shielded, self._n_arm)
         elif self.cfg.hold_arm_until_stable_grasp:
             hold_arm = ~self._arm_hold_released
@@ -1134,7 +1315,17 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             soft = object_force >= self.cfg.tactile_soft_force_limit
             hard = object_force >= self.cfg.tactile_hard_force_limit
             touching = object_force.max(dim=-1).values >= self.cfg.contact_force_thr
-            block_up = (~self._is_grasped) & (touching | self._grasp_bonus_given)
+            authority_latch = (
+                self._power_is_grasped
+                if self.cfg.coupled_power_align_close_option_mode
+                else self._is_grasped
+            )
+            authority_bonus = (
+                self._power_grasp_bonus_given
+                if self.cfg.coupled_power_align_close_option_mode
+                else self._grasp_bonus_given
+            )
+            block_up = (~authority_latch) & (touching | authority_bonus)
             if bool(block_up.any()):
                 jacobian = self.robot.root_physx_view.get_jacobians()
                 palm_jacobian = jacobian[:, self._palm_jac_idx, :, :][:, :, self._arm_ids_t]
@@ -1147,6 +1338,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 shielded[:, : self._n_arm] = torch.where(active.unsqueeze(-1), projected, arm)
                 self._arm_up_shield_fraction.copy_(active.float().mean())
         super()._pre_physics_step(shielded)
+        self._enforce_coupled_arm_target_envelope()
         if self.cfg.enable_grasp_action_shield:
             # `_decode_hand_action` shapes the raw command, but the parent's EMA and joint-limit
             # clamp can otherwise leave a large position-target preload after contact.  Enforce the
@@ -1176,6 +1368,34 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 )
                 hand_target[hard_env] = (actual_hand + release_delta)[hard_env]
                 self.dof_targets[:, self._hand_ids_t] = hand_target
+            if self.cfg.coupled_power_align_close_option_mode:
+                unloaded_align = self._coupled_align_active & soft_env
+                if bool(unloaded_align.any()):
+                    self._coupled_hand_hold_target[unloaded_align] = self.dof_targets[
+                        unloaded_align
+                    ][:, self._hand_ids_t]
+        self._enforce_coupled_arm_target_envelope()
+
+    def _enforce_coupled_arm_target_envelope(self) -> None:
+        """Bound the incremental arm controller around its post-reset close anchor."""
+
+        if not self.cfg.coupled_power_align_close_option_mode:
+            return
+        target = self.dof_targets[:, self._arm_ids_t]
+        bounded, saturated = clamp_arm_target_to_anchor(
+            target,
+            self._coupled_arm_anchor,
+            self.dof_lower[:, self._arm_ids_t],
+            self.dof_upper[:, self._arm_ids_t],
+            limit=self.cfg.coupled_power_arm_target_limit,
+        )
+        self.dof_targets[:, self._arm_ids_t] = bounded
+        self._coupled_arm_target_saturated.logical_or_(saturated)
+        self._coupled_arm_target_saturated_ever.logical_or_(saturated)
+        offset_max = (bounded - self._coupled_arm_anchor).abs().max(dim=-1).values
+        self._coupled_arm_target_offset_abs_max.copy_(
+            torch.maximum(self._coupled_arm_target_offset_abs_max, offset_max)
+        )
 
     def _decode_hand_action(self, hand_action: torch.Tensor) -> torch.Tensor:
         """Decode token9 plus five full-range, non-accumulating distal residuals."""
@@ -1247,6 +1467,17 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         slew_limited = torch.maximum(torch.minimum(slew_limited, hand_upper), hand_lower)
         self._hand_slew_shield_fraction.copy_((slew_limited != target).float().mean())
         target = slew_limited
+        if self.cfg.coupled_power_align_close_option_mode:
+            # ALIGN owns only the arm.  Returning the current controller target makes the parent's
+            # EMA an exact no-op for the hand; a zero CrossDex token is not generally the captured
+            # pregrasp and therefore cannot be used as a physical hold command.  Tactile unloading
+            # still has priority if alignment unexpectedly reaches the object.
+            hold_align = self._coupled_align_active & (~any_soft.squeeze(-1))
+            target = torch.where(
+                hold_align.unsqueeze(-1),
+                self._coupled_hand_hold_target,
+                target,
+            )
         clamped_token = torch.maximum(torch.minimum(token_target, hand_upper), hand_lower)
         delta = target.index_select(1, self._distal_hand_ids) - clamped_token.index_select(
             1, self._distal_hand_ids
@@ -1421,7 +1652,26 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         r_wrap_progress = cfg.wrap_progress_scale * wrap_delta * potential_ready
         # Keep the one-shot strict-latch event as the end of the close sequence.  Unlike the removed
         # contact/hold occupancies it cannot be farmed by waiting or by drop/regrasp cycles.
-        r_grasp = cfg.grasp_bonus * reward_first_stable_grasp.float()
+        grasp_bonus_scale = (
+            cfg.coupled_power_latch_bonus
+            if cfg.coupled_power_align_close_option_mode
+            else cfg.grasp_bonus
+        )
+        r_grasp = grasp_bonus_scale * reward_first_stable_grasp.float()
+        close_option_stable_potential = torch.clamp(
+            self._close_option_stable_steps.float() / cfg.close_option_confirm_steps,
+            0.0,
+            1.0,
+        )
+        stable_delta = (
+            cfg.shaping_discount * close_option_stable_potential
+            - self._prev_close_option_stable_potential
+        )
+        r_coupled_stable_progress = (
+            cfg.coupled_power_stable_progress_scale * stable_delta * potential_ready
+            if cfg.coupled_power_align_close_option_mode
+            else torch.zeros_like(stable_delta)
+        )
         transport_x = torch.clamp(
             (grasp_quality - cfg.grasp_quality_low)
             / max(cfg.grasp_quality_high - cfg.grasp_quality_low, 1.0e-6),
@@ -1469,10 +1719,17 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         r_force_penalty = -cfg.force_excess_penalty_scale * force_excess
         residual_action = self.actions[:, self._n_arm + self._n_tokens :]
         r_residual_penalty = -cfg.distal_residual_penalty_scale * residual_action.square().sum(dim=-1)
+        r_coupled_arm_action_penalty = (
+            -cfg.coupled_power_arm_action_penalty_scale
+            * self.actions[:, : self._n_arm].square().sum(dim=-1)
+            if cfg.coupled_power_align_close_option_mode
+            else torch.zeros_like(r_residual_penalty)
+        )
 
         self._prev_close_quality.copy_(reward_q_close)
         self._prev_wrap_quality.copy_(reward_q_wrap)
         self._prev_lift_potential.copy_(lift_potential)
+        self._prev_close_option_stable_potential.copy_(close_option_stable_potential)
         self._potential_initialized.fill_(True)
 
         object_z = self.object_pos_w[:, 2] - self.scene.env_origins[:, 2]
@@ -1523,6 +1780,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         log["r_contact_mean"] = torch.zeros((), device=self.device)
         log["r_wrap_mean"] = r_wrap_progress.mean()
         log["r_grasp_mean"] = r_grasp.mean()
+        log["r_coupled_stable_progress_mean"] = r_coupled_stable_progress.mean()
         log["r_hold_mean"] = torch.zeros((), device=self.device)
         log["hold_strength_mean"] = transport_x.mean()
         log["r_lift_mean"] = r_lift_progress.mean()
@@ -1540,6 +1798,19 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         log["close_option_horizontal_escape_frac"] = self._close_option_horizontal_escape.float().mean()
         log["close_option_lost_window_frac"] = self._close_option_lost_window.float().mean()
         log["close_option_stable_steps_mean"] = self._close_option_stable_steps.float().mean()
+        log["coupled_power_pose_escape_frac"] = self._coupled_pose_escape.float().mean()
+        log["coupled_power_rotation_drift_mean"] = self._coupled_rotation_drift.mean()
+        log["coupled_power_rotation_drift_max"] = self._coupled_rotation_drift.max()
+        log["coupled_power_xy_drift_mean"] = self._coupled_xy_drift.mean()
+        log["coupled_power_xy_drift_max"] = self._coupled_xy_drift.max()
+        log["coupled_power_true_clearance_max"] = self._coupled_true_clearance.max()
+        log["coupled_power_arm_target_offset_abs_max"] = (
+            self._coupled_arm_target_offset_abs_max.max()
+        )
+        log["coupled_power_arm_target_saturated_frac"] = (
+            self._coupled_arm_target_saturated_ever.float().mean()
+        )
+        log["coupled_power_align_active_frac"] = self._coupled_align_active.float().mean()
         completed = self._close_option_episode_total.clamp_min(1).float()
         log["close_option_episode_total"] = self._close_option_episode_total.float()
         log["close_option_success_rate_total"] = self._close_option_success_total.float() / completed
@@ -1559,6 +1830,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         log["force_excess_mean"] = force_excess.mean()
         log["r_force_penalty_mean"] = r_force_penalty.mean()
         log["r_residual_penalty_mean"] = r_residual_penalty.mean()
+        log["r_coupled_arm_action_penalty_mean"] = r_coupled_arm_action_penalty.mean()
         log["arm_up_shield_fraction"] = self._arm_up_shield_fraction
         log["hierarchical_arm_hold_fraction"] = (
             (~self._arm_hold_released).float().mean()
@@ -1593,6 +1865,8 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 + r_close_option_timeout
                 + r_force_penalty
                 + r_residual_penalty
+                + r_coupled_stable_progress
+                + r_coupled_arm_action_penalty
             )
         return (
             r_close_progress
@@ -1651,6 +1925,21 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             | (self._overforce_steps >= cfg.tactile_terminate_steps)
         )
         self._tactile_terminate_fraction.copy_(unsafe_force.float().mean())
+        horizontal_drift = (
+            self._object_com_position_w()[:, :2] - self._close_option_start_xy
+        ).norm(dim=-1)
+        rotation_drift = self._close_option_rotation_vector().norm(dim=-1)
+        if cfg.coupled_power_align_close_option_mode:
+            self._coupled_xy_drift.copy_(horizontal_drift)
+            self._coupled_rotation_drift.copy_(rotation_drift)
+            self._coupled_true_clearance.copy_(clearance)
+            self._coupled_pose_escape.copy_(
+                (horizontal_drift > cfg.close_option_horizontal_drift_limit)
+                | (rotation_drift > cfg.coupled_power_rotation_drift_limit)
+                | (clearance > cfg.close_option_unlatched_lift_limit)
+            )
+        else:
+            self._coupled_pose_escape.zero_()
         terminal_state = {
             "true_clearance": clearance.clone(),
             "is_grasped": self._is_grasped.clone(),
@@ -1690,12 +1979,20 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             "power_wrap_quality": signals["power_wrap_quality"].clone(),
             "power_grasp_quality": signals["power_grasp_quality"].clone(),
             "power_grasp_latch_confirm_steps": self._power_contact_steps.clone(),
+            "coupled_power_pose_escape": self._coupled_pose_escape.clone(),
+            "coupled_power_rotation_drift": self._coupled_rotation_drift.clone(),
+            "coupled_power_xy_drift": self._coupled_xy_drift.clone(),
+            "coupled_power_true_clearance": self._coupled_true_clearance.clone(),
+            "coupled_power_arm_target_offset_abs_max": (
+                self._coupled_arm_target_offset_abs_max.clone()
+            ),
+            "coupled_power_arm_target_saturated": (
+                self._coupled_arm_target_saturated_ever.clone()
+            ),
+            "coupled_power_align_active": self._coupled_align_active.clone(),
         }
 
         if cfg.close_option_mode:
-            horizontal_drift = (
-                self._object_com_position_w()[:, :2] - self._close_option_start_xy
-            ).norm(dim=-1)
             option_grasp_quality = (
                 signals["power_grasp_quality"]
                 if cfg.power_close_option_mode
@@ -1713,11 +2010,23 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 if cfg.power_close_option_mode
                 else self._is_grasped
             )
+            if cfg.coupled_power_align_close_option_mode:
+                # The 15-frame handoff hold cannot begin while the policy still owns wrist-align
+                # authority.  The same gate prevents a captured contact from skipping ALIGN.
+                option_is_grasped = option_is_grasped & (~self._coupled_align_active)
             option_proximity_quality = (
                 signals["power_proximity_quality"]
                 if cfg.power_close_option_mode
                 else signals["proximity_quality"]
             )
+            if cfg.coupled_power_align_close_option_mode:
+                # Losing the close window is meaningful only once hand closure is enabled.  Pose
+                # escape remains hard throughout ALIGN through the independent safety mask below.
+                option_proximity_quality = torch.where(
+                    self._coupled_align_active,
+                    torch.ones_like(option_proximity_quality),
+                    option_proximity_quality,
+                )
             option_grasp_threshold = (
                 cfg.power_grasp_quality_high
                 if cfg.power_close_option_mode
@@ -1733,7 +2042,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 horizontal_drift,
                 option_proximity_quality,
                 self._close_option_lost_window_steps,
-                unsafe_force | dropped,
+                unsafe_force | dropped | self._coupled_pose_escape,
                 grasp_quality_threshold=option_grasp_threshold,
                 hold_quality_threshold=cfg.close_option_min_hold_quality,
                 safe_force_limit=cfg.grasp_bonus_max_force,
@@ -1868,6 +2177,14 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._power_is_grasped[env_ids] = False
         self._power_grasp_bonus_given[env_ids] = False
         self._power_safe_grasp_steps[env_ids] = 0
+        self._coupled_align_active[env_ids] = False
+        self._coupled_arm_target_saturated[env_ids] = False
+        self._coupled_arm_target_saturated_ever[env_ids] = False
+        self._coupled_arm_target_offset_abs_max[env_ids] = 0.0
+        self._coupled_pose_escape[env_ids] = False
+        self._coupled_rotation_drift[env_ids] = 0.0
+        self._coupled_xy_drift[env_ids] = 0.0
+        self._coupled_true_clearance[env_ids] = 0.0
         self._grasp_age[env_ids] = 0
         self._success_paid[env_ids] = False
         self._unlatched_lift_failure[env_ids] = False
@@ -1893,9 +2210,17 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._prev_close_quality[env_ids] = 0.0
         self._prev_wrap_quality[env_ids] = 0.0
         self._prev_lift_potential[env_ids] = 0.0
+        self._prev_close_option_stable_potential[env_ids] = 0.0
         self._potential_initialized[env_ids] = False
         self._apply_curriculum_resets(env_ids)
         self._close_option_start_xy[env_ids] = self._object_com_position_w()[env_ids, :2]
+        self._close_option_start_quat[env_ids] = self.object.data.root_quat_w[env_ids]
+        self._coupled_arm_anchor[env_ids] = self.dof_targets[env_ids][
+            :, self._arm_ids_t
+        ]
+        self._coupled_hand_hold_target[env_ids] = self.dof_targets[env_ids][
+            :, self._hand_ids_t
+        ]
 
     # ------------------------------------------------------------------ reset object placement (P1-8)
     def _sample_non_overlapping_object_xy(self, env_ids, default_xy):

@@ -55,6 +55,20 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     power_grasp_quality_low = 0.20
     power_grasp_confirm_steps = 4
     power_grasp_release_steps = 6
+    # Independent 21-D exploration bridge for states that cannot reach thumb+three closure with a
+    # frozen wrist.  This does not simply unmask the arm in the hand-only option.  For the first 24
+    # control frames the hand target is held while reduced arm increments align the wrist; after
+    # that boundary (or an early power latch) arm authority is removed and only the hand may close.
+    # The arm target is always bounded around the reset pose, and the object must stay inside the
+    # same trajectory-wide table-side pose envelope used by the feasibility search.
+    coupled_power_align_close_option_mode = False
+    coupled_power_align_steps = 24
+    coupled_power_arm_action_multiplier = 0.20
+    coupled_power_arm_target_limit = 0.12
+    coupled_power_rotation_drift_limit = 0.35
+    coupled_power_latch_bonus = 25.0
+    coupled_power_stable_progress_scale = 50.0
+    coupled_power_arm_action_penalty_scale = 0.001
     close_option_success_bonus = 100.0
     close_option_confirm_steps = 15
     close_option_min_hold_quality = 0.5
@@ -105,6 +119,9 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # residual5 plus 23 bounded close/contact/phase/counter/transport features.  In particular,
     # palm-frame linear and angular slip make held-versus-flung transport observable to the actor.
     enable_grasp_observations = True
+    # The default/full and hand-only option contracts remain 115-D.  The coupled option is an
+    # explicitly separate 131-D contract; its launcher must set both spaces to 131 when enabling
+    # ``coupled_power_align_close_option_mode``.
     observation_space = 115
     state_space = 115
 

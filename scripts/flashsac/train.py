@@ -128,6 +128,11 @@ POWER_CLOSE_OPTION_TERMINAL_EVENT_KEYS = (
     "close_option_lost_window",
 )
 
+COUPLED_POWER_ALIGN_CLOSE_OPTION_TERMINAL_EVENT_KEYS = (
+    *POWER_CLOSE_OPTION_TERMINAL_EVENT_KEYS,
+    "coupled_power_pose_escape",
+)
+
 TASK_CONTRACT_FILENAME = "task_contract.json"
 INCOMPLETE_CHECKPOINT_FILENAME = ".incomplete_checkpoint.json"
 TASK_CONTRACT_VERSION = 3
@@ -146,10 +151,12 @@ STALE_OPTIONAL_CHECKPOINT_FILENAMES = (
 FULL_TASK_MODE = "full_task"
 CLOSE_OPTION_TASK_MODE = "close_option"
 POWER_CLOSE_OPTION_TASK_MODE = "power_close_option_v1"
+COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE = "coupled_power_align_close_option_v1"
 TASK_MODES = (
     FULL_TASK_MODE,
     CLOSE_OPTION_TASK_MODE,
     POWER_CLOSE_OPTION_TASK_MODE,
+    COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
 )
 PICK_TOOL_LATCH_OBSERVATION_INDEX = 106
 PICK_TOOL_ARM_ACTION_DIM = 7
@@ -161,9 +168,16 @@ HAND_POLICY_ACTION_LAYOUT = "crossdex_token9|distal_residual5"
 IDENTITY_ACTION_PROJECTION = "identity_v1"
 PREPEND_ZERO_ARM_ACTION_PROJECTION = "prepend_zero_arm7_v1"
 FULL21_TO_HAND14_ACTOR_PROJECTION = "full21_to_hand14_v1"
+FULL115_TO_COUPLED131_ACTOR_PROJECTION = (
+    "full115_to_coupled131_zero_pad_input_v1"
+)
 PICK_TOOL_OBSERVATION_DIM = 115
 PICK_TOOL_OBSERVATION_CONTRACT = "pick_tool_markov115_v1"
 POWER_CLOSE_OBSERVATION_CONTRACT = "pick_tool_power_close_markov115_v1"
+COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM = 131
+COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_CONTRACT = (
+    "pick_tool_coupled_power_align_close_state131_v1"
+)
 FULL_ACTION_NOISE_GROUP_SPECS = (
     ("arm", 0, 7, 1.0, 1.0, 64),
     ("token", 7, 16, 0.5, 1.25, 32),
@@ -178,13 +192,24 @@ POWER_ACTION_NOISE_GROUP_SPECS = (
 def task_mode_from_close_option(
     close_option_mode: bool,
     power_close_option_mode: bool = False,
+    coupled_power_align_close_option_mode: bool = False,
 ) -> str:
-    """Resolve the mutually-exclusive task flag pair into a checkpoint mode."""
+    """Resolve the mutually-exclusive task flags into a checkpoint mode."""
 
-    if close_option_mode and power_close_option_mode:
-        raise ValueError(
-            "--close_option_mode and --power_close_option_mode are mutually exclusive"
+    selected = sum(
+        (
+            bool(close_option_mode),
+            bool(power_close_option_mode),
+            bool(coupled_power_align_close_option_mode),
         )
+    )
+    if selected > 1:
+        raise ValueError(
+            "--close_option_mode, --power_close_option_mode, and "
+            "--coupled_power_align_close_option_mode are mutually exclusive"
+        )
+    if coupled_power_align_close_option_mode:
+        return COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE
     if power_close_option_mode:
         return POWER_CLOSE_OPTION_TASK_MODE
     return CLOSE_OPTION_TASK_MODE if close_option_mode else FULL_TASK_MODE
@@ -193,7 +218,59 @@ def task_mode_from_close_option(
 def is_close_option_task_mode(task_mode: str) -> bool:
     if task_mode not in TASK_MODES:
         raise ValueError(f"unsupported task_mode={task_mode!r}")
-    return task_mode in (CLOSE_OPTION_TASK_MODE, POWER_CLOSE_OPTION_TASK_MODE)
+    return task_mode in (
+        CLOSE_OPTION_TASK_MODE,
+        POWER_CLOSE_OPTION_TASK_MODE,
+        COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+    )
+
+
+def resolve_default_episode_length_s(
+    *,
+    task_mode: str,
+    smoke: bool,
+) -> float | None:
+    """Return a mode-safe default horizon without censoring coupled success."""
+
+    if task_mode not in TASK_MODES:
+        raise ValueError(f"unsupported task_mode={task_mode!r}")
+    if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE:
+        return 3.0 if smoke else 5.0
+    if is_close_option_task_mode(task_mode):
+        return 0.5 if smoke else 5.0
+    return 0.12 if smoke else None
+
+
+def environment_task_mode_overrides(task_mode: str) -> dict[str, bool | int]:
+    """Translate a checkpoint task mode to the three independent env switches."""
+
+    if task_mode not in TASK_MODES:
+        raise ValueError(f"unsupported task_mode={task_mode!r}")
+    coupled = task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE
+    power = task_mode == POWER_CLOSE_OPTION_TASK_MODE or coupled
+    overrides: dict[str, bool | int] = {
+        "close_option_mode": is_close_option_task_mode(task_mode),
+        "power_close_option_mode": power,
+        "coupled_power_align_close_option_mode": coupled,
+    }
+    if coupled:
+        overrides.update(
+            {
+                "observation_space": COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM,
+                "state_space": COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM,
+            }
+        )
+    return overrides
+
+
+def resolve_smoke_interaction_steps(*, requested: int, task_mode: str) -> int:
+    """Keep legacy smoke tiny but exercise both phases of the coupled option."""
+
+    if task_mode not in TASK_MODES:
+        raise ValueError(f"unsupported task_mode={task_mode!r}")
+    if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE:
+        return 64
+    return min(requested, 8)
 
 
 def policy_action_contract(task_mode: str) -> dict[str, Any]:
@@ -221,7 +298,11 @@ def action_noise_group_specs(task_mode: str) -> tuple[tuple[Any, ...], ...]:
 
     if task_mode == POWER_CLOSE_OPTION_TASK_MODE:
         return POWER_ACTION_NOISE_GROUP_SPECS
-    if task_mode in (FULL_TASK_MODE, CLOSE_OPTION_TASK_MODE):
+    if task_mode in (
+        FULL_TASK_MODE,
+        CLOSE_OPTION_TASK_MODE,
+        COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+    ):
         return FULL_ACTION_NOISE_GROUP_SPECS
     raise ValueError(f"unsupported task_mode={task_mode!r}")
 
@@ -231,6 +312,11 @@ def observation_contract(task_mode: str) -> dict[str, Any]:
 
     if task_mode not in TASK_MODES:
         raise ValueError(f"unsupported task_mode={task_mode!r}")
+    if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE:
+        return {
+            "observation_dim": COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM,
+            "observation_contract": COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_CONTRACT,
+        }
     return {
         "observation_dim": PICK_TOOL_OBSERVATION_DIM,
         "observation_contract": (
@@ -338,7 +424,10 @@ def read_checkpoint_task_contract(checkpoint: Path) -> dict[str, Any]:
         raise ValueError(
             f"checkpoint task contract {path} has unsupported task_mode={task_mode!r}"
         )
-    if version < 3 and task_mode == POWER_CLOSE_OPTION_TASK_MODE:
+    if version < 3 and task_mode in (
+        POWER_CLOSE_OPTION_TASK_MODE,
+        COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+    ):
         raise ValueError(
             f"checkpoint task contract {path} cannot use task_mode={task_mode!r} "
             f"before version 3"
@@ -644,6 +733,8 @@ def validate_training_source_selection(
     power_close_option_mode: bool,
     demo: list[Path] | None,
     actor_demo: list[Path] | None,
+    coupled_power_align_close_option_mode: bool = False,
+    allow_cross_task_actor: bool = False,
 ) -> None:
     """Validate mutually exclusive initialization and task-specific data sources."""
 
@@ -653,8 +744,23 @@ def validate_training_source_selection(
         raise ValueError("--resume_replay requires --checkpoint")
     if resume_actor_demo and checkpoint is None:
         raise ValueError("--resume_actor_demo requires --checkpoint")
-    task_mode_from_close_option(close_option_mode, power_close_option_mode)
-    if (close_option_mode or power_close_option_mode) and demo is not None:
+    task_mode_from_close_option(
+        close_option_mode,
+        power_close_option_mode,
+        coupled_power_align_close_option_mode,
+    )
+    if allow_cross_task_actor and actor_checkpoint is None:
+        raise ValueError("--allow_cross_task_actor requires --actor_checkpoint")
+    if allow_cross_task_actor and not coupled_power_align_close_option_mode:
+        raise ValueError(
+            "--allow_cross_task_actor is only implemented for "
+            "--coupled_power_align_close_option_mode"
+        )
+    if (
+        close_option_mode
+        or power_close_option_mode
+        or coupled_power_align_close_option_mode
+    ) and demo is not None:
         raise ValueError(
             "close-option training rejects full-task transition --demo data; "
             "use allowlisted --actor_demo supervision instead"
@@ -663,6 +769,11 @@ def validate_training_source_selection(
         raise ValueError(
             "--power_close_option_mode rejects --actor_demo until a strict, "
             "power-authority hand14 dataset contract is implemented"
+        )
+    if coupled_power_align_close_option_mode and actor_demo is not None:
+        raise ValueError(
+            "--coupled_power_align_close_option_mode rejects --actor_demo until a strict, "
+            "coupled-power 131D/21D dataset contract is implemented"
         )
 
 
@@ -690,16 +801,29 @@ def validate_close_option_training_config(
     curriculum_joint_noise: float,
     episode_length_s: float | None,
     randomize_episode_lengths: bool,
+    coupled_power_align_close_option_mode: bool = False,
 ) -> None:
     """Keep the close option on its physically meaningful pregrasp MDP."""
 
-    task_mode_from_close_option(close_option_mode, power_close_option_mode)
-    if not (close_option_mode or power_close_option_mode):
+    task_mode_from_close_option(
+        close_option_mode,
+        power_close_option_mode,
+        coupled_power_align_close_option_mode,
+    )
+    if not (
+        close_option_mode
+        or power_close_option_mode
+        or coupled_power_align_close_option_mode
+    ):
         return
     flag = (
-        "--power_close_option_mode"
-        if power_close_option_mode
-        else "--close_option_mode"
+        "--coupled_power_align_close_option_mode"
+        if coupled_power_align_close_option_mode
+        else (
+            "--power_close_option_mode"
+            if power_close_option_mode
+            else "--close_option_mode"
+        )
     )
     if curriculum_dataset is None:
         raise ValueError(f"{flag} requires a close-start curriculum dataset")
@@ -711,7 +835,9 @@ def validate_close_option_training_config(
         raise ValueError(
             f"{flag} requires --curriculum_joint_noise in [0, 0.02]"
         )
-    minimum_episode_length_s = 0.40
+    minimum_episode_length_s = (
+        3.0 if coupled_power_align_close_option_mode else 0.40
+    )
     if (
         episode_length_s is None
         or not minimum_episode_length_s <= episode_length_s <= 5.0
@@ -797,6 +923,9 @@ class TerminalEventAccumulator:
             FULL_TASK_MODE: TERMINAL_EVENT_KEYS,
             CLOSE_OPTION_TASK_MODE: CLOSE_OPTION_TERMINAL_EVENT_KEYS,
             POWER_CLOSE_OPTION_TASK_MODE: POWER_CLOSE_OPTION_TERMINAL_EVENT_KEYS,
+            COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE: (
+                COUPLED_POWER_ALIGN_CLOSE_OPTION_TERMINAL_EVENT_KEYS
+            ),
         }[self.task_mode]
         self.counts = {
             name: torch.zeros((), dtype=torch.long, device=self.device)
@@ -974,6 +1103,14 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         ),
     )
     parser.add_argument(
+        "--allow_cross_task_actor",
+        action="store_true",
+        help=(
+            "Explicitly allow a full-task 115D/21D actor to initialize the coupled-power "
+            "131D/21D actor through the audited zero-padded observation projection."
+        ),
+    )
+    parser.add_argument(
         "--resume_replay",
         action="store_true",
         help="Load replay_buffer.pt from --checkpoint; fails if it is absent.",
@@ -1064,9 +1201,24 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
             "environment still receives an exact zero arm7 prefix."
         ),
     )
+    task_mode_group.add_argument(
+        "--coupled_power_align_close_option_mode",
+        action="store_true",
+        help=(
+            "Train the 21D coupled wrist-align/power-close option; both policy and physical "
+            "environment use the identity arm7+hand14 action boundary."
+        ),
+    )
     parser.add_argument("--output_dir", type=Path, default=Path("logs/flashsac/pick_tool"))
     parser.add_argument("--metrics_every", type=int, default=100)
-    parser.add_argument("--smoke", action="store_true", help="Use a tiny 8-env, 8-step integration run.")
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help=(
+            "Use a tiny 8-env integration run: 8 interactions normally, or 64 for the "
+            "coupled align-close mode so both controller phases are exercised."
+        ),
+    )
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args()
     launcher = AppLauncher(args)
@@ -1077,6 +1229,7 @@ def _validate_args(args: argparse.Namespace) -> None:
     task_mode = task_mode_from_close_option(
         args.close_option_mode,
         args.power_close_option_mode,
+        args.coupled_power_align_close_option_mode,
     )
     validate_training_source_selection(
         checkpoint=args.checkpoint,
@@ -1087,6 +1240,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         power_close_option_mode=args.power_close_option_mode,
         demo=args.demo,
         actor_demo=args.actor_demo,
+        coupled_power_align_close_option_mode=(
+            args.coupled_power_align_close_option_mode
+        ),
+        allow_cross_task_actor=args.allow_cross_task_actor,
     )
     validate_close_option_training_config(
         close_option_mode=args.close_option_mode,
@@ -1097,6 +1254,9 @@ def _validate_args(args: argparse.Namespace) -> None:
         curriculum_joint_noise=args.curriculum_joint_noise,
         episode_length_s=args.episode_length_s,
         randomize_episode_lengths=args.randomize_episode_lengths,
+        coupled_power_align_close_option_mode=(
+            args.coupled_power_align_close_option_mode
+        ),
     )
     for name in (
         "steps",
@@ -1268,11 +1428,17 @@ def _strict_metrics(
         str(name): _scalar(value)
         for name, value in values.items()
         if not (
-            task_mode == POWER_CLOSE_OPTION_TASK_MODE
+            task_mode in (
+                POWER_CLOSE_OPTION_TASK_MODE,
+                COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+            )
             and str(name) in _POWER_CLOSE_INAPPLICABLE_LEGACY_METRICS
         )
     }
-    if task_mode != POWER_CLOSE_OPTION_TASK_MODE:
+    if task_mode not in (
+        POWER_CLOSE_OPTION_TASK_MODE,
+        COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE,
+    ):
         return metrics
 
     terminal = info.get("pick_tool_terminal")
@@ -1288,6 +1454,18 @@ def _strict_metrics(
         "power_grasp_latch_confirm_steps": torch.long,
         "power_close_option_stable_steps": torch.long,
     }
+    if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE:
+        specifications.update(
+            {
+                "coupled_power_pose_escape": torch.bool,
+                "coupled_power_rotation_drift": torch.float32,
+                "coupled_power_xy_drift": torch.float32,
+                "coupled_power_true_clearance": torch.float32,
+                "coupled_power_arm_target_offset_abs_max": torch.float32,
+                "coupled_power_arm_target_saturated": torch.bool,
+                "coupled_power_align_active": torch.bool,
+            }
+        )
     vectors: dict[str, torch.Tensor] = {}
     vector_shape: tuple[int, ...] | None = None
     vector_device: torch.device | None = None
@@ -1354,6 +1532,33 @@ def _strict_metrics(
             "power_grasp_phase_frac": float(power_latch.float().mean().item()),
         }
     )
+    if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE:
+        nonnegative_names = (
+            "coupled_power_rotation_drift",
+            "coupled_power_xy_drift",
+            "coupled_power_arm_target_offset_abs_max",
+        )
+        finite_names = (*nonnegative_names, "coupled_power_true_clearance")
+        for name in finite_names:
+            value = vectors[name]
+            if not bool(torch.isfinite(value).all()):
+                raise ValueError(f"pick_tool_terminal[{name!r}] must be finite")
+        for name in nonnegative_names:
+            if bool((vectors[name] < 0.0).any()):
+                raise ValueError(f"pick_tool_terminal[{name!r}] must be non-negative")
+        for name in finite_names:
+            value = vectors[name]
+            metrics[f"{name}_mean"] = float(value.mean().item())
+            metrics[f"{name}_max"] = float(value.max().item())
+        metrics["coupled_power_true_clearance_min"] = float(
+            vectors["coupled_power_true_clearance"].min().item()
+        )
+        for name in (
+            "coupled_power_pose_escape",
+            "coupled_power_arm_target_saturated",
+            "coupled_power_align_active",
+        ):
+            metrics[f"{name}_frac"] = float(vectors[name].float().mean().item())
     return metrics
 
 
@@ -1370,6 +1575,7 @@ def audit_actor_checkpoint_source(
     *,
     output_checkpoint: Path,
     target_task_mode: str | None = None,
+    allow_cross_task_actor: bool = False,
 ) -> dict[str, Any]:
     """Resolve and fingerprint an actor-only initialization source."""
 
@@ -1395,7 +1601,46 @@ def audit_actor_checkpoint_source(
     source_dim = int(source_contract["policy_action_dim"])
     target_dim = int(target_runtime["policy_action_dim"])
     actor_projection: str | None = None
-    if source_dim != target_dim:
+    source_task_mode = str(source_contract["task_mode"])
+    if (
+        target_task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE
+        and source_task_mode != target_task_mode
+    ):
+        if not allow_cross_task_actor:
+            raise ValueError(
+                "cross-task --actor_checkpoint initialization into coupled power is "
+                "disabled; pass --allow_cross_task_actor to authorize the audited "
+                "full115-to-coupled131 actor projection"
+            )
+        required_source = {
+            "task_mode": FULL_TASK_MODE,
+            "policy_action_dim": PICK_TOOL_ACTION_DIM,
+            "policy_action_layout": FULL_POLICY_ACTION_LAYOUT,
+            "action_projection": IDENTITY_ACTION_PROJECTION,
+            "observation_dim": PICK_TOOL_OBSERVATION_DIM,
+            "observation_contract": PICK_TOOL_OBSERVATION_CONTRACT,
+        }
+        mismatches = {
+            key: (source_contract.get(key), expected)
+            for key, expected in required_source.items()
+            if source_contract.get(key) != expected
+        }
+        if mismatches:
+            raise ValueError(
+                "--allow_cross_task_actor only permits an exact full-task 115D/21D "
+                f"identity actor source for coupled power; mismatches={mismatches}"
+            )
+        if target_dim != PICK_TOOL_ACTION_DIM:
+            raise ValueError("coupled-power actor target must use the full 21D action")
+        actor_projection = FULL115_TO_COUPLED131_ACTOR_PROJECTION
+    elif (
+        source_task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE
+        and target_task_mode != source_task_mode
+    ):
+        raise ValueError(
+            "a coupled-power 131D actor cannot initialize a different 115D task mode"
+        )
+    elif source_dim != target_dim:
         if source_dim == PICK_TOOL_ACTION_DIM and target_dim == PICK_TOOL_HAND_ACTION_DIM:
             actor_projection = FULL21_TO_HAND14_ACTOR_PROJECTION
         else:
@@ -1406,7 +1651,7 @@ def audit_actor_checkpoint_source(
     return {
         "path": str(source),
         "actor_sha256": _sha256(actor_path),
-        "source_task_mode": str(source_contract["task_mode"]),
+        "source_task_mode": source_task_mode,
         "source_policy_action_dim": source_dim,
         "source_policy_action_layout": str(source_contract["policy_action_layout"]),
         "target_task_mode": target_task_mode,
@@ -1433,6 +1678,14 @@ def load_audited_actor_checkpoint(agent: Any, audit: Mapping[str, Any]) -> None:
             expected_source_action_dim=PICK_TOOL_ACTION_DIM,
         )
         return
+    if projection == FULL115_TO_COUPLED131_ACTOR_PROJECTION:
+        if source_dim != PICK_TOOL_ACTION_DIM or target_dim != PICK_TOOL_ACTION_DIM:
+            raise ValueError("invalid full115-to-coupled131 actor projection audit")
+        _load_actor_with_zero_padded_observation_input(
+            agent,
+            Path(str(audit["path"])) / "actor.pt",
+        )
+        return
     if projection is not None:
         raise ValueError(f"unsupported actor projection={projection!r}")
     if source_dim != target_dim:
@@ -1441,6 +1694,129 @@ def load_audited_actor_checkpoint(agent: Any, audit: Mapping[str, Any]) -> None:
             f"source={source_dim!r}, target={target_dim!r}"
         )
     agent.load_actor(audit["path"])
+
+
+def _canonical_actor_state(
+    state: Mapping[str, torch.Tensor],
+    *,
+    label: str,
+) -> dict[str, tuple[str, torch.Tensor]]:
+    """Map compiled/uncompiled actor keys to one unambiguous canonical namespace."""
+
+    prefix = "_orig_mod."
+    canonical: dict[str, tuple[str, torch.Tensor]] = {}
+    for key, value in state.items():
+        if not isinstance(key, str) or not isinstance(value, torch.Tensor):
+            raise TypeError(f"{label} actor state must map string keys to tensors")
+        canonical_key = key.removeprefix(prefix)
+        if canonical_key in canonical:
+            raise ValueError(f"{label} actor state has duplicate key {canonical_key!r}")
+        canonical[canonical_key] = (key, value)
+    if not canonical:
+        raise ValueError(f"{label} actor state is empty")
+    return canonical
+
+
+def project_full_actor_to_coupled_observation_state(
+    source_state: Mapping[str, torch.Tensor],
+    target_state: Mapping[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Copy a 115D actor into a 131D actor while initially ignoring new inputs."""
+
+    source = _canonical_actor_state(source_state, label="source")
+    target = _canonical_actor_state(target_state, label="target")
+    if set(source) != set(target):
+        raise ValueError("full115-to-coupled131 actor keys are structurally incompatible")
+
+    expanded: dict[str, torch.Tensor] = {}
+    resized: set[str] = set()
+    input_vector_keys = {
+        "embedder.norm.weight",
+        "embedder.norm.bias",
+        "embedder.norm.running_mean",
+        "embedder.norm.running_var",
+    }
+    for canonical_key, (target_key, target_value) in target.items():
+        source_value = source[canonical_key][1]
+        if source_value.dtype != target_value.dtype:
+            raise TypeError(
+                f"actor tensor {canonical_key!r} dtype mismatch: "
+                f"source={source_value.dtype}, target={target_value.dtype}"
+            )
+        if source_value.shape == target_value.shape:
+            expanded[target_key] = source_value.to(device=target_value.device).clone()
+            continue
+        if canonical_key == "embedder.w.w.weight":
+            expected_source_shape = (
+                target_value.shape[0],
+                PICK_TOOL_OBSERVATION_DIM,
+            )
+            expected_target_shape = (
+                target_value.shape[0],
+                COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM,
+            )
+            if (
+                tuple(source_value.shape) != expected_source_shape
+                or tuple(target_value.shape) != expected_target_shape
+            ):
+                raise ValueError(
+                    f"actor input matrix has incompatible shapes: "
+                    f"source={tuple(source_value.shape)}, target={tuple(target_value.shape)}"
+                )
+            value = torch.zeros_like(target_value)
+            value[:, :PICK_TOOL_OBSERVATION_DIM].copy_(
+                source_value.to(device=target_value.device)
+            )
+        elif canonical_key in input_vector_keys:
+            if (
+                tuple(source_value.shape) != (PICK_TOOL_OBSERVATION_DIM,)
+                or tuple(target_value.shape)
+                != (COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM,)
+            ):
+                raise ValueError(
+                    f"actor input-normalizer tensor {canonical_key!r} has incompatible shapes"
+                )
+            value = target_value.clone()
+            value[:PICK_TOOL_OBSERVATION_DIM].copy_(
+                source_value.to(device=target_value.device)
+            )
+        else:
+            raise ValueError(
+                f"actor tensor {canonical_key!r} changes outside the allowlisted input "
+                f"expansion: source={tuple(source_value.shape)}, "
+                f"target={tuple(target_value.shape)}"
+            )
+        expanded[target_key] = value
+        resized.add(canonical_key)
+
+    expected_resized = input_vector_keys | {"embedder.w.w.weight"}
+    if resized != expected_resized:
+        raise ValueError(
+            "full115-to-coupled131 actor projection did not resize the exact input layer; "
+            f"resized={sorted(resized)}"
+        )
+    return expanded
+
+
+def _load_actor_with_zero_padded_observation_input(agent: Any, actor_path: Path) -> None:
+    """Load only actor tensors through the audited 115D -> 131D input expansion."""
+
+    payload = torch.load(actor_path, map_location="cpu", weights_only=True)
+    if not isinstance(payload, Mapping):
+        raise TypeError(f"actor checkpoint {actor_path} must contain a mapping")
+    source_state = payload.get("network_state_dict")
+    if not isinstance(source_state, Mapping):
+        raise TypeError(f"actor checkpoint {actor_path} has no mapping network_state_dict")
+    actor_bundle = getattr(agent, "_actor", None)
+    network = getattr(actor_bundle, "network", None)
+    if network is None:
+        raise TypeError("FlashSAC agent has no actor network for observation projection")
+    target_state = network.state_dict()
+    projected = project_full_actor_to_coupled_observation_state(
+        source_state,
+        target_state,
+    )
+    network.load_state_dict(projected, strict=True)
 
 
 def audit_pick_tool_demonstrations(path: Path) -> dict[str, Any]:
@@ -1522,25 +1898,29 @@ def audit_pick_tool_demonstrations(path: Path) -> dict[str, Any]:
 def run(args: argparse.Namespace) -> dict[str, Any]:
     """Create the environment and execute the minimal collection/update loop."""
 
-    physical_close_option_mode = bool(
-        args.close_option_mode or args.power_close_option_mode
+    task_mode = task_mode_from_close_option(
+        args.close_option_mode,
+        args.power_close_option_mode,
+        args.coupled_power_align_close_option_mode,
     )
+    env_task_mode_overrides = environment_task_mode_overrides(task_mode)
+    physical_close_option_mode = bool(env_task_mode_overrides["close_option_mode"])
     if args.smoke:
-        args.steps = min(args.steps, 8)
+        args.steps = resolve_smoke_interaction_steps(
+            requested=args.steps,
+            task_mode=task_mode,
+        )
         args.num_envs = min(args.num_envs, 8)
         args.buffer = min(args.buffer, 128)
         args.batch = min(args.batch, 16)
         args.metrics_every = 1
-        if args.episode_length_s is None:
-            args.episode_length_s = 0.5 if physical_close_option_mode else 0.12
-    if physical_close_option_mode and args.episode_length_s is None:
-        args.episode_length_s = 5.0
+    if args.episode_length_s is None:
+        args.episode_length_s = resolve_default_episode_length_s(
+            task_mode=task_mode,
+            smoke=args.smoke,
+        )
     _validate_args(args)
     _seed_everything(args.seed)
-    task_mode = task_mode_from_close_option(
-        args.close_option_mode,
-        args.power_close_option_mode,
-    )
     current_runtime_contract = runtime_contract(task_mode)
     effective_n_step = 1 if args.smoke else args.n_step
     output_dir = args.output_dir.resolve()
@@ -1571,6 +1951,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             args.actor_checkpoint,
             output_checkpoint=checkpoint_dir,
             target_task_mode=task_mode,
+            allow_cross_task_actor=args.allow_cross_task_actor,
         )
         if args.actor_checkpoint is not None
         else None
@@ -1635,10 +2016,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "curriculum_joint_noise": args.curriculum_joint_noise,
         }
 
-    cfg_overrides = {
-        "close_option_mode": physical_close_option_mode,
-        "power_close_option_mode": bool(args.power_close_option_mode),
-    }
+    cfg_overrides = dict(env_task_mode_overrides)
+    if task_mode == COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE:
+        cfg_overrides.update(
+            {
+                "observation_space": COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM,
+                "state_space": COUPLED_POWER_ALIGN_CLOSE_OBSERVATION_DIM,
+            }
+        )
     if args.episode_length_s is not None:
         cfg_overrides["episode_length_s"] = args.episode_length_s
     if args.curriculum_dataset is not None:
@@ -1948,6 +2333,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             args.actor_checkpoint,
             output_checkpoint=checkpoint_dir,
             target_task_mode=task_mode,
+            allow_cross_task_actor=args.allow_cross_task_actor,
         )
         if revalidated_actor != actor_checkpoint_audit:
             raise RuntimeError("--actor_checkpoint changed while the run was starting")
@@ -2130,6 +2516,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         if actor_checkpoint_audit
                         else None
                     ),
+                    "allow_cross_task_actor": bool(args.allow_cross_task_actor),
                     "resumed_replay": bool(args.resume_replay),
                     "resumed_task_contract": resumed_task_contract,
                     "resumed_actor_demo": bool(args.resume_actor_demo),
