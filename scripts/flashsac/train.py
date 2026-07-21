@@ -286,18 +286,46 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         help="Exact fraction of every update batch drawn from permanent demonstrations.",
     )
     parser.add_argument(
+        "--actor_demo",
+        type=Path,
+        nargs="+",
+        default=None,
+        help=(
+            "Successful observation/action-only teacher datasets used exclusively for actor "
+            "rehearsal; they are never inserted into critic replay."
+        ),
+    )
+    parser.add_argument(
+        "--resume_actor_demo",
+        action="store_true",
+        help="Restore actor_rehearsal.pt sampler state from --checkpoint.",
+    )
+    parser.add_argument(
         "--demo_bc_weight",
         type=float,
         default=None,
-        help="Demo-only actor rehearsal weight (default: 1 with --demo, otherwise 0).",
+        help="Demo-only actor rehearsal weight (default: 1 with any actor demo source).",
     )
     parser.add_argument("--demo_bc_target_std", type=float, default=0.15)
     parser.add_argument("--demo_bc_std_weight", type=float, default=0.05)
+    parser.add_argument("--demo_bc_arm_weight", type=float, default=1.0)
+    parser.add_argument("--demo_bc_token_weight", type=float, default=1.0)
+    parser.add_argument("--demo_bc_residual_weight", type=float, default=1.0)
     parser.add_argument(
         "--demo_bc_batch",
         type=int,
         default=None,
         help="Demo-only rehearsal rows (default: the fixed demo rows per mixed batch).",
+    )
+    parser.add_argument(
+        "--demo_bc_phases",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Optional demo phases used only for actor rehearsal. Critic replay keeps its "
+            "phase-balanced demo mix; e.g. '--demo_bc_phases 3' anchors a lift curriculum."
+        ),
     )
     parser.add_argument(
         "--curriculum_dataset",
@@ -365,6 +393,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise FileNotFoundError(args.curriculum_dataset)
     if args.resume_replay and args.checkpoint is None:
         raise ValueError("--resume_replay requires --checkpoint")
+    if args.resume_actor_demo and args.checkpoint is None:
+        raise ValueError("--resume_actor_demo requires --checkpoint")
     if args.demo is not None:
         missing_demos = [path for path in args.demo if not path.is_file()]
         if missing_demos:
@@ -376,6 +406,14 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--batch * --demo_fraction must be an integer")
         if not 0 < round(demo_rows) < args.batch:
             raise ValueError("a mixed batch must contain both online and demonstration rows")
+    if args.actor_demo is not None:
+        missing_actor_demos = [path for path in args.actor_demo if not path.is_file()]
+        if missing_actor_demos:
+            raise FileNotFoundError(
+                f"actor-only demonstration datasets do not exist: {missing_actor_demos}"
+            )
+    has_actor_supervision = args.demo is not None or args.actor_demo is not None
+    if has_actor_supervision:
         if args.demo_bc_weight is not None and (
             not math.isfinite(args.demo_bc_weight) or args.demo_bc_weight < 0.0
         ):
@@ -384,10 +422,27 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--demo_bc_target_std must be finite and positive")
         if not math.isfinite(args.demo_bc_std_weight) or args.demo_bc_std_weight < 0.0:
             raise ValueError("--demo_bc_std_weight must be finite and non-negative")
+        group_weights = (
+            args.demo_bc_arm_weight,
+            args.demo_bc_token_weight,
+            args.demo_bc_residual_weight,
+        )
+        if any(not math.isfinite(value) or value < 0.0 for value in group_weights):
+            raise ValueError("demo BC action-group weights must be finite and non-negative")
+        if not any(value > 0.0 for value in group_weights):
+            raise ValueError("at least one demo BC action-group weight must be positive")
         if args.demo_bc_batch is not None and args.demo_bc_batch < 1:
             raise ValueError("--demo_bc_batch must be positive")
-    elif args.demo_bc_weight not in (None, 0.0):
-        raise ValueError("--demo_bc_weight must be 0 when --demo is absent")
+        if args.demo_bc_phases is not None:
+            if len(set(args.demo_bc_phases)) != len(args.demo_bc_phases):
+                raise ValueError("--demo_bc_phases must not contain duplicates")
+    else:
+        if args.demo_bc_weight not in (None, 0.0):
+            raise ValueError("--demo_bc_weight must be 0 without an actor demo source")
+        if args.demo_bc_phases is not None:
+            raise ValueError("--demo_bc_phases requires --demo or --actor_demo")
+        if args.resume_actor_demo:
+            raise ValueError("--resume_actor_demo requires --demo or --actor_demo")
     for name in ("latched_arm_noise_scale", "latched_hand_noise_scale"):
         value = getattr(args, name)
         if not math.isfinite(value) or value < 0.0:
@@ -523,9 +578,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _seed_everything(args.seed)
     demo_bc_weight = (
         1.0
-        if args.demo is not None and args.demo_bc_weight is None
+        if (args.demo is not None or args.actor_demo is not None)
+        and args.demo_bc_weight is None
         else float(args.demo_bc_weight or 0.0)
     )
+    demo_bc_group_weights = {
+        "arm": float(args.demo_bc_arm_weight),
+        "token": float(args.demo_bc_token_weight),
+        "residual": float(args.demo_bc_residual_weight),
+    }
 
     # These imports require the simulator process (and, for the task, its USD
     # plugins) to be initialized by AppLauncher first.
@@ -536,6 +597,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         FlashSACTorchBridge,
         build_agent_config,
     )
+    from actor_rehearsal import ActorRehearsalReservoir, load_actor_rehearsal
     from demo_replay import (
         PermanentDemoReservoir,
         attach_demo_replay,
@@ -638,6 +700,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "demo_phase_counts": {},
         "demo_max_abs_n_step_reward": 0.0,
     }
+    actor_batches: list[dict[str, torch.Tensor]] = []
+    actor_phases: list[torch.Tensor | None] = []
+    actor_source_metrics: list[dict[str, Any]] = []
+    actor_source_fingerprints: list[str] = []
     demo_max_abs_reward: torch.Tensor | None = None
     if args.demo is not None:
         demo_audits = [audit_pick_tool_demonstrations(path) for path in args.demo]
@@ -682,6 +748,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     **audit,
                 }
             )
+            actor_batches.append(
+                {"observation": batch["observation"], "action": batch["action"]}
+            )
+            actor_phases.append(labels)
+            actor_source_metrics.append(
+                {
+                    "role": "critic_transition_projection",
+                    "path": str(path.resolve()),
+                    "sha256": source_metrics[-1]["sha256"],
+                    "transitions": int(batch["observation"].shape[0]),
+                }
+            )
+            actor_source_fingerprints.append(source_metrics[-1]["sha256"])
         reservoir.seal()
         demo_replay = attach_demo_replay(
             agent,
@@ -712,6 +791,103 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "demo_max_abs_n_step_reward": float(demo_max_abs_reward.item()),
         }
 
+    if args.actor_demo is not None:
+        expected_lift_teacher = {
+            "collector": "online_base_close_to_scripted_lift_teacher",
+            "dataset_phase": "lift",
+            "teacher_probability": 1.0,
+            "executed_teacher_fraction": 1.0,
+        }
+        for path in args.actor_demo:
+            batch, labels, audit = load_actor_rehearsal(
+                path.resolve(),
+                device=device,
+                observation_dim=env.observation_dim,
+                action_dim=env.action_dim,
+                expected_metadata=expected_lift_teacher,
+            )
+            actor_batches.append(batch)
+            actor_phases.append(labels)
+            actor_source_metrics.append({"role": "actor_only", **audit})
+            actor_source_fingerprints.append(str(audit["sha256"]))
+
+    actor_rehearsal = None
+    actor_rehearsal_metrics: dict[str, Any] = {
+        "actor_demo_sources": [],
+        "actor_rehearsal_transitions": 0,
+        "actor_rehearsal_batch": 0,
+        "actor_rehearsal_phase_counts": {},
+        "actor_rehearsal_stratum_weights": None,
+        "actor_rehearsal_resumed": False,
+    }
+    if actor_batches:
+        if any(labels is None for labels in actor_phases) and not all(
+            labels is None for labels in actor_phases
+        ):
+            raise ValueError(
+                "all actor rehearsal sources must consistently include or omit phase labels"
+            )
+        available_phases: tuple[int, ...] = ()
+        phase_counts: dict[str, int] = {}
+        if actor_phases[0] is not None:
+            concatenated_phase = torch.cat(
+                [labels for labels in actor_phases if labels is not None]
+            )
+            values, counts = torch.unique(
+                concatenated_phase, sorted=True, return_counts=True
+            )
+            available_phases = tuple(int(value) for value in values.detach().cpu().tolist())
+            phase_counts = {
+                str(int(value)): int(count)
+                for value, count in zip(
+                    values.detach().cpu().tolist(),
+                    counts.detach().cpu().tolist(),
+                    strict=True,
+                )
+            }
+        actor_stratum_weights: dict[int, float] | None = None
+        if args.demo_bc_phases is not None:
+            selected_phases = set(args.demo_bc_phases)
+            missing_phases = sorted(selected_phases.difference(available_phases))
+            if missing_phases:
+                raise ValueError(
+                    "--demo_bc_phases contains phases absent from actor demonstrations: "
+                    f"{missing_phases}; available={list(available_phases)}"
+                )
+            actor_stratum_weights = {
+                phase: float(phase in selected_phases) for phase in available_phases
+            }
+        actor_rehearsal_batch = (
+            int(args.demo_bc_batch)
+            if args.demo_bc_batch is not None
+            else (
+                demo_replay.demo_rows_per_batch
+                if demo_replay is not None
+                else max(1, args.batch // 4)
+            )
+        )
+        actor_rehearsal = ActorRehearsalReservoir(
+            capacity=sum(int(batch["observation"].shape[0]) for batch in actor_batches),
+            observation_dim=env.observation_dim,
+            action_dim=env.action_dim,
+            device=device,
+            seed=args.seed + 2_000_003,
+            source_fingerprints=actor_source_fingerprints,
+            default_batch_size=actor_rehearsal_batch,
+            stratum_weights=actor_stratum_weights,
+        )
+        for batch, labels in zip(actor_batches, actor_phases, strict=True):
+            actor_rehearsal.add(batch, phase=labels)
+        actor_rehearsal.seal()
+        actor_rehearsal_metrics = {
+            "actor_demo_sources": actor_source_metrics,
+            "actor_rehearsal_transitions": len(actor_rehearsal),
+            "actor_rehearsal_batch": actor_rehearsal_batch,
+            "actor_rehearsal_phase_counts": phase_counts,
+            "actor_rehearsal_stratum_weights": actor_stratum_weights,
+            "actor_rehearsal_resumed": False,
+        }
+
     if args.checkpoint is not None:
         agent.load(str(args.checkpoint.resolve()))
         if args.resume_replay:
@@ -719,6 +895,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if not replay_path.is_file():
                 raise FileNotFoundError(replay_path)
             agent.load_replay_buffer(str(args.checkpoint.resolve()))
+        if args.resume_actor_demo:
+            if actor_rehearsal is None:
+                raise RuntimeError("--resume_actor_demo requires an actor rehearsal reservoir")
+            actor_rehearsal_path = args.checkpoint.resolve() / "actor_rehearsal.pt"
+            if not actor_rehearsal_path.is_file():
+                raise FileNotFoundError(actor_rehearsal_path)
+            actor_rehearsal.load(actor_rehearsal_path)
+            actor_rehearsal_metrics["actor_rehearsal_resumed"] = True
     if demo_max_abs_reward is not None:
         if agent.reward_normalizer is None:
             raise RuntimeError("demonstration replay requires the configured reward normalizer")
@@ -820,12 +1004,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 update_count += 1
                 if "actor/loss" in update_info:
                     actor_update_count += 1
-                    if demo_replay is not None and demo_bc_weight > 0.0:
-                        rehearsal_batch = demo_replay.sample_demonstrations(args.demo_bc_batch)
+                    if actor_rehearsal is not None and demo_bc_weight > 0.0:
+                        rehearsal_batch = actor_rehearsal.sample()
                         update_info.update(
                             agent.demo_bc_rehearsal(
                                 rehearsal_batch,
                                 weight=demo_bc_weight,
+                                group_weights=demo_bc_group_weights,
                                 target_std=args.demo_bc_target_std,
                                 std_weight=args.demo_bc_std_weight,
                             )
@@ -847,12 +1032,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "critic_burnin_updates": args.critic_burnin_updates,
                     "demo_bc_updates": demo_bc_update_count,
                     "demo_bc_weight": demo_bc_weight,
+                    "demo_bc_group_weights": demo_bc_group_weights,
                     "lr_decay_updates": lr_decay_updates,
                     "lr_warmup_updates": lr_warmup_updates,
                     "initial_checkpoint": (
                         str(args.checkpoint.resolve()) if args.checkpoint is not None else None
                     ),
                     "resumed_replay": bool(args.resume_replay),
+                    "resumed_actor_demo": bool(args.resume_actor_demo),
                     "restore_checkpoint_rng": False,
                     "flashsac_upstream_commit": FLASH_SAC_COMMIT,
                     "observation_dim": env.observation_dim,
@@ -870,6 +1057,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "latched_arm_noise_scale": args.latched_arm_noise_scale,
                     "latched_hand_noise_scale": args.latched_hand_noise_scale,
                     **demo_metrics,
+                    **actor_rehearsal_metrics,
                     "terminated_events": int(terminated_count.item()),
                     "truncated_events": int(truncated_count.item()),
                     "throughput_env_steps_per_second": interaction_step * env.num_envs / elapsed,
@@ -903,6 +1091,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         agent.save(str(checkpoint_dir))
         if args.save_replay:
             agent.save_replay_buffer(str(checkpoint_dir))
+        if actor_rehearsal is not None:
+            actor_rehearsal.save(checkpoint_dir / "actor_rehearsal.pt")
         final_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
         final_metrics["checkpoint"] = str(checkpoint_dir)
         final_metrics["status"] = "complete"

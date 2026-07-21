@@ -605,6 +605,7 @@ class FlashSACTorchBridge(FlashSACAgent):
         batch: Mapping[str, torch.Tensor],
         *,
         weight: float = 1.0,
+        group_weights: Mapping[str, float] | None = None,
         target_std: float = 0.15,
         std_weight: float = 0.05,
         atanh_epsilon: float = 1.0e-4,
@@ -631,6 +632,21 @@ class FlashSACTorchBridge(FlashSACAgent):
             raise ValueError("demo BC requires weight>0, target_std>0, and std_weight>=0")
         if not 0.0 < atanh_epsilon < 0.1 or gradient_clip <= 0.0:
             raise ValueError("invalid demo BC atanh epsilon or gradient clip")
+        requested_group_weights = {} if group_weights is None else dict(group_weights)
+        known_groups = {group.name for group in self._noise_groups}
+        unknown_groups = sorted(set(requested_group_weights).difference(known_groups))
+        if unknown_groups:
+            raise ValueError(f"demo BC weights contain unknown action groups: {unknown_groups}")
+        resolved_group_weights: dict[str, float] = {}
+        for group in self._noise_groups:
+            group_weight = float(requested_group_weights.get(group.name, 1.0))
+            if not math.isfinite(group_weight) or group_weight < 0.0:
+                raise ValueError(
+                    f"demo BC group weight {group.name!r} must be finite and non-negative"
+                )
+            resolved_group_weights[group.name] = group_weight
+        if not any(value > 0.0 for value in resolved_group_weights.values()):
+            raise ValueError("at least one demo BC action-group weight must be positive")
         observation = batch.get("observation")
         action = batch.get("action")
         if not isinstance(observation, torch.Tensor) or not isinstance(action, torch.Tensor):
@@ -648,6 +664,12 @@ class FlashSACTorchBridge(FlashSACAgent):
         )
         limit = 1.0 - atanh_epsilon
         target_mean = torch.atanh(action.clamp(-limit, limit))
+        action_weights = torch.ones(
+            self._action_dim, dtype=torch.float32, device=self._device
+        )
+        for group in self._noise_groups:
+            action_weights[group.start : group.stop] = resolved_group_weights[group.name]
+        action_weight_sum = action_weights.sum()
         optimizer = self._actor.optimizer
         if optimizer is None:
             raise RuntimeError("FlashSAC actor has no optimizer")
@@ -662,12 +684,15 @@ class FlashSACTorchBridge(FlashSACAgent):
                 observations=actor_observation,
                 training=True,
             )
-            action_loss = F.smooth_l1_loss(
+            action_loss_elementwise = F.smooth_l1_loss(
                 predicted_mean,
                 target_mean,
-                reduction="mean",
+                reduction="none",
                 beta=1.0,
             )
+            action_loss = (
+                action_loss_elementwise.float() * action_weights.unsqueeze(0)
+            ).sum() / (observation.shape[0] * action_weight_sum)
             predicted_log_std = predicted_std.float().clamp_min(1.0e-8).log()
             std_loss = (predicted_log_std - math.log(target_std)).square().mean()
             loss = weight * (action_loss + std_weight * std_loss)
@@ -690,12 +715,19 @@ class FlashSACTorchBridge(FlashSACAgent):
         # update.  Rehearsal is a correction within that update, not a second
         # unit of the global learning-rate schedule.
         self._actor.normalize_parameters()
-        return {
+        with torch.no_grad():
+            squared_action_error = (torch.tanh(predicted_mean.float()) - action.float()).square()
+        metrics = {
             "demo_bc/loss": float(loss.detach()),
             "demo_bc/action_loss": float(action_loss.detach()),
             "demo_bc/std_loss": float(std_loss.detach()),
             "demo_bc/grad_norm": float(grad_norm.detach()),
         }
+        for group in self._noise_groups:
+            metrics[f"demo_bc/{group.name}_action_rmse"] = float(
+                squared_action_error[:, group.start : group.stop].mean().sqrt()
+            )
+        return metrics
 
     def _bridge_checkpoint_state(self) -> dict[str, Any]:
         state: dict[str, Any] = {

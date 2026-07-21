@@ -205,8 +205,20 @@ def test_critic_burnin_and_demo_only_actor_rehearsal() -> None:
     rehearsal_metrics = agent.demo_bc_rehearsal(
         {"observation": observation, "action": demo_action},
         weight=1.0,
+        group_weights={"arm": 0.2, "token": 1.0, "residual": 1.0},
     )
     assert all(torch.isfinite(torch.tensor(value)) for value in rehearsal_metrics.values())
+    assert {
+        "demo_bc/arm_action_rmse",
+        "demo_bc/token_action_rmse",
+        "demo_bc/residual_action_rmse",
+    }.issubset(rehearsal_metrics)
+    _expect_error(
+        ValueError,
+        agent.demo_bc_rehearsal,
+        {"observation": observation, "action": demo_action},
+        group_weights={"unknown": 1.0},
+    )
     assert any(
         not torch.equal(agent._actor.network.state_dict()[key], expected)  # noqa: SLF001
         for key, expected in actor_before.items()
