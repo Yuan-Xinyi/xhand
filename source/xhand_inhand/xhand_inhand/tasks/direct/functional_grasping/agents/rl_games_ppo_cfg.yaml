@@ -1,0 +1,80 @@
+params:
+  seed: 42
+
+  env:
+    clip_observations: 5.0
+    clip_actions: 1.0
+
+  algo:
+    name: a2c_continuous
+
+  model:
+    name: continuous_a2c_logstd
+
+  network:
+    name: actor_critic
+    separate: False
+    space:
+      continuous:
+        mu_activation: None
+        sigma_activation: None
+        mu_init:
+          name: default
+        sigma_init:
+          name: const_initializer
+          val: 0
+        fixed_sigma: 'fixed'  # SAPG-fork expects a STRING ('fixed'|'coef_cond'|'obs_cond'); bool True -> builds sigma as a Linear and crashes
+    mlp:
+      units: [256, 128, 64]
+      activation: elu
+      d2rl: False
+      initializer:
+        name: default
+      regularizer:
+        name: None
+
+  load_checkpoint: False
+  load_path: ''
+
+  config:
+    name: hammer_nail_token
+    env_name: rlgpu
+    device: 'cuda:0'
+    device_name: 'cuda:0'
+    multi_gpu: False
+    ppo: True
+    mixed_precision: False
+    normalize_input: True
+    normalize_value: True
+    num_actors: -1
+    # the rl_games backend here is the SAPG fork (/disk2/simtoolreal/rl_games); it reads these
+    # exploration keys unconditionally. expl_type='none' = plain PPO (no SAPG mixed-exploration).
+    expl_type: 'none'  # 'none' | 'mixed_expl' | 'mixed_expl_disjoint'
+    expl_reward_type: rnd
+    expl_reward_coef_embd_size: 32
+    expl_reward_coef_scale: 1.0
+    expl_coef_block_size: 4096
+    reward_shaper:
+      scale_value: 0.01
+    normalize_advantage: True
+    gamma: 0.99
+    tau: 0.95
+    learning_rate: 5e-4
+    lr_schedule: adaptive
+    schedule_type: standard
+    kl_threshold: 0.008
+    score_to_win: 100000
+    max_epochs: 5000
+    save_best_after: 100
+    save_frequency: 200
+    print_stats: True
+    grad_norm: 1.0
+    entropy_coef: 0.0
+    truncate_grads: True
+    e_clip: 0.2
+    horizon_length: 32
+    minibatch_size: 32768  # 8192 envs x 32 horizon = 262144 steps -> 8 minibatches
+    mini_epochs: 8
+    critic_coef: 4
+    clip_value: True
+    bounds_loss_coef: 0.0001
