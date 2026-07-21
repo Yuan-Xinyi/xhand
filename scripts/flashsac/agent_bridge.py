@@ -18,6 +18,8 @@ changing this bridge.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import io
 import math
 import os
 import sys
@@ -33,9 +35,16 @@ import torch.nn.functional as F
 
 
 FLASH_SAC_COMMIT = "87edc9061150ae9e962dd84e6544e27a1554b3ab"
-FLASH_SAC_FORK_COMMIT = "4f4daf6f08e112c5d93fd8537eb4d6095d482134"
+FLASH_SAC_FORK_COMMIT = "5ecf331fa11cd457dd39018b3d68af571b257666"
+FLASH_SAC_COMPATIBLE_FORK_COMMITS = (
+    "4f4daf6f08e112c5d93fd8537eb4d6095d482134",
+    FLASH_SAC_FORK_COMMIT,
+)
 BRIDGE_STATE_FILENAME = "torch_bridge_state.pt"
-BRIDGE_CHECKPOINT_VERSION = 1
+FROZEN_LIFT_ACTOR_FILENAME = "frozen_lift_actor.pt"
+PUBLIC_LATCH_FROZEN_ACTOR_ROUTER_NAME = "public_latch_frozen_actor_v1"
+BRIDGE_CHECKPOINT_VERSION = 2
+_SUPPORTED_BRIDGE_CHECKPOINT_VERSIONS = (1, BRIDGE_CHECKPOINT_VERSION)
 _COMPILED_STATE_PREFIX = "_orig_mod."
 _ACTOR_ACTION_OUTPUT_KEYS = (
     "predictor.mean_w.w.weight",
@@ -83,6 +92,7 @@ from flash_rl.agents.flashSAC.agent import (  # noqa: E402
     FlashSACConfig,
     _update_networks,
 )
+from flash_rl.agents.flashSAC.network import FlashSACActor  # noqa: E402
 from flash_rl.agents.flashSAC.update import (  # noqa: E402
     update_actor,
     update_critic,
@@ -125,6 +135,18 @@ class ActionAuthorityRule:
     active_value: float
 
 
+@dataclasses.dataclass(frozen=True)
+class PublicLatchFrozenActorRouter:
+    """Use a learned close slice before latch and a frozen full actor after it."""
+
+    name: str
+    observation_index: int
+    trainable_start: int
+    trainable_stop: int
+    close_value: float = 0.0
+    frozen_value: float = 1.0
+
+
 def _update_networks_with_action_authority(
     *,
     batch: dict[str, torch.Tensor],
@@ -138,6 +160,8 @@ def _update_networks_with_action_authority(
     grad_scaler: torch.amp.GradScaler,
     actor_action_active: torch.Tensor,
     actor_next_action_active: torch.Tensor,
+    next_action_override: torch.Tensor | None = None,
+    next_action_override_rows: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Run the pinned update with caller-authored policy action authority.
 
@@ -207,6 +231,8 @@ def _update_networks_with_action_authority(
         use_amp=cfg.use_amp,
         grad_scaler=grad_scaler,
         next_action_active=actor_next_action_active,
+        next_action_override=next_action_override,
+        next_action_override_rows=next_action_override_rows,
     )
     target_info = update_target_network(target_network=target_critic)
     return {
@@ -367,6 +393,106 @@ def _normalize_action_authority_rules(
             )
         normalized.append(dataclasses.replace(rule, active_value=float(rule.active_value)))
     return tuple(normalized)
+
+
+def _normalize_public_latch_router(
+    router: PublicLatchFrozenActorRouter | None,
+    *,
+    action_dim: int,
+    actor_observation_dim: int,
+    authority_rules: Sequence[ActionAuthorityRule],
+) -> PublicLatchFrozenActorRouter | None:
+    if router is None:
+        return None
+    if not isinstance(router, PublicLatchFrozenActorRouter):
+        raise TypeError("policy router must be PublicLatchFrozenActorRouter or None")
+    if router.name != PUBLIC_LATCH_FROZEN_ACTOR_ROUTER_NAME:
+        raise ValueError(
+            "policy router name must be "
+            f"{PUBLIC_LATCH_FROZEN_ACTOR_ROUTER_NAME!r}"
+        )
+    if (
+        not isinstance(router.observation_index, int)
+        or isinstance(router.observation_index, bool)
+        or not 0 <= router.observation_index < actor_observation_dim
+    ):
+        raise ValueError("policy router observation_index is outside the actor observation")
+    if (
+        not isinstance(router.trainable_start, int)
+        or isinstance(router.trainable_start, bool)
+        or not isinstance(router.trainable_stop, int)
+        or isinstance(router.trainable_stop, bool)
+        or not 0 < router.trainable_start < router.trainable_stop == action_dim
+    ):
+        raise ValueError(
+            "policy router requires one non-empty trainable suffix ending at action_dim"
+        )
+    if (
+        not isinstance(router.close_value, (int, float))
+        or isinstance(router.close_value, bool)
+        or not isinstance(router.frozen_value, (int, float))
+        or isinstance(router.frozen_value, bool)
+        or float(router.close_value) != 0.0
+        or float(router.frozen_value) != 1.0
+    ):
+        raise ValueError("policy router requires exact binary close=0 and frozen=1 values")
+    expected_authority = (
+        ActionAuthorityRule(
+            name="arm_after_public_latch",
+            start=0,
+            stop=router.trainable_start,
+            observation_index=router.observation_index,
+            active_value=router.frozen_value,
+        ),
+    )
+    if tuple(authority_rules) != expected_authority:
+        raise ValueError(
+            "public-latch frozen-actor routing requires the matching arm action-authority rule"
+        )
+    return dataclasses.replace(
+        router,
+        close_value=float(router.close_value),
+        frozen_value=float(router.frozen_value),
+    )
+
+
+def _network_tensor_sha256(network: torch.nn.Module) -> str:
+    """Hash canonical parameter/buffer names, metadata and bytes."""
+
+    digest = hashlib.sha256()
+    state = {
+        key.removeprefix(_COMPILED_STATE_PREFIX): value
+        for key, value in network.state_dict().items()
+    }
+    if len(state) != len(network.state_dict()):
+        raise RuntimeError("network state has duplicate canonical keys")
+    for key in sorted(state):
+        tensor = state[key].detach().contiguous().cpu()
+        digest.update(key.encode("utf-8"))
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(repr(tuple(tensor.shape)).encode("ascii"))
+        digest.update(tensor.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _regular_file_sha256(path: str | os.PathLike[str], *, label: str) -> str:
+    return hashlib.sha256(_read_regular_file_bytes(path, label=label)).hexdigest()
+
+
+def _read_regular_file_bytes(path: str | os.PathLike[str], *, label: str) -> bytes:
+    resolved = os.fspath(path)
+    if not os.path.isfile(resolved) or os.path.islink(resolved):
+        raise FileNotFoundError(f"{label} must be a regular non-symlink file: {resolved}")
+    with open(resolved, "rb") as stream:
+        return stream.read()
 
 
 def _truncated_zeta_cdf(mu: float, max_n: int, device: torch.device) -> torch.Tensor:
@@ -653,6 +779,7 @@ class FlashSACTorchBridge(FlashSACAgent):
         restore_rng_state_on_load: bool = True,
         actor_action_active_observation_index: int | None = None,
         action_authority_rules: Sequence[ActionAuthorityRule] = (),
+        public_latch_frozen_actor_router: PublicLatchFrozenActorRouter | None = None,
         unit_normalize_actor_mean_head: bool = True,
     ) -> None:
         super().__init__(observation_space, action_space, env_info, cfg)
@@ -679,6 +806,31 @@ class FlashSACTorchBridge(FlashSACAgent):
             action_dim=self._action_dim,
             actor_observation_dim=self._actor_observation_dim,
         )
+        if (
+            actor_action_active_observation_index is not None
+            and public_latch_frozen_actor_router is not None
+        ):
+            raise ValueError(
+                "legacy whole-action authority cannot be combined with a policy router"
+            )
+        self._public_latch_frozen_actor_router = _normalize_public_latch_router(
+            public_latch_frozen_actor_router,
+            action_dim=self._action_dim,
+            actor_observation_dim=self._actor_observation_dim,
+            authority_rules=self._action_authority_rules,
+        )
+        self._frozen_lift_actor: FlashSACActor | None = None
+        self._frozen_lift_actor_loaded = False
+        self._frozen_lift_actor_source_sha256: str | None = None
+        if self._public_latch_frozen_actor_router is not None:
+            self._frozen_lift_actor = FlashSACActor(
+                num_blocks=self._cfg.actor_num_blocks,
+                input_dim=self._actor_observation_dim,
+                hidden_dim=self._cfg.actor_hidden_dim,
+                action_dim=self._action_dim,
+            ).to(self._device)
+            self._frozen_lift_actor.requires_grad_(False)
+            self._frozen_lift_actor.eval()
         if not isinstance(unit_normalize_actor_mean_head, bool):
             raise TypeError("unit_normalize_actor_mean_head must be bool")
         self._unit_normalize_actor_mean_head = unit_normalize_actor_mean_head
@@ -730,8 +882,146 @@ class FlashSACTorchBridge(FlashSACAgent):
         return self._action_authority_rules
 
     @property
+    def public_latch_frozen_actor_router(
+        self,
+    ) -> PublicLatchFrozenActorRouter | None:
+        return self._public_latch_frozen_actor_router
+
+    @property
+    def frozen_lift_actor_sha256(self) -> str | None:
+        if not self._frozen_lift_actor_loaded or self._frozen_lift_actor is None:
+            return None
+        return _network_tensor_sha256(self._frozen_lift_actor)
+
+    @property
+    def frozen_lift_actor_source_sha256(self) -> str | None:
+        return self._frozen_lift_actor_source_sha256
+
+    @property
     def unit_normalize_actor_mean_head(self) -> bool:
         return self._unit_normalize_actor_mean_head
+
+    def _load_frozen_lift_actor_file(
+        self,
+        actor_path: str | os.PathLike[str],
+        *,
+        source_sha256: str | None = None,
+        bind_source_sha256_to_file: bool = False,
+        expected_semantic_sha256: str | None = None,
+    ) -> str:
+        if self._public_latch_frozen_actor_router is None or self._frozen_lift_actor is None:
+            raise RuntimeError("cannot load a frozen lift actor without an active policy router")
+        resolved = os.fspath(actor_path)
+        file_bytes = _read_regular_file_bytes(resolved, label="frozen lift actor")
+        actual_file_sha256 = hashlib.sha256(file_bytes).hexdigest()
+        if bind_source_sha256_to_file:
+            if source_sha256 is not None:
+                raise ValueError(
+                    "source_sha256 must be omitted when binding provenance to actor bytes"
+                )
+            source_sha256 = actual_file_sha256
+        if source_sha256 is not None and not _is_sha256(source_sha256):
+            raise ValueError("frozen lift actor source SHA-256 must be 64 lowercase hex digits")
+        if expected_semantic_sha256 is not None and not _is_sha256(
+            expected_semantic_sha256
+        ):
+            raise ValueError(
+                "expected frozen lift actor semantic SHA-256 must be 64 lowercase hex digits"
+            )
+        checkpoint = torch.load(
+            io.BytesIO(file_bytes),
+            map_location=self._device,
+            weights_only=True,
+        )
+        if not isinstance(checkpoint, Mapping):
+            raise TypeError(f"frozen lift actor checkpoint {resolved} must be a mapping")
+        checkpoint_state = checkpoint.get("network_state_dict")
+        if not isinstance(checkpoint_state, Mapping):
+            raise TypeError(
+                f"frozen lift actor checkpoint {resolved} has no network_state_dict"
+            )
+        candidate_actor = FlashSACActor(
+            num_blocks=self._cfg.actor_num_blocks,
+            input_dim=self._actor_observation_dim,
+            hidden_dim=self._cfg.actor_hidden_dim,
+            action_dim=self._action_dim,
+        ).to(self._device)
+        target_state = candidate_actor.state_dict()
+        portable_state = _portable_network_state_dict(
+            checkpoint_state,
+            target_state,
+            path=resolved,
+        )
+        candidate_actor.load_state_dict(portable_state, strict=True)
+        candidate_actor.requires_grad_(False)
+        candidate_actor.eval()
+        candidate_semantic_sha256 = _network_tensor_sha256(candidate_actor)
+        if (
+            expected_semantic_sha256 is not None
+            and candidate_semantic_sha256 != expected_semantic_sha256
+        ):
+            raise ValueError(
+                "frozen lift actor semantic SHA-256 mismatch; "
+                f"checkpoint={expected_semantic_sha256!r}, "
+                f"actual={candidate_semantic_sha256!r}"
+            )
+        # Commit only after the independently-loaded candidate passes every
+        # provenance and semantic check. A rejected sidecar never contaminates
+        # the live policy router.
+        self._frozen_lift_actor.load_state_dict(candidate_actor.state_dict(), strict=True)
+        self._frozen_lift_actor.requires_grad_(False)
+        self._frozen_lift_actor.eval()
+        self._frozen_lift_actor_loaded = True
+        self._frozen_lift_actor_source_sha256 = source_sha256
+        return actual_file_sha256
+
+    def load_frozen_lift_actor(self, checkpoint: str | os.PathLike[str]) -> None:
+        """Load the immutable lift actor from an ordinary FlashSAC checkpoint."""
+
+        checkpoint_dir = os.fspath(checkpoint)
+        if not os.path.isdir(checkpoint_dir) or os.path.islink(checkpoint_dir):
+            raise FileNotFoundError(
+                f"frozen lift actor checkpoint must be a real directory: {checkpoint_dir}"
+            )
+        actor_path = os.path.join(checkpoint_dir, "actor.pt")
+        self._load_frozen_lift_actor_file(
+            actor_path,
+            bind_source_sha256_to_file=True,
+        )
+
+    def _require_frozen_lift_actor(self) -> FlashSACActor:
+        if not self._frozen_lift_actor_loaded or self._frozen_lift_actor is None:
+            raise RuntimeError("policy router requires a loaded frozen lift actor")
+        return self._frozen_lift_actor
+
+    @torch.no_grad()
+    def frozen_lift_actions(self, actor_observation: torch.Tensor) -> torch.Tensor:
+        actor = self._require_frozen_lift_actor()
+        if (
+            actor_observation.ndim != 2
+            or actor_observation.shape[1] != self._actor_observation_dim
+            or actor_observation.device != self._device
+        ):
+            raise ValueError(
+                "frozen lift actor requires device-local [batch, actor_observation_dim] input"
+            )
+        mean, _ = actor.get_mean_and_std(actor_observation, training=False)
+        return torch.tanh(mean).clone()
+
+    def _load_frozen_lift_actor_sidecar(
+        self,
+        checkpoint: str | os.PathLike[str],
+        *,
+        expected_semantic_sha256: str,
+        source_sha256: str | None,
+    ) -> None:
+        checkpoint_dir = os.fspath(checkpoint)
+        actor_path = os.path.join(checkpoint_dir, FROZEN_LIFT_ACTOR_FILENAME)
+        self._load_frozen_lift_actor_file(
+            actor_path,
+            source_sha256=source_sha256,
+            expected_semantic_sha256=expected_semantic_sha256,
+        )
 
     @torch.no_grad()
     def initialize_zero_actor_mean(self) -> None:
@@ -862,7 +1152,7 @@ class FlashSACTorchBridge(FlashSACAgent):
             )
         return observations.to(dtype=torch.float32)
 
-    def _actor_action_active_rows(
+    def _environment_action_active_rows(
         self,
         actor_observation: torch.Tensor,
     ) -> torch.Tensor | None:
@@ -900,14 +1190,56 @@ class FlashSACTorchBridge(FlashSACAgent):
             active[:, rule.start : rule.stop] &= grants.unsqueeze(-1)
         return active
 
-    @torch.no_grad()
-    def apply_action_authority(
+    def _router_frozen_rows(
+        self,
+        actor_observation: torch.Tensor,
+    ) -> torch.Tensor | None:
+        router = self._public_latch_frozen_actor_router
+        if router is None:
+            return None
+        if (
+            actor_observation.ndim != 2
+            or actor_observation.shape[1] != self._actor_observation_dim
+        ):
+            raise ValueError(
+                "policy router requires [batch, actor_observation_dim] observations"
+            )
+        feature = actor_observation[:, router.observation_index]
+        binary = (feature == router.close_value) | (feature == router.frozen_value)
+        if not bool(binary.all()):
+            invalid = feature[~binary]
+            raise ValueError(
+                f"policy router feature {router.observation_index} must be exactly "
+                f"binary; got {invalid[:8].detach().cpu().tolist()}"
+            )
+        return feature == router.frozen_value
+
+    def _actor_action_active_rows(
+        self,
+        actor_observation: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Return dimensions owned by the trainable actor during optimization."""
+
+        router = self._public_latch_frozen_actor_router
+        if router is None:
+            return self._environment_action_active_rows(actor_observation)
+        frozen_rows = self._router_frozen_rows(actor_observation)
+        assert frozen_rows is not None
+        active = torch.zeros(
+            (actor_observation.shape[0], self._action_dim),
+            dtype=torch.bool,
+            device=actor_observation.device,
+        )
+        active[:, router.trainable_start : router.trainable_stop] = (
+            ~frozen_rows
+        ).unsqueeze(-1)
+        return active
+
+    def _validate_action_authority_inputs(
         self,
         actions: torch.Tensor,
         observations: torch.Tensor,
-    ) -> torch.Tensor:
-        """Project actor or random proposals to the canonical executed action."""
-
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         observations = self._validate_observations(observations)
         if not isinstance(actions, torch.Tensor):
             raise TypeError("actions must be a torch.Tensor")
@@ -923,12 +1255,59 @@ class FlashSACTorchBridge(FlashSACAgent):
             if self._cfg.asymmetric_observation
             else observations
         )
+        return observations, actor_observation
+
+    @torch.no_grad()
+    def apply_trainable_action_authority(
+        self,
+        actions: torch.Tensor,
+        observations: torch.Tensor,
+    ) -> torch.Tensor:
+        """Keep only action dimensions owned by the trainable actor.
+
+        Unlike :meth:`apply_action_authority`, this never invokes a frozen
+        policy. It is the canonical projection for actor-only demonstration
+        targets and therefore remains usable before the frozen sidecar loads.
+        """
+
+        _, actor_observation = self._validate_action_authority_inputs(
+            actions, observations
+        )
         active = self._actor_action_active_rows(actor_observation)
         if active is None:
             return actions
         if active.ndim == 1:
             active = active.unsqueeze(-1)
         return torch.where(active, actions, torch.zeros_like(actions))
+
+    @torch.no_grad()
+    def apply_action_authority(
+        self,
+        actions: torch.Tensor,
+        observations: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project actor or random proposals to the canonical executed action."""
+
+        _, actor_observation = self._validate_action_authority_inputs(
+            actions, observations
+        )
+        active = self._environment_action_active_rows(actor_observation)
+        if active is None:
+            canonical = actions
+        else:
+            if active.ndim == 1:
+                active = active.unsqueeze(-1)
+            canonical = torch.where(active, actions, torch.zeros_like(actions))
+
+        frozen_rows = self._router_frozen_rows(actor_observation)
+        if frozen_rows is None:
+            return canonical
+        frozen_actions = self.frozen_lift_actions(actor_observation)
+        return torch.where(
+            frozen_rows.unsqueeze(-1),
+            frozen_actions.to(dtype=canonical.dtype),
+            canonical,
+        )
 
     def _resolve_runtime_noise_scale(
         self,
@@ -1043,8 +1422,9 @@ class FlashSACTorchBridge(FlashSACAgent):
         if not torch.equal(canonical_action, transition["action"]):
             mismatch = canonical_action != transition["action"]
             raise ValueError(
-                "transition action contains non-zero values in dimensions without "
-                f"public action authority ({int(mismatch.sum().item())} entries)"
+                "transition action is not canonical under the configured public "
+                "action authority/policy router "
+                f"({int(mismatch.sum().item())} entries)"
             )
         before = getattr(self._replay_buffer, "total_materialized_rows", None)
         if not isinstance(before, int) or isinstance(before, bool) or before < 0:
@@ -1116,6 +1496,16 @@ class FlashSACTorchBridge(FlashSACAgent):
                 )
             actor_action_active = torch.zeros_like(actor_action_active)
             actor_next_action_active = torch.zeros_like(actor_next_action_active)
+        next_action_override: torch.Tensor | None = None
+        next_action_override_rows: torch.Tensor | None = None
+        if self._public_latch_frozen_actor_router is not None:
+            next_action_override_rows = self._router_frozen_rows(
+                batch["actor_next_observation"]
+            )
+            assert next_action_override_rows is not None
+            next_action_override = self.frozen_lift_actions(
+                batch["actor_next_observation"]
+            )
         if actor_action_active is None:
             if actor_next_action_active is not None:
                 raise RuntimeError("current and next actor action authority disagree")
@@ -1147,6 +1537,8 @@ class FlashSACTorchBridge(FlashSACAgent):
                 grad_scaler=self._grad_scaler,
                 actor_action_active=actor_action_active,
                 actor_next_action_active=actor_next_action_active,
+                next_action_override=next_action_override,
+                next_action_override_rows=next_action_override_rows,
             )
         self._update_step += 1
         return {
@@ -1427,6 +1819,20 @@ class FlashSACTorchBridge(FlashSACAgent):
             state["action_authority_rules"] = [
                 dataclasses.asdict(rule) for rule in self._action_authority_rules
             ]
+        if self._public_latch_frozen_actor_router is not None:
+            self._require_frozen_lift_actor()
+            frozen_sha256 = self.frozen_lift_actor_sha256
+            source_sha256 = self._frozen_lift_actor_source_sha256
+            if not _is_sha256(frozen_sha256) or not _is_sha256(source_sha256):
+                raise RuntimeError(
+                    "policy router checkpoint requires canonical frozen actor and "
+                    "source actor SHA-256 fingerprints"
+                )
+            state["public_latch_frozen_actor_router"] = dataclasses.asdict(
+                self._public_latch_frozen_actor_router
+            )
+            state["frozen_lift_actor_semantic_sha256"] = frozen_sha256
+            state["frozen_lift_actor_source_sha256"] = source_sha256
         if not self._unit_normalize_actor_mean_head:
             state["unit_normalize_actor_mean_head"] = False
         if self._device.type == "cuda":
@@ -1435,7 +1841,131 @@ class FlashSACTorchBridge(FlashSACAgent):
 
     def save(self, path: str) -> None:
         super().save(path)
+        if self._public_latch_frozen_actor_router is not None:
+            frozen_actor = self._require_frozen_lift_actor()
+            sidecar_path = os.path.join(path, FROZEN_LIFT_ACTOR_FILENAME)
+            if os.path.islink(sidecar_path):
+                raise ValueError(
+                    f"refusing to overwrite frozen lift actor symlink: {sidecar_path}"
+                )
+            torch.save(
+                {"network_state_dict": frozen_actor.state_dict()},
+                sidecar_path,
+            )
         torch.save(self._bridge_checkpoint_state(), os.path.join(path, BRIDGE_STATE_FILENAME))
+
+    def _validate_and_load_router_sidecar(
+        self,
+        path: str | os.PathLike[str],
+        state: Mapping[str, Any],
+    ) -> None:
+        checkpoint_router = state.get("public_latch_frozen_actor_router")
+        current_router = (
+            None
+            if self._public_latch_frozen_actor_router is None
+            else dataclasses.asdict(self._public_latch_frozen_actor_router)
+        )
+        if checkpoint_router != current_router:
+            raise ValueError(
+                "checkpoint policy router differs from the current bridge "
+                f"configuration; checkpoint={checkpoint_router}, current={current_router}"
+            )
+
+        sidecar_path = os.path.join(os.fspath(path), FROZEN_LIFT_ACTOR_FILENAME)
+        if current_router is None:
+            unexpected_metadata = {
+                key: state[key]
+                for key in (
+                    "frozen_lift_actor_semantic_sha256",
+                    "frozen_lift_actor_source_sha256",
+                )
+                if key in state
+            }
+            if unexpected_metadata or os.path.lexists(sidecar_path):
+                raise ValueError(
+                    "checkpoint without a policy router contains frozen lift actor "
+                    f"state: metadata={unexpected_metadata}, sidecar={os.path.lexists(sidecar_path)}"
+                )
+            return
+
+        if state.get("version") != BRIDGE_CHECKPOINT_VERSION:
+            raise ValueError(
+                "public-latch frozen-actor routing requires bridge checkpoint "
+                f"version {BRIDGE_CHECKPOINT_VERSION}"
+            )
+        semantic_sha256 = state.get("frozen_lift_actor_semantic_sha256")
+        source_sha256 = state.get("frozen_lift_actor_source_sha256")
+        if not _is_sha256(semantic_sha256) or not _is_sha256(source_sha256):
+            raise ValueError(
+                "routed checkpoint has invalid frozen actor semantic/source SHA-256 metadata"
+            )
+        self._load_frozen_lift_actor_sidecar(
+            path,
+            expected_semantic_sha256=semantic_sha256,
+            source_sha256=source_sha256,
+        )
+
+    def load_frozen_lift_actor_sidecar(
+        self,
+        checkpoint: str | os.PathLike[str],
+    ) -> None:
+        """Load and authenticate the self-contained frozen actor for evaluation."""
+
+        checkpoint_dir = os.fspath(checkpoint)
+        if not os.path.isdir(checkpoint_dir) or os.path.islink(checkpoint_dir):
+            raise FileNotFoundError(
+                f"routed checkpoint must be a real directory: {checkpoint_dir}"
+            )
+        bridge_path = os.path.join(checkpoint_dir, BRIDGE_STATE_FILENAME)
+        _regular_file_sha256(bridge_path, label="Torch bridge checkpoint state")
+        state = torch.load(bridge_path, map_location=self._device, weights_only=True)
+        if not isinstance(state, Mapping):
+            raise TypeError(f"Torch bridge checkpoint state must be a mapping: {bridge_path}")
+        if state.get("version") not in _SUPPORTED_BRIDGE_CHECKPOINT_VERSIONS:
+            raise ValueError(
+                f"unsupported Torch bridge checkpoint version {state.get('version')!r}"
+            )
+        if state.get("upstream_commit") != FLASH_SAC_COMMIT:
+            raise ValueError(
+                f"checkpoint targets upstream commit {state.get('upstream_commit')!r}, "
+                f"expected {FLASH_SAC_COMMIT}"
+            )
+        if state.get("fork_commit") != FLASH_SAC_FORK_COMMIT:
+            raise ValueError(
+                "public-latch frozen-actor routing requires the current audited "
+                f"FlashSAC fork {FLASH_SAC_FORK_COMMIT}"
+            )
+        if state.get("action_dim") != self._action_dim:
+            raise ValueError(
+                "routed checkpoint action dimension differs from the current bridge"
+            )
+        if state.get("actor_action_active_observation_index") != (
+            self._actor_action_active_observation_index
+        ):
+            raise ValueError(
+                "routed checkpoint legacy action authority differs from the current bridge"
+            )
+        checkpoint_authority = state.get("action_authority_rules", [])
+        current_authority = [
+            dataclasses.asdict(rule) for rule in self._action_authority_rules
+        ]
+        if checkpoint_authority != current_authority:
+            raise ValueError(
+                "routed checkpoint action authority rules differ from the current bridge"
+            )
+        if state.get("unit_normalize_actor_mean_head", True) != (
+            self._unit_normalize_actor_mean_head
+        ):
+            raise ValueError(
+                "routed checkpoint actor mean-head normalization differs from the current bridge"
+            )
+        checkpoint_groups = state.get("noise_groups")
+        current_groups = [_group_dict(group) for group in self._noise_groups]
+        if checkpoint_groups != current_groups:
+            raise ValueError(
+                "routed checkpoint noise groups differ from the current bridge"
+            )
+        self._validate_and_load_router_sidecar(checkpoint_dir, state)
 
     def load_actor(
         self,
@@ -1488,6 +2018,10 @@ class FlashSACTorchBridge(FlashSACAgent):
         )
 
     def load(self, path: str) -> None:
+        if self._public_latch_frozen_actor_router is not None:
+            # Fail closed on all router/sidecar metadata before any trainable
+            # network or optimizer is overwritten by a full resume.
+            self.load_frozen_lift_actor_sidecar(path)
         load_optimizer = self._cfg.load_optimizer
         _load_network_portably(
             self._actor,
@@ -1533,6 +2067,17 @@ class FlashSACTorchBridge(FlashSACAgent):
 
         bridge_path = os.path.join(path, BRIDGE_STATE_FILENAME)
         if not os.path.exists(bridge_path):
+            orphan_sidecar = os.path.join(path, FROZEN_LIFT_ACTOR_FILENAME)
+            if os.path.lexists(orphan_sidecar):
+                raise ValueError(
+                    "checkpoint without Torch bridge state contains an orphan frozen "
+                    f"lift actor sidecar: {orphan_sidecar}"
+                )
+            if self._public_latch_frozen_actor_router is not None:
+                raise FileNotFoundError(
+                    "policy router checkpoint is missing its Torch bridge state: "
+                    f"{bridge_path}"
+                )
             warnings.warn(
                 f"{bridge_path} is absent; loaded an upstream-only checkpoint and reset exploration state.",
                 stacklevel=2,
@@ -1540,11 +2085,14 @@ class FlashSACTorchBridge(FlashSACAgent):
             self.reset_exploration()
             return
 
+        _regular_file_sha256(bridge_path, label="Torch bridge checkpoint state")
         state = torch.load(bridge_path, map_location=self._device, weights_only=True)
-        if state.get("version") != BRIDGE_CHECKPOINT_VERSION:
+        if not isinstance(state, Mapping):
+            raise TypeError(f"Torch bridge checkpoint state must be a mapping: {bridge_path}")
+        if state.get("version") not in _SUPPORTED_BRIDGE_CHECKPOINT_VERSIONS:
             raise ValueError(
                 f"unsupported Torch bridge checkpoint version {state.get('version')!r}; "
-                f"expected {BRIDGE_CHECKPOINT_VERSION}"
+                f"expected one of {_SUPPORTED_BRIDGE_CHECKPOINT_VERSIONS}"
             )
         if state.get("upstream_commit") != FLASH_SAC_COMMIT:
             raise ValueError(
@@ -1552,14 +2100,25 @@ class FlashSACTorchBridge(FlashSACAgent):
                 f"expected {FLASH_SAC_COMMIT}"
             )
         checkpoint_fork_commit = state.get("fork_commit")
-        if checkpoint_fork_commit not in (None, FLASH_SAC_FORK_COMMIT):
+        if checkpoint_fork_commit not in (None, *FLASH_SAC_COMPATIBLE_FORK_COMMITS):
             raise ValueError(
                 f"checkpoint targets FlashSAC fork {checkpoint_fork_commit!r}, "
-                f"expected {FLASH_SAC_FORK_COMMIT}"
+                f"expected one of {FLASH_SAC_COMPATIBLE_FORK_COMMITS}"
             )
-        if self._action_authority_rules and checkpoint_fork_commit != FLASH_SAC_FORK_COMMIT:
+        if (
+            self._action_authority_rules
+            and checkpoint_fork_commit not in FLASH_SAC_COMPATIBLE_FORK_COMMITS
+        ):
             raise ValueError(
                 "per-action authority requires a checkpoint created by the audited "
+                f"FlashSAC forks {FLASH_SAC_COMPATIBLE_FORK_COMMITS}"
+            )
+        if (
+            self._public_latch_frozen_actor_router is not None
+            and checkpoint_fork_commit != FLASH_SAC_FORK_COMMIT
+        ):
+            raise ValueError(
+                "public-latch frozen-actor routing requires the current audited "
                 f"FlashSAC fork {FLASH_SAC_FORK_COMMIT}"
             )
         if state.get("action_dim") != self._action_dim:
@@ -1587,6 +2146,7 @@ class FlashSACTorchBridge(FlashSACAgent):
                 f"checkpoint={checkpoint_authority_rules}, "
                 f"current={current_authority_rules}"
             )
+        self._validate_and_load_router_sidecar(path, state)
         checkpoint_unit_normalize_mean = state.get(
             "unit_normalize_actor_mean_head",
             True,
@@ -1686,8 +2246,12 @@ __all__ = [
     "BRIDGE_CHECKPOINT_VERSION",
     "BRIDGE_STATE_FILENAME",
     "FLASH_SAC_COMMIT",
+    "FLASH_SAC_COMPATIBLE_FORK_COMMITS",
     "FLASH_SAC_FORK_COMMIT",
+    "FROZEN_LIFT_ACTOR_FILENAME",
     "FlashSACTorchBridge",
+    "PUBLIC_LATCH_FROZEN_ACTOR_ROUTER_NAME",
+    "PublicLatchFrozenActorRouter",
     "assert_transition_tensors",
     "build_agent_config",
 ]

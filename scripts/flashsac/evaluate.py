@@ -438,6 +438,16 @@ def validate_checkpoint_evaluation_contract(
     requested_task_mode = _validate_task_mode(requested_task_mode)
     source = checkpoint_policy_action_contract(checkpoint_contract)
     target = requested_policy_action_contract(requested_task_mode)
+    checkpoint_router = checkpoint_contract.get("policy_router")
+    if checkpoint_router is not None and (
+        checkpoint_task_mode != FULL_TASK_MODE
+        or requested_task_mode != FULL_TASK_MODE
+        or source != target
+    ):
+        raise ValueError(
+            "a routed checkpoint is a self-contained full-task policy and cannot "
+            "be projected across task modes"
+        )
     if actor_action_dim != source["policy_action_dim"]:
         raise RuntimeError(
             "actor checkpoint action dimension disagrees with task_contract.json: "
@@ -3048,6 +3058,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ActionAuthorityRule,
         ActionNoiseGroup,
         FlashSACTorchBridge,
+        PublicLatchFrozenActorRouter,
         build_agent_config,
     )
 
@@ -3058,8 +3069,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     checkpoint = resolve_checkpoint_directory(args.checkpoint)
     checkpoint_contract = read_checkpoint_task_contract(checkpoint)
+    checkpoint_actor_sha256 = _sha256(checkpoint / "actor.pt")
     checkpoint_task_mode = str(checkpoint_contract["task_mode"])
     checkpoint_authority = checkpoint_contract.get("policy_action_authority", [])
+    checkpoint_router = checkpoint_contract.get("policy_router")
+    checkpoint_native_router = checkpoint_router is not None
     expected_public_latch_authority = [
         {
             "name": "arm_after_public_latch",
@@ -3070,10 +3084,32 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         }
     ]
     checkpoint_native_public_latch_gate = bool(
-        checkpoint_task_mode == FULL_TASK_MODE
+        not checkpoint_native_router
+        and checkpoint_task_mode == FULL_TASK_MODE
         and task_mode == FULL_TASK_MODE
         and checkpoint_authority == expected_public_latch_authority
     )
+    checkpoint_uses_public_latch_authority = bool(
+        checkpoint_native_router or checkpoint_native_public_latch_gate
+    )
+    if checkpoint_native_router:
+        incompatible_overrides = {
+            "--hold_arm_until_stable_grasp": args.hold_arm_until_stable_grasp,
+            "--gate_arm_until_grasp_latch": args.gate_arm_until_grasp_latch,
+            "--hold_hand_after_grasp_latch": args.hold_hand_after_grasp_latch,
+            "--allow_cross_task_actor": args.allow_cross_task_actor,
+            "--prior_only": args.prior_only,
+            "--coupled_controller_ablation": controller_ablation is not None,
+            "--latched_arm_action_scale": args.latched_arm_action_scale != 1.0,
+        }
+        enabled_overrides = [
+            name for name, enabled in incompatible_overrides.items() if enabled
+        ]
+        if enabled_overrides:
+            raise ValueError(
+                "native routed checkpoints reject external policy transforms: "
+                f"{enabled_overrides}"
+            )
     cross_task_actor_evaluation = resolve_cross_task_actor_evaluation(
         checkpoint_task_mode=checkpoint_task_mode,
         requested_task_mode=task_mode,
@@ -3238,8 +3274,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 ActionAuthorityRule(**rule)
                 for rule in expected_public_latch_authority
             )
-            if checkpoint_native_public_latch_gate
+            if checkpoint_uses_public_latch_authority
             else ()
+        ),
+        public_latch_frozen_actor_router=(
+            PublicLatchFrozenActorRouter(
+                name=str(checkpoint_router["kind"]),
+                observation_index=int(checkpoint_router["observation_index"]),
+                trainable_start=int(checkpoint_router["trainable_action_slice"][0]),
+                trainable_stop=int(checkpoint_router["trainable_action_slice"][1]),
+                close_value=float(checkpoint_router["close_value"]),
+                frozen_value=float(checkpoint_router["frozen_value"]),
+            )
+            if checkpoint_native_router
+            else None
         ),
         unit_normalize_actor_mean_head=(
             task_mode != COUPLED_TEACHER_RESIDUAL_MODE
@@ -3260,6 +3308,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             source_action_indices=source_action_indices,
             expected_source_action_dim=int(source_policy_contract["policy_action_dim"]),
         )
+    if checkpoint_native_router:
+        agent.load_frozen_lift_actor_sidecar(str(checkpoint))
+        frozen_actor_contract = checkpoint_router["frozen_actor"]
+        if (
+            agent.frozen_lift_actor_sha256
+            != frozen_actor_contract["network_sha256"]
+            or agent.frozen_lift_actor_source_sha256
+            != frozen_actor_contract["source_actor_sha256"]
+        ):
+            raise RuntimeError(
+                "loaded frozen lift actor fingerprints disagree with task_contract.json"
+            )
+    post_load_contract = read_checkpoint_task_contract(checkpoint)
+    if post_load_contract != checkpoint_contract:
+        raise RuntimeError("checkpoint task contract changed while the actor was loading")
+    if _sha256(checkpoint / "actor.pt") != checkpoint_actor_sha256:
+        raise RuntimeError("checkpoint actor.pt changed while the actor was loading")
     # A deterministic evaluation never consumes cached noise.  Reset it anyway
     # so a checkpoint trained with another num_envs cannot leak stale shape.
     agent.reset_exploration(batch_size=args.num_envs)
@@ -3278,10 +3343,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     default_max_steps = max(1, env.max_episode_steps * quota_max + quota_max)
     max_vector_steps = args.max_vector_steps or default_max_steps
     vector_steps = 0
+    router_route_counts = torch.zeros(2, dtype=torch.long, device=env.device)
 
     try:
         while not tracker.complete and vector_steps < max_vector_steps:
             vector_steps += 1
+            if checkpoint_native_router:
+                active_latch = observation[
+                    tracker.active, FULL_TASK_GRASP_LATCH_OBSERVATION_INDEX
+                ]
+                router_route_counts[0].add_((active_latch == 0.0).sum())
+                router_route_counts[1].add_((active_latch == 1.0).sum())
             if args.prior_only:
                 action = observation.new_zeros(
                     (args.num_envs, int(target_policy_contract["policy_action_dim"]))
@@ -3405,6 +3477,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             power_required_other_contacts=power_required_other_contacts,
         )
         metrics["checkpoint_policy_contract"] = source_policy_contract
+        metrics["checkpoint_actor_sha256"] = checkpoint_actor_sha256
         metrics["flashsac_fork_commit"] = FLASH_SAC_FORK_COMMIT
         metrics["actor_action_projection_indices"] = (
             list(source_action_indices) if source_action_indices is not None else None
@@ -3424,6 +3497,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             args.hold_hand_after_grasp_latch
         )
         metrics["checkpoint_policy_action_authority"] = checkpoint_authority
+        metrics["checkpoint_policy_router"] = checkpoint_router
+        metrics["checkpoint_native_policy_router"] = bool(checkpoint_native_router)
+        metrics["checkpoint_uses_public_latch_authority"] = bool(
+            checkpoint_uses_public_latch_authority
+        )
+        metrics["policy_router_close_rows"] = int(router_route_counts[0].item())
+        metrics["policy_router_frozen_rows"] = int(router_route_counts[1].item())
         metrics["checkpoint_native_public_latch_arm_gate"] = bool(
             checkpoint_native_public_latch_gate
         )
@@ -3451,7 +3531,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 + str(controller_ablation)
                 + "+native_phase_shield"
             )
-        if args.hold_arm_until_stable_grasp:
+        if checkpoint_native_router:
+            frozen_actor_contract = checkpoint_router["frozen_actor"]
+            metrics["policy"] = (
+                "deterministic_close_hand14_then_frozen_lift_actor21_by_public_latch"
+            )
+            metrics["policy_router"] = {
+                "contract": checkpoint_router,
+                "loaded_network_sha256": agent.frozen_lift_actor_sha256,
+                "loaded_source_actor_sha256": (
+                    agent.frozen_lift_actor_source_sha256
+                ),
+                "close_semantics": (
+                    "latch[106]=0 -> arm7 exact zero + trainable deterministic hand14"
+                ),
+                "frozen_semantics": (
+                    "latch[106]=1 -> frozen deterministic full21; entropy exact zero"
+                ),
+                "sidecar_sha256": frozen_actor_contract["sha256"],
+            }
+        elif args.hold_arm_until_stable_grasp:
             metrics["policy"] = (
                 "deterministic_tanh_actor_mean+arm_hold_supervisor"
             )

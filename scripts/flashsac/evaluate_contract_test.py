@@ -1908,21 +1908,25 @@ def test_checkpoint_task_mode_evaluation_contract() -> None:
     full_contract = {
         "version": 3,
         "task_mode": FULL_TASK_MODE,
+        "policy_router": None,
         **requested_policy_action_contract(FULL_TASK_MODE),
     }
     power_contract = {
         "version": 3,
         "task_mode": POWER_CLOSE_OPTION_MODE,
+        "policy_router": None,
         **requested_policy_action_contract(POWER_CLOSE_OPTION_MODE),
     }
     coupled_contract = {
         "version": 3,
         "task_mode": COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE,
+        "policy_router": None,
         **requested_policy_action_contract(COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE),
     }
     residual_contract = {
         "version": 4,
         "task_mode": COUPLED_TEACHER_RESIDUAL_MODE,
+        "policy_router": None,
         **requested_policy_action_contract(COUPLED_TEACHER_RESIDUAL_MODE),
     }
     source, target, indices = validate_checkpoint_evaluation_contract(
@@ -1984,6 +1988,56 @@ def test_checkpoint_task_mode_evaluation_contract() -> None:
         COUPLED_POWER_ALIGN_CLOSE_OPTION_MODE
     )
     assert indices is None
+
+    routed_contract = {
+        "version": 6,
+        "task_mode": FULL_TASK_MODE,
+        "policy_router": {
+            "kind": "public_latch_frozen_actor_v1",
+            "observation_index": 106,
+            "close_value": 0.0,
+            "frozen_value": 1.0,
+            "trainable_action_slice": [7, 21],
+            "close_arm_fill": "exact_zero",
+            "frozen_action_slice": [0, 21],
+            "frozen_action_sampling": "deterministic_tanh_mean",
+            "frozen_action_entropy": "exact_zero",
+            "frozen_actor": {
+                "filename": "frozen_lift_actor.pt",
+                "sha256": "0" * 64,
+                "network_sha256": "1" * 64,
+                "source_actor_sha256": "2" * 64,
+                "observation_dim": 115,
+                "action_dim": ACTION_DIM,
+            },
+        },
+        **requested_policy_action_contract(FULL_TASK_MODE),
+    }
+    source, target, indices = validate_checkpoint_evaluation_contract(
+        checkpoint_task_mode=FULL_TASK_MODE,
+        checkpoint_contract=routed_contract,
+        requested_task_mode=FULL_TASK_MODE,
+        actor_action_dim=ACTION_DIM,
+    )
+    assert source == target == requested_policy_action_contract(FULL_TASK_MODE)
+    assert indices is None
+
+    # The outer opt-in may permit ordinary cross-task actor projections, but a
+    # routed V6 checkpoint is a self-contained two-actor policy.  The pure
+    # contract resolver must therefore reject projection independently.
+    assert resolve_cross_task_actor_evaluation(
+        checkpoint_task_mode=FULL_TASK_MODE,
+        requested_task_mode=POWER_CLOSE_OPTION_MODE,
+        allow_cross_task_actor=True,
+    )
+    _expect_error(
+        ValueError,
+        validate_checkpoint_evaluation_contract,
+        checkpoint_task_mode=FULL_TASK_MODE,
+        checkpoint_contract=routed_contract,
+        requested_task_mode=POWER_CLOSE_OPTION_MODE,
+        actor_action_dim=ACTION_DIM,
+    )
 
     _expect_error(
         ValueError,
@@ -2065,6 +2119,25 @@ def test_local_train_contract_import_precedes_upstream_path_mutation() -> None:
     assert "source_action_indices=source_action_indices" in source
     assert "agent.load_actor(" in source
     assert "agent.load(str(checkpoint))" not in source
+
+    router_constructor = source.index("PublicLatchFrozenActorRouter(")
+    actor_load = source.index("agent.load_actor(")
+    frozen_sidecar_load = source.index("agent.load_frozen_lift_actor_sidecar(")
+    assert router_constructor < actor_load < frozen_sidecar_load
+    assert (
+        "checkpoint_native_public_latch_gate = bool(\n"
+        "        not checkpoint_native_router\n"
+        "        and checkpoint_task_mode == FULL_TASK_MODE"
+    ) in source
+    assert 'metrics["checkpoint_native_policy_router"]' in source
+    router_metrics = source.index(
+        "if checkpoint_native_router:\n"
+        '            frozen_actor_contract = checkpoint_router["frozen_actor"]'
+    )
+    v5_metrics = source.index(
+        "elif checkpoint_native_public_latch_gate:", router_metrics
+    )
+    assert router_metrics < v5_metrics
 
 
 def test_strict_json_and_summary() -> None:

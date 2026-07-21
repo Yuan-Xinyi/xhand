@@ -9,6 +9,7 @@ Do not disable TorchDynamo: one test exercises a real ``torch.compile`` wrapper:
 from __future__ import annotations
 
 import copy
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,10 @@ from agent_bridge import (
     ActionAuthorityRule,
     ActionNoiseGroup,
     BRIDGE_STATE_FILENAME,
+    FROZEN_LIFT_ACTOR_FILENAME,
     FlashSACTorchBridge,
+    PUBLIC_LATCH_FROZEN_ACTOR_ROUTER_NAME,
+    PublicLatchFrozenActorRouter,
     assert_transition_tensors,
     build_agent_config,
 )
@@ -34,6 +38,8 @@ AUTHORITY_OBSERVATION_DIM = 131
 AUTHORITY_ACTION_DIM = 14
 ALIGN_ACTIVE_OBSERVATION_INDEX = 129
 PUBLIC_LATCH_OBSERVATION_INDEX = OBSERVATION_DIM - 1
+ROUTER_ACTION_DIM = 21
+ROUTER_ARM_STOP = 7
 
 
 def _spaces() -> tuple[gym.spaces.Box, gym.spaces.Box]:
@@ -112,6 +118,59 @@ def _slice_authority_agent(**config_overrides: Any) -> FlashSACTorchBridge:
             ),
         ),
     )
+
+
+def _public_latch_rule() -> ActionAuthorityRule:
+    return ActionAuthorityRule(
+        "arm_after_public_latch",
+        0,
+        ROUTER_ARM_STOP,
+        PUBLIC_LATCH_OBSERVATION_INDEX,
+        1.0,
+    )
+
+
+def _router_noise_groups() -> tuple[ActionNoiseGroup, ...]:
+    return (
+        ActionNoiseGroup("arm", 0, ROUTER_ARM_STOP, scale=0.0),
+        ActionNoiseGroup("hand", ROUTER_ARM_STOP, ROUTER_ACTION_DIM, scale=0.5),
+    )
+
+
+def _public_latch_agent(*, routed: bool) -> FlashSACTorchBridge:
+    observation_space = gym.spaces.Box(
+        -1.0, 1.0, shape=(OBSERVATION_DIM,), dtype="float32"
+    )
+    action_space = gym.spaces.Box(
+        -1.0, 1.0, shape=(ROUTER_ACTION_DIM,), dtype="float32"
+    )
+    router = (
+        PublicLatchFrozenActorRouter(
+            name=PUBLIC_LATCH_FROZEN_ACTOR_ROUTER_NAME,
+            observation_index=PUBLIC_LATCH_OBSERVATION_INDEX,
+            trainable_start=ROUTER_ARM_STOP,
+            trainable_stop=ROUTER_ACTION_DIM,
+        )
+        if routed
+        else None
+    )
+    return FlashSACTorchBridge(
+        observation_space,
+        action_space,
+        {},
+        _config(actor_update_period=1),
+        noise_groups=_router_noise_groups(),
+        action_authority_rules=(_public_latch_rule(),),
+        public_latch_frozen_actor_router=router,
+    )
+
+
+def _load_same_actor_into_router(
+    routed: FlashSACTorchBridge,
+    source_checkpoint: Path,
+) -> None:
+    routed.load_actor(str(source_checkpoint))
+    routed.load_frozen_lift_actor(str(source_checkpoint))
 
 
 def _authority_agent(
@@ -479,6 +538,292 @@ def test_public_slice_authority_masks_actor_target_entropy_and_checkpoint() -> N
         restored.load(str(checkpoint))
         mismatched = _agent()
         _expect_error(ValueError, mismatched.load, str(checkpoint))
+
+
+def test_public_latch_router_routes_mixed_collection_and_trainable_targets() -> None:
+    torch.manual_seed(2054)
+    observation = torch.randn(NUM_ENVS, OBSERVATION_DIM)
+    observation[:, PUBLIC_LATCH_OBSERVATION_INDEX] = torch.tensor(
+        [0.0, 1.0, 0.0, 1.0]
+    )
+    close_rows = observation[:, PUBLIC_LATCH_OBSERVATION_INDEX] == 0.0
+    proposal = torch.linspace(
+        -0.9, 0.9, NUM_ENVS * ROUTER_ACTION_DIM
+    ).reshape(NUM_ENVS, ROUTER_ACTION_DIM)
+
+    # Demonstration targets can be canonicalized before the frozen actor is
+    # loaded: only the close-policy hand suffix remains trainable.
+    unloaded = _public_latch_agent(routed=True)
+    expected_trainable = torch.zeros_like(proposal)
+    expected_trainable[close_rows, ROUTER_ARM_STOP:] = proposal[
+        close_rows, ROUTER_ARM_STOP:
+    ]
+    torch.testing.assert_close(
+        unloaded.apply_trainable_action_authority(proposal, observation),
+        expected_trainable,
+        rtol=0.0,
+        atol=0.0,
+    )
+    _expect_error(
+        RuntimeError,
+        unloaded.apply_action_authority,
+        proposal,
+        observation,
+    )
+    malformed = observation.clone()
+    malformed[0, PUBLIC_LATCH_OBSERVATION_INDEX] = 0.25
+    _expect_error(
+        ValueError,
+        unloaded.apply_trainable_action_authority,
+        proposal,
+        malformed,
+    )
+    _expect_error(
+        ValueError,
+        unloaded.apply_action_authority,
+        proposal,
+        malformed,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="flashsac_router_collection_") as directory:
+        source_checkpoint = Path(directory) / "source"
+        source = _public_latch_agent(routed=False)
+        source.save(str(source_checkpoint))
+        agent = _public_latch_agent(routed=True)
+        _load_same_actor_into_router(agent, source_checkpoint)
+
+        with torch.no_grad():
+            mean, _ = agent._actor.apply(  # noqa: SLF001
+                "get_mean_and_std",
+                observations=observation,
+                training=False,
+            )
+            close_proposal = torch.tanh(mean)
+            frozen_action = agent.frozen_lift_actions(observation)
+
+        expected = frozen_action.clone()
+        expected[close_rows, :ROUTER_ARM_STOP] = 0.0
+        expected[close_rows, ROUTER_ARM_STOP:] = close_proposal[
+            close_rows, ROUTER_ARM_STOP:
+        ]
+        first = agent.sample_actions(
+            1, {"next_observation": observation}, training=False
+        )
+        second = agent.sample_actions(
+            2, {"next_observation": observation}, training=False
+        )
+        torch.testing.assert_close(first, expected, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(second, expected, rtol=0.0, atol=0.0)
+
+        explicit_expected = proposal.clone()
+        explicit_expected[close_rows, :ROUTER_ARM_STOP] = 0.0
+        explicit_expected[~close_rows] = frozen_action[~close_rows]
+        torch.testing.assert_close(
+            agent.apply_action_authority(proposal, observation),
+            explicit_expected,
+            rtol=0.0,
+            atol=0.0,
+        )
+
+        stochastic = agent.sample_actions(
+            3, {"next_observation": observation}, training=True
+        )
+        torch.testing.assert_close(
+            stochastic[~close_rows],
+            frozen_action[~close_rows],
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            stochastic[close_rows, :ROUTER_ARM_STOP],
+            torch.zeros_like(stochastic[close_rows, :ROUTER_ARM_STOP]),
+            rtol=0.0,
+            atol=0.0,
+        )
+
+
+def test_public_latch_router_checkpoint_sidecar_is_strict_and_bit_exact() -> None:
+    torch.manual_seed(2055)
+    observation = torch.randn(9, OBSERVATION_DIM)
+    observation[:, PUBLIC_LATCH_OBSERVATION_INDEX] = torch.tensor(
+        [0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0]
+    )
+
+    with tempfile.TemporaryDirectory(prefix="flashsac_router_sidecar_") as directory:
+        root = Path(directory)
+        source_checkpoint = root / "source"
+        source = _public_latch_agent(routed=False)
+        source.save(str(source_checkpoint))
+        agent = _public_latch_agent(routed=True)
+        _load_same_actor_into_router(agent, source_checkpoint)
+
+        checkpoint = root / "routed"
+        agent.save(str(checkpoint))
+        assert (checkpoint / FROZEN_LIFT_ACTOR_FILENAME).is_file()
+        expected_sha256 = agent.frozen_lift_actor_sha256
+        expected_action = agent.sample_actions(
+            1, {"next_observation": observation}, training=False
+        )
+        restored = _public_latch_agent(routed=True)
+        restored.load(str(checkpoint))
+        actual_action = restored.sample_actions(
+            1, {"next_observation": observation}, training=False
+        )
+        torch.testing.assert_close(actual_action, expected_action, rtol=0.0, atol=0.0)
+        assert restored.frozen_lift_actor_sha256 == expected_sha256
+        assert (
+            restored.frozen_lift_actor_source_sha256
+            == agent.frozen_lift_actor_source_sha256
+        )
+
+        missing_checkpoint = root / "missing_sidecar"
+        agent.save(str(missing_checkpoint))
+        (missing_checkpoint / FROZEN_LIFT_ACTOR_FILENAME).unlink()
+        _expect_error(
+            FileNotFoundError,
+            _public_latch_agent(routed=True).load,
+            str(missing_checkpoint),
+        )
+
+        tampered_checkpoint = root / "tampered_sidecar"
+        agent.save(str(tampered_checkpoint))
+        sidecar_path = tampered_checkpoint / FROZEN_LIFT_ACTOR_FILENAME
+        sidecar = torch.load(sidecar_path, map_location="cpu", weights_only=True)
+        state = sidecar["network_state_dict"]
+        tensor_name = next(
+            name
+            for name, value in state.items()
+            if isinstance(value, torch.Tensor) and value.dtype.is_floating_point
+        )
+        tampered = state[tensor_name].clone()
+        tampered.reshape(-1)[0] += 0.125
+        state[tensor_name] = tampered
+        torch.save(sidecar, sidecar_path)
+        _expect_error(
+            ValueError,
+            _public_latch_agent(routed=True).load,
+            str(tampered_checkpoint),
+        )
+        guarded = _public_latch_agent(routed=True)
+        guarded.load_actor(str(checkpoint))
+        guarded.load_frozen_lift_actor_sidecar(str(checkpoint))
+        guarded_sha256 = guarded.frozen_lift_actor_sha256
+        guarded_action = guarded.sample_actions(
+            1, {"next_observation": observation}, training=False
+        )
+        _expect_error(
+            ValueError,
+            guarded.load_frozen_lift_actor_sidecar,
+            str(tampered_checkpoint),
+        )
+        assert guarded.frozen_lift_actor_sha256 == guarded_sha256
+        torch.testing.assert_close(
+            guarded.sample_actions(
+                1, {"next_observation": observation}, training=False
+            ),
+            guarded_action,
+            rtol=0.0,
+            atol=0.0,
+        )
+
+        orphan_checkpoint = root / "orphan_sidecar"
+        nonrouter = _public_latch_agent(routed=False)
+        nonrouter.save(str(orphan_checkpoint))
+        shutil.copy2(
+            checkpoint / FROZEN_LIFT_ACTOR_FILENAME,
+            orphan_checkpoint / FROZEN_LIFT_ACTOR_FILENAME,
+        )
+        _expect_error(
+            ValueError,
+            _public_latch_agent(routed=False).load,
+            str(orphan_checkpoint),
+        )
+
+
+def test_public_latch_router_zero_update_matches_v5_gate_elementwise() -> None:
+    torch.manual_seed(2056)
+    observation = torch.randn(23, OBSERVATION_DIM)
+    observation[:, PUBLIC_LATCH_OBSERVATION_INDEX] = (
+        torch.arange(observation.shape[0]) % 3 == 0
+    ).float()
+
+    with tempfile.TemporaryDirectory(prefix="flashsac_router_v5_equivalence_") as directory:
+        source_checkpoint = Path(directory) / "source"
+        v5 = _public_latch_agent(routed=False)
+        v5.save(str(source_checkpoint))
+        routed = _public_latch_agent(routed=True)
+        _load_same_actor_into_router(routed, source_checkpoint)
+
+        expected = v5.sample_actions(
+            1, {"next_observation": observation}, training=False
+        )
+        actual = routed.sample_actions(
+            1, {"next_observation": observation}, training=False
+        )
+        torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+
+def test_public_latch_router_all_frozen_batch_skips_actor_and_routes_target() -> None:
+    torch.manual_seed(2057)
+    with tempfile.TemporaryDirectory(prefix="flashsac_router_target_") as directory:
+        source_checkpoint = Path(directory) / "source"
+        source = _public_latch_agent(routed=False)
+        source.save(str(source_checkpoint))
+        agent = _public_latch_agent(routed=True)
+        _load_same_actor_into_router(agent, source_checkpoint)
+
+        observation = torch.randn(NUM_ENVS, OBSERVATION_DIM)
+        next_observation = torch.randn(NUM_ENVS, OBSERVATION_DIM)
+        observation[:, PUBLIC_LATCH_OBSERVATION_INDEX] = 1.0
+        next_observation[:, PUBLIC_LATCH_OBSERVATION_INDEX] = 1.0
+        action = agent.sample_actions(
+            1, {"next_observation": observation}, training=False
+        )
+        transition = _transition(observation, action)
+        transition["next_observation"] = next_observation
+        assert agent.process_transition(transition) == NUM_ENVS
+
+        target_calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+        def record_target(_module, _args, kwargs, _output):
+            target_calls.append(
+                (
+                    kwargs["observations"].detach().clone(),
+                    kwargs["actions"].detach().clone(),
+                )
+            )
+
+        handle = agent._target_critic.network.register_forward_hook(  # noqa: SLF001
+            record_target,
+            with_kwargs=True,
+        )
+        actor_before = _canonical_network_state(agent._actor)  # noqa: SLF001
+        temperature_before = _canonical_network_state(agent._temperature)  # noqa: SLF001
+        try:
+            metrics = agent.update(actor_enabled=True)
+        finally:
+            handle.remove()
+
+        assert metrics["actor/updated"] == 0.0
+        assert metrics["critic/max_entropy_bonus"] == 0.0
+        assert len(target_calls) == 1
+        target_observation, target_action = target_calls[0]
+        target_next_observation = target_observation[NUM_ENVS:]
+        expected_target_action = agent.frozen_lift_actions(target_next_observation)
+        torch.testing.assert_close(
+            target_action[NUM_ENVS:],
+            expected_target_action,
+            rtol=0.0,
+            atol=0.0,
+        )
+        _assert_nested_equal(
+            _canonical_network_state(agent._actor),  # noqa: SLF001
+            actor_before,
+        )
+        _assert_nested_equal(
+            _canonical_network_state(agent._temperature),  # noqa: SLF001
+            temperature_before,
+        )
 
 
 def test_demo_rehearsal_respects_public_slice_authority() -> None:
@@ -1513,6 +1858,14 @@ def main() -> None:
     print("[PASS] public slice authority gates collection, random warmup, and replay")
     test_public_slice_authority_masks_actor_target_entropy_and_checkpoint()
     print("[PASS] public slice authority masks SAC updates and checkpoints")
+    test_public_latch_router_routes_mixed_collection_and_trainable_targets()
+    print("[PASS] public-latch router collection and trainable-target authority")
+    test_public_latch_router_checkpoint_sidecar_is_strict_and_bit_exact()
+    print("[PASS] public-latch router sidecar integrity and exact roundtrip")
+    test_public_latch_router_zero_update_matches_v5_gate_elementwise()
+    print("[PASS] public-latch router zero-update V5 equivalence")
+    test_public_latch_router_all_frozen_batch_skips_actor_and_routes_target()
+    print("[PASS] public-latch router frozen critic targets and actor skip")
     test_demo_rehearsal_respects_public_slice_authority()
     print("[PASS] demo rehearsal respects public slice authority")
     test_initialize_zero_actor_mean_is_exact_and_fresh_only()

@@ -138,7 +138,9 @@ TASK_CONTRACT_FILENAME = "task_contract.json"
 TEACHER_ACTION_PRIOR_FILENAME = "teacher_action_prior.json"
 TEACHER_RESIDUAL_STATE_FILENAME = "teacher_residual_training_state.json"
 INCOMPLETE_CHECKPOINT_FILENAME = ".incomplete_checkpoint.json"
-TASK_CONTRACT_VERSION = 5
+FROZEN_LIFT_ACTOR_FILENAME = "frozen_lift_actor.pt"
+PUBLIC_LATCH_FROZEN_ACTOR_ROUTER_KIND = "public_latch_frozen_actor_v1"
+TASK_CONTRACT_VERSION = 6
 FLASH_SAC_GAMMA = 0.99
 CORE_CHECKPOINT_FILENAMES = (
     "actor.pt",
@@ -151,6 +153,7 @@ STALE_OPTIONAL_CHECKPOINT_FILENAMES = (
     "actor_rehearsal.pt",
     TEACHER_ACTION_PRIOR_FILENAME,
     TEACHER_RESIDUAL_STATE_FILENAME,
+    FROZEN_LIFT_ACTOR_FILENAME,
     TASK_CONTRACT_FILENAME,
 )
 FULL_TASK_MODE = "full_task"
@@ -287,6 +290,212 @@ def validate_policy_action_authority_contract(
             f"{source} public latch arm authority requires task_mode={FULL_TASK_MODE!r}"
         )
     return normalized
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def validate_policy_router_contract(
+    value: Any,
+    *,
+    task_mode: str,
+    policy_action_authority: Sequence[Mapping[str, Any]],
+    runtime: Mapping[str, Any],
+    source: str,
+) -> dict[str, Any] | None:
+    """Validate the closed V6 dual-policy routing contract."""
+
+    if value is None:
+        return None
+    expected_outer_keys = {
+        "kind",
+        "observation_index",
+        "close_value",
+        "frozen_value",
+        "trainable_action_slice",
+        "close_arm_fill",
+        "frozen_action_slice",
+        "frozen_action_sampling",
+        "frozen_action_entropy",
+        "frozen_actor",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected_outer_keys:
+        raise ValueError(f"{source} policy_router has invalid fields")
+    if task_mode != FULL_TASK_MODE:
+        raise ValueError(f"{source} policy_router requires task_mode={FULL_TASK_MODE!r}")
+    if [dict(rule) for rule in policy_action_authority] != [
+        dict(rule) for rule in PUBLIC_LATCH_ARM_ACTION_AUTHORITY
+    ]:
+        raise ValueError(f"{source} policy_router requires public latch arm authority")
+    expected_runtime = runtime_contract(FULL_TASK_MODE)
+    if dict(runtime) != expected_runtime:
+        raise ValueError(f"{source} policy_router requires the full-task runtime contract")
+
+    if value.get("kind") != PUBLIC_LATCH_FROZEN_ACTOR_ROUTER_KIND:
+        raise ValueError(f"{source} policy_router has unsupported kind")
+    observation_index = value.get("observation_index")
+    if (
+        not isinstance(observation_index, int)
+        or isinstance(observation_index, bool)
+        or observation_index != PICK_TOOL_LATCH_OBSERVATION_INDEX
+    ):
+        raise ValueError(f"{source} policy_router has invalid observation_index")
+    for key, expected in (("close_value", 0.0), ("frozen_value", 1.0)):
+        candidate = value.get(key)
+        if (
+            not isinstance(candidate, (int, float))
+            or isinstance(candidate, bool)
+            or not math.isfinite(float(candidate))
+            or float(candidate) != expected
+        ):
+            raise ValueError(f"{source} policy_router has invalid {key}")
+
+    def require_exact_int_slice(key: str, expected: tuple[int, int]) -> list[int]:
+        candidate = value.get(key)
+        if (
+            not isinstance(candidate, (list, tuple))
+            or len(candidate) != 2
+            or any(not isinstance(item, int) or isinstance(item, bool) for item in candidate)
+            or tuple(candidate) != expected
+        ):
+            raise ValueError(f"{source} policy_router has invalid {key}")
+        return [int(candidate[0]), int(candidate[1])]
+
+    trainable_slice = require_exact_int_slice(
+        "trainable_action_slice",
+        (PICK_TOOL_ARM_ACTION_DIM, PICK_TOOL_ACTION_DIM),
+    )
+    frozen_slice = require_exact_int_slice(
+        "frozen_action_slice",
+        (0, PICK_TOOL_ACTION_DIM),
+    )
+    expected_constants = {
+        "close_arm_fill": "exact_zero",
+        "frozen_action_sampling": "deterministic_tanh_mean",
+        "frozen_action_entropy": "exact_zero",
+    }
+    for key, expected in expected_constants.items():
+        if value.get(key) != expected:
+            raise ValueError(f"{source} policy_router has invalid {key}")
+
+    frozen_actor = value.get("frozen_actor")
+    expected_actor_keys = {
+        "filename",
+        "sha256",
+        "network_sha256",
+        "source_actor_sha256",
+        "observation_dim",
+        "action_dim",
+    }
+    if not isinstance(frozen_actor, Mapping) or set(frozen_actor) != expected_actor_keys:
+        raise ValueError(f"{source} policy_router.frozen_actor has invalid fields")
+    if frozen_actor.get("filename") != FROZEN_LIFT_ACTOR_FILENAME:
+        raise ValueError(f"{source} policy_router names an unsupported frozen actor file")
+    for key in ("sha256", "network_sha256", "source_actor_sha256"):
+        if not _is_sha256(frozen_actor.get(key)):
+            raise ValueError(f"{source} policy_router.frozen_actor.{key} is invalid")
+    for key, expected in (
+        ("observation_dim", PICK_TOOL_OBSERVATION_DIM),
+        ("action_dim", PICK_TOOL_ACTION_DIM),
+    ):
+        candidate = frozen_actor.get(key)
+        if (
+            not isinstance(candidate, int)
+            or isinstance(candidate, bool)
+            or candidate != expected
+        ):
+            raise ValueError(f"{source} policy_router.frozen_actor.{key} is invalid")
+    return {
+        "kind": PUBLIC_LATCH_FROZEN_ACTOR_ROUTER_KIND,
+        "observation_index": PICK_TOOL_LATCH_OBSERVATION_INDEX,
+        "close_value": 0.0,
+        "frozen_value": 1.0,
+        "trainable_action_slice": trainable_slice,
+        "close_arm_fill": "exact_zero",
+        "frozen_action_slice": frozen_slice,
+        "frozen_action_sampling": "deterministic_tanh_mean",
+        "frozen_action_entropy": "exact_zero",
+        "frozen_actor": {
+            "filename": FROZEN_LIFT_ACTOR_FILENAME,
+            "sha256": str(frozen_actor["sha256"]),
+            "network_sha256": str(frozen_actor["network_sha256"]),
+            "source_actor_sha256": str(frozen_actor["source_actor_sha256"]),
+            "observation_dim": PICK_TOOL_OBSERVATION_DIM,
+            "action_dim": PICK_TOOL_ACTION_DIM,
+        },
+    }
+
+
+def public_latch_frozen_actor_router_contract(
+    *,
+    sidecar_sha256: str,
+    network_sha256: str,
+    source_actor_sha256: str,
+) -> dict[str, Any]:
+    candidate = {
+        "kind": PUBLIC_LATCH_FROZEN_ACTOR_ROUTER_KIND,
+        "observation_index": PICK_TOOL_LATCH_OBSERVATION_INDEX,
+        "close_value": 0.0,
+        "frozen_value": 1.0,
+        "trainable_action_slice": [PICK_TOOL_ARM_ACTION_DIM, PICK_TOOL_ACTION_DIM],
+        "close_arm_fill": "exact_zero",
+        "frozen_action_slice": [0, PICK_TOOL_ACTION_DIM],
+        "frozen_action_sampling": "deterministic_tanh_mean",
+        "frozen_action_entropy": "exact_zero",
+        "frozen_actor": {
+            "filename": FROZEN_LIFT_ACTOR_FILENAME,
+            "sha256": sidecar_sha256,
+            "network_sha256": network_sha256,
+            "source_actor_sha256": source_actor_sha256,
+            "observation_dim": PICK_TOOL_OBSERVATION_DIM,
+            "action_dim": PICK_TOOL_ACTION_DIM,
+        },
+    }
+    normalized = validate_policy_router_contract(
+        candidate,
+        task_mode=FULL_TASK_MODE,
+        policy_action_authority=PUBLIC_LATCH_ARM_ACTION_AUTHORITY,
+        runtime=runtime_contract(FULL_TASK_MODE),
+        source="policy router builder",
+    )
+    assert normalized is not None
+    return normalized
+
+
+def policy_router_semantics(value: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Strip instance fingerprints while retaining every routing decision."""
+
+    if value is None:
+        return None
+    frozen_actor = value["frozen_actor"]
+    return {
+        **{key: item for key, item in value.items() if key != "frozen_actor"},
+        "frozen_actor": {
+            key: item
+            for key, item in frozen_actor.items()
+            if key not in {"sha256", "network_sha256", "source_actor_sha256"}
+        },
+    }
+
+
+def expected_policy_router_semantics(enabled: bool) -> dict[str, Any] | None:
+    if not isinstance(enabled, bool):
+        raise TypeError("policy router enabled flag must be bool")
+    if not enabled:
+        return None
+    placeholder = "0" * 64
+    return policy_router_semantics(
+        public_latch_frozen_actor_router_contract(
+            sidecar_sha256=placeholder,
+            network_sha256=placeholder,
+            source_actor_sha256=placeholder,
+        )
+    )
 
 
 def task_mode_from_close_option(
@@ -632,13 +841,14 @@ def read_checkpoint_task_contract(checkpoint: Path) -> dict[str, Any]:
             for filename in (
                 TEACHER_ACTION_PRIOR_FILENAME,
                 TEACHER_RESIDUAL_STATE_FILENAME,
+                FROZEN_LIFT_ACTOR_FILENAME,
             )
             if (checkpoint / filename).exists()
             or (checkpoint / filename).is_symlink()
         ]
         if unexpected_sidecars:
             raise ValueError(
-                "checkpoint has residual sidecars but no task contract: "
+                "checkpoint has semantic sidecars but no task contract: "
                 f"{unexpected_sidecars}"
             )
         # A missing contract is only backward-compatible evidence when the
@@ -650,6 +860,7 @@ def read_checkpoint_task_contract(checkpoint: Path) -> dict[str, Any]:
             "replay_n_step": None,
             "replay_gamma": None,
             "policy_action_authority": [],
+            "policy_router": None,
             "teacher_action_prior": None,
             "teacher_residual_state": None,
             **runtime_contract(FULL_TASK_MODE),
@@ -667,11 +878,11 @@ def read_checkpoint_task_contract(checkpoint: Path) -> dict[str, Any]:
     if (
         not isinstance(version, int)
         or isinstance(version, bool)
-        or version not in (1, 2, 3, 4, TASK_CONTRACT_VERSION)
+        or version not in range(1, TASK_CONTRACT_VERSION + 1)
     ):
         raise ValueError(
             f"checkpoint task contract {path} has version={version!r}, "
-            f"expected 1, 2, 3, 4 or {TASK_CONTRACT_VERSION}"
+            f"expected an integer in [1, {TASK_CONTRACT_VERSION}]"
         )
     task_mode = payload.get("task_mode")
     if task_mode not in TASK_MODES:
@@ -718,6 +929,37 @@ def read_checkpoint_task_contract(checkpoint: Path) -> dict[str, Any]:
         task_mode=str(task_mode),
         source=f"checkpoint task contract {path}",
     )
+    if version < 6 and "policy_router" in payload:
+        raise ValueError(
+            f"checkpoint task contract {path} declares policy_router before version 6"
+        )
+    if version >= 6 and "policy_router" not in payload:
+        raise ValueError(f"checkpoint task contract {path} is missing policy_router")
+    serialized_router = validate_policy_router_contract(
+        payload.get("policy_router") if version >= 6 else None,
+        task_mode=str(task_mode),
+        policy_action_authority=serialized_authority,
+        runtime=serialized_runtime,
+        source=f"checkpoint task contract {path}",
+    )
+    frozen_actor_path = checkpoint / FROZEN_LIFT_ACTOR_FILENAME
+    if serialized_router is None:
+        if frozen_actor_path.exists() or frozen_actor_path.is_symlink():
+            raise ValueError(
+                "checkpoint without a policy router contains a frozen actor sidecar: "
+                f"{frozen_actor_path}"
+            )
+    else:
+        if not frozen_actor_path.is_file() or frozen_actor_path.is_symlink():
+            raise FileNotFoundError(
+                "checkpoint frozen actor is missing or not a regular file: "
+                f"{frozen_actor_path}"
+            )
+        expected_sidecar_sha256 = serialized_router["frozen_actor"]["sha256"]
+        if _sha256(frozen_actor_path) != expected_sidecar_sha256:
+            raise ValueError(
+                f"checkpoint frozen actor SHA256 mismatch: {frozen_actor_path}"
+            )
     teacher_action_prior: dict[str, str] | None = None
     teacher_residual_state: dict[str, Any] | None = None
     prior_payload = payload.get("teacher_action_prior")
@@ -803,6 +1045,7 @@ def read_checkpoint_task_contract(checkpoint: Path) -> dict[str, Any]:
         "replay_n_step": replay_n_step,
         "replay_gamma": replay_gamma,
         "policy_action_authority": serialized_authority,
+        "policy_router": serialized_router,
         "teacher_action_prior": teacher_action_prior,
         "teacher_residual_state": teacher_residual_state,
         **serialized_runtime,
@@ -822,6 +1065,7 @@ def write_checkpoint_task_contract(
     observation_dim: int | None = None,
     observation_contract_name: str | None = None,
     policy_action_authority: Sequence[Mapping[str, Any]] = (),
+    policy_router: Mapping[str, Any] | None = None,
     teacher_action_prior_sha256: str | None = None,
     teacher_residual_state_sha256: str | None = None,
 ) -> None:
@@ -858,6 +1102,30 @@ def write_checkpoint_task_contract(
             raise ValueError(
                 f"{key}={resolved_runtime[key]!r} is incompatible with "
                 f"task_mode={task_mode!r}; expected {expected!r}"
+            )
+    resolved_router = validate_policy_router_contract(
+        policy_router,
+        task_mode=task_mode,
+        policy_action_authority=resolved_authority,
+        runtime=resolved_runtime,
+        source="checkpoint writer",
+    )
+    frozen_actor_path = checkpoint / FROZEN_LIFT_ACTOR_FILENAME
+    if resolved_router is None:
+        if frozen_actor_path.exists() or frozen_actor_path.is_symlink():
+            raise ValueError(
+                "checkpoint writer found a frozen actor sidecar without a policy router: "
+                f"{frozen_actor_path}"
+            )
+    else:
+        if not frozen_actor_path.is_file() or frozen_actor_path.is_symlink():
+            raise FileNotFoundError(
+                "checkpoint writer requires a regular frozen actor sidecar: "
+                f"{frozen_actor_path}"
+            )
+        if _sha256(frozen_actor_path) != resolved_router["frozen_actor"]["sha256"]:
+            raise ValueError(
+                f"checkpoint writer frozen actor SHA256 mismatch: {frozen_actor_path}"
             )
     prior_entry: dict[str, str] | None = None
     state_entry: dict[str, str] | None = None
@@ -903,6 +1171,7 @@ def write_checkpoint_task_contract(
         "replay_n_step": replay_n_step,
         "replay_gamma": replay_gamma,
         "policy_action_authority": resolved_authority,
+        "policy_router": resolved_router,
         **resolved_runtime,
     }
     if prior_entry is not None:
@@ -943,6 +1212,7 @@ def save_final_checkpoint(
     save_replay: bool,
     actor_rehearsal: Any | None,
     policy_action_authority: Sequence[Mapping[str, Any]] = (),
+    policy_router_enabled: bool = False,
     teacher_prior: Any | None = None,
     teacher_residual_state: Mapping[str, Any] | None = None,
 ) -> None:
@@ -983,6 +1253,28 @@ def save_final_checkpoint(
     atomic_write_json(incomplete, {"version": 1, "status": "incomplete"})
     clear_stale_checkpoint_optional_artifacts(checkpoint)
     agent.save(str(checkpoint))
+    policy_router: dict[str, Any] | None = None
+    frozen_actor_path = checkpoint / FROZEN_LIFT_ACTOR_FILENAME
+    if policy_router_enabled:
+        network_sha256 = getattr(agent, "frozen_lift_actor_sha256", None)
+        source_actor_sha256 = getattr(
+            agent, "frozen_lift_actor_source_sha256", None
+        )
+        if not frozen_actor_path.is_file() or frozen_actor_path.is_symlink():
+            raise FileNotFoundError(
+                "routed agent did not save a regular frozen actor sidecar: "
+                f"{frozen_actor_path}"
+            )
+        policy_router = public_latch_frozen_actor_router_contract(
+            sidecar_sha256=_sha256(frozen_actor_path),
+            network_sha256=network_sha256,
+            source_actor_sha256=source_actor_sha256,
+        )
+    elif frozen_actor_path.exists() or frozen_actor_path.is_symlink():
+        raise ValueError(
+            "non-routed agent unexpectedly saved a frozen actor sidecar: "
+            f"{frozen_actor_path}"
+        )
     if save_replay:
         agent.save_replay_buffer(str(checkpoint))
     if actor_rehearsal is not None:
@@ -1003,6 +1295,7 @@ def save_final_checkpoint(
         replay_n_step=replay_n_step,
         replay_gamma=replay_gamma,
         policy_action_authority=policy_action_authority,
+        policy_router=policy_router,
         teacher_action_prior_sha256=teacher_prior_sha256,
         teacher_residual_state_sha256=teacher_residual_state_sha256,
     )
@@ -1061,6 +1354,7 @@ def validate_replay_task_contract(
     n_step: int,
     gamma: float,
     policy_action_authority: Sequence[Mapping[str, Any]] = (),
+    policy_router_enabled: bool = False,
 ) -> dict[str, Any]:
     """Reject replay collected under different reward/termination semantics."""
 
@@ -1097,6 +1391,14 @@ def validate_replay_task_contract(
             f"checkpoint={contract.get('policy_action_authority')!r}, "
             f"current={current_authority!r}"
         )
+    checkpoint_router_semantics = policy_router_semantics(contract.get("policy_router"))
+    current_router_semantics = expected_policy_router_semantics(policy_router_enabled)
+    if checkpoint_router_semantics != current_router_semantics:
+        raise ValueError(
+            "--resume_replay policy_router mismatch: "
+            f"checkpoint={checkpoint_router_semantics!r}, "
+            f"current={current_router_semantics!r}"
+        )
     checkpoint_n_step = contract["replay_n_step"]
     checkpoint_gamma = contract["replay_gamma"]
     if checkpoint_n_step is None or checkpoint_gamma is None:
@@ -1121,6 +1423,7 @@ def validate_checkpoint_task_contract(
     n_step: int,
     gamma: float,
     policy_action_authority: Sequence[Mapping[str, Any]] = (),
+    policy_router_enabled: bool = False,
 ) -> dict[str, Any]:
     """Reject a full-agent restore across reward/termination objectives.
 
@@ -1162,6 +1465,14 @@ def validate_checkpoint_task_contract(
             f"checkpoint={contract.get('policy_action_authority')!r}, "
             f"current={current_authority!r}"
         )
+    checkpoint_router_semantics = policy_router_semantics(contract.get("policy_router"))
+    current_router_semantics = expected_policy_router_semantics(policy_router_enabled)
+    if checkpoint_router_semantics != current_router_semantics:
+        raise ValueError(
+            "--checkpoint policy_router mismatch; use --actor_checkpoint instead: "
+            f"checkpoint={checkpoint_router_semantics!r}, "
+            f"current={current_router_semantics!r}"
+        )
     checkpoint_n_step = contract["replay_n_step"]
     checkpoint_gamma = contract["replay_gamma"]
     if checkpoint_n_step is None or checkpoint_gamma is None:
@@ -1199,6 +1510,8 @@ def validate_training_source_selection(
     coupled_teacher_residual_mode: bool = False,
     allow_cross_task_actor: bool = False,
     public_latch_arm_gate: bool = False,
+    public_latch_frozen_lift_router: bool = False,
+    frozen_lift_actor_checkpoint: Path | None = None,
 ) -> None:
     """Validate mutually exclusive initialization and task-specific data sources."""
 
@@ -1240,6 +1553,28 @@ def validate_training_source_selection(
                 "their next observations/rewards were generated by ungated actions; "
                 "use actor-only --actor_demo supervision"
             )
+    if public_latch_frozen_lift_router:
+        if task_mode != FULL_TASK_MODE:
+            raise ValueError("--public_latch_frozen_lift_router requires full_task mode")
+        if not public_latch_arm_gate:
+            raise ValueError(
+                "--public_latch_frozen_lift_router requires --public_latch_arm_gate"
+            )
+        if checkpoint is None:
+            if actor_checkpoint is None or frozen_lift_actor_checkpoint is None:
+                raise ValueError(
+                    "fresh routed training requires both --actor_checkpoint and "
+                    "--frozen_lift_actor_checkpoint"
+                )
+        elif frozen_lift_actor_checkpoint is not None:
+            raise ValueError(
+                "routed --checkpoint resume restores its self-contained frozen actor; "
+                "do not pass --frozen_lift_actor_checkpoint"
+            )
+    elif frozen_lift_actor_checkpoint is not None:
+        raise ValueError(
+            "--frozen_lift_actor_checkpoint requires --public_latch_frozen_lift_router"
+        )
     if allow_cross_task_actor and actor_checkpoint is None:
         raise ValueError("--allow_cross_task_actor requires --actor_checkpoint")
     if allow_cross_task_actor and not coupled_power_align_close_option_mode:
@@ -1733,6 +2068,23 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         ),
     )
     parser.add_argument(
+        "--public_latch_frozen_lift_router",
+        action="store_true",
+        help=(
+            "Train only hand14 while latch[106]=0, then route latch[106]=1 to a "
+            "self-contained frozen deterministic full21 lift actor."
+        ),
+    )
+    parser.add_argument(
+        "--frozen_lift_actor_checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Fresh-run source checkpoint for the immutable lift actor. Routed resumes "
+            "restore frozen_lift_actor.pt from --checkpoint instead."
+        ),
+    )
+    parser.add_argument(
         "--episode_length_s",
         type=float,
         default=None,
@@ -1932,6 +2284,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         coupled_teacher_residual_mode=args.coupled_teacher_residual_mode,
         allow_cross_task_actor=args.allow_cross_task_actor,
         public_latch_arm_gate=args.public_latch_arm_gate,
+        public_latch_frozen_lift_router=(
+            args.public_latch_frozen_lift_router
+        ),
+        frozen_lift_actor_checkpoint=args.frozen_lift_actor_checkpoint,
     )
     validate_close_option_training_config(
         close_option_mode=args.close_option_mode,
@@ -2323,6 +2679,11 @@ def audit_actor_checkpoint_source(
     if not actor_path.is_file():
         raise FileNotFoundError(f"missing FlashSAC actor checkpoint: {actor_path}")
     source_contract = read_checkpoint_task_contract(source)
+    if source_contract.get("policy_router") is not None:
+        raise ValueError(
+            "a routed checkpoint actor.pt cannot be used alone because that would "
+            "discard its frozen lift branch"
+        )
     target_task_mode = (
         str(source_contract["task_mode"])
         if target_task_mode is None
@@ -2397,6 +2758,7 @@ def audit_actor_checkpoint_source(
         "source_policy_action_authority": source_contract[
             "policy_action_authority"
         ],
+        "source_policy_router": source_contract["policy_router"],
         "target_task_mode": target_task_mode,
         "target_policy_action_dim": target_dim,
         "actor_projection": actor_projection,
@@ -2650,6 +3012,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     current_policy_action_authority = policy_action_authority_contract(
         args.public_latch_arm_gate
     )
+    policy_router_enabled = bool(args.public_latch_frozen_lift_router)
     env_task_mode_overrides = environment_task_mode_overrides(task_mode)
     physical_close_option_mode = bool(env_task_mode_overrides["close_option_mode"])
     if args.smoke:
@@ -2704,6 +3067,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             n_step=effective_n_step,
             gamma=FLASH_SAC_GAMMA,
             policy_action_authority=current_policy_action_authority,
+            policy_router_enabled=policy_router_enabled,
         )
         if teacher_prior is not None:
             prior_entry = resumed_task_contract.get("teacher_action_prior")
@@ -2726,6 +3090,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 n_step=effective_n_step,
                 gamma=FLASH_SAC_GAMMA,
                 policy_action_authority=current_policy_action_authority,
+                policy_router_enabled=policy_router_enabled,
             )
     residual_native_successes_base = 0
     residual_actor_unlocked = task_mode != COUPLED_TEACHER_RESIDUAL_TASK_MODE
@@ -2770,6 +3135,34 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if args.actor_checkpoint is not None
         else None
     )
+    frozen_lift_actor_audit = (
+        audit_actor_checkpoint_source(
+            args.frozen_lift_actor_checkpoint,
+            output_checkpoint=checkpoint_dir,
+            target_task_mode=FULL_TASK_MODE,
+            allow_cross_task_actor=False,
+        )
+        if args.frozen_lift_actor_checkpoint is not None
+        else None
+    )
+    if frozen_lift_actor_audit is not None:
+        frozen_requirements = {
+            "source_task_mode": FULL_TASK_MODE,
+            "source_policy_action_dim": PICK_TOOL_ACTION_DIM,
+            "target_policy_action_dim": PICK_TOOL_ACTION_DIM,
+            "actor_projection": None,
+            "source_policy_router": None,
+        }
+        frozen_mismatches = {
+            key: (frozen_lift_actor_audit.get(key), expected)
+            for key, expected in frozen_requirements.items()
+            if frozen_lift_actor_audit.get(key) != expected
+        }
+        if frozen_mismatches:
+            raise ValueError(
+                "--frozen_lift_actor_checkpoint must be an ordinary full-task "
+                f"115D/21D actor; mismatches={frozen_mismatches}"
+            )
     demo_bc_weight = (
         1.0
         if (args.demo is not None or args.actor_demo is not None)
@@ -2801,6 +3194,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ActionAuthorityRule,
         ActionNoiseGroup,
         FlashSACTorchBridge,
+        PublicLatchFrozenActorRouter,
         build_agent_config,
     )
     from actor_rehearsal import (
@@ -2928,6 +3322,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         action_authority_rules=(
             tuple(ActionAuthorityRule(**rule) for rule in current_policy_action_authority)
         ),
+        public_latch_frozen_actor_router=(
+            PublicLatchFrozenActorRouter(
+                name=PUBLIC_LATCH_FROZEN_ACTOR_ROUTER_KIND,
+                observation_index=PICK_TOOL_LATCH_OBSERVATION_INDEX,
+                trainable_start=PICK_TOOL_ARM_ACTION_DIM,
+                trainable_stop=PICK_TOOL_ACTION_DIM,
+            )
+            if policy_router_enabled
+            else None
+        ),
         unit_normalize_actor_mean_head=(
             task_mode != COUPLED_TEACHER_RESIDUAL_TASK_MODE
         ),
@@ -3046,6 +3450,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             actor_demo_contracts = PICK_TOOL_COUPLED_POWER_ACTOR_DEMO_CONTRACTS
         elif is_close_option_task_mode(task_mode):
             actor_demo_contracts = PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS
+        elif policy_router_enabled:
+            actor_demo_contracts = PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS
         else:
             actor_demo_contracts = PICK_TOOL_LIFT_ACTOR_DEMO_CONTRACTS
         for path in args.actor_demo:
@@ -3103,10 +3509,43 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         "audited_coupled_teacher21_to_exact_zero_residual14_v1"
                     ),
                 }
+            if policy_router_enabled:
+                row_count = int(batch["observation"].shape[0])
+                latch = batch["observation"][:, PICK_TOOL_LATCH_OBSERVATION_INDEX]
+                binary = (latch == 0.0) | (latch == 1.0)
+                if not bool(binary.all()):
+                    raise ValueError(
+                        f"{path}: routed actor demo latch observation must be exactly binary"
+                    )
+                keep = latch == 0.0
+                kept_rows = int(keep.sum().item())
+                if kept_rows == 0:
+                    raise ValueError(
+                        f"{path}: routed actor demo has no unlatched close-policy rows"
+                    )
+                batch = {
+                    key: value[keep]
+                    for key, value in batch.items()
+                }
+                if labels is not None:
+                    labels = labels[keep]
+                audit = {
+                    **audit,
+                    "transitions": kept_rows,
+                    "router_input_rows": row_count,
+                    "router_unlatched_rows": kept_rows,
+                    "router_removed_latched_rows": row_count - kept_rows,
+                }
             if current_policy_action_authority:
                 source_action = batch["action"]
-                projected_action = agent.apply_action_authority(
-                    source_action, batch["observation"]
+                projected_action = (
+                    agent.apply_trainable_action_authority(
+                        source_action, batch["observation"]
+                    )
+                    if policy_router_enabled
+                    else agent.apply_action_authority(
+                        source_action, batch["observation"]
+                    )
                 )
                 changed = projected_action != source_action
                 batch = {
@@ -3212,6 +3651,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             n_step=effective_n_step,
             gamma=FLASH_SAC_GAMMA,
             policy_action_authority=current_policy_action_authority,
+            policy_router_enabled=policy_router_enabled,
         )
         if revalidated_contract != resumed_task_contract:
             raise RuntimeError("--checkpoint task contract changed while the run was starting")
@@ -3222,6 +3662,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             n_step=effective_n_step,
             gamma=FLASH_SAC_GAMMA,
             policy_action_authority=current_policy_action_authority,
+            policy_router_enabled=policy_router_enabled,
         )
         if post_load_contract != resumed_task_contract:
             raise RuntimeError("--checkpoint changed while it was being loaded")
@@ -3254,6 +3695,30 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         if loaded_actor_sha256 != actor_checkpoint_audit["actor_sha256"]:
             raise RuntimeError("--actor_checkpoint changed while actor.pt was being loaded")
+        if policy_router_enabled:
+            if frozen_lift_actor_audit is None or args.frozen_lift_actor_checkpoint is None:
+                raise RuntimeError("fresh policy router has no audited frozen lift actor")
+            revalidated_frozen = audit_actor_checkpoint_source(
+                args.frozen_lift_actor_checkpoint,
+                output_checkpoint=checkpoint_dir,
+                target_task_mode=FULL_TASK_MODE,
+                allow_cross_task_actor=False,
+            )
+            if revalidated_frozen != frozen_lift_actor_audit:
+                raise RuntimeError(
+                    "--frozen_lift_actor_checkpoint changed while the run was starting"
+                )
+            agent.load_frozen_lift_actor(frozen_lift_actor_audit["path"])
+            loaded_frozen_sha256 = _sha256(
+                Path(frozen_lift_actor_audit["path"]) / "actor.pt"
+            )
+            if (
+                loaded_frozen_sha256 != frozen_lift_actor_audit["actor_sha256"]
+                or agent.frozen_lift_actor_source_sha256 != loaded_frozen_sha256
+            ):
+                raise RuntimeError(
+                    "--frozen_lift_actor_checkpoint changed while actor.pt was being loaded"
+                )
         if args.public_latch_arm_gate and agent.replay_size != 0:
             raise RuntimeError(
                 "public latch arm-gate actor-only initialization must start with fresh replay"
@@ -3285,6 +3750,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     update_count = 0
     terminated_count = torch.zeros((), dtype=torch.long, device=env.device)
     truncated_count = torch.zeros((), dtype=torch.long, device=env.device)
+    router_route_counts = torch.zeros(2, dtype=torch.long, device=env.device)
     update_sums: dict[str, float] = {}
     update_metric_counts: dict[str, int] = {}
     actor_update_count = 0
@@ -3302,6 +3768,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     try:
         for interaction_step in range(1, args.steps + 1):
+            if policy_router_enabled:
+                latch = observation[:, PICK_TOOL_LATCH_OBSERVATION_INDEX]
+                router_route_counts[0].add_((latch == 0.0).sum())
+                router_route_counts[1].add_((latch == 1.0).sum())
             training_ready = agent.can_start_training()
             if (
                 task_mode == COUPLED_TEACHER_RESIDUAL_TASK_MODE
@@ -3507,6 +3977,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         if actor_checkpoint_audit
                         else None
                     ),
+                    "initial_actor_checkpoint_source_policy_router": (
+                        actor_checkpoint_audit["source_policy_router"]
+                        if actor_checkpoint_audit
+                        else None
+                    ),
                     "initial_actor_checkpoint_projection": (
                         actor_checkpoint_audit["actor_projection"]
                         if actor_checkpoint_audit
@@ -3516,6 +3991,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "resumed_replay": bool(args.resume_replay),
                     "resumed_task_contract": resumed_task_contract,
                     "policy_action_authority": current_policy_action_authority,
+                    "policy_router_enabled": policy_router_enabled,
+                    "policy_router_semantics": expected_policy_router_semantics(
+                        policy_router_enabled
+                    ),
+                    "frozen_lift_actor_checkpoint": (
+                        frozen_lift_actor_audit["path"]
+                        if frozen_lift_actor_audit
+                        else None
+                    ),
+                    "frozen_lift_actor_source_sha256": (
+                        agent.frozen_lift_actor_source_sha256
+                        if policy_router_enabled
+                        else None
+                    ),
+                    "frozen_lift_actor_network_sha256": (
+                        agent.frozen_lift_actor_sha256
+                        if policy_router_enabled
+                        else None
+                    ),
+                    "policy_router_close_rows": int(router_route_counts[0].item()),
+                    "policy_router_frozen_rows": int(router_route_counts[1].item()),
                     "resumed_actor_demo": bool(args.resume_actor_demo),
                     "restore_checkpoint_rng": False,
                     "flashsac_upstream_commit": FLASH_SAC_COMMIT,
@@ -3588,6 +4084,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             save_replay=bool(args.save_replay),
             actor_rehearsal=actor_rehearsal,
             policy_action_authority=current_policy_action_authority,
+            policy_router_enabled=policy_router_enabled,
             teacher_prior=teacher_prior,
             teacher_residual_state=final_residual_state,
         )

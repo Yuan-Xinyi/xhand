@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -31,6 +32,7 @@ from train import (  # noqa: E402
     FULL_ACTION_NOISE_GROUP_SPECS,
     FULL_POLICY_ACTION_LAYOUT,
     FULL_TASK_MODE,
+    FROZEN_LIFT_ACTOR_FILENAME,
     FractionalUpdateBudget,
     HAND_POLICY_ACTION_LAYOUT,
     IDENTITY_ACTION_PROJECTION,
@@ -55,6 +57,7 @@ from train import (  # noqa: E402
     environment_task_mode_overrides,
     policy_action_contract,
     policy_action_authority_contract,
+    public_latch_frozen_actor_router_contract,
     project_coupled_teacher_demo_to_zero_residual,
     project_full_actor_to_coupled_observation_state,
     clear_stale_checkpoint_optional_artifacts,
@@ -98,6 +101,23 @@ def _write_core_checkpoint(checkpoint: Path) -> None:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_frozen_actor_sidecar(
+    checkpoint: Path,
+    *,
+    payload: bytes = b"self-contained frozen lift actor",
+    network_sha256: str = "1" * 64,
+    source_actor_sha256: str = "2" * 64,
+) -> dict[str, object]:
+    checkpoint.mkdir(parents=True, exist_ok=True)
+    sidecar = checkpoint / FROZEN_LIFT_ACTOR_FILENAME
+    sidecar.write_bytes(payload)
+    return public_latch_frozen_actor_router_contract(
+        sidecar_sha256=_sha256(sidecar),
+        network_sha256=network_sha256,
+        source_actor_sha256=source_actor_sha256,
+    )
 
 
 def _residual_prior() -> CoupledTeacherPrior:
@@ -1082,6 +1102,7 @@ def test_task_mode_source_and_replay_contracts() -> None:
             "replay_n_step": None,
             "replay_gamma": None,
             "policy_action_authority": [],
+            "policy_router": None,
             "teacher_action_prior": None,
             "teacher_residual_state": None,
             **runtime_contract(FULL_TASK_MODE),
@@ -1162,6 +1183,7 @@ def test_task_mode_source_and_replay_contracts() -> None:
             "replay_n_step": 3,
             "replay_gamma": 0.99,
             "policy_action_authority": [],
+            "policy_router": None,
             **runtime_contract(CLOSE_OPTION_TASK_MODE),
         }
         contract = validate_replay_task_contract(
@@ -1220,6 +1242,7 @@ def test_task_mode_source_and_replay_contracts() -> None:
             "replay_n_step": 3,
             "replay_gamma": 0.99,
             "policy_action_authority": [],
+            "policy_router": None,
             **runtime_contract(CLOSE_OPTION_TASK_MODE),
         }
         invalid_values = {
@@ -1298,6 +1321,7 @@ def test_task_mode_source_and_replay_contracts() -> None:
         assert v1["policy_action_dim"] == ACTION_DIM
         assert v1["action_projection"] == IDENTITY_ACTION_PROJECTION
         assert v1["policy_action_authority"] == []
+        assert v1["policy_router"] is None
         _expect_error(
             ValueError,
             validate_replay_task_contract,
@@ -1383,6 +1407,7 @@ def test_task_mode_source_and_replay_contracts() -> None:
             "replay_n_step": 3,
             "replay_gamma": 0.99,
             "policy_action_authority": [],
+            "policy_router": None,
             **runtime_contract(POWER_CLOSE_OPTION_TASK_MODE),
         }
         assert power_payload["policy_action_dim"] == HAND_ACTION_DIM
@@ -1439,6 +1464,7 @@ def test_task_mode_source_and_replay_contracts() -> None:
             "replay_n_step": 3,
             "replay_gamma": 0.99,
             "policy_action_authority": [],
+            "policy_router": None,
             **runtime_contract(COUPLED_POWER_ALIGN_CLOSE_OPTION_TASK_MODE),
         }
         assert validate_checkpoint_task_contract(
@@ -1566,6 +1592,177 @@ def test_task_mode_source_and_replay_contracts() -> None:
         _expect_error(ValueError, read_checkpoint_task_contract, checkpoint)
 
 
+def test_v6_policy_router_contract() -> None:
+    with tempfile.TemporaryDirectory(prefix="flashsac_router_contract_") as directory:
+        root = Path(directory)
+        checkpoint = root / "routed"
+        _write_core_checkpoint(checkpoint)
+        torch.save({"observation": torch.zeros(1, 1)}, checkpoint / "replay_buffer.pt")
+        authority = policy_action_authority_contract(True)
+        router = _write_frozen_actor_sidecar(checkpoint)
+        write_checkpoint_task_contract(
+            checkpoint,
+            task_mode=FULL_TASK_MODE,
+            replay_n_step=3,
+            replay_gamma=0.99,
+            policy_action_authority=authority,
+            policy_router=router,
+        )
+        contract_path = checkpoint / TASK_CONTRACT_FILENAME
+        valid_payload = json.loads(contract_path.read_text(encoding="utf-8"))
+        assert valid_payload["version"] == 6 == TASK_CONTRACT_VERSION
+        assert valid_payload["policy_router"] == router
+        contract = read_checkpoint_task_contract(checkpoint)
+        assert contract["policy_router"] == router
+        assert contract["policy_action_authority"] == authority
+        assert contract["policy_router"]["frozen_actor"]["sha256"] == _sha256(
+            checkpoint / FROZEN_LIFT_ACTOR_FILENAME
+        )
+        assert validate_checkpoint_task_contract(
+            checkpoint,
+            task_mode=FULL_TASK_MODE,
+            n_step=3,
+            gamma=0.99,
+            policy_action_authority=authority,
+            policy_router_enabled=True,
+        )["policy_router"] == router
+        assert validate_replay_task_contract(
+            checkpoint,
+            task_mode=FULL_TASK_MODE,
+            n_step=3,
+            gamma=0.99,
+            policy_action_authority=authority,
+            policy_router_enabled=True,
+        )["policy_router"] == router
+
+        # A routed checkpoint cannot be resumed by a non-routed run, even when
+        # every other task, authority, runtime, and discount field agrees.
+        for validator in (
+            validate_checkpoint_task_contract,
+            validate_replay_task_contract,
+        ):
+            _expect_error(
+                ValueError,
+                validator,
+                checkpoint,
+                task_mode=FULL_TASK_MODE,
+                n_step=3,
+                gamma=0.99,
+                policy_action_authority=authority,
+                policy_router_enabled=False,
+            )
+
+        sidecar = checkpoint / FROZEN_LIFT_ACTOR_FILENAME
+        sidecar_bytes = sidecar.read_bytes()
+
+        sidecar.unlink()
+        _expect_error(FileNotFoundError, read_checkpoint_task_contract, checkpoint)
+
+        external_sidecar = root / "external_frozen_actor.pt"
+        external_sidecar.write_bytes(sidecar_bytes)
+        sidecar.symlink_to(external_sidecar)
+        _expect_error(FileNotFoundError, read_checkpoint_task_contract, checkpoint)
+        sidecar.unlink()
+
+        sidecar.write_bytes(sidecar_bytes + b"tampered")
+        _expect_error(ValueError, read_checkpoint_task_contract, checkpoint)
+        sidecar.write_bytes(sidecar_bytes)
+
+        missing_router = dict(valid_payload)
+        missing_router.pop("policy_router")
+        contract_path.write_text(json.dumps(missing_router), encoding="utf-8")
+        _expect_error(ValueError, read_checkpoint_task_contract, checkpoint)
+
+        orphaned_sidecar = dict(valid_payload)
+        orphaned_sidecar["policy_router"] = None
+        contract_path.write_text(json.dumps(orphaned_sidecar), encoding="utf-8")
+        _expect_error(ValueError, read_checkpoint_task_contract, checkpoint)
+
+        # Routing decisions and tensor boundaries are closed static fields;
+        # neither substitutions nor forward-compatible-looking extras are
+        # accepted silently.
+        invalid_static_values = (
+            (("kind",), "another_router"),
+            (("observation_index",), 105),
+            (("close_value",), 1.0),
+            (("frozen_value",), 0.0),
+            (("trainable_action_slice",), [0, 21]),
+            (("close_arm_fill",), "learned"),
+            (("frozen_action_slice",), [7, 21]),
+            (("frozen_action_sampling",), "stochastic"),
+            (("frozen_action_entropy",), "learned"),
+            (("frozen_actor", "filename"), "other.pt"),
+            (("frozen_actor", "sha256"), "not-a-sha256"),
+            (("frozen_actor", "observation_dim"), 114),
+            (("frozen_actor", "action_dim"), 20),
+        )
+        for field_path, invalid_value in invalid_static_values:
+            candidate = copy.deepcopy(valid_payload)
+            target = candidate["policy_router"]
+            for field in field_path[:-1]:
+                target = target[field]
+            target[field_path[-1]] = invalid_value
+            contract_path.write_text(json.dumps(candidate), encoding="utf-8")
+            _expect_error(ValueError, read_checkpoint_task_contract, checkpoint)
+
+        extra_outer = copy.deepcopy(valid_payload)
+        extra_outer["policy_router"]["unexpected"] = True
+        contract_path.write_text(json.dumps(extra_outer), encoding="utf-8")
+        _expect_error(ValueError, read_checkpoint_task_contract, checkpoint)
+
+        extra_frozen_actor = copy.deepcopy(valid_payload)
+        extra_frozen_actor["policy_router"]["frozen_actor"]["unexpected"] = True
+        contract_path.write_text(json.dumps(extra_frozen_actor), encoding="utf-8")
+        _expect_error(ValueError, read_checkpoint_task_contract, checkpoint)
+
+        plain = root / "non_routed"
+        _write_core_checkpoint(plain)
+        torch.save({"observation": torch.zeros(1, 1)}, plain / "replay_buffer.pt")
+        write_checkpoint_task_contract(
+            plain,
+            task_mode=FULL_TASK_MODE,
+            replay_n_step=3,
+            replay_gamma=0.99,
+            policy_action_authority=authority,
+        )
+        assert read_checkpoint_task_contract(plain)["policy_router"] is None
+
+        # The inverse resume direction also fails closed: enabling routing
+        # cannot manufacture the immutable lift branch absent from a source.
+        for validator in (
+            validate_checkpoint_task_contract,
+            validate_replay_task_contract,
+        ):
+            _expect_error(
+                ValueError,
+                validator,
+                plain,
+                task_mode=FULL_TASK_MODE,
+                n_step=3,
+                gamma=0.99,
+                policy_action_authority=authority,
+                policy_router_enabled=True,
+            )
+
+        # V5 predates policy routing and remains readable as an explicit None.
+        (plain / TASK_CONTRACT_FILENAME).write_text(
+            json.dumps(
+                {
+                    "version": 5,
+                    "task_mode": FULL_TASK_MODE,
+                    "replay_n_step": 3,
+                    "replay_gamma": 0.99,
+                    "policy_action_authority": authority,
+                    **runtime_contract(FULL_TASK_MODE),
+                }
+            ),
+            encoding="utf-8",
+        )
+        v5 = read_checkpoint_task_contract(plain)
+        assert v5["version"] == 5
+        assert v5["policy_router"] is None
+
+
 def test_actor_checkpoint_audit() -> None:
     with tempfile.TemporaryDirectory(prefix="flashsac_actor_checkpoint_") as directory:
         root = Path(directory)
@@ -1591,6 +1788,7 @@ def test_actor_checkpoint_audit() -> None:
             "source_policy_action_dim": ACTION_DIM,
             "source_policy_action_layout": FULL_POLICY_ACTION_LAYOUT,
             "source_policy_action_authority": [],
+            "source_policy_router": None,
             "target_task_mode": CLOSE_OPTION_TASK_MODE,
             "target_policy_action_dim": ACTION_DIM,
             "actor_projection": None,
@@ -1870,8 +2068,58 @@ def test_final_checkpoint_cleanup_and_contract_order() -> None:
             "replay_n_step": 3,
             "replay_gamma": 0.99,
             "policy_action_authority": [],
+            "policy_router": None,
             **runtime_contract(CLOSE_OPTION_TASK_MODE),
         }
+
+        routed_checkpoint = Path(directory) / "routed_checkpoint_final"
+        routed_sidecar_bytes = b"published immutable lift actor"
+        routed_network_sha256 = "3" * 64
+        routed_source_actor_sha256 = "4" * 64
+
+        class RoutedAgent:
+            frozen_lift_actor_sha256 = routed_network_sha256
+            frozen_lift_actor_source_sha256 = routed_source_actor_sha256
+
+            def save(self, path: str) -> None:
+                destination = Path(path)
+                assert (destination / INCOMPLETE_CHECKPOINT_FILENAME).is_file()
+                assert not (destination / TASK_CONTRACT_FILENAME).exists()
+                _write_core_checkpoint(destination)
+                (destination / FROZEN_LIFT_ACTOR_FILENAME).write_bytes(
+                    routed_sidecar_bytes
+                )
+
+            def save_replay_buffer(self, path: str) -> None:
+                raise AssertionError("routed test did not request replay save")
+
+        routed_authority = policy_action_authority_contract(True)
+        save_final_checkpoint(
+            routed_checkpoint,
+            agent=RoutedAgent(),
+            task_mode=FULL_TASK_MODE,
+            replay_n_step=3,
+            replay_gamma=0.99,
+            save_replay=False,
+            actor_rehearsal=None,
+            policy_action_authority=routed_authority,
+            policy_router_enabled=True,
+        )
+        assert not (routed_checkpoint / INCOMPLETE_CHECKPOINT_FILENAME).exists()
+        assert (
+            routed_checkpoint / FROZEN_LIFT_ACTOR_FILENAME
+        ).read_bytes() == routed_sidecar_bytes
+        routed_contract = read_checkpoint_task_contract(routed_checkpoint)
+        assert routed_contract["policy_action_authority"] == routed_authority
+        assert routed_contract["policy_router"] == (
+            public_latch_frozen_actor_router_contract(
+                sidecar_sha256=_sha256(
+                    routed_checkpoint / FROZEN_LIFT_ACTOR_FILENAME
+                ),
+                network_sha256=routed_network_sha256,
+                source_actor_sha256=routed_source_actor_sha256,
+            )
+        )
 
         residual_checkpoint = Path(directory) / "residual_checkpoint_final"
 
@@ -2004,6 +2252,7 @@ def main() -> None:
     test_power_close_strict_metrics_are_power_specific()
     test_atomic_json()
     test_task_mode_source_and_replay_contracts()
+    test_v6_policy_router_contract()
     test_actor_checkpoint_audit()
     test_full_actor_coupled_observation_projection()
     test_final_checkpoint_cleanup_and_contract_order()
