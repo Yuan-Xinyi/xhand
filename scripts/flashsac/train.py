@@ -1236,11 +1236,125 @@ def resolve_warmup_transitions(
     return min(buffer, max(batch, min(10_000, buffer)))
 
 
-def _strict_metrics(info: Mapping[str, Any]) -> dict[str, float]:
+_POWER_CLOSE_INAPPLICABLE_LEGACY_METRICS = frozenset(
+    {
+        # These task log fields are authored by the legacy thumb+two/full-task
+        # state.  Reporting them during power-close training would silently mix
+        # two different grasp definitions.
+        "success_frac",
+        "is_grasped_phase_frac",
+        "grasp_quality_mean",
+    }
+)
+
+
+def _strict_metrics(
+    info: Mapping[str, Any], *, task_mode: str = FULL_TASK_MODE
+) -> dict[str, float]:
+    """Return scalar training telemetry with mode-specific grasp authority.
+
+    Power-close metrics are reduced from the per-environment reset-before
+    ``pick_tool_terminal`` tensors.  This preserves rare exploration hits that
+    an aggregate mean alone would hide and, importantly, never substitutes the
+    legacy thumb+two latch or quality.
+    """
+
+    if task_mode not in TASK_MODES:
+        raise ValueError(f"unsupported task_mode={task_mode!r}")
     values = info.get("strict_metrics", {})
     if not isinstance(values, Mapping):
         raise TypeError("adapter info['strict_metrics'] must be a mapping")
-    return {str(name): _scalar(value) for name, value in values.items()}
+    metrics = {
+        str(name): _scalar(value)
+        for name, value in values.items()
+        if not (
+            task_mode == POWER_CLOSE_OPTION_TASK_MODE
+            and str(name) in _POWER_CLOSE_INAPPLICABLE_LEGACY_METRICS
+        )
+    }
+    if task_mode != POWER_CLOSE_OPTION_TASK_MODE:
+        return metrics
+
+    terminal = info.get("pick_tool_terminal")
+    if not isinstance(terminal, Mapping):
+        raise KeyError("power-close adapter info has no pick_tool_terminal ground truth")
+    specifications = {
+        "power_close_quality": torch.float32,
+        "power_wrap_quality": torch.float32,
+        "power_grasp_quality": torch.float32,
+        "power_legal_other_contact_count": torch.long,
+        "power_thumb_contact": torch.bool,
+        "power_is_grasped": torch.bool,
+        "power_grasp_latch_confirm_steps": torch.long,
+        "power_close_option_stable_steps": torch.long,
+    }
+    vectors: dict[str, torch.Tensor] = {}
+    vector_shape: tuple[int, ...] | None = None
+    vector_device: torch.device | None = None
+    for name, dtype in specifications.items():
+        value = terminal.get(name)
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"pick_tool_terminal[{name!r}] must be a torch.Tensor")
+        if value.ndim != 1 or value.numel() < 1 or value.dtype != dtype:
+            raise ValueError(
+                f"pick_tool_terminal[{name!r}] must be non-empty {dtype} vector, "
+                f"got {value.dtype}{tuple(value.shape)}"
+            )
+        if vector_shape is None:
+            vector_shape = tuple(value.shape)
+            vector_device = value.device
+        elif tuple(value.shape) != vector_shape or value.device != vector_device:
+            raise ValueError(
+                "power-close terminal telemetry tensors must share shape and device"
+            )
+        vectors[name] = value
+
+    for name in (
+        "power_close_quality",
+        "power_wrap_quality",
+        "power_grasp_quality",
+    ):
+        value = vectors[name]
+        if not bool(torch.isfinite(value).all()) or bool(
+            ((value < 0.0) | (value > 1.0)).any()
+        ):
+            raise ValueError(f"pick_tool_terminal[{name!r}] must be finite and in [0, 1]")
+    legal_other = vectors["power_legal_other_contact_count"]
+    latch_confirm_steps = vectors["power_grasp_latch_confirm_steps"]
+    stable_steps = vectors["power_close_option_stable_steps"]
+    if bool(((legal_other < 0) | (legal_other > 4)).any()):
+        raise ValueError("power legal non-thumb contact count must be in [0, 4]")
+    if bool((latch_confirm_steps < 0).any()) or bool((stable_steps < 0).any()):
+        raise ValueError("power latch/stable step counters must be non-negative")
+
+    thumb = vectors["power_thumb_contact"]
+    other_ge3 = legal_other >= 3
+    power_latch = vectors["power_is_grasped"]
+    float_vectors = {
+        "power_q_close": vectors["power_close_quality"],
+        "power_q_wrap": vectors["power_wrap_quality"],
+        "power_grasp_quality": vectors["power_grasp_quality"],
+        "power_legal_other_contacts": legal_other.float(),
+        "power_latch_confirm_steps": latch_confirm_steps.float(),
+        "power_close_option_stable_steps": stable_steps.float(),
+    }
+    for name, value in float_vectors.items():
+        metrics[f"{name}_mean"] = float(value.mean().item())
+        metrics[f"{name}_max"] = float(value.max().item())
+    metrics.update(
+        {
+            "power_thumb_contact_frac": float(thumb.float().mean().item()),
+            "power_other_ge3_frac": float(other_ge3.float().mean().item()),
+            "power_thumb_plus_three_frac": float(
+                (thumb & other_ge3).float().mean().item()
+            ),
+            "power_is_grasped_frac": float(power_latch.float().mean().item()),
+            # Explicit phase alias for readers comparing old is_grasped_phase
+            # charts; both values come from the power latch above.
+            "power_grasp_phase_frac": float(power_latch.float().mean().item()),
+        }
+    )
+    return metrics
 
 
 def _sha256(path: Path) -> str:
@@ -1935,7 +2049,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             done = terminated | truncated
             episodes.step(reward, done)
             terminal_events.step(info)
-            instant_strict = _strict_metrics(info)
+            instant_strict = _strict_metrics(info, task_mode=task_mode)
             for name, value in instant_strict.items():
                 run_max_strict[name] = max(run_max_strict.get(name, -math.inf), value)
             terminated_count.add_(terminated.sum())

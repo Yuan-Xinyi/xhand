@@ -56,6 +56,7 @@ from train import (  # noqa: E402
     validate_replay_task_contract,
     validate_training_source_selection,
     write_checkpoint_task_contract,
+    _strict_metrics,
 )
 
 
@@ -257,6 +258,65 @@ def test_terminal_event_accumulator() -> None:
         "pick_tool_terminal/close_option_horizontal_escape": 0,
         "pick_tool_terminal/close_option_lost_window": 0,
     }
+
+
+def test_power_close_strict_metrics_are_power_specific() -> None:
+    info = {
+        "strict_metrics": {
+            "clearance_max": torch.tensor(0.012),
+            "success_frac": torch.tensor(0.75),
+            "is_grasped_phase_frac": torch.tensor(0.90),
+            "grasp_quality_mean": torch.tensor(0.80),
+        },
+        "pick_tool_terminal": {
+            "power_close_quality": torch.tensor([0.10, 0.85, 0.50]),
+            "power_wrap_quality": torch.tensor([0.00, 0.45, 0.20]),
+            "power_grasp_quality": torch.tensor([0.00, 0.40, 0.15]),
+            "power_legal_other_contact_count": torch.tensor(
+                [1, 3, 4], dtype=torch.long
+            ),
+            "power_thumb_contact": torch.tensor([False, True, False]),
+            "power_is_grasped": torch.tensor([False, True, False]),
+            "power_grasp_latch_confirm_steps": torch.tensor(
+                [0, 7, 2], dtype=torch.long
+            ),
+            "power_close_option_stable_steps": torch.tensor(
+                [0, 5, 1], dtype=torch.long
+            ),
+        },
+    }
+    metrics = _strict_metrics(info, task_mode=POWER_CLOSE_OPTION_TASK_MODE)
+    assert metrics["clearance_max"] == float(info["strict_metrics"]["clearance_max"])
+    assert "success_frac" not in metrics
+    assert "is_grasped_phase_frac" not in metrics
+    assert "grasp_quality_mean" not in metrics
+    assert abs(metrics["power_q_close_mean"] - 1.45 / 3.0) < 1.0e-6
+    assert abs(metrics["power_q_close_max"] - 0.85) < 1.0e-6
+    assert abs(metrics["power_q_wrap_mean"] - 0.65 / 3.0) < 1.0e-6
+    assert abs(metrics["power_grasp_quality_max"] - 0.40) < 1.0e-6
+    assert metrics["power_legal_other_contacts_max"] == 4.0
+    assert abs(metrics["power_thumb_contact_frac"] - 1.0 / 3.0) < 1.0e-6
+    assert abs(metrics["power_other_ge3_frac"] - 2.0 / 3.0) < 1.0e-6
+    assert abs(metrics["power_thumb_plus_three_frac"] - 1.0 / 3.0) < 1.0e-6
+    assert abs(metrics["power_is_grasped_frac"] - 1.0 / 3.0) < 1.0e-6
+    assert metrics["power_grasp_phase_frac"] == metrics["power_is_grasped_frac"]
+    assert metrics["power_latch_confirm_steps_max"] == 7.0
+    assert metrics["power_close_option_stable_steps_max"] == 5.0
+
+    legacy = _strict_metrics(info, task_mode=FULL_TASK_MODE)
+    assert legacy["success_frac"] == 0.75
+    assert abs(legacy["is_grasped_phase_frac"] - 0.90) < 1.0e-6
+    assert "power_q_close_max" not in legacy
+
+    missing = dict(info)
+    missing["pick_tool_terminal"] = dict(info["pick_tool_terminal"])
+    del missing["pick_tool_terminal"]["power_close_quality"]
+    _expect_error(
+        TypeError,
+        _strict_metrics,
+        missing,
+        task_mode=POWER_CLOSE_OPTION_TASK_MODE,
+    )
 
 
 def test_atomic_json() -> None:
@@ -983,6 +1043,7 @@ def main() -> None:
     test_auto_reset_replay_boundary()
     test_episode_accumulator()
     test_terminal_event_accumulator()
+    test_power_close_strict_metrics_are_power_specific()
     test_atomic_json()
     test_task_mode_source_and_replay_contracts()
     test_actor_checkpoint_audit()

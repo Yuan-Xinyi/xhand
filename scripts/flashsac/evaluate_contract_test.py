@@ -89,8 +89,10 @@ def _events(
     power_grasped=(False, False),
     power_thumb_contact=(False, False),
     power_legal_other_contacts=(0, 0),
+    power_close_quality=(0.0, 0.0),
     power_wrap_quality=(0.0, 0.0),
     power_grasp_quality=(0.0, 0.0),
+    power_latch_confirm_steps=(0, 0),
 ) -> dict[str, torch.Tensor]:
     if full_task_success is None:
         full_task_success = success
@@ -145,8 +147,12 @@ def _events(
         "power_legal_other_contact_count": torch.tensor(
             power_legal_other_contacts, dtype=torch.long
         ),
+        "power_close_quality": torch.tensor(power_close_quality, dtype=torch.float32),
         "power_wrap_quality": torch.tensor(power_wrap_quality, dtype=torch.float32),
         "power_grasp_quality": torch.tensor(power_grasp_quality, dtype=torch.float32),
+        "power_grasp_latch_confirm_steps": torch.tensor(
+            power_latch_confirm_steps, dtype=torch.long
+        ),
     }
 
 
@@ -492,8 +498,10 @@ def _valid_power_events() -> dict[str, torch.Tensor]:
         power_grasped=(True, False),
         power_thumb_contact=(True, False),
         power_legal_other_contacts=(3, 0),
+        power_close_quality=(0.85, 0.0),
         power_wrap_quality=(0.45, 0.0),
         power_grasp_quality=(0.40, 0.0),
+        power_latch_confirm_steps=(18, 0),
     )
 
 
@@ -796,6 +804,32 @@ def test_power_close_tracker_metrics_and_hand_action_contract() -> None:
         initial_truth=_truth((-0.001, -0.001), (False, False)),
         task_mode=POWER_CLOSE_OPTION_MODE,
     )
+    progress_raw = _events(
+        close_stable_steps=(5, 0),
+        power_stable_steps=(5, 0),
+        hold_quality=(0.75, 0.20),
+        power_grasped=(True, False),
+        power_thumb_contact=(True, True),
+        power_legal_other_contacts=(4, 2),
+        power_close_quality=(0.95, 0.30),
+        power_wrap_quality=(0.65, 0.10),
+        power_grasp_quality=(0.55, 0.05),
+        power_latch_confirm_steps=(7, 1),
+    )
+    progress_events = validate_terminal_events(
+        {"pick_tool_terminal": progress_raw},
+        torch.tensor([False, False]),
+        torch.tensor([False, False]),
+        task_mode=POWER_CLOSE_OPTION_MODE,
+    )
+    tracker.step(
+        reward=torch.tensor([1.0, 2.0]),
+        terminated=torch.tensor([False, False]),
+        truncated=torch.tensor([False, False]),
+        events=progress_events,
+        transition_truth=_truth((0.001, 0.001), (True, False)),
+        post_reset_truth=_truth((0.001, 0.001), (True, False)),
+    )
     raw = _valid_power_events()
     events = validate_terminal_events(
         {"pick_tool_terminal": raw},
@@ -815,6 +849,16 @@ def test_power_close_tracker_metrics_and_hand_action_contract() -> None:
     assert tracker.records[0]["power_close_option_success"] is True
     assert tracker.records[0]["power_thumb_contact"] is True
     assert tracker.records[0]["power_legal_other_contact_count"] == 3
+    assert tracker.records[0]["terminal_power_legal_other_contact_count"] == 3
+    assert tracker.records[0]["max_power_legal_other_contact_count"] == 4
+    assert tracker.records[0]["ever_power_thumb_plus_three"] is True
+    assert tracker.records[0]["ever_power_grasp_latched"] is True
+    assert abs(tracker.records[0]["max_power_staged_close_quality"] - 0.95) < 1.0e-6
+    assert abs(tracker.records[0]["max_power_wrap_quality"] - 0.65) < 1.0e-6
+    assert abs(tracker.records[0]["max_power_grasp_quality"] - 0.55) < 1.0e-6
+    assert tracker.records[0]["max_power_close_option_stable_steps"] == 15
+    assert tracker.records[1]["max_power_legal_other_contact_count"] == 2
+    assert tracker.records[1]["ever_power_thumb_plus_three"] is False
     assert "success" not in tracker.records[0]
     assert "close_option_success" not in tracker.records[0]
 
@@ -876,6 +920,15 @@ def test_power_close_tracker_metrics_and_hand_action_contract() -> None:
         "close_option_horizontal_escape": 1,
         "close_option_lost_window": 0,
     }
+    telemetry = metrics["power_close_telemetry"]
+    assert telemetry["episodes_ever_thumb_contact"] == 2
+    assert telemetry["episodes_ever_thumb_plus_three"] == 1
+    assert telemetry["episodes_ever_grasp_latched"] == 1
+    assert telemetry["episode_max_legal_other_contact_count"]["max"] == 4.0
+    assert abs(telemetry["episode_max_staged_close_quality"]["max"] - 0.95) < 1.0e-6
+    assert abs(telemetry["episode_max_wrap_quality"]["max"] - 0.65) < 1.0e-6
+    assert abs(telemetry["episode_max_grasp_quality"]["max"] - 0.55) < 1.0e-6
+    assert telemetry["episode_max_close_option_stable_steps"]["max"] == 15.0
     assert metrics["success_contract"] == {
         "name": "stable_power_close_option_latch_v1",
         "confirm_steps": 15,

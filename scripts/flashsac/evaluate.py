@@ -112,8 +112,10 @@ POWER_CLOSE_OPTION_EVENT_KEYS = (
     "power_is_grasped",
     "power_thumb_contact",
     "power_legal_other_contact_count",
+    "power_close_quality",
     "power_wrap_quality",
     "power_grasp_quality",
+    "power_grasp_latch_confirm_steps",
 )
 
 ARM_HOLD_HANDOFF_KEYS = (
@@ -379,8 +381,13 @@ def validate_terminal_events(
             "close_option_stable_steps",
             "power_close_option_stable_steps",
             "power_legal_other_contact_count",
+            "power_grasp_latch_confirm_steps",
         }
-        float_keys = {"power_wrap_quality", "power_grasp_quality"}
+        float_keys = {
+            "power_close_quality",
+            "power_wrap_quality",
+            "power_grasp_quality",
+        }
         power_events = {
             name: _require_vector(
                 f"pick_tool_terminal[{name!r}]",
@@ -447,12 +454,23 @@ def validate_terminal_events(
             device=terminated.device,
             dtype=torch.float32,
         )
-        for name in ("power_wrap_quality", "power_grasp_quality"):
+        for name in (
+            "power_close_quality",
+            "power_wrap_quality",
+            "power_grasp_quality",
+        ):
             quality = power_events[name]
             if not bool(torch.isfinite(quality).all()) or bool(
                 ((quality < 0.0) | (quality > 1.0)).any()
             ):
                 raise RuntimeError(f"{name} must be finite and in [0, 1]")
+        legal_other = power_events["power_legal_other_contact_count"]
+        latch_confirm_steps = power_events["power_grasp_latch_confirm_steps"]
+        stable_steps = power_events["power_close_option_stable_steps"]
+        if bool(((legal_other < 0) | (legal_other > 4)).any()):
+            raise RuntimeError("power legal non-thumb contact count must be in [0, 4]")
+        if bool((latch_confirm_steps < 0).any()) or bool((stable_steps < 0).any()):
+            raise RuntimeError("power latch/stable step counters must be non-negative")
         if not bool(torch.isfinite(hold_quality).all()) or not bool(
             torch.isfinite(max_force).all()
         ):
@@ -926,6 +944,36 @@ class StrictEpisodeTracker:
         self.arm_hold_release_step = torch.full(
             (num_envs,), -1, dtype=torch.long, device=device
         )
+        # Power-close episode accumulators are separate from legacy
+        # ``ever_grasped``.  The latter is physical-truth plumbing shared with
+        # older reports, while these tensors have thumb+three semantics only.
+        self.max_power_legal_other_contact_count = torch.zeros(
+            num_envs, dtype=torch.long, device=device
+        )
+        self.ever_power_thumb_contact = torch.zeros(
+            num_envs, dtype=torch.bool, device=device
+        )
+        self.ever_power_thumb_plus_three = torch.zeros(
+            num_envs, dtype=torch.bool, device=device
+        )
+        self.ever_power_grasp_latched = torch.zeros(
+            num_envs, dtype=torch.bool, device=device
+        )
+        self.max_power_staged_close_quality = torch.zeros(
+            num_envs, dtype=torch.float32, device=device
+        )
+        self.max_power_wrap_quality = torch.zeros(
+            num_envs, dtype=torch.float32, device=device
+        )
+        self.max_power_grasp_quality = torch.zeros(
+            num_envs, dtype=torch.float32, device=device
+        )
+        self.max_power_latch_confirm_steps = torch.zeros(
+            num_envs, dtype=torch.long, device=device
+        )
+        self.max_power_close_option_stable_steps = torch.zeros(
+            num_envs, dtype=torch.long, device=device
+        )
         self.records: list[dict[str, Any]] = []
 
     @property
@@ -991,8 +1039,13 @@ class StrictEpisodeTracker:
                 "close_option_stable_steps",
                 "power_close_option_stable_steps",
                 "power_legal_other_contact_count",
+                "power_grasp_latch_confirm_steps",
             }
-            float_keys = {"power_wrap_quality", "power_grasp_quality"}
+            float_keys = {
+                "power_close_quality",
+                "power_wrap_quality",
+                "power_grasp_quality",
+            }
             for name in option_keys:
                 _require_vector(
                     f"events[{name!r}]",
@@ -1036,6 +1089,37 @@ class StrictEpisodeTracker:
         self.ever_5cm |= active & (transition_truth.clearance >= 0.05)
         self.ever_20cm |= active & (transition_truth.clearance >= 0.20)
         self.ever_unlatched_5cm |= active & events["unlatched_clearance_ge_5cm"]
+        if self.task_mode == POWER_CLOSE_OPTION_MODE:
+            thumb_contact = events["power_thumb_contact"]
+            legal_other = events["power_legal_other_contact_count"]
+            self.max_power_legal_other_contact_count = torch.where(
+                active,
+                torch.maximum(self.max_power_legal_other_contact_count, legal_other),
+                self.max_power_legal_other_contact_count,
+            )
+            self.ever_power_thumb_contact |= active & thumb_contact
+            self.ever_power_thumb_plus_three |= active & thumb_contact & (legal_other >= 3)
+            self.ever_power_grasp_latched |= active & events["power_is_grasped"]
+            for accumulator, event_name in (
+                (self.max_power_staged_close_quality, "power_close_quality"),
+                (self.max_power_wrap_quality, "power_wrap_quality"),
+                (self.max_power_grasp_quality, "power_grasp_quality"),
+                (
+                    self.max_power_latch_confirm_steps,
+                    "power_grasp_latch_confirm_steps",
+                ),
+                (
+                    self.max_power_close_option_stable_steps,
+                    "power_close_option_stable_steps",
+                ),
+            ):
+                accumulator.copy_(
+                    torch.where(
+                        active,
+                        torch.maximum(accumulator, events[event_name]),
+                        accumulator,
+                    )
+                )
         if self.track_arm_hold_handoff:
             first_released = (
                 active
@@ -1134,17 +1218,80 @@ class StrictEpisodeTracker:
                         "power_close_option_stable_steps": int(
                             events["power_close_option_stable_steps"][env_id].item()
                         ),
+                        "power_is_grasped": bool(
+                            events["power_is_grasped"][env_id].item()
+                        ),
                         "power_thumb_contact": bool(
                             events["power_thumb_contact"][env_id].item()
                         ),
                         "power_legal_other_contact_count": int(
                             events["power_legal_other_contact_count"][env_id].item()
                         ),
+                        "power_close_quality": float(
+                            events["power_close_quality"][env_id].item()
+                        ),
                         "power_wrap_quality": float(
                             events["power_wrap_quality"][env_id].item()
                         ),
                         "power_grasp_quality": float(
                             events["power_grasp_quality"][env_id].item()
+                        ),
+                        "power_grasp_latch_confirm_steps": int(
+                            events["power_grasp_latch_confirm_steps"][env_id].item()
+                        ),
+                        # Explicit terminal aliases preserve the old fields
+                        # above while making their reset-before/last-frame
+                        # semantics unambiguous to downstream analysis.
+                        "terminal_power_is_grasped": bool(
+                            events["power_is_grasped"][env_id].item()
+                        ),
+                        "terminal_power_thumb_contact": bool(
+                            events["power_thumb_contact"][env_id].item()
+                        ),
+                        "terminal_power_legal_other_contact_count": int(
+                            events["power_legal_other_contact_count"][env_id].item()
+                        ),
+                        "terminal_power_staged_close_quality": float(
+                            events["power_close_quality"][env_id].item()
+                        ),
+                        "terminal_power_wrap_quality": float(
+                            events["power_wrap_quality"][env_id].item()
+                        ),
+                        "terminal_power_grasp_quality": float(
+                            events["power_grasp_quality"][env_id].item()
+                        ),
+                        "terminal_power_grasp_latch_confirm_steps": int(
+                            events["power_grasp_latch_confirm_steps"][env_id].item()
+                        ),
+                        "terminal_power_close_option_stable_steps": int(
+                            events["power_close_option_stable_steps"][env_id].item()
+                        ),
+                        "max_power_legal_other_contact_count": int(
+                            self.max_power_legal_other_contact_count[env_id].item()
+                        ),
+                        "ever_power_thumb_contact": bool(
+                            self.ever_power_thumb_contact[env_id].item()
+                        ),
+                        "ever_power_thumb_plus_three": bool(
+                            self.ever_power_thumb_plus_three[env_id].item()
+                        ),
+                        "ever_power_grasp_latched": bool(
+                            self.ever_power_grasp_latched[env_id].item()
+                        ),
+                        "max_power_staged_close_quality": float(
+                            self.max_power_staged_close_quality[env_id].item()
+                        ),
+                        "max_power_wrap_quality": float(
+                            self.max_power_wrap_quality[env_id].item()
+                        ),
+                        "max_power_grasp_quality": float(
+                            self.max_power_grasp_quality[env_id].item()
+                        ),
+                        "max_power_grasp_latch_confirm_steps": int(
+                            self.max_power_latch_confirm_steps[env_id].item()
+                        ),
+                        "max_power_close_option_stable_steps": int(
+                            self.max_power_close_option_stable_steps[env_id].item()
                         ),
                     }
                 )
@@ -1202,6 +1349,15 @@ class StrictEpisodeTracker:
         self.ever_arm_hold_released.masked_fill_(accepted_done, False)
         self.max_arm_hold_stable_steps.masked_fill_(accepted_done, 0)
         self.arm_hold_release_step.masked_fill_(accepted_done, -1)
+        self.max_power_legal_other_contact_count.masked_fill_(accepted_done, 0)
+        self.ever_power_thumb_contact.masked_fill_(accepted_done, False)
+        self.ever_power_thumb_plus_three.masked_fill_(accepted_done, False)
+        self.ever_power_grasp_latched.masked_fill_(accepted_done, False)
+        self.max_power_staged_close_quality.masked_fill_(accepted_done, 0.0)
+        self.max_power_wrap_quality.masked_fill_(accepted_done, 0.0)
+        self.max_power_grasp_quality.masked_fill_(accepted_done, 0.0)
+        self.max_power_latch_confirm_steps.masked_fill_(accepted_done, 0)
+        self.max_power_close_option_stable_steps.masked_fill_(accepted_done, 0)
 
         if len(self.records) > self.episodes:
             raise RuntimeError("episode tracker exceeded its exact episode quota")
@@ -1430,6 +1586,47 @@ def build_strict_metrics(
                     ),
                 }
         metrics["arm_hold_release_topology"] = topology
+    if task_mode == POWER_CLOSE_OPTION_MODE:
+        ever_thumb = sum(bool(record["ever_power_thumb_contact"]) for record in records)
+        ever_thumb_plus_three = sum(
+            bool(record["ever_power_thumb_plus_three"]) for record in records
+        )
+        ever_latched = sum(bool(record["ever_power_grasp_latched"]) for record in records)
+        metrics["power_close_telemetry"] = {
+            "episodes_ever_thumb_contact": ever_thumb,
+            "episodes_ever_thumb_plus_three": ever_thumb_plus_three,
+            "episodes_ever_grasp_latched": ever_latched,
+            "ever_thumb_contact_rate": ever_thumb / episodes,
+            "ever_thumb_plus_three_rate": ever_thumb_plus_three / episodes,
+            "ever_grasp_latched_rate": ever_latched / episodes,
+            "episode_max_legal_other_contact_count": summarize(
+                [
+                    int(record["max_power_legal_other_contact_count"])
+                    for record in records
+                ]
+            ),
+            "episode_max_staged_close_quality": summarize(
+                [float(record["max_power_staged_close_quality"]) for record in records]
+            ),
+            "episode_max_wrap_quality": summarize(
+                [float(record["max_power_wrap_quality"]) for record in records]
+            ),
+            "episode_max_grasp_quality": summarize(
+                [float(record["max_power_grasp_quality"]) for record in records]
+            ),
+            "episode_max_grasp_latch_confirm_steps": summarize(
+                [
+                    int(record["max_power_grasp_latch_confirm_steps"])
+                    for record in records
+                ]
+            ),
+            "episode_max_close_option_stable_steps": summarize(
+                [
+                    int(record["max_power_close_option_stable_steps"])
+                    for record in records
+                ]
+            ),
+        }
     if task_mode == FULL_TASK_MODE:
         metrics["strict_success_rate"] = event_counts["success"] / episodes
     elif task_mode == CLOSE_OPTION_MODE:

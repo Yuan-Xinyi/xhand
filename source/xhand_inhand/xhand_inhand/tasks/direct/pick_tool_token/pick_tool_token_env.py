@@ -1683,8 +1683,13 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             "power_legal_other_contact_count": signals[
                 "power_legal_other_contact_count"
             ].clone(),
+            # Per-environment power-close telemetry must live in the reset-before
+            # snapshot.  Aggregate ``extras['log']`` means cannot recover an
+            # episode maximum after DirectRLEnv has auto-reset a completed row.
+            "power_close_quality": signals["power_close_quality"].clone(),
             "power_wrap_quality": signals["power_wrap_quality"].clone(),
             "power_grasp_quality": signals["power_grasp_quality"].clone(),
+            "power_grasp_latch_confirm_steps": self._power_contact_steps.clone(),
         }
 
         if cfg.close_option_mode:
