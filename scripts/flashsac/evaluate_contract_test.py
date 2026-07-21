@@ -50,6 +50,8 @@ from evaluate import (
     requested_policy_action_contract,
     task_mode_from_option_flags,
     summarize,
+    update_diagnostic_approach_handoff,
+    validate_diagnostic_approach_horizon,
     validate_close_option_evaluation_config,
     validate_curriculum_config,
     validate_hierarchical_arm_hold_evaluation_config,
@@ -1457,6 +1459,95 @@ def test_public_latch_arm_gate_is_memoryless_and_exact() -> None:
     )
 
 
+def test_diagnostic_approach_handoff_debounce_is_explicit() -> None:
+    validate_diagnostic_approach_horizon(
+        enabled=True,
+        episode_length_s=None,
+        min_step=400,
+        hold_steps=4,
+    )
+    validate_diagnostic_approach_horizon(
+        enabled=True,
+        episode_length_s=20.0,
+        min_step=996,
+        hold_steps=4,
+    )
+    _expect_error(
+        ValueError,
+        validate_diagnostic_approach_horizon,
+        enabled=True,
+        episode_length_s=120.0,
+        min_step=400,
+        hold_steps=4,
+    )
+    _expect_error(
+        ValueError,
+        validate_diagnostic_approach_horizon,
+        enabled=True,
+        episode_length_s=20.0,
+        min_step=997,
+        hold_steps=4,
+    )
+    active = torch.tensor([True, True, False])
+    ready_steps = torch.tensor([3, 2, 9], dtype=torch.long)
+    episode_step = torch.tensor([400, 399, 500], dtype=torch.long)
+    score = torch.tensor([0.30, 0.80, 0.90])
+    proximity = torch.tensor([0.02, 0.50, 0.50])
+    force = torch.tensor([30.0, 1.0, 1.0])
+    latch = torch.tensor([False, False, False])
+    result = update_diagnostic_approach_handoff(
+        approach_active=active,
+        ready_steps=ready_steps,
+        episode_step=episode_step,
+        pregrasp_score=score,
+        proximity_quality=proximity,
+        max_force_n=force,
+        grasp_latch=latch,
+        min_step=400,
+        score_threshold=0.30,
+        proximity_threshold=0.02,
+        safe_force_limit_n=30.0,
+        hold_steps=4,
+    )
+    assert torch.equal(result.enter_close, torch.tensor([True, False, False]))
+    assert torch.equal(result.approach_active, torch.tensor([False, True, False]))
+    assert torch.equal(result.ready_steps, torch.tensor([4, 0, 0]))
+    assert torch.equal(ready_steps, torch.tensor([3, 2, 9]))
+
+    blocked = update_diagnostic_approach_handoff(
+        approach_active=torch.ones(3, dtype=torch.bool),
+        ready_steps=torch.tensor([2, 2, 2]),
+        episode_step=torch.full((3,), 500, dtype=torch.long),
+        pregrasp_score=torch.full((3,), 0.9),
+        proximity_quality=torch.full((3,), 0.9),
+        max_force_n=torch.tensor([31.0, 1.0, 1.0]),
+        grasp_latch=torch.tensor([False, True, False]),
+        min_step=400,
+        score_threshold=0.30,
+        proximity_threshold=0.02,
+        safe_force_limit_n=30.0,
+        hold_steps=4,
+    )
+    assert torch.equal(blocked.ready_steps, torch.tensor([0, 0, 3]))
+    assert not bool(blocked.enter_close.any())
+    _expect_error(
+        TypeError,
+        update_diagnostic_approach_handoff,
+        approach_active=active,
+        ready_steps=ready_steps,
+        episode_step=episode_step,
+        pregrasp_score=score,
+        proximity_quality=proximity,
+        max_force_n=force,
+        grasp_latch=latch.float(),
+        min_step=400,
+        score_threshold=0.30,
+        proximity_threshold=0.02,
+        safe_force_limit_n=30.0,
+        hold_steps=4,
+    )
+
+
 def test_public_latch_hand_hold_uses_observed_previous_action() -> None:
     action = torch.arange(42, dtype=torch.float32).reshape(2, 21) / 42.0
     observation = torch.zeros(2, 115)
@@ -2172,6 +2263,7 @@ def main() -> None:
     test_power_close_tracker_metrics_and_hand_action_contract()
     test_coupled_controller_ablation_composition()
     test_public_latch_arm_gate_is_memoryless_and_exact()
+    test_diagnostic_approach_handoff_debounce_is_explicit()
     test_public_latch_hand_hold_uses_observed_previous_action()
     test_curriculum_argument_contract()
     test_checkpoint_architecture_and_path_contract()

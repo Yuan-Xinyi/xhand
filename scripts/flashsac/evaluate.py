@@ -31,6 +31,7 @@ import os
 from pathlib import Path
 import random
 import re
+import sys
 import tempfile
 import traceback
 from typing import Any, Iterator, Mapping, Sequence
@@ -44,6 +45,8 @@ COUPLED_OBSERVATION_DIM = 131
 ACTION_DIM = 21
 ARM_ACTION_DIM = 7
 HAND_ACTION_DIM = 14
+NATIVE_FULL_TASK_EPISODE_LENGTH_S = 20.0
+NATIVE_FULL_TASK_MAX_EPISODE_STEPS = 1000
 FULL_TASK_GRASP_LATCH_OBSERVATION_INDEX = 106
 FULL_TASK_LAST_ARM_TOKEN_ACTION_START = 70
 FULL_TASK_LAST_ARM_TOKEN_ACTION_STOP = 86
@@ -179,6 +182,122 @@ ARM_HOLD_HANDOFF_KEYS = (
     "arm_hold_release_wrap_quality",
     "arm_hold_release_max_force",
 )
+
+
+@dataclass(frozen=True)
+class ApproachHandoffState:
+    """One diagnostic SEARCH-to-CLOSE supervisor update.
+
+    This helper is intentionally explicit about its hidden state.  It is used
+    only to establish an option-composition baseline before the same state is
+    promoted into the environment observation contract.  A checkpoint using
+    this evaluator-side supervisor must not be described as a Markov policy.
+    """
+
+    approach_active: torch.Tensor
+    ready_steps: torch.Tensor
+    enter_close: torch.Tensor
+
+
+def validate_diagnostic_approach_horizon(
+    *,
+    enabled: bool,
+    episode_length_s: float | None,
+    min_step: int,
+    hold_steps: int,
+) -> None:
+    """Keep the diagnostic hierarchy on the native 20 s task horizon."""
+
+    if not enabled:
+        return
+    if episode_length_s is not None and not math.isclose(
+        episode_length_s,
+        NATIVE_FULL_TASK_EPISODE_LENGTH_S,
+        rel_tol=0.0,
+        abs_tol=1.0e-9,
+    ):
+        raise ValueError(
+            "--approach_checkpoint requires the native 20 s full-task horizon"
+        )
+    if min_step < 0 or hold_steps < 1:
+        raise ValueError(
+            "approach handoff min_step must be non-negative and hold_steps positive"
+        )
+    if min_step + hold_steps > NATIVE_FULL_TASK_MAX_EPISODE_STEPS:
+        raise ValueError(
+            "approach handoff minimum step plus debounce exceeds the native horizon"
+        )
+
+
+def update_diagnostic_approach_handoff(
+    *,
+    approach_active: torch.Tensor,
+    ready_steps: torch.Tensor,
+    episode_step: torch.Tensor,
+    pregrasp_score: torch.Tensor,
+    proximity_quality: torch.Tensor,
+    max_force_n: torch.Tensor,
+    grasp_latch: torch.Tensor,
+    min_step: int,
+    score_threshold: float,
+    proximity_threshold: float,
+    safe_force_limit_n: float,
+    hold_steps: int,
+) -> ApproachHandoffState:
+    """Debounce the audited geometric handoff gate without mutating inputs."""
+
+    tensors = {
+        "approach_active": approach_active,
+        "ready_steps": ready_steps,
+        "episode_step": episode_step,
+        "pregrasp_score": pregrasp_score,
+        "proximity_quality": proximity_quality,
+        "max_force_n": max_force_n,
+        "grasp_latch": grasp_latch,
+    }
+    shape = approach_active.shape
+    if approach_active.dtype != torch.bool or approach_active.ndim != 1:
+        raise TypeError("approach_active must be a one-dimensional bool tensor")
+    for name, value in tensors.items():
+        if not isinstance(value, torch.Tensor) or value.shape != shape:
+            raise ValueError(f"{name} must have shape {tuple(shape)}")
+        if value.device != approach_active.device:
+            raise ValueError("approach handoff tensors must share a device")
+    if ready_steps.dtype != torch.long or episode_step.dtype != torch.long:
+        raise TypeError("ready_steps and episode_step must use torch.long")
+    if grasp_latch.dtype != torch.bool:
+        raise TypeError("grasp_latch must use torch.bool")
+    for name in ("pregrasp_score", "proximity_quality", "max_force_n"):
+        value = tensors[name]
+        if not value.is_floating_point() or not bool(torch.isfinite(value).all()):
+            raise ValueError(f"{name} must be a finite floating tensor")
+    if min_step < 0 or hold_steps < 1:
+        raise ValueError("min_step must be non-negative and hold_steps positive")
+    for name, value in (
+        ("score_threshold", score_threshold),
+        ("proximity_threshold", proximity_threshold),
+    ):
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be finite and in [0, 1]")
+    if not math.isfinite(safe_force_limit_n) or safe_force_limit_n <= 0.0:
+        raise ValueError("safe_force_limit_n must be finite and positive")
+
+    ready_now = (
+        approach_active
+        & (episode_step >= min_step)
+        & (~grasp_latch)
+        & (pregrasp_score >= score_threshold)
+        & (proximity_quality >= proximity_threshold)
+        & (max_force_n <= safe_force_limit_n)
+    )
+    next_ready_steps = torch.where(
+        ready_now,
+        ready_steps + 1,
+        torch.zeros_like(ready_steps),
+    )
+    enter_close = approach_active & (next_ready_steps >= hold_steps)
+    next_active = approach_active & (~enter_close)
+    return ApproachHandoffState(next_active, next_ready_steps, enter_close)
 
 
 def _validate_task_mode(task_mode: str) -> str:
@@ -1287,6 +1406,47 @@ def _read_physical_truth(
         name="runtime_truth",
     )
     return truth
+
+
+def _diagnostic_pregrasp_measurements(
+    unwrapped: Any,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Read the historical geometric handoff gate from live simulator state.
+
+    The score intentionally matches ``base_handoff_close_dataset.py`` byte for
+    byte in semantics.  It is privileged evaluator state and is therefore
+    reported as a diagnostic supervisor, never as part of the deployed policy.
+    """
+
+    unwrapped._compute_intermediate_values()
+    signals = unwrapped._compute_grasp_signals()
+    distances = unwrapped._curr_fingertip_distances
+    other_distances = distances[:, unwrapped._other_ee_idx]
+    nearest_distances, nearest_indices = torch.topk(
+        other_distances, k=2, dim=1, largest=False
+    )
+    grasp_distance = (
+        distances[:, unwrapped._thumb_ee_idx] + nearest_distances.sum(dim=-1)
+    ) / 3.0
+    other_alignment = unwrapped._finger_align[:, unwrapped._other_ee_idx]
+    alignment = (
+        unwrapped._finger_align[:, unwrapped._thumb_ee_idx]
+        + torch.gather(other_alignment, 1, nearest_indices).sum(dim=-1)
+    ) / 3.0
+    to_handle = unwrapped.handle_center_w - unwrapped.palm_center_w
+    to_handle = to_handle / to_handle.norm(dim=-1, keepdim=True).clamp_min(1.0e-6)
+    palm_facing = 0.5 * (
+        1.0 + (unwrapped.palm_normal_w * to_handle).sum(dim=-1)
+    )
+    clearance = unwrapped._object_true_min_z() - unwrapped._table_surface_z
+    score = torch.exp(-grasp_distance / 0.025) * alignment * palm_facing
+    score = torch.where(clearance.abs() <= 0.005, score, torch.zeros_like(score))
+    return (
+        score.detach().to(dtype=torch.float32),
+        signals["proximity_quality"].detach().to(dtype=torch.float32),
+        signals["force_magnitude"].detach().amax(dim=-1).to(dtype=torch.float32),
+        unwrapped._is_grasped.detach().to(dtype=torch.bool),
+    )
 
 
 def episode_quotas(episodes: int, num_envs: int, *, device: torch.device) -> torch.Tensor:
@@ -2563,6 +2723,38 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _load_diagnostic_approach_actor(
+    checkpoint: Path,
+    *,
+    device: torch.device,
+) -> Any:
+    """Load the frozen rl_games policy used only by the hierarchy baseline."""
+
+    rl_games_script_dir = Path(__file__).resolve().parents[1] / "rl_games"
+    if str(rl_games_script_dir) not in sys.path:
+        sys.path.insert(0, str(rl_games_script_dir))
+    from bc_pick_tool import MigratedActor, load_torch
+
+    raw = load_torch(checkpoint)
+    if not isinstance(raw, dict):
+        raise TypeError("approach checkpoint root is not a dictionary")
+    if isinstance(raw.get("model"), dict):
+        payload = raw
+    else:
+        payload = raw[0] if 0 in raw else raw.get("0")
+    if not isinstance(payload, dict) or not isinstance(payload.get("model"), dict):
+        raise KeyError(
+            "approach checkpoint must contain {'model': state_dict}, optionally below root key 0"
+        )
+    actor = MigratedActor(payload["model"]).to(device).eval()
+    if actor.observation_dim != OBSERVATION_DIM or actor.action_dim != ACTION_DIM:
+        raise RuntimeError(
+            "approach actor must use the 115/21 PickTool contract, got "
+            f"{actor.observation_dim}/{actor.action_dim}"
+        )
+    return actor
+
+
 def load_checkpoint_teacher_prior(
     *,
     checkpoint: Path,
@@ -2635,6 +2827,28 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
     parser.add_argument("--episodes", type=int, default=256)
     parser.add_argument("--num_envs", type=int, default=256)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--approach_checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Diagnostic hierarchy only: run this frozen rl_games 115/21 actor during "
+            "SEARCH, then hand control in-place to a checkpoint-native FlashSAC "
+            "CLOSE/LIFT router. The evaluator-side handoff state is explicitly non-Markov."
+        ),
+    )
+    parser.add_argument(
+        "--approach_base_only",
+        action="store_true",
+        help=(
+            "With --approach_checkpoint, keep the frozen SEARCH actor for the whole "
+            "episode. This is the paired native-horizon baseline and performs no handoff."
+        ),
+    )
+    parser.add_argument("--approach_handoff_min_step", type=int, default=400)
+    parser.add_argument("--approach_handoff_score", type=float, default=0.30)
+    parser.add_argument("--approach_handoff_min_proximity", type=float, default=0.02)
+    parser.add_argument("--approach_handoff_hold_steps", type=int, default=4)
     parser.add_argument(
         "--architecture",
         choices=("production", "smoke", "auto"),
@@ -2923,6 +3137,46 @@ def _validate_args(args: argparse.Namespace) -> None:
     )
     if args.episodes < 1 or args.num_envs < 1:
         raise ValueError("--episodes and --num_envs must be positive")
+    if args.approach_base_only and args.approach_checkpoint is None:
+        raise ValueError("--approach_base_only requires --approach_checkpoint")
+    if args.approach_checkpoint is not None:
+        if task_mode != FULL_TASK_MODE:
+            raise ValueError("--approach_checkpoint requires full-task mode")
+        if not args.approach_checkpoint.is_file() or args.approach_checkpoint.is_symlink():
+            raise FileNotFoundError(
+                "--approach_checkpoint must be a regular non-symlink checkpoint file"
+            )
+        if args.curriculum_dataset is not None or args.curriculum_probability != 0.0:
+            raise ValueError(
+                "--approach_checkpoint is a default-reset evaluation and rejects curriculum"
+            )
+        if args.hold_arm_until_stable_grasp or args.gate_arm_until_grasp_latch:
+            raise ValueError(
+                "--approach_checkpoint cannot be combined with another evaluator arm supervisor"
+            )
+        if args.hold_hand_after_grasp_latch:
+            raise ValueError(
+                "--approach_checkpoint cannot be combined with --hold_hand_after_grasp_latch"
+            )
+    validate_diagnostic_approach_horizon(
+        enabled=args.approach_checkpoint is not None,
+        episode_length_s=args.episode_length_s,
+        min_step=args.approach_handoff_min_step,
+        hold_steps=args.approach_handoff_hold_steps,
+    )
+    if args.approach_handoff_min_step < 0:
+        raise ValueError("--approach_handoff_min_step must be non-negative")
+    if args.approach_handoff_hold_steps < 1:
+        raise ValueError("--approach_handoff_hold_steps must be positive")
+    for name, value in (
+        ("--approach_handoff_score", args.approach_handoff_score),
+        (
+            "--approach_handoff_min_proximity",
+            args.approach_handoff_min_proximity,
+        ),
+    ):
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be finite and in [0, 1]")
     if args.max_vector_steps is not None and args.max_vector_steps < 1:
         raise ValueError("--max_vector_steps must be positive")
     if args.episode_length_s is not None and (
@@ -3074,6 +3328,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     checkpoint_authority = checkpoint_contract.get("policy_action_authority", [])
     checkpoint_router = checkpoint_contract.get("policy_router")
     checkpoint_native_router = checkpoint_router is not None
+    if (
+        args.approach_checkpoint is not None
+        and not args.approach_base_only
+        and not checkpoint_native_router
+    ):
+        raise ValueError(
+            "diagnostic SEARCH handoff requires a checkpoint-native CLOSE/LIFT router"
+        )
     expected_public_latch_authority = [
         {
             "name": "arm_after_public_latch",
@@ -3193,6 +3455,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             else None
         ),
     )
+    if args.approach_checkpoint is not None and (
+        not math.isclose(
+            float(env.unwrapped.cfg.episode_length_s),
+            NATIVE_FULL_TASK_EPISODE_LENGTH_S,
+            rel_tol=0.0,
+            abs_tol=1.0e-9,
+        )
+        or env.max_episode_steps != NATIVE_FULL_TASK_MAX_EPISODE_STEPS
+    ):
+        raise RuntimeError(
+            "diagnostic approach hierarchy requires native 20 s / 1000-step termination"
+        )
     task_cfg = env.unwrapped.cfg
     close_option_confirm_steps = int(task_cfg.close_option_confirm_steps)
     close_option_min_hold_quality = float(task_cfg.close_option_min_hold_quality)
@@ -3325,6 +3599,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("checkpoint task contract changed while the actor was loading")
     if _sha256(checkpoint / "actor.pt") != checkpoint_actor_sha256:
         raise RuntimeError("checkpoint actor.pt changed while the actor was loading")
+    approach_checkpoint = (
+        args.approach_checkpoint.resolve()
+        if args.approach_checkpoint is not None
+        else None
+    )
+    approach_checkpoint_sha256 = (
+        _sha256(approach_checkpoint) if approach_checkpoint is not None else None
+    )
+    approach_actor = (
+        _load_diagnostic_approach_actor(approach_checkpoint, device=device)
+        if approach_checkpoint is not None
+        else None
+    )
+    if (
+        approach_checkpoint is not None
+        and _sha256(approach_checkpoint) != approach_checkpoint_sha256
+    ):
+        raise RuntimeError("approach checkpoint changed while its actor was loading")
     # A deterministic evaluation never consumes cached noise.  Reset it anyway
     # so a checkpoint trained with another num_envs cannot leak stale shape.
     agent.reset_exploration(batch_size=args.num_envs)
@@ -3344,13 +3636,90 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     max_vector_steps = args.max_vector_steps or default_max_steps
     vector_steps = 0
     router_route_counts = torch.zeros(2, dtype=torch.long, device=env.device)
+    approach_active = torch.full(
+        (args.num_envs,),
+        approach_actor is not None,
+        dtype=torch.bool,
+        device=env.device,
+    )
+    approach_ready_steps = torch.zeros(
+        args.num_envs, dtype=torch.long, device=env.device
+    )
+    approach_episode_step = torch.zeros(
+        args.num_envs, dtype=torch.long, device=env.device
+    )
+    approach_handoff_seen = torch.zeros(
+        args.num_envs, dtype=torch.bool, device=env.device
+    )
+    approach_handoff_step = torch.full(
+        (args.num_envs,), -1, dtype=torch.long, device=env.device
+    )
+    approach_ever_post_handoff_latch = torch.zeros(
+        args.num_envs, dtype=torch.bool, device=env.device
+    )
+    approach_max_pregrasp_score = torch.zeros(
+        args.num_envs, dtype=torch.float32, device=env.device
+    )
+    hierarchy_approach_rows = torch.zeros((), dtype=torch.long, device=env.device)
+    hierarchy_flashsac_rows = torch.zeros((), dtype=torch.long, device=env.device)
 
     try:
         while not tracker.complete and vector_steps < max_vector_steps:
             vector_steps += 1
+            if approach_actor is not None:
+                (
+                    pregrasp_score,
+                    proximity_quality,
+                    max_force_n,
+                    physical_latch,
+                ) = _diagnostic_pregrasp_measurements(env.unwrapped)
+                observed_latch = (
+                    observation[:, FULL_TASK_GRASP_LATCH_OBSERVATION_INDEX] == 1.0
+                )
+                if not torch.equal(physical_latch, observed_latch):
+                    raise RuntimeError(
+                        "diagnostic hierarchy observed latch disagrees with physical latch"
+                    )
+                approach_max_pregrasp_score.copy_(
+                    torch.where(
+                        tracker.active & approach_active,
+                        torch.maximum(
+                            approach_max_pregrasp_score, pregrasp_score
+                        ),
+                        approach_max_pregrasp_score,
+                    )
+                )
+                if not args.approach_base_only:
+                    handoff = update_diagnostic_approach_handoff(
+                        approach_active=approach_active,
+                        ready_steps=approach_ready_steps,
+                        episode_step=approach_episode_step,
+                        pregrasp_score=pregrasp_score,
+                        proximity_quality=proximity_quality,
+                        max_force_n=max_force_n,
+                        grasp_latch=physical_latch,
+                        min_step=args.approach_handoff_min_step,
+                        score_threshold=args.approach_handoff_score,
+                        proximity_threshold=args.approach_handoff_min_proximity,
+                        safe_force_limit_n=close_option_safe_force_limit,
+                        hold_steps=args.approach_handoff_hold_steps,
+                    )
+                    new_handoff = tracker.active & handoff.enter_close
+                    approach_handoff_seen |= new_handoff
+                    approach_handoff_step = torch.where(
+                        new_handoff,
+                        approach_episode_step,
+                        approach_handoff_step,
+                    )
+                    approach_active = handoff.approach_active
+                    approach_ready_steps = handoff.ready_steps
+                approach_ever_post_handoff_latch |= (
+                    tracker.active & approach_handoff_seen & physical_latch
+                )
+            flashsac_active = tracker.active & (~approach_active)
             if checkpoint_native_router:
                 active_latch = observation[
-                    tracker.active, FULL_TASK_GRASP_LATCH_OBSERVATION_INDEX
+                    flashsac_active, FULL_TASK_GRASP_LATCH_OBSERVATION_INDEX
                 ]
                 router_route_counts[0].add_((active_latch == 0.0).sum())
                 router_route_counts[1].add_((active_latch == 1.0).sum())
@@ -3364,6 +3733,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     {"next_observation": observation},
                     training=False,
                 )
+            if approach_actor is not None:
+                with torch.no_grad():
+                    approach_action = approach_actor(observation[:, :OBSERVATION_DIM])
+                if approach_action.shape != action.shape:
+                    raise RuntimeError(
+                        "approach actor action shape differs from the FlashSAC policy"
+                    )
+                if not bool(torch.isfinite(approach_action).all()):
+                    raise FloatingPointError("approach actor produced a non-finite action")
+                approach_action = approach_action.clamp(-1.0, 1.0)
+                action = torch.where(
+                    approach_active.unsqueeze(-1), approach_action, action
+                )
+                hierarchy_approach_rows.add_(
+                    (tracker.active & approach_active).sum()
+                )
+                hierarchy_flashsac_rows.add_(flashsac_active.sum())
             if controller_ablation is not None:
                 assert teacher_prior is not None
                 teacher_action = teacher_prior.teacher_action(observation)
@@ -3414,10 +3800,40 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 grasp_quality_threshold=grasp_quality_threshold,
                 safe_force_limit=close_option_safe_force_limit,
             )
+            active_before_step = tracker.active
+            accepted_done = active_before_step & (terminated | truncated)
+            if approach_actor is not None:
+                approach_ever_post_handoff_latch |= (
+                    active_before_step
+                    & approach_handoff_seen
+                    & transition_truth.grasped
+                )
+                done_hierarchy = {
+                    int(env_id): {
+                        "hierarchy_handoff": bool(
+                            approach_handoff_seen[env_id].item()
+                        ),
+                        "hierarchy_handoff_step": int(
+                            approach_handoff_step[env_id].item()
+                        ),
+                        "hierarchy_ever_post_handoff_latch": bool(
+                            approach_ever_post_handoff_latch[env_id].item()
+                        ),
+                        "hierarchy_max_pregrasp_score": float(
+                            approach_max_pregrasp_score[env_id].item()
+                        ),
+                    }
+                    for env_id in accepted_done.nonzero(
+                        as_tuple=False
+                    ).squeeze(-1).detach().cpu().tolist()
+                }
+            else:
+                done_hierarchy = {}
             # DirectRLEnv has already reset done rows at this point.  This read
             # is used only to initialize their next episode; old-episode maxima
             # above came exclusively from the reset-before terminal payload.
             post_reset_truth = _read_physical_truth(env.unwrapped, task_mode=task_mode)
+            records_before = len(tracker.records)
             tracker.step(
                 reward=reward.to(dtype=torch.float32),
                 terminated=terminated,
@@ -3426,6 +3842,35 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 transition_truth=transition_truth,
                 post_reset_truth=post_reset_truth,
             )
+            if approach_actor is not None:
+                new_records = tracker.records[records_before:]
+                if len(new_records) != len(done_hierarchy):
+                    raise RuntimeError(
+                        "hierarchy metadata count disagrees with accepted episode records"
+                    )
+                for record in new_records:
+                    env_id = int(record["env_slot"])
+                    record.update(done_hierarchy[env_id])
+
+                next_step = approach_episode_step + active_before_step.long()
+                approach_episode_step = torch.where(
+                    accepted_done,
+                    torch.zeros_like(approach_episode_step),
+                    next_step,
+                )
+                reset_active = torch.full_like(
+                    approach_active, approach_actor is not None
+                )
+                approach_active = torch.where(
+                    accepted_done, reset_active, approach_active
+                )
+                approach_ready_steps.masked_fill_(accepted_done, 0)
+                approach_handoff_seen.masked_fill_(accepted_done, False)
+                approach_handoff_step.masked_fill_(accepted_done, -1)
+                approach_ever_post_handoff_latch.masked_fill_(
+                    accepted_done, False
+                )
+                approach_max_pregrasp_score.masked_fill_(accepted_done, 0.0)
             observation = next_observation
 
         if not tracker.complete:
@@ -3609,6 +4054,119 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "checkpoint V5 authority: arm7=0 iff actor-visible latch[106]=0"
                 ),
             }
+        if approach_actor is not None:
+            assert approach_checkpoint is not None
+            assert approach_checkpoint_sha256 is not None
+            if _sha256(approach_checkpoint) != approach_checkpoint_sha256:
+                raise RuntimeError(
+                    "approach checkpoint changed during strict evaluation; refusing metrics"
+                )
+            hierarchy_records = tracker.records
+            handoff_records = [
+                record
+                for record in hierarchy_records
+                if bool(record["hierarchy_handoff"])
+            ]
+            base_only_records = [
+                record
+                for record in hierarchy_records
+                if not bool(record["hierarchy_handoff"])
+            ]
+
+            def hierarchy_cohort(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+                count = len(records)
+                successes = sum(bool(record["success"]) for record in records)
+                return {
+                    "episodes": count,
+                    "strict_success_count": successes,
+                    "strict_success_rate": successes / count if count else None,
+                    "ever_grasped_count": sum(
+                        bool(record["ever_grasped"]) for record in records
+                    ),
+                    "ever_clearance_ge_5cm_count": sum(
+                        bool(record["ever_clearance_ge_5cm"]) for record in records
+                    ),
+                    "ever_clearance_ge_20cm_count": sum(
+                        bool(record["ever_clearance_ge_20cm"]) for record in records
+                    ),
+                    "unlatched_clearance_ge_5cm_count": sum(
+                        bool(record["ever_unlatched_clearance_ge_5cm"])
+                        for record in records
+                    ),
+                    "dropped_count": sum(
+                        bool(record["dropped"]) for record in records
+                    ),
+                    "unsafe_force_count": sum(
+                        bool(record["unsafe_force"]) for record in records
+                    ),
+                }
+
+            metrics["diagnostic_approach_hierarchy"] = {
+                "mode": (
+                    "frozen_rlgames_base_only"
+                    if args.approach_base_only
+                    else "frozen_rlgames_search_then_flashsac_close_lift"
+                ),
+                "markov_policy": bool(args.approach_base_only),
+                "deployment_claim_allowed": bool(args.approach_base_only),
+                "reason_non_markov": (
+                    None
+                    if args.approach_base_only
+                    else (
+                        "handoff debounce and episode-step gate live in evaluator state; "
+                        "this experiment only tests option composition"
+                    )
+                ),
+                "approach_checkpoint": str(approach_checkpoint),
+                "approach_checkpoint_sha256": approach_checkpoint_sha256,
+                "approach_observation_dim": OBSERVATION_DIM,
+                "approach_action_dim": ACTION_DIM,
+                "approach_action_sampling": "deterministic_rl_games_mean",
+                "approach_rows": int(hierarchy_approach_rows.item()),
+                "flashsac_rows": int(hierarchy_flashsac_rows.item()),
+                "handoff_count": len(handoff_records),
+                "post_handoff_latch_count": sum(
+                    bool(record["hierarchy_ever_post_handoff_latch"])
+                    for record in handoff_records
+                ),
+                "handoff_step": (
+                    summarize(
+                        [
+                            int(record["hierarchy_handoff_step"])
+                            for record in handoff_records
+                        ]
+                    )
+                    if handoff_records
+                    else None
+                ),
+                "episode_max_pregrasp_score": summarize(
+                    [
+                        float(record["hierarchy_max_pregrasp_score"])
+                        for record in hierarchy_records
+                    ]
+                ),
+                "base_only_outcomes": hierarchy_cohort(base_only_records),
+                "assisted_outcomes": hierarchy_cohort(handoff_records),
+                "supervisor": {
+                    "minimum_zero_based_episode_step": (
+                        args.approach_handoff_min_step
+                    ),
+                    "pregrasp_score_threshold": args.approach_handoff_score,
+                    "minimum_proximity_quality": (
+                        args.approach_handoff_min_proximity
+                    ),
+                    "hold_steps": args.approach_handoff_hold_steps,
+                    "safe_force_limit_n": close_option_safe_force_limit,
+                    "requires_unlatched": True,
+                    "requires_abs_true_clearance_le_m": 0.005,
+                },
+            }
+            metrics["policy"] = (
+                "diagnostic_frozen_rlgames_base_only"
+                if args.approach_base_only
+                else "diagnostic_frozen_rlgames_search_then_"
+                "checkpoint_native_flashsac_close_lift"
+            )
         _atomic_write_json(args.output.resolve(), metrics)
         return metrics
     finally:
