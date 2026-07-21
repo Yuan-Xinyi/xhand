@@ -831,7 +831,10 @@ class FlashSACTorchBridge(FlashSACAgent):
             predicted_mean, predicted_std = self._actor.apply(
                 "get_mean_and_std",
                 observations=actor_observation,
-                training=True,
+                # Rehearse the exact function used by collection/evaluation.
+                # Gradients remain enabled; only BatchNorm switches from
+                # transient batch statistics to its fixed deployment buffers.
+                training=False,
             )
             action_loss_elementwise = F.smooth_l1_loss(
                 predicted_mean,

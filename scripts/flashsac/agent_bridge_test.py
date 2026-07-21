@@ -14,6 +14,7 @@ from typing import Any
 
 import gymnasium as gym
 import torch
+import torch.nn.functional as F
 
 from agent_bridge import (
     ActionNoiseGroup,
@@ -94,6 +95,35 @@ def _transition(observation: torch.Tensor, action: torch.Tensor) -> dict[str, to
         "terminated": torch.zeros(num_envs, dtype=torch.bool, device=observation.device),
         "truncated": torch.zeros(num_envs, dtype=torch.bool, device=observation.device),
         "next_observation": observation.add(0.25),
+    }
+
+
+def _actor_batch_norm_buffers(
+    agent: FlashSACTorchBridge,
+) -> dict[str, torch.Tensor]:
+    buffers = {
+        name.removeprefix("_orig_mod."): value.detach().clone()
+        for name, value in agent._actor.network.named_buffers()  # noqa: SLF001
+        if name.endswith(("running_mean", "running_var"))
+    }
+    assert buffers, "FlashSAC actor regression requires stateful BatchNorm buffers"
+    return buffers
+
+
+def _assert_actor_batch_norm_buffers_equal(
+    agent: FlashSACTorchBridge,
+    expected: dict[str, torch.Tensor],
+) -> None:
+    actual = _actor_batch_norm_buffers(agent)
+    assert actual.keys() == expected.keys()
+    for name, value in expected.items():
+        torch.testing.assert_close(actual[name], value, rtol=0.0, atol=0.0)
+
+
+def _actor_parameters(agent: FlashSACTorchBridge) -> dict[str, torch.Tensor]:
+    return {
+        name.removeprefix("_orig_mod."): value.detach().clone()
+        for name, value in agent._actor.network.named_parameters()  # noqa: SLF001
     }
 
 
@@ -240,6 +270,97 @@ def test_critic_burnin_and_demo_only_actor_rehearsal() -> None:
     assert any(
         not torch.equal(agent._actor.network.state_dict()[key], expected)  # noqa: SLF001
         for key, expected in actor_before.items()
+    )
+
+
+def test_sac_actor_update_uses_frozen_deployment_batch_norm() -> None:
+    """SAC must optimize the deployed actor without adapting actor BN buffers."""
+
+    torch.manual_seed(203)
+    agent = _agent(actor_update_period=1)
+    # This is deliberately far from the actor's initial running statistics. A
+    # training-mode actor forward would visibly overwrite every BN buffer.
+    observation = 40.0 + 3.0 * torch.randn(NUM_ENVS, OBSERVATION_DIM)
+    action = torch.zeros(NUM_ENVS, ACTION_DIM)
+    agent.process_transition(_transition(observation, action))
+    buffers_before = _actor_batch_norm_buffers(agent)
+    parameters_before = _actor_parameters(agent)
+
+    forward_training_flags: list[bool] = []
+
+    def record_actor_mode(_module, _args, kwargs):
+        forward_training_flags.append(bool(kwargs["training"]))
+
+    handle = agent._actor.network.register_forward_pre_hook(  # noqa: SLF001
+        record_actor_mode,
+        with_kwargs=True,
+    )
+    try:
+        metrics = agent.update(actor_enabled=True)
+    finally:
+        handle.remove()
+
+    assert "actor/loss" in metrics
+    # Both the optimized actor forward and the target-action forward must use
+    # the same running-statistics path as deployment.
+    assert forward_training_flags and not any(forward_training_flags)
+    _assert_actor_batch_norm_buffers_equal(agent, buffers_before)
+    parameters_after = _actor_parameters(agent)
+    assert any(
+        not torch.equal(parameters_after[name], value)
+        for name, value in parameters_before.items()
+    ), "actor optimizer did not update deployment-path parameters"
+
+
+def test_demo_rehearsal_optimizes_deployment_path_without_bn_drift() -> None:
+    """Demo correction must reduce inference loss while keeping BN fixed."""
+
+    torch.manual_seed(204)
+    agent = _agent(actor_update_period=1)
+    observation = 35.0 + 4.0 * torch.randn(32, OBSERVATION_DIM)
+    with torch.no_grad():
+        initial_mean, _ = agent._actor.apply(  # noqa: SLF001
+            "get_mean_and_std",
+            observations=observation,
+            training=False,
+        )
+        # Stay away from tanh saturation so atanh(action) recovers this target
+        # exactly inside demo_bc_rehearsal.
+        target_mean = initial_mean.clamp(-1.5, 1.5) + 0.25
+        target_action = torch.tanh(target_mean)
+    buffers_before = _actor_batch_norm_buffers(agent)
+    parameters_before = _actor_parameters(agent)
+
+    def deployment_loss() -> torch.Tensor:
+        mean, _ = agent._actor.apply(  # noqa: SLF001
+            "get_mean_and_std",
+            observations=observation,
+            training=False,
+        )
+        return F.smooth_l1_loss(mean, target_mean, beta=1.0)
+
+    with torch.no_grad():
+        loss_before = deployment_loss()
+    for _ in range(8):
+        metrics = agent.demo_bc_rehearsal(
+            {"observation": observation, "action": target_action},
+            weight=1.0,
+            target_std=0.15,
+            std_weight=0.0,
+        )
+        assert all(torch.isfinite(torch.tensor(value)) for value in metrics.values())
+    with torch.no_grad():
+        loss_after = deployment_loss()
+
+    _assert_actor_batch_norm_buffers_equal(agent, buffers_before)
+    assert loss_after < loss_before, (
+        "demo rehearsal failed to improve the deployed inference function: "
+        f"before={float(loss_before)}, after={float(loss_after)}"
+    )
+    parameters_after = _actor_parameters(agent)
+    assert any(
+        not torch.equal(parameters_after[name], value)
+        for name, value in parameters_before.items()
     )
 
 
@@ -574,6 +695,10 @@ def main() -> None:
     print("[PASS] fresh rollout boundary resets only trajectory-local state")
     test_critic_burnin_and_demo_only_actor_rehearsal()
     print("[PASS] critic burn-in and demo-only actor rehearsal")
+    test_sac_actor_update_uses_frozen_deployment_batch_norm()
+    print("[PASS] SAC actor update uses frozen deployment BatchNorm")
+    test_demo_rehearsal_optimizes_deployment_path_without_bn_drift()
+    print("[PASS] demo rehearsal optimizes deployment path without BatchNorm drift")
     test_partial_reset_refreshes_only_completed_envs()
     print("[PASS] per-environment exploration reset")
     test_cuda_interaction_has_no_host_round_trip()
