@@ -17,6 +17,9 @@ if str(HERE) not in sys.path:
 
 from actor_rehearsal import (  # noqa: E402
     ACTOR_REHEARSAL_KEYS,
+    PICK_TOOL_ACTOR_DEMO_CONTRACTS,
+    PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS,
+    PICK_TOOL_LIFT_ACTOR_DEMO_CONTRACTS,
     ActorRehearsalReservoir,
     load_actor_rehearsal,
     sha256_file,
@@ -109,6 +112,144 @@ def test_loader_accepts_obs_action_only_and_audits_success() -> None:
             action_dim=ACTION_DIM,
         )
         assert set(projected) == {"observation", "action"}
+
+
+def _pick_tool_actor_payload(*, close: bool, production_close: bool = False) -> dict[str, Any]:
+    payload = _teacher_payload()
+    required_phase = 1 if close else 3
+    payload["phase"] = torch.full((6,), required_phase, dtype=torch.uint8)
+    metadata: dict[str, Any] = {
+        "format_version": 1,
+        "observation_dim": OBSERVATION_DIM,
+        "action_dim": ACTION_DIM,
+        "action_layout": "arm_delta7|crossdex_token9|distal_residual5",
+        "observation_layout": "legacy_prefix87|distal_action5|grasp_transport23",
+        "phase_names": ["approach", "close", "micro", "lift", "settle"],
+        "close_arm_mode": "zero",
+        "first_observation_last_action_max_error": 0.0,
+    }
+    if close:
+        metadata.update(
+            {
+                "collector": "online_frozen_base_to_close_teacher",
+            }
+        )
+        if production_close:
+            metadata.update(
+                {
+                    "dataset_phase": "close",
+                    "teacher_probability": 1.0,
+                    "executed_teacher_fraction": 1.0,
+                    "option_teacher_arm_action_abs_max": 0.0,
+                }
+            )
+        else:
+            metadata["close_teacher_arm_action_abs_max"] = 0.0
+    else:
+        metadata.update(
+            {
+                "collector": "online_base_close_to_scripted_lift_teacher",
+                "dataset_phase": "lift",
+                "teacher_probability": 1.0,
+                "executed_teacher_fraction": 1.0,
+            }
+        )
+    payload["meta"] = metadata
+    return payload
+
+
+def test_pick_tool_actor_demo_allowlist_and_phase_contracts() -> None:
+    with tempfile.TemporaryDirectory(prefix="actor_rehearsal_allowlist_") as directory:
+        root = Path(directory)
+        for close, production_close, expected_contract, expected_phase in (
+            (False, False, "scripted_lift_teacher", 3),
+            (True, False, "frozen_base_close_teacher_legacy", 1),
+            (True, True, "frozen_base_close_teacher", 1),
+        ):
+            suffix = "production" if production_close else "legacy"
+            path = root / f"{'close_' + suffix if close else 'lift'}.pt"
+            _write_payload(
+                path,
+                _pick_tool_actor_payload(close=close, production_close=production_close),
+            )
+            _, phase, audit = load_actor_rehearsal(
+                path,
+                device="cpu",
+                observation_dim=OBSERVATION_DIM,
+                action_dim=ACTION_DIM,
+                allowed_contracts=PICK_TOOL_ACTOR_DEMO_CONTRACTS,
+            )
+            assert phase is not None and bool((phase == expected_phase).all())
+            assert audit["source_contract"] == expected_contract
+            assert audit["dataset_phase"] == (
+                "close" if production_close else (None if close else "lift")
+            )
+
+        assert {contract.required_phase for contract in PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS} == {1}
+        assert {contract.required_phase for contract in PICK_TOOL_LIFT_ACTOR_DEMO_CONTRACTS} == {3}
+
+        lift_path = root / "lift.pt"
+        _expect_error(
+            ValueError,
+            load_actor_rehearsal,
+            lift_path,
+            device="cpu",
+            observation_dim=OBSERVATION_DIM,
+            action_dim=ACTION_DIM,
+            allowed_contracts=PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS,
+        )
+        _expect_error(
+            ValueError,
+            load_actor_rehearsal,
+            root / "close_production.pt",
+            device="cpu",
+            observation_dim=OBSERVATION_DIM,
+            action_dim=ACTION_DIM,
+            allowed_contracts=PICK_TOOL_LIFT_ACTOR_DEMO_CONTRACTS,
+        )
+
+        dagger_close = _pick_tool_actor_payload(close=True, production_close=True)
+        dagger_close["meta"]["teacher_probability"] = 0.25
+        dagger_close["meta"]["executed_teacher_fraction"] = 0.2
+        dagger_path = root / "close_dagger.pt"
+        _write_payload(dagger_path, dagger_close)
+        _, dagger_phase, dagger_audit = load_actor_rehearsal(
+            dagger_path,
+            device="cpu",
+            observation_dim=OBSERVATION_DIM,
+            action_dim=ACTION_DIM,
+            allowed_contracts=PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS,
+        )
+        assert dagger_phase is not None and bool((dagger_phase == 1).all())
+        assert dagger_audit["source_contract"] == "frozen_base_close_teacher"
+
+        wrong_phase = _pick_tool_actor_payload(close=True)
+        wrong_phase["phase"][0] = 3
+        wrong_phase_path = root / "wrong_phase.pt"
+        _write_payload(wrong_phase_path, wrong_phase)
+        _expect_error(
+            ValueError,
+            load_actor_rehearsal,
+            wrong_phase_path,
+            device="cpu",
+            observation_dim=OBSERVATION_DIM,
+            action_dim=ACTION_DIM,
+            allowed_contracts=PICK_TOOL_ACTOR_DEMO_CONTRACTS,
+        )
+
+        unknown = _pick_tool_actor_payload(close=True)
+        unknown["meta"]["collector"] = "unreviewed_teacher"
+        unknown_path = root / "unknown.pt"
+        _write_payload(unknown_path, unknown)
+        _expect_error(
+            ValueError,
+            load_actor_rehearsal,
+            unknown_path,
+            device="cpu",
+            observation_dim=OBSERVATION_DIM,
+            action_dim=ACTION_DIM,
+            allowed_contracts=PICK_TOOL_ACTOR_DEMO_CONTRACTS,
+        )
 
 
 def test_loader_rejects_ambiguous_failed_or_malformed_sources() -> None:
@@ -323,6 +464,8 @@ def test_cuda_storage_sampling_and_resume_stay_on_device() -> None:
 def main() -> None:
     test_loader_accepts_obs_action_only_and_audits_success()
     print("[PASS] obs/action loader and successful-episode audit")
+    test_pick_tool_actor_demo_allowlist_and_phase_contracts()
+    print("[PASS] PickTool actor-demo allowlist and phase contracts")
     test_loader_rejects_ambiguous_failed_or_malformed_sources()
     print("[PASS] malformed data and metadata are rejected")
     test_gpu_style_stratification_and_private_generator()

@@ -270,7 +270,10 @@ def update_close_option_state(
     next_stable_count = torch.where(
         stable_now, stable_count + 1, torch.zeros_like(stable_count)
     )
-    success = next_stable_count >= confirm_steps
+    # ``unsafe_force`` also includes task-authored drop termination in the
+    # caller. Safety must dominate a simultaneously completed confirmation
+    # streak; otherwise a dropped object could be reported as a close success.
+    success = (next_stable_count >= confirm_steps) & ~unsafe_force
 
     outside_window = (~is_grasped) & (proximity_quality < min_proximity)
     next_lost_window_count = torch.where(

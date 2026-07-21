@@ -749,6 +749,27 @@ class FlashSACTorchBridge(FlashSACAgent):
         super().save(path)
         torch.save(self._bridge_checkpoint_state(), os.path.join(path, BRIDGE_STATE_FILENAME))
 
+    def load_actor(self, path: str) -> None:
+        """Strictly load only actor weights from a portable checkpoint directory.
+
+        This transfer path intentionally leaves the actor optimizer/scheduler,
+        critic, target critic, temperature, replay, reward normalizer,
+        exploration state, agent update counter, AMP scaler, and RNG untouched.
+        It is the safe initialization boundary between different task modes.
+        """
+
+        checkpoint_dir = os.fspath(path)
+        if not os.path.isdir(checkpoint_dir):
+            raise FileNotFoundError(f"actor checkpoint directory does not exist: {checkpoint_dir}")
+        actor_path = os.path.join(checkpoint_dir, "actor.pt")
+        if not os.path.isfile(actor_path):
+            raise FileNotFoundError(f"missing FlashSAC actor checkpoint: {actor_path}")
+        _load_network_portably(self._actor, actor_path, load_optimizer=False)
+        print(
+            f"\033[32m[FlashSAC]\033[0m Successfully loaded actor-only checkpoint "
+            f"from {checkpoint_dir}."
+        )
+
     def load(self, path: str) -> None:
         load_optimizer = self._cfg.load_optimizer
         _load_network_portably(

@@ -106,6 +106,466 @@ TERMINAL_EVENT_KEYS = (
     "unlatched_clearance_ge_5cm",
 )
 
+CLOSE_OPTION_TERMINAL_EVENT_KEYS = (
+    "close_option_success",
+    "close_option_failure",
+    "close_option_timeout",
+    "dropped",
+    "unsafe_force",
+    "close_option_unlatched_lift",
+    "close_option_horizontal_escape",
+    "close_option_lost_window",
+)
+
+TASK_CONTRACT_FILENAME = "task_contract.json"
+INCOMPLETE_CHECKPOINT_FILENAME = ".incomplete_checkpoint.json"
+TASK_CONTRACT_VERSION = 2
+FLASH_SAC_GAMMA = 0.99
+CORE_CHECKPOINT_FILENAMES = (
+    "actor.pt",
+    "critic.pt",
+    "target_critic.pt",
+    "temperature.pt",
+)
+STALE_OPTIONAL_CHECKPOINT_FILENAMES = (
+    "replay_buffer.pt",
+    "actor_rehearsal.pt",
+    TASK_CONTRACT_FILENAME,
+)
+FULL_TASK_MODE = "full_task"
+CLOSE_OPTION_TASK_MODE = "close_option"
+TASK_MODES = (FULL_TASK_MODE, CLOSE_OPTION_TASK_MODE)
+PICK_TOOL_LATCH_OBSERVATION_INDEX = 106
+PICK_TOOL_ARM_ACTION_DIM = 7
+PICK_TOOL_ACTION_DIM = 21
+
+
+def task_mode_from_close_option(close_option_mode: bool) -> str:
+    return CLOSE_OPTION_TASK_MODE if close_option_mode else FULL_TASK_MODE
+
+
+def require_complete_core_checkpoint(checkpoint: Path) -> None:
+    """Require the portable network files used to identify a legacy checkpoint."""
+
+    if not checkpoint.is_dir():
+        raise FileNotFoundError(f"checkpoint directory does not exist: {checkpoint}")
+    missing = [
+        filename
+        for filename in CORE_CHECKPOINT_FILENAMES
+        if not (checkpoint / filename).is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            f"incomplete checkpoint {checkpoint}: missing regular files {missing}"
+        )
+
+
+def read_checkpoint_task_contract(checkpoint: Path) -> dict[str, Any]:
+    """Read a task contract, treating pre-contract checkpoints as full-task."""
+
+    incomplete = checkpoint / INCOMPLETE_CHECKPOINT_FILENAME
+    if incomplete.exists() or incomplete.is_symlink():
+        raise ValueError(
+            f"checkpoint {checkpoint} is marked incomplete by {incomplete.name}; "
+            "refusing a partial or concurrently-written snapshot"
+        )
+    require_complete_core_checkpoint(checkpoint)
+    path = checkpoint / TASK_CONTRACT_FILENAME
+    if not path.exists():
+        if path.is_symlink():
+            raise ValueError(f"checkpoint task contract is a dangling symlink: {path}")
+        # A missing contract is only backward-compatible evidence when the
+        # directory is demonstrably a complete pre-contract network snapshot.
+        return {
+            "version": 0,
+            "task_mode": FULL_TASK_MODE,
+            "legacy_checkpoint": True,
+            "replay_n_step": None,
+            "replay_gamma": None,
+        }
+    if not path.is_file():
+        raise ValueError(f"checkpoint task contract is not a regular file: {path}")
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read checkpoint task contract {path}: {error}") from error
+    if not isinstance(payload, Mapping):
+        raise TypeError(f"checkpoint task contract {path} must contain a JSON object")
+    version = payload.get("version")
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version not in (1, TASK_CONTRACT_VERSION)
+    ):
+        raise ValueError(
+            f"checkpoint task contract {path} has version={version!r}, "
+            f"expected 1 or {TASK_CONTRACT_VERSION}"
+        )
+    task_mode = payload.get("task_mode")
+    if task_mode not in TASK_MODES:
+        raise ValueError(
+            f"checkpoint task contract {path} has unsupported task_mode={task_mode!r}"
+        )
+    replay_n_step: int | None = None
+    replay_gamma: float | None = None
+    if version >= 2:
+        replay_n_step = payload.get("replay_n_step")
+        replay_gamma = payload.get("replay_gamma")
+        if not isinstance(replay_n_step, int) or isinstance(replay_n_step, bool) or replay_n_step < 1:
+            raise ValueError(f"checkpoint task contract {path} has invalid replay_n_step")
+        if not isinstance(replay_gamma, (int, float)) or isinstance(replay_gamma, bool):
+            raise ValueError(f"checkpoint task contract {path} has invalid replay_gamma")
+        replay_gamma = float(replay_gamma)
+        if not math.isfinite(replay_gamma) or not 0.0 <= replay_gamma <= 1.0:
+            raise ValueError(f"checkpoint task contract {path} has invalid replay_gamma")
+    return {
+        "version": int(version),
+        "task_mode": str(task_mode),
+        "legacy_checkpoint": False,
+        "replay_n_step": replay_n_step,
+        "replay_gamma": replay_gamma,
+    }
+
+
+def write_checkpoint_task_contract(
+    checkpoint: Path,
+    *,
+    task_mode: str,
+    replay_n_step: int,
+    replay_gamma: float,
+) -> None:
+    if task_mode not in TASK_MODES:
+        raise ValueError(f"unsupported task_mode={task_mode!r}")
+    if (
+        not isinstance(replay_n_step, int)
+        or isinstance(replay_n_step, bool)
+        or replay_n_step < 1
+    ):
+        raise ValueError("replay_n_step must be a positive integer")
+    if not math.isfinite(replay_gamma) or not 0.0 <= replay_gamma <= 1.0:
+        raise ValueError("replay_gamma must be finite and in [0, 1]")
+    atomic_write_json(
+        checkpoint / TASK_CONTRACT_FILENAME,
+        {
+            "version": TASK_CONTRACT_VERSION,
+            "task_mode": task_mode,
+            "replay_n_step": replay_n_step,
+            "replay_gamma": replay_gamma,
+        },
+    )
+
+
+def clear_stale_checkpoint_optional_artifacts(checkpoint: Path) -> tuple[str, ...]:
+    """Remove only optional artifacts whose absence is meaningful on a re-save."""
+
+    if checkpoint.is_symlink():
+        raise ValueError(f"checkpoint output must be a real directory: {checkpoint}")
+    if not checkpoint.exists():
+        return ()
+    if not checkpoint.is_dir():
+        raise ValueError(f"checkpoint output must be a real directory: {checkpoint}")
+
+    removed: list[str] = []
+    for filename in STALE_OPTIONAL_CHECKPOINT_FILENAMES:
+        path = checkpoint / filename
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+            removed.append(filename)
+        elif path.exists():
+            raise ValueError(f"stale checkpoint artifact is not a regular file: {path}")
+    return tuple(removed)
+
+
+def save_final_checkpoint(
+    checkpoint: Path,
+    *,
+    agent: Any,
+    task_mode: str,
+    replay_n_step: int,
+    replay_gamma: float,
+    save_replay: bool,
+    actor_rehearsal: Any | None,
+) -> None:
+    """Save one final checkpoint, publishing its task contract last."""
+
+    if checkpoint.is_symlink():
+        raise ValueError(f"checkpoint output must be a real directory: {checkpoint}")
+    checkpoint.mkdir(parents=True, exist_ok=True)
+    if not checkpoint.is_dir():
+        raise ValueError(f"checkpoint output must be a real directory: {checkpoint}")
+    incomplete = checkpoint / INCOMPLETE_CHECKPOINT_FILENAME
+    atomic_write_json(incomplete, {"version": 1, "status": "incomplete"})
+    clear_stale_checkpoint_optional_artifacts(checkpoint)
+    agent.save(str(checkpoint))
+    if save_replay:
+        agent.save_replay_buffer(str(checkpoint))
+    if actor_rehearsal is not None:
+        actor_rehearsal.save(checkpoint / "actor_rehearsal.pt")
+    write_checkpoint_task_contract(
+        checkpoint,
+        task_mode=task_mode,
+        replay_n_step=replay_n_step,
+        replay_gamma=replay_gamma,
+    )
+    incomplete.unlink()
+
+
+def read_legacy_replay_discount_contract(checkpoint: Path) -> tuple[int, float]:
+    """Read mixed-replay metadata lazily without materializing its tensor payload."""
+
+    path = checkpoint / "replay_buffer.pt"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError(f"cannot audit legacy replay contract {path}: {error}") from error
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("version") not in (1, 2, 3)
+        or not isinstance(payload.get("online"), Mapping)
+        or not isinstance(payload.get("demos"), Mapping)
+    ):
+        raise ValueError(
+            f"legacy replay {path} is not a supported mixed replay with auditable metadata; "
+            "refusing an unsafe resume"
+        )
+    online = payload["online"]
+    demos = payload["demos"]
+    n_step = online.get("n_step")
+    gamma = online.get("gamma")
+    if not isinstance(n_step, int) or isinstance(n_step, bool) or n_step < 1:
+        raise ValueError(f"legacy replay {path} has invalid n_step")
+    if not isinstance(gamma, (int, float)) or isinstance(gamma, bool):
+        raise ValueError(f"legacy replay {path} has invalid gamma")
+    gamma = float(gamma)
+    if not math.isfinite(gamma) or not 0.0 <= gamma <= 1.0:
+        raise ValueError(f"legacy replay {path} has invalid gamma")
+    demo_n_step = demos.get("n_step")
+    demo_gamma = demos.get("gamma")
+    if (
+        demo_n_step != n_step
+        or not isinstance(demo_gamma, (int, float))
+        or isinstance(demo_gamma, bool)
+        or not math.isclose(
+            float(demo_gamma), gamma, rel_tol=0.0, abs_tol=1.0e-12
+        )
+    ):
+        raise ValueError(f"legacy replay {path} has inconsistent online/demo discount metadata")
+    return n_step, gamma
+
+
+def validate_replay_task_contract(
+    checkpoint: Path,
+    *,
+    task_mode: str,
+    n_step: int,
+    gamma: float,
+) -> dict[str, Any]:
+    """Reject replay collected under different reward/termination semantics."""
+
+    if task_mode not in TASK_MODES:
+        raise ValueError(f"unsupported current task_mode={task_mode!r}")
+    if not isinstance(n_step, int) or isinstance(n_step, bool) or n_step < 1:
+        raise ValueError("current replay n_step must be a positive integer")
+    if not math.isfinite(gamma) or not 0.0 <= gamma <= 1.0:
+        raise ValueError("current replay gamma must be finite and in [0, 1]")
+    replay_path = checkpoint / "replay_buffer.pt"
+    if not replay_path.is_file():
+        raise FileNotFoundError(replay_path)
+    contract = read_checkpoint_task_contract(checkpoint)
+    if contract["task_mode"] != task_mode:
+        raise ValueError(
+            "--resume_replay cannot cross task modes: "
+            f"checkpoint={contract['task_mode']!r}, current={task_mode!r}"
+        )
+    checkpoint_n_step = contract["replay_n_step"]
+    checkpoint_gamma = contract["replay_gamma"]
+    if checkpoint_n_step is None or checkpoint_gamma is None:
+        checkpoint_n_step, checkpoint_gamma = read_legacy_replay_discount_contract(checkpoint)
+    if checkpoint_n_step != n_step:
+        raise ValueError(
+            "--resume_replay n_step mismatch: "
+            f"checkpoint={checkpoint_n_step}, current={n_step}"
+        )
+    if not math.isclose(checkpoint_gamma, gamma, rel_tol=0.0, abs_tol=1.0e-12):
+        raise ValueError(
+            "--resume_replay gamma mismatch: "
+            f"checkpoint={checkpoint_gamma}, current={gamma}"
+        )
+    return contract
+
+
+def validate_checkpoint_task_contract(
+    checkpoint: Path,
+    *,
+    task_mode: str,
+    n_step: int,
+    gamma: float,
+) -> dict[str, Any]:
+    """Reject a full-agent restore across reward/termination objectives.
+
+    A full checkpoint also restores the critic, target critic, temperature,
+    optimizers, scheduler, and reward normalizer. Those states are just as
+    objective-specific as replay. Cross-mode transfer must therefore use the
+    deliberately actor-only ``--actor_checkpoint`` path.
+    """
+
+    if task_mode not in TASK_MODES:
+        raise ValueError(f"unsupported current task_mode={task_mode!r}")
+    if not isinstance(n_step, int) or isinstance(n_step, bool) or n_step < 1:
+        raise ValueError("current checkpoint n_step must be a positive integer")
+    if not math.isfinite(gamma) or not 0.0 <= gamma <= 1.0:
+        raise ValueError("current checkpoint gamma must be finite and in [0, 1]")
+    contract = read_checkpoint_task_contract(checkpoint)
+    if contract["task_mode"] != task_mode:
+        raise ValueError(
+            "--checkpoint cannot cross task modes because it restores objective-specific "
+            "critic/optimizer/normalizer state; use --actor_checkpoint instead: "
+            f"checkpoint={contract['task_mode']!r}, current={task_mode!r}"
+        )
+    checkpoint_n_step = contract["replay_n_step"]
+    checkpoint_gamma = contract["replay_gamma"]
+    if checkpoint_n_step is None or checkpoint_gamma is None:
+        try:
+            checkpoint_n_step, checkpoint_gamma = read_legacy_replay_discount_contract(
+                checkpoint
+            )
+        except (FileNotFoundError, ValueError) as error:
+            raise ValueError(
+                "legacy --checkpoint has no auditable n_step/gamma contract; use "
+                "--actor_checkpoint for a safe actor-only initialization"
+            ) from error
+    if checkpoint_n_step != n_step or not math.isclose(
+        checkpoint_gamma, gamma, rel_tol=0.0, abs_tol=1.0e-12
+    ):
+        raise ValueError(
+            "--checkpoint discount contract mismatch; use --actor_checkpoint instead: "
+            f"checkpoint=(n_step={checkpoint_n_step}, gamma={checkpoint_gamma}), "
+            f"current=(n_step={n_step}, gamma={gamma})"
+        )
+    return contract
+
+
+def validate_training_source_selection(
+    *,
+    checkpoint: Path | None,
+    actor_checkpoint: Path | None,
+    resume_replay: bool,
+    resume_actor_demo: bool,
+    close_option_mode: bool,
+    demo: list[Path] | None,
+) -> None:
+    """Validate mutually exclusive initialization and task-specific data sources."""
+
+    if checkpoint is not None and actor_checkpoint is not None:
+        raise ValueError("--checkpoint and --actor_checkpoint are mutually exclusive")
+    if resume_replay and checkpoint is None:
+        raise ValueError("--resume_replay requires --checkpoint")
+    if resume_actor_demo and checkpoint is None:
+        raise ValueError("--resume_actor_demo requires --checkpoint")
+    if close_option_mode and demo is not None:
+        raise ValueError(
+            "--close_option_mode rejects full-task transition --demo data; "
+            "use allowlisted --actor_demo supervision instead"
+        )
+
+
+def validate_checkpoint_output_separation(
+    checkpoint: Path | None,
+    *,
+    output_checkpoint: Path,
+) -> None:
+    """Never overwrite the only full-agent source while resuming from it."""
+
+    if checkpoint is not None and checkpoint.resolve() == output_checkpoint.resolve():
+        raise ValueError(
+            "--checkpoint cannot be the current output checkpoint_final; choose a new "
+            "--output_dir so the source remains recoverable"
+        )
+
+
+def validate_close_option_training_config(
+    *,
+    close_option_mode: bool,
+    curriculum_dataset: Path | None,
+    curriculum_boundary: str,
+    curriculum_probability: float,
+    curriculum_joint_noise: float,
+    episode_length_s: float | None,
+    randomize_episode_lengths: bool,
+) -> None:
+    """Keep the close option on its physically meaningful pregrasp MDP."""
+
+    if not close_option_mode:
+        return
+    if curriculum_dataset is None:
+        raise ValueError("--close_option_mode requires a close-start curriculum dataset")
+    if curriculum_boundary != "close_start":
+        raise ValueError("--close_option_mode requires --curriculum_boundary close_start")
+    if curriculum_probability != 1.0:
+        raise ValueError("--close_option_mode requires --curriculum_probability 1")
+    if not 0.0 <= curriculum_joint_noise <= 0.02:
+        raise ValueError(
+            "--close_option_mode requires --curriculum_joint_noise in [0, 0.02]"
+        )
+    if episode_length_s is None or not 0.30 <= episode_length_s <= 5.0:
+        raise ValueError(
+            "--close_option_mode requires --episode_length_s in [0.30, 5] so the "
+            "15-frame confirmation window is physically reachable"
+        )
+    if randomize_episode_lengths:
+        raise ValueError(
+            "--close_option_mode rejects --randomize_episode_lengths because shortened "
+            "initial episodes can censor the stable-latch confirmation window"
+        )
+
+
+def build_latch_conditioned_noise_scale(
+    observation: torch.Tensor,
+    *,
+    unlatched_arm: float,
+    unlatched_hand: float,
+    latched_arm: float,
+    latched_hand: float,
+    action_dim: int = PICK_TOOL_ACTION_DIM,
+) -> torch.Tensor:
+    """Build per-row action noise multipliers from the actor-visible latch bit."""
+
+    if not isinstance(observation, torch.Tensor):
+        raise TypeError("observation must be a torch.Tensor")
+    if observation.ndim != 2 or observation.shape[1] <= PICK_TOOL_LATCH_OBSERVATION_INDEX:
+        raise ValueError(
+            "observation must be [batch, dim] and contain the PickTool latch bit at index "
+            f"{PICK_TOOL_LATCH_OBSERVATION_INDEX}"
+        )
+    if action_dim <= PICK_TOOL_ARM_ACTION_DIM:
+        raise ValueError("action_dim must contain both arm and hand action groups")
+    values = {
+        "unlatched_arm": unlatched_arm,
+        "unlatched_hand": unlatched_hand,
+        "latched_arm": latched_arm,
+        "latched_hand": latched_hand,
+    }
+    for name, value in values.items():
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"{name} must be finite and non-negative")
+
+    latched = observation[:, PICK_TOOL_LATCH_OBSERVATION_INDEX] > 0.5
+    scale = torch.empty(
+        (observation.shape[0], action_dim),
+        dtype=torch.float32,
+        device=observation.device,
+    )
+    arm_scale = torch.full_like(latched, unlatched_arm, dtype=torch.float32)
+    hand_scale = torch.full_like(latched, unlatched_hand, dtype=torch.float32)
+    arm_scale.masked_fill_(latched, latched_arm)
+    hand_scale.masked_fill_(latched, latched_hand)
+    scale[:, :PICK_TOOL_ARM_ACTION_DIM] = arm_scale.unsqueeze(-1)
+    scale[:, PICK_TOOL_ARM_ACTION_DIM:] = hand_scale.unsqueeze(-1)
+    return scale
+
 
 @dataclass
 class TerminalEventAccumulator:
@@ -113,13 +573,22 @@ class TerminalEventAccumulator:
 
     num_envs: int
     device: torch.device
+    task_mode: str = FULL_TASK_MODE
     counts: dict[str, torch.Tensor] = field(init=False)
+    _event_keys: tuple[str, ...] = field(init=False)
     _unlatched_seen: torch.Tensor = field(init=False)
 
     def __post_init__(self) -> None:
+        if self.task_mode not in TASK_MODES:
+            raise ValueError(f"unsupported task_mode={self.task_mode!r}")
+        self._event_keys = (
+            TERMINAL_EVENT_KEYS
+            if self.task_mode == FULL_TASK_MODE
+            else CLOSE_OPTION_TERMINAL_EVENT_KEYS
+        )
         self.counts = {
             name: torch.zeros((), dtype=torch.long, device=self.device)
-            for name in TERMINAL_EVENT_KEYS
+            for name in self._event_keys
         }
         self._unlatched_seen = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
@@ -128,7 +597,7 @@ class TerminalEventAccumulator:
         if not isinstance(values, Mapping):
             raise KeyError("adapter info has no pick_tool_terminal ground truth")
         validated: dict[str, torch.Tensor] = {}
-        for name in TERMINAL_EVENT_KEYS:
+        for name in self._event_keys:
             value = values.get(name)
             if not isinstance(value, torch.Tensor):
                 raise TypeError(f"pick_tool_terminal[{name!r}] must be a torch.Tensor")
@@ -143,15 +612,27 @@ class TerminalEventAccumulator:
                 )
             validated[name] = value
 
-        # Terminal flags are one-step events.  Unlatched 5 cm is a state and
-        # can persist, so count its first rising occurrence once per episode.
-        for name in TERMINAL_EVENT_KEYS[:-1]:
+        if self.task_mode == FULL_TASK_MODE:
+            # Terminal flags are one-step events. Unlatched 5 cm is a state and
+            # can persist, so count its first rising occurrence once per episode.
+            for name in TERMINAL_EVENT_KEYS[:-1]:
+                self.counts[name].add_(validated[name].sum())
+            unlatched = validated["unlatched_clearance_ge_5cm"]
+            self.counts["unlatched_clearance_ge_5cm"].add_(
+                (unlatched & ~self._unlatched_seen).sum()
+            )
+            self._unlatched_seen |= unlatched
+            episode_done = (
+                validated["success"] | validated["failure"] | validated["time_out"]
+            )
+            self._unlatched_seen &= ~episode_done
+            return
+
+        # Every close-option field is a reset-before terminal event. Keep its
+        # metrics explicitly option-named so a stable latch cannot be mistaken
+        # for full-task 20 cm success in training reports.
+        for name in CLOSE_OPTION_TERMINAL_EVENT_KEYS:
             self.counts[name].add_(validated[name].sum())
-        unlatched = validated["unlatched_clearance_ge_5cm"]
-        self.counts["unlatched_clearance_ge_5cm"].add_((unlatched & ~self._unlatched_seen).sum())
-        self._unlatched_seen |= unlatched
-        episode_done = validated["success"] | validated["failure"] | validated["time_out"]
-        self._unlatched_seen &= ~episode_done
 
     def metrics(self) -> dict[str, int]:
         return {
@@ -231,6 +712,18 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
     parser.add_argument("--no_compile", action="store_true")
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument(
+        "--unlatched_arm_noise_scale",
+        type=float,
+        default=1.0,
+        help="Additional exploration multiplier for arm actions before observed latch.",
+    )
+    parser.add_argument(
+        "--unlatched_hand_noise_scale",
+        type=float,
+        default=1.0,
+        help="Additional exploration multiplier for token/residual actions before observed latch.",
+    )
+    parser.add_argument(
         "--latched_arm_noise_scale",
         type=float,
         default=1.0,
@@ -259,6 +752,15 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         help="Synchronously check every observation/action/reward for NaN/Inf (always on in smoke).",
     )
     parser.add_argument("--checkpoint", type=Path, default=None, help="Optional FlashSAC checkpoint to load.")
+    parser.add_argument(
+        "--actor_checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Load only actor.pt from a FlashSAC checkpoint. Critic, target, temperature, "
+            "optimizers, replay, exploration, and reward normalization remain fresh."
+        ),
+    )
     parser.add_argument(
         "--resume_replay",
         action="store_true",
@@ -336,6 +838,11 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
     parser.add_argument("--curriculum_boundary", default="close_start")
     parser.add_argument("--curriculum_probability", type=float, default=0.0)
     parser.add_argument("--curriculum_joint_noise", type=float, default=0.0)
+    parser.add_argument(
+        "--close_option_mode",
+        action="store_true",
+        help="Train the close-only task contract instead of the full reach/grasp/lift task.",
+    )
     parser.add_argument("--output_dir", type=Path, default=Path("logs/flashsac/pick_tool"))
     parser.add_argument("--metrics_every", type=int, default=100)
     parser.add_argument("--smoke", action="store_true", help="Use a tiny 8-env, 8-step integration run.")
@@ -346,6 +853,23 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    validate_training_source_selection(
+        checkpoint=args.checkpoint,
+        actor_checkpoint=args.actor_checkpoint,
+        resume_replay=args.resume_replay,
+        resume_actor_demo=args.resume_actor_demo,
+        close_option_mode=args.close_option_mode,
+        demo=args.demo,
+    )
+    validate_close_option_training_config(
+        close_option_mode=args.close_option_mode,
+        curriculum_dataset=args.curriculum_dataset,
+        curriculum_boundary=args.curriculum_boundary,
+        curriculum_probability=args.curriculum_probability,
+        curriculum_joint_noise=args.curriculum_joint_noise,
+        episode_length_s=args.episode_length_s,
+        randomize_episode_lengths=args.randomize_episode_lengths,
+    )
     for name in (
         "steps",
         "num_envs",
@@ -391,10 +915,6 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--curriculum_probability > 0 requires --curriculum_dataset")
     if args.curriculum_dataset is not None and not args.curriculum_dataset.is_file():
         raise FileNotFoundError(args.curriculum_dataset)
-    if args.resume_replay and args.checkpoint is None:
-        raise ValueError("--resume_replay requires --checkpoint")
-    if args.resume_actor_demo and args.checkpoint is None:
-        raise ValueError("--resume_actor_demo requires --checkpoint")
     if args.demo is not None:
         missing_demos = [path for path in args.demo if not path.is_file()]
         if missing_demos:
@@ -443,7 +963,12 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--demo_bc_phases requires --demo or --actor_demo")
         if args.resume_actor_demo:
             raise ValueError("--resume_actor_demo requires --demo or --actor_demo")
-    for name in ("latched_arm_noise_scale", "latched_hand_noise_scale"):
+    for name in (
+        "unlatched_arm_noise_scale",
+        "unlatched_hand_noise_scale",
+        "latched_arm_noise_scale",
+        "latched_hand_noise_scale",
+    ):
         value = getattr(args, name)
         if not math.isfinite(value) or value < 0.0:
             raise ValueError(f"--{name} must be finite and non-negative")
@@ -485,6 +1010,33 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def audit_actor_checkpoint_source(
+    actor_checkpoint: Path,
+    *,
+    output_checkpoint: Path,
+) -> dict[str, str]:
+    """Resolve and fingerprint an actor-only initialization source."""
+
+    source = actor_checkpoint.resolve()
+    destination = output_checkpoint.resolve()
+    if source == destination:
+        raise ValueError(
+            "--actor_checkpoint cannot be the current output checkpoint_final: "
+            f"{source}"
+        )
+    if not source.is_dir():
+        raise FileNotFoundError(f"actor checkpoint directory does not exist: {source}")
+    actor_path = source / "actor.pt"
+    if not actor_path.is_file():
+        raise FileNotFoundError(f"missing FlashSAC actor checkpoint: {actor_path}")
+    source_contract = read_checkpoint_task_contract(source)
+    return {
+        "path": str(source),
+        "actor_sha256": _sha256(actor_path),
+        "source_task_mode": str(source_contract["task_mode"]),
+    }
 
 
 def audit_pick_tool_demonstrations(path: Path) -> dict[str, Any]:
@@ -573,9 +1125,44 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         args.batch = min(args.batch, 16)
         args.metrics_every = 1
         if args.episode_length_s is None:
-            args.episode_length_s = 0.12
+            args.episode_length_s = 0.5 if args.close_option_mode else 0.12
+    if args.close_option_mode and args.episode_length_s is None:
+        args.episode_length_s = 5.0
     _validate_args(args)
     _seed_everything(args.seed)
+    task_mode = task_mode_from_close_option(args.close_option_mode)
+    effective_n_step = 1 if args.smoke else args.n_step
+    output_dir = args.output_dir.resolve()
+    checkpoint_dir = output_dir / "checkpoint_final"
+    validate_checkpoint_output_separation(
+        args.checkpoint,
+        output_checkpoint=checkpoint_dir,
+    )
+    resumed_task_contract: dict[str, Any] | None = None
+    if args.checkpoint is not None:
+        resumed_task_contract = validate_checkpoint_task_contract(
+            args.checkpoint.resolve(),
+            task_mode=task_mode,
+            n_step=effective_n_step,
+            gamma=FLASH_SAC_GAMMA,
+        )
+        if args.resume_replay:
+            # Keep the replay-specific validation as an explicit second guard:
+            # it documents why replay continuation is legal in this run.
+            validate_replay_task_contract(
+                args.checkpoint.resolve(),
+                task_mode=task_mode,
+                n_step=effective_n_step,
+                gamma=FLASH_SAC_GAMMA,
+            )
+    actor_checkpoint_audit = (
+        audit_actor_checkpoint_source(
+            args.actor_checkpoint,
+            output_checkpoint=checkpoint_dir,
+        )
+        if args.actor_checkpoint is not None
+        else None
+    )
     demo_bc_weight = (
         1.0
         if (args.demo is not None or args.actor_demo is not None)
@@ -597,7 +1184,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         FlashSACTorchBridge,
         build_agent_config,
     )
-    from actor_rehearsal import ActorRehearsalReservoir, load_actor_rehearsal
+    from actor_rehearsal import (
+        PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS,
+        PICK_TOOL_LIFT_ACTOR_DEMO_CONTRACTS,
+        ActorRehearsalReservoir,
+        load_actor_rehearsal,
+    )
     from demo_replay import (
         PermanentDemoReservoir,
         attach_demo_replay,
@@ -624,7 +1216,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "curriculum_joint_noise": args.curriculum_joint_noise,
         }
 
-    cfg_overrides = {}
+    cfg_overrides = {"close_option_mode": bool(args.close_option_mode)}
     if args.episode_length_s is not None:
         cfg_overrides["episode_length_s"] = args.episode_length_s
     if args.curriculum_dataset is not None:
@@ -663,7 +1255,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         sample_batch_size=args.batch,
         normalize_reward=True,
         normalized_G_max=5.0,
-        n_step=1 if args.smoke else args.n_step,
+        n_step=effective_n_step,
+        gamma=FLASH_SAC_GAMMA,
         actor_num_blocks=1 if args.smoke else args.actor_blocks,
         actor_hidden_dim=32 if args.smoke else args.actor_hidden,
         critic_num_blocks=1 if args.smoke else args.critic_blocks,
@@ -792,19 +1385,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         }
 
     if args.actor_demo is not None:
-        expected_lift_teacher = {
-            "collector": "online_base_close_to_scripted_lift_teacher",
-            "dataset_phase": "lift",
-            "teacher_probability": 1.0,
-            "executed_teacher_fraction": 1.0,
-        }
+        actor_demo_contracts = (
+            PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS
+            if task_mode == CLOSE_OPTION_TASK_MODE
+            else PICK_TOOL_LIFT_ACTOR_DEMO_CONTRACTS
+        )
         for path in args.actor_demo:
             batch, labels, audit = load_actor_rehearsal(
                 path.resolve(),
                 device=device,
                 observation_dim=env.observation_dim,
                 action_dim=env.action_dim,
-                expected_metadata=expected_lift_teacher,
+                allowed_contracts=actor_demo_contracts,
             )
             actor_batches.append(batch)
             actor_phases.append(labels)
@@ -889,7 +1481,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         }
 
     if args.checkpoint is not None:
+        revalidated_contract = validate_checkpoint_task_contract(
+            args.checkpoint.resolve(),
+            task_mode=task_mode,
+            n_step=effective_n_step,
+            gamma=FLASH_SAC_GAMMA,
+        )
+        if revalidated_contract != resumed_task_contract:
+            raise RuntimeError("--checkpoint task contract changed while the run was starting")
         agent.load(str(args.checkpoint.resolve()))
+        post_load_contract = validate_checkpoint_task_contract(
+            args.checkpoint.resolve(),
+            task_mode=task_mode,
+            n_step=effective_n_step,
+            gamma=FLASH_SAC_GAMMA,
+        )
+        if post_load_contract != resumed_task_contract:
+            raise RuntimeError("--checkpoint changed while it was being loaded")
         if args.resume_replay:
             replay_path = args.checkpoint.resolve() / "replay_buffer.pt"
             if not replay_path.is_file():
@@ -903,6 +1511,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 raise FileNotFoundError(actor_rehearsal_path)
             actor_rehearsal.load(actor_rehearsal_path)
             actor_rehearsal_metrics["actor_rehearsal_resumed"] = True
+    elif args.actor_checkpoint is not None:
+        assert actor_checkpoint_audit is not None
+        revalidated_actor = audit_actor_checkpoint_source(
+            args.actor_checkpoint,
+            output_checkpoint=checkpoint_dir,
+        )
+        if revalidated_actor != actor_checkpoint_audit:
+            raise RuntimeError("--actor_checkpoint changed while the run was starting")
+        agent.load_actor(actor_checkpoint_audit["path"])
+        loaded_actor_sha256 = _sha256(
+            Path(actor_checkpoint_audit["path"]) / "actor.pt"
+        )
+        if loaded_actor_sha256 != actor_checkpoint_audit["actor_sha256"]:
+            raise RuntimeError("--actor_checkpoint changed while actor.pt was being loaded")
     if demo_max_abs_reward is not None:
         if agent.reward_normalizer is None:
             raise RuntimeError("demonstration replay requires the configured reward normalizer")
@@ -916,13 +1538,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             demo_max_abs_reward.reshape_as(agent.reward_normalizer.G_r_max),
         )
 
-    output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = output_dir / "metrics.json"
     observation, _ = env.reset(randomize_episode_lengths=args.randomize_episode_lengths)
     agent.start_fresh_rollout(batch_size=env.num_envs)
     episodes = EpisodeAccumulator(env.num_envs, env.device)
-    terminal_events = TerminalEventAccumulator(env.num_envs, env.device)
+    terminal_events = TerminalEventAccumulator(
+        env.num_envs,
+        env.device,
+        task_mode=task_mode,
+    )
     update_budget = FractionalUpdateBudget(args.updates)
     update_count = 0
     terminated_count = torch.zeros((), dtype=torch.long, device=env.device)
@@ -938,25 +1563,30 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     try:
         for interaction_step in range(1, args.steps + 1):
             training_ready = agent.can_start_training()
-            if args.checkpoint is not None or training_ready:
+            if (
+                args.checkpoint is not None
+                or args.actor_checkpoint is not None
+                or training_ready
+            ):
                 noise_scale = None
                 if (
-                    args.latched_arm_noise_scale != 1.0
+                    args.unlatched_arm_noise_scale != 1.0
+                    or args.unlatched_hand_noise_scale != 1.0
+                    or args.latched_arm_noise_scale != 1.0
                     or args.latched_hand_noise_scale != 1.0
                 ):
                     # PickTool's public 115-D Markov observation stores the
                     # grasp-latch bit at index 106.  This is not privileged
-                    # simulator state: the actor sees the same bit.  Preserve
-                    # coherent arm exploration while preventing random hand
-                    # reopening from destroying a newly discovered grasp.
-                    latched = observation[:, 106] > 0.5
-                    noise_scale = torch.ones(
-                        (env.num_envs, env.action_dim),
-                        dtype=torch.float32,
-                        device=env.device,
+                    # simulator state: the actor sees the same bit.  Scale
+                    # exploration independently on both sides of the latch.
+                    noise_scale = build_latch_conditioned_noise_scale(
+                        observation,
+                        unlatched_arm=args.unlatched_arm_noise_scale,
+                        unlatched_hand=args.unlatched_hand_noise_scale,
+                        latched_arm=args.latched_arm_noise_scale,
+                        latched_hand=args.latched_hand_noise_scale,
+                        action_dim=env.action_dim,
                     )
-                    noise_scale[latched, :7] = args.latched_arm_noise_scale
-                    noise_scale[latched, 7:] = args.latched_hand_noise_scale
                 action = agent.sample_actions(
                     interaction_step,
                     {"next_observation": observation},
@@ -1025,6 +1655,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 metrics: dict[str, Any] = {
                     "seed": args.seed,
                     "smoke": bool(args.smoke),
+                    "task_mode": task_mode,
                     "interaction_step": interaction_step,
                     "environment_steps": interaction_step * env.num_envs,
                     "gradient_updates": update_count,
@@ -1038,7 +1669,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "initial_checkpoint": (
                         str(args.checkpoint.resolve()) if args.checkpoint is not None else None
                     ),
+                    "initial_actor_checkpoint": (
+                        actor_checkpoint_audit["path"] if actor_checkpoint_audit else None
+                    ),
+                    "initial_actor_checkpoint_sha256": (
+                        actor_checkpoint_audit["actor_sha256"]
+                        if actor_checkpoint_audit
+                        else None
+                    ),
+                    "initial_actor_checkpoint_source_task_mode": (
+                        actor_checkpoint_audit["source_task_mode"]
+                        if actor_checkpoint_audit
+                        else None
+                    ),
                     "resumed_replay": bool(args.resume_replay),
+                    "resumed_task_contract": resumed_task_contract,
                     "resumed_actor_demo": bool(args.resume_actor_demo),
                     "restore_checkpoint_rng": False,
                     "flashsac_upstream_commit": FLASH_SAC_COMMIT,
@@ -1054,6 +1699,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "critic_hidden": agent_cfg.critic_hidden_dim,
                     "critic_bins": agent_cfg.critic_num_bins,
                     **curriculum_metrics,
+                    "unlatched_arm_noise_scale": args.unlatched_arm_noise_scale,
+                    "unlatched_hand_noise_scale": args.unlatched_hand_noise_scale,
                     "latched_arm_noise_scale": args.latched_arm_noise_scale,
                     "latched_hand_noise_scale": args.latched_hand_noise_scale,
                     **demo_metrics,
@@ -1087,12 +1734,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     )
                 atomic_write_json(metrics_path, metrics)
 
-        checkpoint_dir = output_dir / "checkpoint_final"
-        agent.save(str(checkpoint_dir))
-        if args.save_replay:
-            agent.save_replay_buffer(str(checkpoint_dir))
-        if actor_rehearsal is not None:
-            actor_rehearsal.save(checkpoint_dir / "actor_rehearsal.pt")
+        save_final_checkpoint(
+            checkpoint_dir,
+            agent=agent,
+            task_mode=task_mode,
+            replay_n_step=agent_cfg.n_step,
+            replay_gamma=agent_cfg.gamma,
+            save_replay=bool(args.save_replay),
+            actor_rehearsal=actor_rehearsal,
+        )
         final_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
         final_metrics["checkpoint"] = str(checkpoint_dir)
         final_metrics["status"] = "complete"

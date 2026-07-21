@@ -1356,6 +1356,8 @@ def main() -> None:
             },
             "meta": {
                 "format_version": 1,
+                "observation_dim": 115,
+                "action_dim": 21,
                 "action_layout": "arm_delta7|crossdex_token9|distal_residual5",
                 "observation_layout": "legacy_prefix87|distal_action5|grasp_transport23",
                 "phase_names": ["approach", "close", "micro", "lift", "settle"],

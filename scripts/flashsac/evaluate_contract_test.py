@@ -11,6 +11,8 @@ from typing import Any
 import torch
 
 from evaluate import (
+    CLOSE_OPTION_MODE,
+    FULL_TASK_MODE,
     NOISE_GROUP_SPECS,
     PhysicalTruth,
     PRODUCTION_CRITIC_BINS,
@@ -22,7 +24,9 @@ from evaluate import (
     infer_actor_architecture_from_state,
     physical_truth_from_terminal_info,
     resolve_checkpoint_directory,
+    resolve_cross_task_actor_evaluation,
     summarize,
+    validate_close_option_evaluation_config,
     validate_curriculum_config,
     validate_terminal_events,
 )
@@ -46,7 +50,20 @@ def _events(
     unlatched=(False, False),
     clearance=(-0.001, -0.001),
     grasped=(False, False),
+    full_task_success=None,
+    close_success=(False, False),
+    close_failure=(False, False),
+    close_timeout=(False, False),
+    close_unlatched_lift=(False, False),
+    close_horizontal_escape=(False, False),
+    close_lost_window=(False, False),
+    close_stable_steps=(0, 0),
+    grasp_quality=(0.0, 0.0),
+    hold_quality=(0.0, 0.0),
+    max_force=(0.0, 0.0),
 ) -> dict[str, torch.Tensor]:
+    if full_task_success is None:
+        full_task_success = success
     return {
         "success": torch.tensor(success, dtype=torch.bool),
         "failure": torch.tensor(failure, dtype=torch.bool),
@@ -56,6 +73,21 @@ def _events(
         "unlatched_clearance_ge_5cm": torch.tensor(unlatched, dtype=torch.bool),
         "true_clearance": torch.tensor(clearance, dtype=torch.float32),
         "is_grasped": torch.tensor(grasped, dtype=torch.bool),
+        "full_task_success": torch.tensor(full_task_success, dtype=torch.bool),
+        "close_option_success": torch.tensor(close_success, dtype=torch.bool),
+        "close_option_failure": torch.tensor(close_failure, dtype=torch.bool),
+        "close_option_timeout": torch.tensor(close_timeout, dtype=torch.bool),
+        "close_option_unlatched_lift": torch.tensor(
+            close_unlatched_lift, dtype=torch.bool
+        ),
+        "close_option_horizontal_escape": torch.tensor(
+            close_horizontal_escape, dtype=torch.bool
+        ),
+        "close_option_lost_window": torch.tensor(close_lost_window, dtype=torch.bool),
+        "close_option_stable_steps": torch.tensor(close_stable_steps, dtype=torch.long),
+        "grasp_quality": torch.tensor(grasp_quality, dtype=torch.float32),
+        "hold_quality": torch.tensor(hold_quality, dtype=torch.float32),
+        "max_force": torch.tensor(max_force, dtype=torch.float32),
     }
 
 
@@ -121,6 +153,95 @@ def test_terminal_event_contract() -> None:
     )
 
 
+def test_close_option_terminal_event_contract() -> None:
+    terminal = _events(
+        success=(True, False),
+        time_out=(False, True),
+        full_task_success=(False, False),
+        close_success=(True, False),
+        close_timeout=(False, True),
+        close_stable_steps=(15, 0),
+    )
+    actual = validate_terminal_events(
+        {"pick_tool_terminal": terminal},
+        torch.tensor([True, False]),
+        torch.tensor([False, True]),
+        task_mode=CLOSE_OPTION_MODE,
+    )
+
+    unsafe_success = _events(
+        success=(True, False),
+        dropped=(True, False),
+        full_task_success=(False, False),
+        close_success=(True, False),
+        close_stable_steps=(15, 0),
+    )
+    _expect_error(
+        RuntimeError,
+        validate_terminal_events,
+        {"pick_tool_terminal": unsafe_success},
+        torch.tensor([True, False]),
+        torch.tensor([False, False]),
+        task_mode=CLOSE_OPTION_MODE,
+    )
+    assert actual["close_option_success"].tolist() == [True, False]
+    assert actual["full_task_success"].tolist() == [False, False]
+
+    # The option fails pre-latch at 1.5 cm, well before the full task's 5 cm
+    # anti-fling boundary.  This is a valid close failure even though the legacy
+    # unlatched-5-cm diagnostic remains false.
+    early_lift = _events(
+        failure=(True, False),
+        close_failure=(True, False),
+        close_unlatched_lift=(True, False),
+        clearance=(0.016, -0.001),
+    )
+    validate_terminal_events(
+        {"pick_tool_terminal": early_lift},
+        torch.tensor([True, False]),
+        torch.tensor([False, False]),
+        task_mode=CLOSE_OPTION_MODE,
+    )
+
+    horizontal_escape = _events(
+        failure=(True, False),
+        close_failure=(True, False),
+        close_horizontal_escape=(True, False),
+    )
+    validate_terminal_events(
+        {"pick_tool_terminal": horizontal_escape},
+        torch.tensor([True, False]),
+        torch.tensor([False, False]),
+        task_mode=CLOSE_OPTION_MODE,
+    )
+
+    premature = _events(
+        success=(True, False),
+        close_success=(True, False),
+        close_stable_steps=(14, 0),
+        full_task_success=(False, False),
+    )
+    _expect_error(
+        RuntimeError,
+        validate_terminal_events,
+        {"pick_tool_terminal": premature},
+        torch.tensor([True, False]),
+        torch.tensor([False, False]),
+        task_mode=CLOSE_OPTION_MODE,
+    )
+
+    inconsistent_alias = dict(terminal)
+    inconsistent_alias["close_option_success"] = torch.tensor([False, False])
+    _expect_error(
+        RuntimeError,
+        validate_terminal_events,
+        {"pick_tool_terminal": inconsistent_alias},
+        torch.tensor([True, False]),
+        torch.tensor([False, True]),
+        task_mode=CLOSE_OPTION_MODE,
+    )
+
+
 def test_reset_before_terminal_physical_truth() -> None:
     raw = _events(
         success=(True, False),
@@ -150,6 +271,87 @@ def test_reset_before_terminal_physical_truth() -> None:
         {"pick_tool_terminal": invalid},
         num_envs=2,
         device=torch.device("cpu"),
+    )
+
+
+def test_close_option_physical_truth_is_not_20cm_success() -> None:
+    close_success = _events(
+        success=(True, False),
+        full_task_success=(False, False),
+        close_success=(True, False),
+        close_stable_steps=(15, 0),
+        clearance=(0.004, -0.001),
+        grasped=(True, False),
+        grasp_quality=(0.40, 0.0),
+        hold_quality=(0.60, 0.0),
+        max_force=(12.0, 0.0),
+    )
+    truth = physical_truth_from_terminal_info(
+        {"pick_tool_terminal": close_success},
+        num_envs=2,
+        device=torch.device("cpu"),
+        task_mode=CLOSE_OPTION_MODE,
+    )
+    assert truth.clearance[0] < 0.20
+
+    # The identical generic success alias is invalid under full-task semantics;
+    # the explicitly named full_task_success remains authoritative.
+    _expect_error(
+        RuntimeError,
+        physical_truth_from_terminal_info,
+        {"pick_tool_terminal": close_success},
+        num_envs=2,
+        device=torch.device("cpu"),
+        task_mode=FULL_TASK_MODE,
+    )
+
+    no_latch = dict(close_success)
+    no_latch["is_grasped"] = torch.tensor([False, False])
+    _expect_error(
+        RuntimeError,
+        physical_truth_from_terminal_info,
+        {"pick_tool_terminal": no_latch},
+        num_envs=2,
+        device=torch.device("cpu"),
+        task_mode=CLOSE_OPTION_MODE,
+    )
+
+    for key, replacement in (
+        ("grasp_quality", torch.tensor([0.34, 0.0])),
+        ("hold_quality", torch.tensor([0.49, 0.0])),
+        ("max_force", torch.tensor([30.01, 0.0])),
+    ):
+        invalid_quality = dict(close_success)
+        invalid_quality[key] = replacement
+        _expect_error(
+            RuntimeError,
+            physical_truth_from_terminal_info,
+            {"pick_tool_terminal": invalid_quality},
+            num_envs=2,
+            device=torch.device("cpu"),
+            task_mode=CLOSE_OPTION_MODE,
+        )
+
+    dropped_success = dict(close_success)
+    dropped_success["dropped"] = torch.tensor([True, False])
+    _expect_error(
+        RuntimeError,
+        physical_truth_from_terminal_info,
+        {"pick_tool_terminal": dropped_success},
+        num_envs=2,
+        device=torch.device("cpu"),
+        task_mode=CLOSE_OPTION_MODE,
+    )
+
+    false_full_success = dict(close_success)
+    false_full_success["full_task_success"] = torch.tensor([True, False])
+    _expect_error(
+        RuntimeError,
+        physical_truth_from_terminal_info,
+        {"pick_tool_terminal": false_full_success},
+        num_envs=2,
+        device=torch.device("cpu"),
+        task_mode=CLOSE_OPTION_MODE,
     )
 
 
@@ -257,6 +459,125 @@ def test_exact_episode_quotas_and_strict_tracker() -> None:
     }
 
 
+def test_close_option_tracker_and_metrics_are_separate_from_full_success() -> None:
+    tracker = StrictEpisodeTracker(
+        episodes=2,
+        num_envs=2,
+        device=torch.device("cpu"),
+        initial_truth=_truth((-0.001, -0.001), (False, False)),
+        task_mode=CLOSE_OPTION_MODE,
+    )
+    raw = _events(
+        success=(True, False),
+        failure=(False, True),
+        full_task_success=(False, False),
+        close_success=(True, False),
+        close_failure=(False, True),
+        close_horizontal_escape=(False, True),
+        close_stable_steps=(15, 0),
+        clearance=(0.003, 0.002),
+        grasped=(True, False),
+        grasp_quality=(0.40, 0.0),
+        hold_quality=(0.60, 0.0),
+        max_force=(10.0, 0.0),
+    )
+    events = validate_terminal_events(
+        {"pick_tool_terminal": raw},
+        torch.tensor([True, True]),
+        torch.tensor([False, False]),
+        task_mode=CLOSE_OPTION_MODE,
+    )
+    tracker.step(
+        reward=torch.tensor([100.0, -100.0]),
+        terminated=torch.tensor([True, True]),
+        truncated=torch.tensor([False, False]),
+        events=events,
+        transition_truth=_truth((0.003, 0.002), (True, False)),
+        post_reset_truth=_truth((-0.001, -0.001), (False, False)),
+    )
+    assert tracker.complete
+    assert tracker.records[0]["close_option_success"] is True
+    assert "success" not in tracker.records[0]
+    assert tracker.records[1]["close_option_horizontal_escape"] is True
+
+    timeout_tracker = StrictEpisodeTracker(
+        episodes=1,
+        num_envs=2,
+        device=torch.device("cpu"),
+        initial_truth=_truth((-0.001, -0.001), (False, False)),
+        task_mode=CLOSE_OPTION_MODE,
+    )
+    timeout_raw = _events(
+        time_out=(True, False),
+        close_timeout=(True, False),
+    )
+    timeout_events = validate_terminal_events(
+        {"pick_tool_terminal": timeout_raw},
+        torch.tensor([False, False]),
+        torch.tensor([True, False]),
+        task_mode=CLOSE_OPTION_MODE,
+    )
+    timeout_tracker.step(
+        reward=torch.zeros(2),
+        terminated=torch.tensor([False, False]),
+        truncated=torch.tensor([True, False]),
+        events=timeout_events,
+        transition_truth=_truth((-0.001, -0.001), (False, False)),
+        post_reset_truth=_truth((-0.001, -0.001), (False, False)),
+    )
+    assert timeout_tracker.records[0]["close_option_timeout"] is True
+    assert "time_out" not in timeout_tracker.records[0]
+
+    with tempfile.TemporaryDirectory(prefix="flashsac_close_eval_") as directory:
+        close_dataset = Path(directory) / "close.pt"
+        close_dataset.touch()
+        validate_close_option_evaluation_config(
+            close_option_mode=True,
+            curriculum_dataset=close_dataset,
+            curriculum_boundary="close_start",
+            curriculum_probability=1.0,
+            curriculum_joint_noise=0.0,
+            episode_length_s=3.0,
+        )
+        metrics = build_strict_metrics(
+            tracker.records,
+            checkpoint=Path("/tmp/close-checkpoint"),
+            architecture="production",
+            seed=11,
+            num_envs=2,
+            vector_steps=1,
+            max_vector_steps=10,
+            episode_length_s=3.0,
+            max_episode_steps=150,
+            curriculum_dataset=close_dataset,
+            curriculum_dataset_sha256="test-close-dataset-sha256",
+            curriculum_boundary="close_start",
+            curriculum_probability=1.0,
+            curriculum_joint_noise=0.0,
+            use_compile=False,
+            upstream_commit="test-commit",
+            task_mode=CLOSE_OPTION_MODE,
+            checkpoint_task_mode=CLOSE_OPTION_MODE,
+        )
+    assert metrics["task_mode"] == CLOSE_OPTION_MODE
+    assert metrics["close_option_success_rate"] == 0.5
+    assert "strict_success_rate" not in metrics
+    assert metrics["success_contract"]["full_task_20cm_success"] == "not_evaluated"
+    assert metrics["events"] == {
+        "close_option_success": 1,
+        "close_option_failure": 1,
+        "close_option_timeout": 0,
+        "dropped": 0,
+        "unsafe_force": 0,
+        "close_option_unlatched_lift": 0,
+        "close_option_horizontal_escape": 1,
+        "close_option_lost_window": 0,
+    }
+    assert metrics["success_contract"]["min_grasp_quality"] == 0.35
+    assert metrics["failure_contract"]["unlatched_lift_limit_m"] == 0.015
+    assert all("success" not in episode for episode in metrics["episodes"])
+
+
 def test_curriculum_argument_contract() -> None:
     validate_curriculum_config(dataset=None, probability=0.0, joint_noise=0.0)
     _expect_error(
@@ -274,6 +595,35 @@ def test_curriculum_argument_contract() -> None:
             probability=probability,
             joint_noise=0.0,
         )
+    with tempfile.TemporaryDirectory() as directory:
+        dataset = Path(directory) / "close.pt"
+        dataset.touch()
+        validate_close_option_evaluation_config(
+            close_option_mode=True,
+            curriculum_dataset=dataset,
+            curriculum_boundary="close_start",
+            curriculum_probability=1.0,
+            curriculum_joint_noise=0.005,
+            episode_length_s=5.0,
+        )
+        for override in (
+            {"curriculum_dataset": None},
+            {"curriculum_boundary": "lift_start"},
+            {"curriculum_probability": 0.5},
+            {"curriculum_joint_noise": 0.021},
+            {"episode_length_s": 0.29},
+            {"episode_length_s": 20.0},
+        ):
+            config = {
+                "close_option_mode": True,
+                "curriculum_dataset": dataset,
+                "curriculum_boundary": "close_start",
+                "curriculum_probability": 1.0,
+                "curriculum_joint_noise": 0.005,
+                "episode_length_s": 5.0,
+            }
+            config.update(override)
+            _expect_error(ValueError, validate_close_option_evaluation_config, **config)
     for joint_noise in (-0.01, float("inf")):
         _expect_error(
             ValueError,
@@ -347,6 +697,36 @@ def test_checkpoint_architecture_and_path_contract() -> None:
         _expect_error(FileNotFoundError, resolve_checkpoint_directory, root)
 
 
+def test_checkpoint_task_mode_evaluation_contract() -> None:
+    assert not resolve_cross_task_actor_evaluation(
+        checkpoint_task_mode=FULL_TASK_MODE,
+        requested_task_mode=FULL_TASK_MODE,
+        allow_cross_task_actor=False,
+    )
+    assert not resolve_cross_task_actor_evaluation(
+        checkpoint_task_mode=CLOSE_OPTION_MODE,
+        requested_task_mode=CLOSE_OPTION_MODE,
+        allow_cross_task_actor=False,
+    )
+    _expect_error(
+        ValueError,
+        resolve_cross_task_actor_evaluation,
+        checkpoint_task_mode=FULL_TASK_MODE,
+        requested_task_mode=CLOSE_OPTION_MODE,
+        allow_cross_task_actor=False,
+    )
+    assert resolve_cross_task_actor_evaluation(
+        checkpoint_task_mode=FULL_TASK_MODE,
+        requested_task_mode=CLOSE_OPTION_MODE,
+        allow_cross_task_actor=True,
+    )
+    assert resolve_cross_task_actor_evaluation(
+        checkpoint_task_mode=CLOSE_OPTION_MODE,
+        requested_task_mode=FULL_TASK_MODE,
+        allow_cross_task_actor=True,
+    )
+
+
 def test_strict_json_and_summary() -> None:
     summary = summarize([0.0, 1.0, 2.0])
     assert summary["min"] == 0.0
@@ -366,10 +746,14 @@ def test_strict_json_and_summary() -> None:
 
 def main() -> None:
     test_terminal_event_contract()
+    test_close_option_terminal_event_contract()
     test_reset_before_terminal_physical_truth()
+    test_close_option_physical_truth_is_not_20cm_success()
     test_exact_episode_quotas_and_strict_tracker()
+    test_close_option_tracker_and_metrics_are_separate_from_full_success()
     test_curriculum_argument_contract()
     test_checkpoint_architecture_and_path_contract()
+    test_checkpoint_task_mode_evaluation_contract()
     test_strict_json_and_summary()
     print("evaluate contract tests passed")
 

@@ -243,6 +243,9 @@ def test_close_option_state() -> None:
     check(not result["success"].any().item(), "close option succeeded before 15 stable frames")
     result = update()
     check(result["success"].all().item(), "close option did not succeed on frame 15")
+    result = update(unsafe=torch.ones(n, dtype=torch.bool))
+    check(not result["success"].any().item(), "unsafe/drop state won over close failure")
+    check(result["failure"].all().item(), "unsafe/drop did not dominate close success")
 
     # One low-hold frame clears the independent option streak even though the four-frame phase
     # latch can remain set in its Schmitt dead band.

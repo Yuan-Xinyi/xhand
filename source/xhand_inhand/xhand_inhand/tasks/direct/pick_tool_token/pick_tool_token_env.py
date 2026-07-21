@@ -1421,6 +1421,18 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 "unlatched_clearance_ge_5cm": (
                     (clearance >= 0.05) & (~self._is_grasped)
                 ).clone(),
+                # Keep the Gym-compatible generic success/failure aliases above, while also
+                # publishing the objective-specific truth.  A close-option success is a stable
+                # latch near the table, not a 20 cm full-task success; downstream evaluators must
+                # never have to infer which meaning the generic key has from object height.
+                "full_task_success": self._is_success.clone(),
+                "close_option_success": self._close_option_success.clone(),
+                "close_option_failure": self._close_option_failure.clone(),
+                "close_option_timeout": self._close_option_timeout.clone(),
+                "close_option_unlatched_lift": self._close_option_unlatched_lift.clone(),
+                "close_option_horizontal_escape": self._close_option_horizontal_escape.clone(),
+                "close_option_lost_window": self._close_option_lost_window.clone(),
+                "close_option_stable_steps": self._close_option_stable_steps.clone(),
                 **terminal_state,
             }
             return terminated, time_out
@@ -1441,6 +1453,16 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             "dropped": dropped.clone(),
             "unsafe_force": unsafe_force.clone(),
             "unlatched_clearance_ge_5cm": self._unlatched_lift_failure.clone(),
+            "full_task_success": self._is_success.clone(),
+            # Publish a fixed terminal schema in both modes.  These tensors remain zero in the
+            # full task because the close-option state machine is inactive.
+            "close_option_success": self._close_option_success.clone(),
+            "close_option_failure": self._close_option_failure.clone(),
+            "close_option_timeout": self._close_option_timeout.clone(),
+            "close_option_unlatched_lift": self._close_option_unlatched_lift.clone(),
+            "close_option_horizontal_escape": self._close_option_horizontal_escape.clone(),
+            "close_option_lost_window": self._close_option_lost_window.clone(),
+            "close_option_stable_steps": self._close_option_stable_steps.clone(),
             **terminal_state,
         }
         return terminated, time_out

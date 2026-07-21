@@ -16,6 +16,7 @@ after an exact rehearsal-state resume is bitwise identical.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 import hashlib
 import math
 import os
@@ -27,6 +28,78 @@ import torch
 
 ACTOR_REHEARSAL_VERSION = 1
 ACTOR_REHEARSAL_KEYS = ("observation", "action")
+
+
+@dataclass(frozen=True)
+class ActorRehearsalSourceContract:
+    """Exact metadata/phase allowlist entry for an actor-only dataset."""
+
+    name: str
+    required_metadata: Mapping[str, Any]
+    required_phase: int
+
+
+_PICK_TOOL_ACTION_LAYOUT = "arm_delta7|crossdex_token9|distal_residual5"
+_PICK_TOOL_OBSERVATION_LAYOUT = "legacy_prefix87|distal_action5|grasp_transport23"
+_PICK_TOOL_PHASE_NAMES = ["approach", "close", "micro", "lift", "settle"]
+
+PICK_TOOL_ACTOR_DEMO_CONTRACTS = (
+    ActorRehearsalSourceContract(
+        name="scripted_lift_teacher",
+        required_metadata={
+            "action_layout": _PICK_TOOL_ACTION_LAYOUT,
+            "observation_layout": _PICK_TOOL_OBSERVATION_LAYOUT,
+            "phase_names": _PICK_TOOL_PHASE_NAMES,
+            "collector": "online_base_close_to_scripted_lift_teacher",
+            "dataset_phase": "lift",
+            "close_arm_mode": "zero",
+            "teacher_probability": 1.0,
+            "executed_teacher_fraction": 1.0,
+            "first_observation_last_action_max_error": 0.0,
+        },
+        required_phase=3,
+    ),
+    ActorRehearsalSourceContract(
+        # Legacy July-2026 close datasets predate ``dataset_phase`` and used a
+        # close-specific arm-action audit key. Keep this schema explicit rather
+        # than silently accepting arbitrary missing metadata.
+        name="frozen_base_close_teacher_legacy",
+        required_metadata={
+            "action_layout": _PICK_TOOL_ACTION_LAYOUT,
+            "observation_layout": _PICK_TOOL_OBSERVATION_LAYOUT,
+            "phase_names": _PICK_TOOL_PHASE_NAMES,
+            "collector": "online_frozen_base_to_close_teacher",
+            "close_arm_mode": "zero",
+            "first_observation_last_action_max_error": 0.0,
+            "close_teacher_arm_action_abs_max": 0.0,
+        },
+        required_phase=1,
+    ),
+    ActorRehearsalSourceContract(
+        # Current base_handoff_close_dataset.py producer schema. The saved
+        # action is always the close teacher label, including on DAgger rows;
+        # rollout teacher-execution fractions therefore do not constrain BC.
+        name="frozen_base_close_teacher",
+        required_metadata={
+            "action_layout": _PICK_TOOL_ACTION_LAYOUT,
+            "observation_layout": _PICK_TOOL_OBSERVATION_LAYOUT,
+            "phase_names": _PICK_TOOL_PHASE_NAMES,
+            "collector": "online_frozen_base_to_close_teacher",
+            "dataset_phase": "close",
+            "close_arm_mode": "zero",
+            "first_observation_last_action_max_error": 0.0,
+            "option_teacher_arm_action_abs_max": 0.0,
+        },
+        required_phase=1,
+    ),
+)
+
+PICK_TOOL_LIFT_ACTOR_DEMO_CONTRACTS = tuple(
+    contract for contract in PICK_TOOL_ACTOR_DEMO_CONTRACTS if contract.required_phase == 3
+)
+PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS = tuple(
+    contract for contract in PICK_TOOL_ACTOR_DEMO_CONTRACTS if contract.required_phase == 1
+)
 
 _INTEGER_DTYPES = {
     torch.uint8,
@@ -183,7 +256,8 @@ def _audit_metadata(
     action_dim: int,
     phase: torch.Tensor | None,
     expected_metadata: Mapping[str, Any] | None,
-) -> Mapping[str, Any]:
+    allowed_contracts: Sequence[ActorRehearsalSourceContract] | None,
+) -> tuple[Mapping[str, Any], ActorRehearsalSourceContract | None]:
     metadata = payload.get("meta")
     if not isinstance(metadata, Mapping):
         raise TypeError("actor rehearsal dataset requires mapping metadata in 'meta'")
@@ -191,9 +265,16 @@ def _audit_metadata(
         raise ValueError(
             f"actor rehearsal format_version={metadata.get('format_version')!r}, expected 1"
         )
-    for key in ("action_layout", "observation_layout", "collector", "dataset_phase"):
+    for key in ("action_layout", "observation_layout", "collector"):
         if not isinstance(metadata.get(key), str) or not metadata[key]:
             raise ValueError(f"actor rehearsal metadata requires non-empty {key!r}")
+    if "dataset_phase" in metadata:
+        if not isinstance(metadata["dataset_phase"], str) or not metadata["dataset_phase"]:
+            raise ValueError("actor rehearsal metadata dataset_phase must be non-empty when present")
+    elif allowed_contracts is None:
+        # Historical close-option teachers predate this descriptive field and
+        # are admitted only through their explicit allowlist contract below.
+        raise ValueError("actor rehearsal metadata requires non-empty 'dataset_phase'")
     for key, expected in (
         ("observation_dim", observation_dim),
         ("action_dim", action_dim),
@@ -202,12 +283,46 @@ def _audit_metadata(
             raise ValueError(
                 f"actor rehearsal metadata {key}={metadata[key]!r}, expected {expected}"
             )
+    if expected_metadata is not None and allowed_contracts is not None:
+        raise ValueError("expected_metadata and allowed_contracts are mutually exclusive")
     if expected_metadata is not None:
         for key, expected in expected_metadata.items():
             if metadata.get(key) != expected:
                 raise ValueError(
                     f"actor rehearsal metadata {key}={metadata.get(key)!r}, expected {expected!r}"
                 )
+
+    matched_contract: ActorRehearsalSourceContract | None = None
+    if allowed_contracts is not None:
+        if not allowed_contracts:
+            raise ValueError("actor rehearsal allowed_contracts must not be empty")
+        matches = [
+            contract
+            for contract in allowed_contracts
+            if all(metadata.get(key) == expected for key, expected in contract.required_metadata.items())
+        ]
+        if len(matches) != 1:
+            names = [contract.name for contract in allowed_contracts]
+            if not matches:
+                raise ValueError(
+                    "actor rehearsal metadata does not match an allowed source contract; "
+                    f"collector={metadata.get('collector')!r}, allowed={names}"
+                )
+            raise ValueError(
+                "actor rehearsal metadata ambiguously matches multiple source contracts: "
+                f"{[contract.name for contract in matches]}"
+            )
+        matched_contract = matches[0]
+        if phase is None:
+            raise ValueError(
+                f"actor rehearsal source contract {matched_contract.name!r} requires phase labels"
+            )
+        if bool((phase != matched_contract.required_phase).any()):
+            values = sorted(int(value) for value in torch.unique(phase).detach().cpu().tolist())
+            raise ValueError(
+                f"actor rehearsal source contract {matched_contract.name!r} requires every "
+                f"phase={matched_contract.required_phase}, got {values}"
+            )
 
     phase_names = metadata.get("phase_names")
     if phase_names is not None:
@@ -226,7 +341,7 @@ def _audit_metadata(
                 raise ValueError(f"actor rehearsal metadata {key} must be finite")
             if not 0.0 <= float(value) <= 1.0:
                 raise ValueError(f"actor rehearsal metadata {key} must be in [0, 1]")
-    return metadata
+    return metadata, matched_contract
 
 
 def load_actor_rehearsal(
@@ -236,6 +351,7 @@ def load_actor_rehearsal(
     observation_dim: int,
     action_dim: int,
     expected_metadata: Mapping[str, Any] | None = None,
+    allowed_contracts: Sequence[ActorRehearsalSourceContract] | None = None,
 ) -> tuple[dict[str, torch.Tensor], torch.Tensor | None, dict[str, Any]]:
     """Load and audit a successful observation/action teacher dataset.
 
@@ -273,12 +389,13 @@ def load_actor_rehearsal(
     }
     phase = _require_phase(payload.get("phase"), rows=rows, device=resolved_device)
     episodes = _audit_episode_partition(payload, rows=rows)
-    metadata = _audit_metadata(
+    metadata, source_contract = _audit_metadata(
         payload,
         observation_dim=observation_dim,
         action_dim=action_dim,
         phase=phase,
         expected_metadata=expected_metadata,
+        allowed_contracts=allowed_contracts,
     )
     phase_counts: dict[str, int] = {}
     if phase is not None:
@@ -298,7 +415,8 @@ def load_actor_rehearsal(
         "episodes": episodes,
         "phase_counts": phase_counts,
         "collector": str(metadata["collector"]),
-        "dataset_phase": str(metadata["dataset_phase"]),
+        "dataset_phase": metadata.get("dataset_phase"),
+        "source_contract": source_contract.name if source_contract is not None else None,
     }
     return batch, phase, audit
 

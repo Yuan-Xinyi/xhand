@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic, strict physical evaluation for PickTool FlashSAC checkpoints.
+"""Deterministic physical evaluation for PickTool FlashSAC checkpoints.
 
 The evaluator deliberately runs in a fresh Isaac process.  It reconstructs the
 same production network architecture as :mod:`train`, loads a checkpoint
@@ -13,9 +13,10 @@ Those reset-before clones are the sole authority for the episode being closed;
 the physical state visible after ``step`` is used only to initialize the next
 episode on a reset row.
 
-Success, failure, timeout, drop, unsafe-force and unlatched-5-cm counts are
+Full-task success, close-option success, failure, timeout and safety counts are
 episode events.  They are never inferred from aggregate log means or from a
-post-reset state.
+post-reset state.  Close-option evaluation deliberately uses a separate output
+contract: a stable latch near the table is never reported as 20 cm success.
 """
 
 from __future__ import annotations
@@ -47,6 +48,9 @@ SMOKE_ACTOR_HIDDEN = 32
 SMOKE_CRITIC_BLOCKS = 1
 SMOKE_CRITIC_HIDDEN = 64
 SMOKE_CRITIC_BINS = 51
+FULL_TASK_MODE = "full_task"
+CLOSE_OPTION_MODE = "close_option"
+TASK_MODES = (FULL_TASK_MODE, CLOSE_OPTION_MODE)
 
 # This is checkpoint metadata as well as interaction behavior.  Bridge loading
 # intentionally rejects a different grouping, so keep the evaluator contract
@@ -65,6 +69,43 @@ TERMINAL_EVENT_KEYS = (
     "unsafe_force",
     "unlatched_clearance_ge_5cm",
 )
+
+CLOSE_OPTION_EVENT_KEYS = (
+    "full_task_success",
+    "close_option_success",
+    "close_option_failure",
+    "close_option_timeout",
+    "close_option_unlatched_lift",
+    "close_option_horizontal_escape",
+    "close_option_lost_window",
+    "close_option_stable_steps",
+)
+
+
+def _validate_task_mode(task_mode: str) -> str:
+    if task_mode not in TASK_MODES:
+        raise ValueError(f"unsupported task_mode={task_mode!r}; expected one of {TASK_MODES}")
+    return task_mode
+
+
+def resolve_cross_task_actor_evaluation(
+    *,
+    checkpoint_task_mode: str,
+    requested_task_mode: str,
+    allow_cross_task_actor: bool,
+) -> bool:
+    """Return whether evaluation crosses task modes, requiring explicit permission."""
+
+    checkpoint_task_mode = _validate_task_mode(checkpoint_task_mode)
+    requested_task_mode = _validate_task_mode(requested_task_mode)
+    cross_task = checkpoint_task_mode != requested_task_mode
+    if cross_task and not allow_cross_task_actor:
+        raise ValueError(
+            "requested evaluation task mode differs from checkpoint task contract; "
+            "pass --allow_cross_task_actor for an explicit actor-only cross-task benchmark: "
+            f"checkpoint={checkpoint_task_mode!r}, requested={requested_task_mode!r}"
+        )
+    return cross_task
 
 
 def _require_vector(
@@ -98,8 +139,15 @@ def validate_terminal_events(
     info: Mapping[str, Any],
     terminated: torch.Tensor,
     truncated: torch.Tensor,
+    *,
+    task_mode: str = FULL_TASK_MODE,
+    close_option_confirm_steps: int = 15,
 ) -> dict[str, torch.Tensor]:
-    """Return task-authored terminal tensors after checking Gym consistency."""
+    """Return task-authored terminal tensors after checking mode-specific consistency."""
+
+    task_mode = _validate_task_mode(task_mode)
+    if close_option_confirm_steps < 1:
+        raise ValueError("close_option_confirm_steps must be positive")
 
     num_envs = int(terminated.numel())
     if terminated.shape != (num_envs,) or terminated.dtype != torch.bool:
@@ -132,18 +180,80 @@ def validate_terminal_events(
         )
     if bool((events["success"] & events["failure"]).any()):
         raise RuntimeError("an episode cannot be both a strict success and task failure")
-    failure_sources = (
-        events["dropped"]
-        | events["unsafe_force"]
-        | events["unlatched_clearance_ge_5cm"]
-    )
-    if not torch.equal(events["failure"], failure_sources):
-        raise RuntimeError(
-            "task failure must be exactly drop, unsafe force, or unlatched lift"
-        )
     if bool((task_terminated & events["time_out"]).any()):
         raise RuntimeError("task termination and timeout must be mutually exclusive")
-    return events
+
+    full_task_success_raw = raw.get("full_task_success", events["success"])
+    full_task_success = _require_vector(
+        "pick_tool_terminal['full_task_success']",
+        full_task_success_raw,
+        num_envs=num_envs,
+        device=terminated.device,
+        dtype=torch.bool,
+    )
+    if task_mode == FULL_TASK_MODE:
+        if not torch.equal(events["success"], full_task_success):
+            raise RuntimeError("full-task generic success alias does not match full_task_success")
+        failure_sources = (
+            events["dropped"]
+            | events["unsafe_force"]
+            | events["unlatched_clearance_ge_5cm"]
+        )
+        if not torch.equal(events["failure"], failure_sources):
+            raise RuntimeError(
+                "task failure must be exactly drop, unsafe force, or unlatched lift"
+            )
+        # Preserve the established full-task return schema exactly.
+        return events
+
+    close_events = {
+        name: _require_vector(
+            f"pick_tool_terminal[{name!r}]",
+            raw.get(name),
+            num_envs=num_envs,
+            device=terminated.device,
+            dtype=torch.long if name == "close_option_stable_steps" else torch.bool,
+        )
+        for name in CLOSE_OPTION_EVENT_KEYS
+    }
+    if not torch.equal(close_events["full_task_success"], full_task_success):
+        raise RuntimeError("close-option payload contains inconsistent full_task_success aliases")
+    if not torch.equal(events["success"], close_events["close_option_success"]):
+        raise RuntimeError("close-option generic success alias does not match close_option_success")
+    if not torch.equal(events["failure"], close_events["close_option_failure"]):
+        raise RuntimeError("close-option generic failure alias does not match close_option_failure")
+    if not torch.equal(events["time_out"], close_events["close_option_timeout"]):
+        raise RuntimeError("close-option generic timeout alias does not match close_option_timeout")
+    if bool(
+        (
+            close_events["close_option_success"]
+            & (events["dropped"] | events["unsafe_force"])
+        ).any()
+    ):
+        raise RuntimeError("close-option success cannot coexist with drop or unsafe force")
+
+    close_failure_sources = (
+        events["dropped"]
+        | events["unsafe_force"]
+        | close_events["close_option_unlatched_lift"]
+        | close_events["close_option_horizontal_escape"]
+        | close_events["close_option_lost_window"]
+    ) & ~close_events["close_option_success"]
+    if not torch.equal(close_events["close_option_failure"], close_failure_sources):
+        raise RuntimeError(
+            "close-option failure must be exactly drop, unsafe force, pre-latch lift, "
+            "horizontal escape, or lost pregrasp window"
+        )
+    if bool(
+        (
+            close_events["close_option_success"]
+            & (close_events["close_option_stable_steps"] < close_option_confirm_steps)
+        ).any()
+    ):
+        raise RuntimeError(
+            "close-option success reported before the stable-latch confirmation window"
+        )
+    return {**events, **close_events}
 
 
 @dataclass(frozen=True)
@@ -176,8 +286,24 @@ def physical_truth_from_terminal_info(
     *,
     num_envs: int,
     device: torch.device,
+    task_mode: str = FULL_TASK_MODE,
+    close_option_confirm_steps: int = 15,
+    close_option_min_hold_quality: float = 0.5,
+    grasp_quality_threshold: float = 0.35,
+    safe_force_limit: float = 30.0,
 ) -> PhysicalTruth:
     """Read per-step physical truth cloned by ``_get_dones`` before reset."""
+
+    task_mode = _validate_task_mode(task_mode)
+    if close_option_confirm_steps < 1:
+        raise ValueError("close_option_confirm_steps must be positive")
+    for name, value in (
+        ("close_option_min_hold_quality", close_option_min_hold_quality),
+        ("grasp_quality_threshold", grasp_quality_threshold),
+        ("safe_force_limit", safe_force_limit),
+    ):
+        if not math.isfinite(value):
+            raise ValueError(f"{name} must be finite")
 
     raw = _terminal_mapping(info)
     truth = PhysicalTruth(
@@ -197,12 +323,94 @@ def physical_truth_from_terminal_info(
         ),
     )
     truth.validate(num_envs=num_envs, device=device, name="pick_tool_terminal")
-    success = raw.get("success")
-    if isinstance(success, torch.Tensor):
-        if bool((success & (truth.clearance < 0.20 - 1.0e-6)).any()):
-            raise RuntimeError("strict success reported below 20 cm true mesh clearance")
-        if bool((success & ~truth.grasped).any()):
-            raise RuntimeError("strict success reported without the grasp latch")
+
+    generic_success = raw.get("success")
+    full_task_success_raw = raw.get(
+        "full_task_success",
+        generic_success if task_mode == FULL_TASK_MODE else None,
+    )
+    full_task_success = _require_vector(
+        "pick_tool_terminal['full_task_success']",
+        full_task_success_raw,
+        num_envs=num_envs,
+        device=device,
+        dtype=torch.bool,
+    )
+    # This invariant remains active even while evaluating the close option.  It
+    # protects the explicitly named full-task signal without imposing 20 cm on
+    # the independent close-option success event.
+    if bool((full_task_success & (truth.clearance < 0.20 - 1.0e-6)).any()):
+        raise RuntimeError("full-task success reported below 20 cm true mesh clearance")
+    if bool((full_task_success & ~truth.grasped).any()):
+        raise RuntimeError("full-task success reported without the grasp latch")
+
+    if task_mode == FULL_TASK_MODE:
+        if isinstance(generic_success, torch.Tensor) and not torch.equal(
+            generic_success, full_task_success
+        ):
+            raise RuntimeError("full-task generic success alias is inconsistent")
+        return truth
+
+    close_success = _require_vector(
+        "pick_tool_terminal['close_option_success']",
+        raw.get("close_option_success"),
+        num_envs=num_envs,
+        device=device,
+        dtype=torch.bool,
+    )
+    stable_steps = _require_vector(
+        "pick_tool_terminal['close_option_stable_steps']",
+        raw.get("close_option_stable_steps"),
+        num_envs=num_envs,
+        device=device,
+        dtype=torch.long,
+    )
+    grasp_quality = _require_vector(
+        "pick_tool_terminal['grasp_quality']",
+        raw.get("grasp_quality"),
+        num_envs=num_envs,
+        device=device,
+        dtype=torch.float32,
+    )
+    hold_quality = _require_vector(
+        "pick_tool_terminal['hold_quality']",
+        raw.get("hold_quality"),
+        num_envs=num_envs,
+        device=device,
+        dtype=torch.float32,
+    )
+    max_force = _require_vector(
+        "pick_tool_terminal['max_force']",
+        raw.get("max_force"),
+        num_envs=num_envs,
+        device=device,
+        dtype=torch.float32,
+    )
+    dropped = _require_vector(
+        "pick_tool_terminal['dropped']",
+        raw.get("dropped"),
+        num_envs=num_envs,
+        device=device,
+        dtype=torch.bool,
+    )
+    unsafe_force = _require_vector(
+        "pick_tool_terminal['unsafe_force']",
+        raw.get("unsafe_force"),
+        num_envs=num_envs,
+        device=device,
+        dtype=torch.bool,
+    )
+    invalid_close = close_success & (
+        (~truth.grasped)
+        | dropped
+        | unsafe_force
+        | (stable_steps < close_option_confirm_steps)
+        | (grasp_quality < grasp_quality_threshold)
+        | (hold_quality < close_option_min_hold_quality)
+        | (max_force > safe_force_limit)
+    )
+    if bool(invalid_close.any()):
+        raise RuntimeError("close-option success violates the stable, safe latch contract")
     return truth
 
 
@@ -242,8 +450,10 @@ class StrictEpisodeTracker:
         num_envs: int,
         device: torch.device,
         initial_truth: PhysicalTruth,
+        task_mode: str = FULL_TASK_MODE,
     ) -> None:
         initial_truth.validate(num_envs=num_envs, device=device, name="initial_truth")
+        self.task_mode = _validate_task_mode(task_mode)
         self.episodes = episodes
         self.num_envs = num_envs
         self.device = device
@@ -311,6 +521,15 @@ class StrictEpisodeTracker:
                 device=self.device,
                 dtype=torch.bool,
             )
+        if self.task_mode == CLOSE_OPTION_MODE:
+            for name in CLOSE_OPTION_EVENT_KEYS:
+                _require_vector(
+                    f"events[{name!r}]",
+                    events.get(name),
+                    num_envs=self.num_envs,
+                    device=self.device,
+                    dtype=torch.long if name == "close_option_stable_steps" else torch.bool,
+                )
 
         active = self.active
         self.returns.add_(torch.where(active, reward, 0.0))
@@ -328,7 +547,7 @@ class StrictEpisodeTracker:
         accepted_done = active & (terminated | truncated)
         ids = accepted_done.nonzero(as_tuple=False).squeeze(-1)
         for env_id in ids.detach().cpu().tolist():
-            record = {
+            record: dict[str, Any] = {
                 "episode_index": len(self.records),
                 "env_slot": env_id,
                 "slot_episode_index": int(self.completed_by_slot[env_id].item()),
@@ -338,15 +557,46 @@ class StrictEpisodeTracker:
                 "ever_grasped": bool(self.ever_grasped[env_id].item()),
                 "ever_clearance_ge_5cm": bool(self.ever_5cm[env_id].item()),
                 "ever_clearance_ge_20cm": bool(self.ever_20cm[env_id].item()),
-                "success": bool(events["success"][env_id].item()),
-                "failure": bool(events["failure"][env_id].item()),
-                "time_out": bool(events["time_out"][env_id].item()),
                 "dropped": bool(events["dropped"][env_id].item()),
                 "unsafe_force": bool(events["unsafe_force"][env_id].item()),
                 "ever_unlatched_clearance_ge_5cm": bool(
                     self.ever_unlatched_5cm[env_id].item()
                 ),
             }
+            if self.task_mode == FULL_TASK_MODE:
+                record.update(
+                    {
+                        "success": bool(events["success"][env_id].item()),
+                        "failure": bool(events["failure"][env_id].item()),
+                        "time_out": bool(events["time_out"][env_id].item()),
+                    }
+                )
+            else:
+                record.update(
+                    {
+                        "close_option_success": bool(
+                            events["close_option_success"][env_id].item()
+                        ),
+                        "close_option_failure": bool(
+                            events["close_option_failure"][env_id].item()
+                        ),
+                        "close_option_timeout": bool(
+                            events["close_option_timeout"][env_id].item()
+                        ),
+                        "close_option_unlatched_lift": bool(
+                            events["close_option_unlatched_lift"][env_id].item()
+                        ),
+                        "close_option_horizontal_escape": bool(
+                            events["close_option_horizontal_escape"][env_id].item()
+                        ),
+                        "close_option_lost_window": bool(
+                            events["close_option_lost_window"][env_id].item()
+                        ),
+                        "close_option_stable_steps": int(
+                            events["close_option_stable_steps"][env_id].item()
+                        ),
+                    }
+                )
             if not math.isfinite(record["return"]) or not math.isfinite(
                 record["max_true_clearance_m"]
             ):
@@ -415,16 +665,48 @@ def build_strict_metrics(
     curriculum_joint_noise: float,
     use_compile: bool,
     upstream_commit: str,
+    task_mode: str = FULL_TASK_MODE,
+    close_option_confirm_steps: int = 15,
+    close_option_grasp_quality_threshold: float = 0.35,
+    close_option_min_hold_quality: float = 0.5,
+    close_option_safe_force_limit: float = 30.0,
+    close_option_unlatched_lift_limit: float = 0.015,
+    close_option_horizontal_drift_limit: float = 0.03,
+    close_option_min_proximity: float = 0.01,
+    close_option_lost_window_steps: int = 12,
+    checkpoint_task_mode: str = FULL_TASK_MODE,
+    cross_task_actor_evaluation: bool = False,
 ) -> dict[str, Any]:
     if not records:
         raise ValueError("strict evaluation completed no episodes")
-    event_names = TERMINAL_EVENT_KEYS[:-1]
+    task_mode = _validate_task_mode(task_mode)
+    checkpoint_task_mode = _validate_task_mode(checkpoint_task_mode)
+    expected_cross_task = checkpoint_task_mode != task_mode
+    if bool(cross_task_actor_evaluation) != expected_cross_task:
+        raise ValueError(
+            "cross_task_actor_evaluation is inconsistent with checkpoint/requested task modes"
+        )
+    event_names = (
+        TERMINAL_EVENT_KEYS[:-1]
+        if task_mode == FULL_TASK_MODE
+        else (
+            "close_option_success",
+            "close_option_failure",
+            "close_option_timeout",
+            "dropped",
+            "unsafe_force",
+            "close_option_unlatched_lift",
+            "close_option_horizontal_escape",
+            "close_option_lost_window",
+        )
+    )
     event_counts = {
         name: sum(bool(record[name]) for record in records) for name in event_names
     }
-    event_counts["unlatched_clearance_ge_5cm"] = sum(
-        bool(record["ever_unlatched_clearance_ge_5cm"]) for record in records
-    )
+    if task_mode == FULL_TASK_MODE:
+        event_counts["unlatched_clearance_ge_5cm"] = sum(
+            bool(record["ever_unlatched_clearance_ge_5cm"]) for record in records
+        )
     funnel = {
         "ever_grasped": sum(bool(record["ever_grasped"]) for record in records),
         "ever_clearance_ge_5cm": sum(
@@ -435,8 +717,11 @@ def build_strict_metrics(
         ),
     }
     episodes = len(records)
-    return {
+    metrics: dict[str, Any] = {
         "status": "complete",
+        "task_mode": task_mode,
+        "checkpoint_task_mode": checkpoint_task_mode,
+        "cross_task_actor_evaluation": bool(cross_task_actor_evaluation),
         "checkpoint": str(checkpoint.resolve()),
         "flashsac_upstream_commit": upstream_commit,
         "policy": "deterministic_tanh_actor_mean",
@@ -477,7 +762,6 @@ def build_strict_metrics(
         "observation_dim": OBSERVATION_DIM,
         "action_dim": ACTION_DIM,
         "events": event_counts,
-        "strict_success_rate": event_counts["success"] / episodes,
         "funnel": funnel,
         "max_true_clearance_m": summarize(
             [float(record["max_true_clearance_m"]) for record in records]
@@ -486,6 +770,28 @@ def build_strict_metrics(
         "episode_length": summarize([int(record["length"]) for record in records]),
         "episodes": list(records),
     }
+    if task_mode == FULL_TASK_MODE:
+        metrics["strict_success_rate"] = event_counts["success"] / episodes
+    else:
+        metrics["close_option_success_rate"] = (
+            event_counts["close_option_success"] / episodes
+        )
+        metrics["success_contract"] = {
+            "name": "stable_close_option_latch",
+            "confirm_steps": close_option_confirm_steps,
+            "min_grasp_quality": close_option_grasp_quality_threshold,
+            "min_hold_quality": close_option_min_hold_quality,
+            "safe_force_limit_n": close_option_safe_force_limit,
+            "full_task_20cm_success": "not_evaluated",
+        }
+        metrics["failure_contract"] = {
+            "unlatched_lift_limit_m": close_option_unlatched_lift_limit,
+            "horizontal_drift_limit_m": close_option_horizontal_drift_limit,
+            "min_proximity": close_option_min_proximity,
+            "lost_window_steps": close_option_lost_window_steps,
+            "unsafe_force_or_drop": True,
+        }
+    return metrics
 
 
 _COMPILED_PREFIX = "_orig_mod."
@@ -605,6 +911,22 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
     )
     parser.add_argument("--use_compile", action="store_true")
     parser.add_argument("--compile_mode", default="reduce-overhead")
+    parser.add_argument(
+        "--close_option_mode",
+        action="store_true",
+        help=(
+            "Evaluate the short-horizon stable-latch option. Its success is reported separately "
+            "and is never treated as full-task 20 cm success."
+        ),
+    )
+    parser.add_argument(
+        "--allow_cross_task_actor",
+        action="store_true",
+        help=(
+            "Explicitly benchmark actor weights under a task mode different from the "
+            "checkpoint's task_contract.json. The critic is evaluation-only and ignored."
+        ),
+    )
     parser.add_argument("--episode_length_s", type=float, default=None)
     parser.add_argument(
         "--curriculum_dataset",
@@ -642,6 +964,36 @@ def validate_curriculum_config(
         raise FileNotFoundError(dataset)
 
 
+def validate_close_option_evaluation_config(
+    *,
+    close_option_mode: bool,
+    curriculum_dataset: Path | None,
+    curriculum_boundary: str,
+    curriculum_probability: float,
+    curriculum_joint_noise: float,
+    episode_length_s: float | None,
+) -> None:
+    """Reject close-option evaluations outside the captured pregrasp MDP."""
+
+    if not close_option_mode:
+        return
+    if curriculum_dataset is None:
+        raise ValueError("--close_option_mode requires a close-start curriculum dataset")
+    if curriculum_boundary != "close_start":
+        raise ValueError("--close_option_mode requires --curriculum_boundary close_start")
+    if curriculum_probability != 1.0:
+        raise ValueError("--close_option_mode requires --curriculum_probability 1")
+    if not 0.0 <= curriculum_joint_noise <= 0.02:
+        raise ValueError(
+            "--close_option_mode requires --curriculum_joint_noise in [0, 0.02]"
+        )
+    if episode_length_s is None or not 0.30 <= episode_length_s <= 5.0:
+        raise ValueError(
+            "--close_option_mode requires --episode_length_s in [0.30, 5] so the "
+            "15-frame confirmation window is physically reachable"
+        )
+
+
 def _validate_args(args: argparse.Namespace) -> None:
     if args.episodes < 1 or args.num_envs < 1:
         raise ValueError("--episodes and --num_envs must be positive")
@@ -656,11 +1008,22 @@ def _validate_args(args: argparse.Namespace) -> None:
         probability=args.curriculum_probability,
         joint_noise=args.curriculum_joint_noise,
     )
+    validate_close_option_evaluation_config(
+        close_option_mode=args.close_option_mode,
+        curriculum_dataset=args.curriculum_dataset,
+        curriculum_boundary=args.curriculum_boundary,
+        curriculum_probability=args.curriculum_probability,
+        curriculum_joint_noise=args.curriculum_joint_noise,
+        episode_length_s=args.episode_length_s,
+    )
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    if args.close_option_mode and args.episode_length_s is None:
+        args.episode_length_s = 5.0
     _validate_args(args)
     _seed_everything(args.seed)
+    task_mode = CLOSE_OPTION_MODE if args.close_option_mode else FULL_TASK_MODE
 
     from adapter import make_pick_tool_env
     from agent_bridge import (
@@ -669,6 +1032,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         FlashSACTorchBridge,
         build_agent_config,
     )
+    from train import read_checkpoint_task_contract
 
     device_string = str(args.device or "cuda:0")
     device = torch.device(device_string)
@@ -676,6 +1040,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(f"PickTool FlashSAC evaluation requires CUDA, got {device_string}")
 
     checkpoint = resolve_checkpoint_directory(args.checkpoint)
+    checkpoint_contract = read_checkpoint_task_contract(checkpoint)
+    checkpoint_task_mode = str(checkpoint_contract["task_mode"])
+    cross_task_actor_evaluation = resolve_cross_task_actor_evaluation(
+        checkpoint_task_mode=checkpoint_task_mode,
+        requested_task_mode=task_mode,
+        allow_cross_task_actor=args.allow_cross_task_actor,
+    )
     checkpoint_architecture = infer_checkpoint_architecture(checkpoint)
     architecture = checkpoint_architecture if args.architecture == "auto" else args.architecture
     if architecture != checkpoint_architecture:
@@ -684,7 +1055,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "use --architecture auto only when smoke-checkpoint evaluation is intentional"
         )
 
-    cfg_overrides: dict[str, Any] = {}
+    cfg_overrides: dict[str, Any] = {
+        "close_option_mode": bool(args.close_option_mode),
+    }
     if args.episode_length_s is not None:
         cfg_overrides["episode_length_s"] = args.episode_length_s
     if args.curriculum_dataset is not None:
@@ -703,6 +1076,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         cfg_overrides=cfg_overrides,
         validate_finite=args.validate_finite,
     )
+    task_cfg = env.unwrapped.cfg
+    close_option_confirm_steps = int(task_cfg.close_option_confirm_steps)
+    close_option_min_hold_quality = float(task_cfg.close_option_min_hold_quality)
+    grasp_quality_threshold = float(task_cfg.grasp_quality_high)
+    close_option_safe_force_limit = float(task_cfg.grasp_bonus_max_force)
+    close_option_unlatched_lift_limit = float(task_cfg.close_option_unlatched_lift_limit)
+    close_option_horizontal_drift_limit = float(task_cfg.close_option_horizontal_drift_limit)
+    close_option_min_proximity = float(task_cfg.close_option_min_proximity)
+    close_option_lost_window_steps = int(task_cfg.close_option_lost_window_steps)
 
     if architecture == "production":
         actor_blocks, actor_hidden = PRODUCTION_ACTOR_BLOCKS, PRODUCTION_ACTOR_HIDDEN
@@ -767,6 +1149,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         num_envs=args.num_envs,
         device=env.device,
         initial_truth=initial_truth,
+        task_mode=task_mode,
     )
     quota_max = int(tracker.quotas.max().item())
     default_max_steps = max(1, env.max_episode_steps * quota_max + quota_max)
@@ -785,11 +1168,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             # independently but cannot contribute additional events.
             action = torch.where(tracker.active.unsqueeze(-1), action, torch.zeros_like(action))
             next_observation, reward, terminated, truncated, info = env.step(action)
-            events = validate_terminal_events(info, terminated, truncated)
+            events = validate_terminal_events(
+                info,
+                terminated,
+                truncated,
+                task_mode=task_mode,
+                close_option_confirm_steps=close_option_confirm_steps,
+            )
             transition_truth = physical_truth_from_terminal_info(
                 info,
                 num_envs=args.num_envs,
                 device=env.device,
+                task_mode=task_mode,
+                close_option_confirm_steps=close_option_confirm_steps,
+                close_option_min_hold_quality=close_option_min_hold_quality,
+                grasp_quality_threshold=grasp_quality_threshold,
+                safe_force_limit=close_option_safe_force_limit,
             )
             # DirectRLEnv has already reset done rows at this point.  This read
             # is used only to initialize their next episode; old-episode maxima
@@ -831,6 +1225,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             curriculum_joint_noise=args.curriculum_joint_noise,
             use_compile=args.use_compile,
             upstream_commit=FLASH_SAC_COMMIT,
+            task_mode=task_mode,
+            close_option_confirm_steps=close_option_confirm_steps,
+            close_option_grasp_quality_threshold=grasp_quality_threshold,
+            close_option_min_hold_quality=close_option_min_hold_quality,
+            close_option_safe_force_limit=close_option_safe_force_limit,
+            close_option_unlatched_lift_limit=close_option_unlatched_lift_limit,
+            close_option_horizontal_drift_limit=close_option_horizontal_drift_limit,
+            close_option_min_proximity=close_option_min_proximity,
+            close_option_lost_window_steps=close_option_lost_window_steps,
+            checkpoint_task_mode=checkpoint_task_mode,
+            cross_task_actor_evaluation=cross_task_actor_evaluation,
         )
         _atomic_write_json(args.output.resolve(), metrics)
         return metrics

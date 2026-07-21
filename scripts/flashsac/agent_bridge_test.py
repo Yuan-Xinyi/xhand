@@ -375,6 +375,75 @@ def test_checkpoint_loads_across_amp_boundary() -> None:
             )
 
 
+def test_actor_only_checkpoint_is_portable_and_leaves_fresh_state() -> None:
+    for source_compiled, target_compiled in ((False, True), (True, False)):
+        torch.manual_seed(210 + int(source_compiled))
+        source = _agent(use_compile=source_compiled, normalize_reward=True)
+        _seed_optimizer_state(source)
+        source._update_step = 29  # noqa: SLF001
+
+        with tempfile.TemporaryDirectory(prefix="flashsac_actor_only_") as directory:
+            checkpoint = Path(directory) / "checkpoint"
+            source.save(str(checkpoint))
+
+            target = _agent(use_compile=target_compiled, normalize_reward=True)
+            observations = torch.randn(NUM_ENVS, OBSERVATION_DIM)
+            _ = target.sample_actions(
+                1, {"next_observation": observations}, training=True
+            )
+            target.process_transition(
+                _transition(observations, torch.zeros(NUM_ENVS, ACTION_DIM))
+            )
+            untouched_networks = {
+                name: _canonical_network_state(getattr(target, name))
+                for name in ("_critic", "_target_critic", "_temperature")
+            }
+            untouched_actor_optimizer = target._actor.optimizer.state_dict()  # noqa: SLF001
+            untouched_actor_step = target._actor.update_step  # noqa: SLF001
+            untouched_agent_step = target._update_step  # noqa: SLF001
+            untouched_noise = target._cached_noise.clone()  # noqa: SLF001
+            untouched_replay = target._replay_buffer.get_observations().clone()  # noqa: SLF001
+            assert target.reward_normalizer is not None
+            untouched_normalizer_max = target.reward_normalizer.G_r_max.clone()
+
+            target.load_actor(str(checkpoint))
+
+            _assert_nested_equal(
+                _canonical_network_state(target._actor),  # noqa: SLF001
+                _canonical_network_state(source._actor),  # noqa: SLF001
+            )
+            for name, expected in untouched_networks.items():
+                _assert_nested_equal(
+                    _canonical_network_state(getattr(target, name)), expected
+                )
+            _assert_nested_equal(
+                target._actor.optimizer.state_dict(), untouched_actor_optimizer  # noqa: SLF001
+            )
+            assert target._actor.update_step == untouched_actor_step == 0  # noqa: SLF001
+            assert target._update_step == untouched_agent_step == 0  # noqa: SLF001
+            torch.testing.assert_close(
+                target._cached_noise, untouched_noise, rtol=0.0, atol=0.0  # noqa: SLF001
+            )
+            torch.testing.assert_close(
+                target._replay_buffer.get_observations(),  # noqa: SLF001
+                untouched_replay,
+                rtol=0.0,
+                atol=0.0,
+            )
+            torch.testing.assert_close(
+                target.reward_normalizer.G_r_max,
+                untouched_normalizer_max,
+                rtol=0.0,
+                atol=0.0,
+            )
+
+            _expect_error(
+                FileNotFoundError,
+                target.load_actor,
+                str(Path(directory) / "missing"),
+            )
+
+
 def test_group_partition_is_validated() -> None:
     observation_space, action_space = _spaces()
     overlapping = (
@@ -411,6 +480,8 @@ def main() -> None:
     print("[PASS] compiled/uncompiled checkpoint portability (both directions)")
     test_checkpoint_loads_across_amp_boundary()
     print("[PASS] enabled/disabled AMP checkpoint portability (both directions)")
+    test_actor_only_checkpoint_is_portable_and_leaves_fresh_state()
+    print("[PASS] actor-only portability and fresh critic/replay/normalizer state")
     test_group_partition_is_validated()
     print("[PASS] noise-group validation")
     print("All FlashSAC Torch bridge tests passed.")
