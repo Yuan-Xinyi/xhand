@@ -90,6 +90,26 @@ def test_terminal_event_contract() -> None:
         torch.tensor([True, False]),
         torch.tensor([False, False]),
     )
+    unlatched_failure = _events(
+        failure=(True, False),
+        unlatched=(True, False),
+        clearance=(0.05, -0.001),
+    )
+    validate_terminal_events(
+        {"pick_tool_terminal": unlatched_failure},
+        torch.tensor([True, False]),
+        torch.tensor([False, False]),
+    )
+    terminal_timeout_overlap = _events(
+        success=(True, False), time_out=(True, False), grasped=(True, False)
+    )
+    _expect_error(
+        RuntimeError,
+        validate_terminal_events,
+        {"pick_tool_terminal": terminal_timeout_overlap},
+        torch.tensor([True, False]),
+        torch.tensor([True, False]),
+    )
     missing = dict(events)
     del missing["success"]
     _expect_error(

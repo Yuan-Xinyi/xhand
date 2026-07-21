@@ -132,8 +132,17 @@ def validate_terminal_events(
         )
     if bool((events["success"] & events["failure"]).any()):
         raise RuntimeError("an episode cannot be both a strict success and task failure")
-    if not torch.equal(events["failure"], events["dropped"] | events["unsafe_force"]):
-        raise RuntimeError("task failure must be exactly drop or unsafe force")
+    failure_sources = (
+        events["dropped"]
+        | events["unsafe_force"]
+        | events["unlatched_clearance_ge_5cm"]
+    )
+    if not torch.equal(events["failure"], failure_sources):
+        raise RuntimeError(
+            "task failure must be exactly drop, unsafe force, or unlatched lift"
+        )
+    if bool((task_terminated & events["time_out"]).any()):
+        raise RuntimeError("task termination and timeout must be mutually exclusive")
     return events
 
 

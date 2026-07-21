@@ -209,6 +209,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._safe_grasp_steps = torch.zeros(N, dtype=torch.long, device=dev)    # consecutive low-impact latch steps
         self._grasp_age = torch.zeros(N, dtype=torch.long, device=dev)           # steps since is_grasped became True (unused mvp20)
         self._success_paid = torch.zeros(N, dtype=torch.bool, device=dev)        # one-shot stable-success bonus latch (unused mvp20)
+        self._unlatched_lift_failure = torch.zeros(N, dtype=torch.bool, device=dev)
         self._close_option_success = torch.zeros(N, dtype=torch.bool, device=dev)
         self._close_option_failure = torch.zeros(N, dtype=torch.bool, device=dev)
         self._close_option_timeout = torch.zeros(N, dtype=torch.bool, device=dev)
@@ -1163,6 +1164,11 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         newly_successful = self._is_success & (~self._success_paid)
         r_success = cfg.success_bonus * newly_successful.float()
         self._success_paid = self._success_paid | self._is_success
+        r_unlatched_lift_failure = (
+            -cfg.unlatched_lift_failure_penalty * self._unlatched_lift_failure.float()
+            if not cfg.close_option_mode
+            else torch.zeros_like(r_success)
+        )
         r_close_option_success = (
             cfg.close_option_success_bonus * self._close_option_success.float()
             if cfg.close_option_mode
@@ -1239,6 +1245,8 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         log["lift_quality_mean"] = transport_gate.mean()
         log["lift_potential_mean"] = lift_potential.mean()
         log["r_success_mean"] = r_success.mean()
+        log["unlatched_lift_failure_frac"] = self._unlatched_lift_failure.float().mean()
+        log["r_unlatched_lift_failure_mean"] = r_unlatched_lift_failure.mean()
         log["close_option_success_frac"] = self._close_option_success.float().mean()
         log["r_close_option_success_mean"] = r_close_option_success.mean()
         log["close_option_failure_frac"] = self._close_option_failure.float().mean()
@@ -1297,6 +1305,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             + r_grasp
             + r_lift_progress
             + r_success
+            + r_unlatched_lift_failure
             + r_force_penalty
             + r_residual_penalty
         )
@@ -1416,16 +1425,22 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             }
             return terminated, time_out
 
-        terminated = dropped | unsafe_force | self._is_success
+        # A full-task lift must preserve the robust six-frame grasp latch.  Continuing an episode
+        # after an unlatched object has crossed 5 cm lets a fling bootstrap into a later regrasp or
+        # success and was the sole dominant deterministic L1 failure branch (153/512 episodes).
+        self._unlatched_lift_failure.copy_(
+            (clearance >= cfg.unlatched_lift_failure_height) & (~self._is_grasped)
+        )
+        failure = (dropped | unsafe_force | self._unlatched_lift_failure) & ~self._is_success
+        terminated = failure | self._is_success
+        time_out = time_out & ~terminated
         self.extras["pick_tool_terminal"] = {
             "success": self._is_success.clone(),
-            "failure": (dropped | unsafe_force).clone(),
+            "failure": failure.clone(),
             "time_out": time_out.clone(),
             "dropped": dropped.clone(),
             "unsafe_force": unsafe_force.clone(),
-            "unlatched_clearance_ge_5cm": (
-                (clearance >= 0.05) & (~self._is_grasped)
-            ).clone(),
+            "unlatched_clearance_ge_5cm": self._unlatched_lift_failure.clone(),
             **terminal_state,
         }
         return terminated, time_out
@@ -1450,6 +1465,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._safe_grasp_steps[env_ids] = 0
         self._grasp_age[env_ids] = 0
         self._success_paid[env_ids] = False
+        self._unlatched_lift_failure[env_ids] = False
         self._close_option_success[env_ids] = False
         self._close_option_failure[env_ids] = False
         self._close_option_timeout[env_ids] = False

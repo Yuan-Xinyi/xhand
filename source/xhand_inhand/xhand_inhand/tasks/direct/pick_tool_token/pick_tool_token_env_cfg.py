@@ -231,6 +231,13 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # there is deliberately no held-height occupancy annuity.
     lift_progress_scale = 400.0
 
+    # Stable pickup is a continuous-hold task.  Once an object is already 5 cm off the table,
+    # losing the six-frame Schmitt latch is a failed transport, not a state from which a thrown
+    # object may keep flying and later bootstrap into a regrasp/success.  The one-shot terminal
+    # penalty makes deliberate early termination worse than maintaining the grasp.
+    unlatched_lift_failure_height = 0.05
+    unlatched_lift_failure_penalty = 100.0
+
     # A real oracle carry peaks around 21N.  Penalize only excess fingertip-object force so normal
     # closure is free while the historical 285--460N crush/launch solutions are uneconomic.
     safe_contact_force = 20.0
