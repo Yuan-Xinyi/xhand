@@ -33,6 +33,7 @@ from online_close_ab import (
     FORMAT_VERSION,
     HANDOFF_HOLD_STEPS,
     HANDOFF_MIN_SCORE,
+    KIT_ARGS,
     MAX_EPISODE_ACTIONS,
     OBSERVATION_DIM,
     REPORT_KIND,
@@ -114,6 +115,7 @@ class CollectionSpec:
     seed: int
     replicate: str
     num_envs: int
+    kit_args: str
     output_stem: Path
     artifact_output: Path
     report_output: Path
@@ -150,6 +152,8 @@ def build_spec(args: argparse.Namespace) -> CollectionSpec:
         raise TypeError("seed must be an integer")
     if args.num_envs < 2 or args.num_envs % 2:
         raise ValueError("num_envs must be at least two and even")
+    if getattr(args, "kit_args", None) != KIT_ARGS:
+        raise ValueError(f"A/B collection requires exact --kit_args={KIT_ARGS!r}")
     baseline = _checkpoint_directory(args.baseline_checkpoint, label="baseline")
     candidate = _checkpoint_directory(args.candidate_checkpoint, label="candidate")
     if baseline == candidate:
@@ -181,6 +185,7 @@ def build_spec(args: argparse.Namespace) -> CollectionSpec:
         seed=int(args.seed),
         replicate=str(args.replicate),
         num_envs=int(args.num_envs),
+        kit_args=KIT_ARGS,
         output_stem=output_stem,
         artifact_output=artifact_output,
         report_output=report_output,
@@ -764,6 +769,7 @@ def run_collection(spec: CollectionSpec, *, device_string: str) -> tuple[dict[st
             "observation_dim": OBSERVATION_DIM,
             "action_dim": ACTION_DIM,
             "max_episode_actions": MAX_EPISODE_ACTIONS,
+            "kit_args": spec.kit_args,
             "seed": spec.seed,
             "replicate": spec.replicate,
             "num_envs": spec.num_envs,

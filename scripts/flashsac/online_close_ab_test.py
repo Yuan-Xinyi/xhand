@@ -21,6 +21,7 @@ from online_close_ab import (
     FORMAT_VERSION,
     HANDOFF_HOLD_STEPS,
     HANDOFF_MIN_SCORE,
+    KIT_ARGS,
     MAX_EPISODE_ACTIONS,
     OBSERVATION_DIM,
     OUTCOME_NAMES,
@@ -66,6 +67,7 @@ def _metadata(num_envs: int = 8, replicate: str = "a") -> dict[str, object]:
         "observation_dim": OBSERVATION_DIM,
         "action_dim": ACTION_DIM,
         "max_episode_actions": MAX_EPISODE_ACTIONS,
+        "kit_args": KIT_ARGS,
         "seed": 290,
         "replicate": replicate,
         "num_envs": num_envs,
@@ -438,6 +440,7 @@ def test_collection_spec_freezes_assignment_before_launcher() -> None:
             seed=290,
             replicate="a",
             num_envs=8,
+            kit_args=KIT_ARGS,
             output_stem=root / "trial",
         )
         spec = build_spec(args)
@@ -447,6 +450,9 @@ def test_collection_spec_freezes_assignment_before_launcher() -> None:
             spec.assignment_candidate,
             assignment_candidate_mask(seed=290, num_envs=8, replicate="a"),
         )
+        wrong_launcher = copy.copy(args)
+        wrong_launcher.kit_args = ""
+        _expect(ValueError, build_spec, wrong_launcher)
         (candidate / "frozen_lift_actor.pt").write_bytes(b"changed-lift")
         _expect(ValueError, build_spec, args)
 
@@ -479,6 +485,7 @@ def test_failure_attempts_leave_canonical_outputs_retryable() -> None:
                 seed=290,
                 replicate="a",
                 num_envs=8,
+                kit_args=KIT_ARGS,
                 output_stem=root / "trial",
             )
         )

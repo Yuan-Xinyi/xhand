@@ -14,12 +14,15 @@ from typing import Any, Mapping
 import torch
 
 
-ARTIFACT_KIND = "pick_tool_online_close_ab_trial_v1"
-REPORT_KIND = "pick_tool_online_close_ab_collection_report_v1"
-FORMAT_VERSION = 1
-COLLECTION_CONTRACT = "search_q030_h4_then_randomized_close_then_common_lift_v1"
+ARTIFACT_KIND = "pick_tool_online_close_ab_trial_v2"
+REPORT_KIND = "pick_tool_online_close_ab_collection_report_v2"
+FORMAT_VERSION = 2
+COLLECTION_CONTRACT = (
+    "search_q030_h4_then_randomized_close_then_common_lift_fswatchoff_v2"
+)
 ASSIGNMENT_CONTRACT = "sha256_rank_exact_balanced_complement_v1"
-ASSIGNMENT_SALT = "pick_tool_online_close_ab_20260722_v1"
+ASSIGNMENT_SALT = "pick_tool_online_close_ab_20260722_v2"
+KIT_ARGS = "--/app/extensions/fsWatcherEnabled=false"
 HANDOFF_MIN_SCORE = 0.30
 HANDOFF_HOLD_STEPS = 4
 OBSERVATION_DIM = 115
@@ -73,6 +76,7 @@ METADATA_NAMES = (
     "observation_dim",
     "action_dim",
     "max_episode_actions",
+    "kit_args",
     "seed",
     "replicate",
     "num_envs",
@@ -306,6 +310,7 @@ def _require_metadata(metadata: Mapping[str, Any]) -> tuple[int, int, str]:
         "observation_dim": OBSERVATION_DIM,
         "action_dim": ACTION_DIM,
         "max_episode_actions": MAX_EPISODE_ACTIONS,
+        "kit_args": KIT_ARGS,
     }
     for key, expected in fixed.items():
         if metadata.get(key) != expected:
@@ -733,6 +738,7 @@ __all__ = [
     "HANDOFF_HOLD_STEPS",
     "HANDOFF_MIN_SCORE",
     "MAX_EPISODE_ACTIONS",
+    "KIT_ARGS",
     "OBSERVATION_DIM",
     "OUTCOME_NAMES",
     "REPORT_KIND",
