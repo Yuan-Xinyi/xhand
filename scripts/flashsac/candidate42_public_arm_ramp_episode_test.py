@@ -767,11 +767,17 @@ def test_metadata_implementation_commit_is_bound_when_sealed() -> None:
 
 def _post_exit_authority(artifact: dict) -> dict:
     metadata = artifact["metadata"]
+    plan = contract.validate_sealed_plan(require_sealed=False)
+    preregistration_commit = plan["preregistration_receipt"].get("commit")
     return {
         "status": "passed",
         "collection_commit": metadata["git"]["commit"],
         "implementation_commit": metadata["implementation_commit"],
-        "preregistration_tag_commit": "2" * 40,
+        "preregistration_tag_commit": (
+            preregistration_commit
+            if preregistration_commit is not None
+            else "2" * 40
+        ),
         "collection_tag_commit": metadata["git"]["commit"],
         "superproject_clean": True,
         "submodules_clean": True,
@@ -900,6 +906,7 @@ def test_complements_and_transactional_final_report_envelope() -> None:
 def test_post_exit_preregistration_tag_must_match_registered_receipt() -> None:
     artifact = _artifact()
     authority = _post_exit_authority(artifact)
+    authority["preregistration_tag_commit"] = "2" * 40
     plan = copy.deepcopy(contract.validate_sealed_plan(require_sealed=False))
     plan["preregistration_receipt"]["commit"] = "1" * 40
     assert authority["preregistration_tag_commit"] == "2" * 40
