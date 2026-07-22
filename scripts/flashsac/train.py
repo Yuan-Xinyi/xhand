@@ -35,8 +35,10 @@ import numpy as np
 import torch
 
 from online_handoff import (
+    INITIAL_EPISODE_TERMINAL_EVENT_KEYS,
     online_handoff_metrics,
     reset_online_handoff_state,
+    update_initial_episode_handoff_audit,
     update_online_handoff,
     validate_online_handoff_config,
 )
@@ -3939,6 +3941,32 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         name: torch.zeros((), dtype=torch.long, device=env.device)
         for name in TERMINAL_EVENT_KEYS
     }
+    # This is an audit cohort, not routing state: every environment row enters
+    # pending exactly once at run start and leaves on its first completed
+    # episode, even though the simulator continues auto-resetting that row.
+    handoff_initial_episode_pending = torch.ones(
+        env.num_envs, dtype=torch.bool, device=env.device
+    )
+    handoff_initial_episode_triggered_seen = torch.zeros(
+        env.num_envs, dtype=torch.bool, device=env.device
+    )
+    handoff_initial_episode_trigger_count = torch.zeros(
+        (), dtype=torch.long, device=env.device
+    )
+    handoff_initial_episode_completed_triggered = torch.zeros(
+        (), dtype=torch.long, device=env.device
+    )
+    handoff_initial_episode_completed_search_only = torch.zeros(
+        (), dtype=torch.long, device=env.device
+    )
+    handoff_initial_episode_triggered_terminal_counts = {
+        name: torch.zeros((), dtype=torch.long, device=env.device)
+        for name in INITIAL_EPISODE_TERMINAL_EVENT_KEYS
+    }
+    handoff_initial_episode_triggered_terminal_masks = {
+        name: torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        for name in INITIAL_EPISODE_TERMINAL_EVENT_KEYS
+    }
     update_sums: dict[str, float] = {}
     update_metric_counts: dict[str, int] = {}
     actor_update_count = 0
@@ -4095,6 +4123,37 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 if not isinstance(terminal_truth, Mapping):
                     raise KeyError(
                         "online SEARCH handoff requires pick_tool_terminal ground truth"
+                    )
+                initial_episode_audit = update_initial_episode_handoff_audit(
+                    pending_before=handoff_initial_episode_pending,
+                    triggered_seen_before=handoff_initial_episode_triggered_seen,
+                    trigger=handoff["trigger"],
+                    done=done,
+                    terminal_truth=terminal_truth,
+                )
+                handoff_initial_episode_pending = initial_episode_audit[
+                    "pending_after"
+                ]
+                handoff_initial_episode_triggered_seen = initial_episode_audit[
+                    "triggered_seen_after"
+                ]
+                handoff_initial_episode_trigger_count.add_(
+                    initial_episode_audit["trigger_count"]
+                )
+                handoff_initial_episode_completed_triggered.add_(
+                    initial_episode_audit["completed_triggered_episodes"]
+                )
+                handoff_initial_episode_completed_search_only.add_(
+                    initial_episode_audit["completed_search_only_episodes"]
+                )
+                for name, count in (
+                    handoff_initial_episode_triggered_terminal_counts.items()
+                ):
+                    count.add_(
+                        initial_episode_audit["triggered_terminal_counts"][name]
+                    )
+                    handoff_initial_episode_triggered_terminal_masks[name] |= (
+                        initial_episode_audit["triggered_terminal_masks"][name]
                     )
                 for name, count in handoff_terminal_counts.items():
                     value = terminal_truth.get(name)
@@ -4311,6 +4370,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         option_action_rows=handoff_option_action_rows,
                         completed_triggered_episodes=handoff_completed_triggered,
                         completed_search_only_episodes=handoff_completed_search_only,
+                        initial_episode_pending_rows=(
+                            handoff_initial_episode_pending.sum()
+                        ),
+                        initial_episode_trigger_count=(
+                            handoff_initial_episode_trigger_count
+                        ),
+                        initial_episode_completed_triggered_episodes=(
+                            handoff_initial_episode_completed_triggered
+                        ),
+                        initial_episode_completed_search_only_episodes=(
+                            handoff_initial_episode_completed_search_only
+                        ),
+                        initial_episode_triggered_terminal_counts=(
+                            handoff_initial_episode_triggered_terminal_counts
+                        ),
+                        initial_episode_triggered_seen=(
+                            handoff_initial_episode_triggered_seen
+                        ),
+                        initial_episode_triggered_terminal_masks=(
+                            handoff_initial_episode_triggered_terminal_masks
+                        ),
                     ),
                     **{
                         f"online_search_handoff_terminal/{name}": int(count.item())
