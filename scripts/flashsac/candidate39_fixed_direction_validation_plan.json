@@ -1,0 +1,230 @@
+{
+  "kind": "pick_tool_candidate39_fixed_direction_development_validation_plan_v1",
+  "status": "preregistered_before_implementation_and_collection",
+  "created_local_date": "2026-07-22",
+  "branch": "flashsac-pick-tool-curriculum",
+  "fixed_direction_seal_commit": "9253c9304e8fd7d4385f2fce1d940ad4ad2f3ff8",
+  "fixed_direction_seal_commit_short": "9253c93",
+  "purpose": "Use only reserved development seeds 329 and 330 to test whether the immutable Candidate39 fixed residual direction improves pre-latch CLOSE acquisition without introducing lift hacks, unsafe force, action saturation, or downstream success regression.",
+  "development_only": {
+    "is_formal_acceptance": false,
+    "allowed_claim_if_all_gates_pass": "The fixed direction is eligible for a separately preregistered formal A/B screen; it is not an accepted or deployable policy.",
+    "allowed_claim_if_any_gate_fails": "Reject this fixed direction before formal screening.",
+    "forbidden_claims": [
+      "generalization to unseen formal seeds",
+      "end-to-end task improvement",
+      "formal success-rate improvement",
+      "production or deployment readiness"
+    ],
+    "reserved_formal_seeds_untouched": [331, 332, 333]
+  },
+  "immutable_fixed_direction_evidence": {
+    "manifest": {
+      "path": "scripts/flashsac/candidate39_fixed_direction_manifest.json",
+      "sha256": "b4140aef4e9aae105028dcfd2ea416ba58d734cc8f3ddb951790e49ca94d8772",
+      "kind": "pick_tool_candidate39_fixed_direction_manifest_v1",
+      "status": "sealed_before_fixed_direction_validation"
+    },
+    "payload": {
+      "path": "logs/flashsac/pick_tool/50_c39_residual_fixed_z.pt",
+      "sha256": "ca60397c7414e9710b3089f64855548b79ce9d92d0687c6eb014a4ae8934a304",
+      "kind": "pick_tool_candidate39_fixed_residual_direction_v1",
+      "weights_only_loadable": true,
+      "dtype": "float32",
+      "shape": [14]
+    },
+    "derivation": {
+      "development_seeds_consumed": [327, 328],
+      "discovery_report": "logs/flashsac/pick_tool/50_c39_residual_development_discovery.json",
+      "discovery_report_sha256": "2cb4f72ca14dfe74066d0c9bca1c93a8cc754a5c27277edd606fef05490c063d",
+      "network_updates": 0,
+      "fixed_z_must_not_be_recomputed_or_tuned": true
+    }
+  },
+  "immutable_policies": {
+    "v6_checkpoint": "logs/flashsac/pick_tool/16_v6_router_zero_actor_s254/checkpoint_final",
+    "v6_actor_sha256": "d9aacbd48891c192c0d1491514137262b82990fa71440787076403de06606288",
+    "v6_task_contract_sha256": "8a2a135fa1cd5bb01965fc7dc6d6a73978dffc1bf55941ae392146de1d17f61d",
+    "v6_bridge_state_sha256": "78176bb99eb5dac80a2789b231d54db6cf2b86132bc7835a129dd7f5a7df978c",
+    "frozen_lift_actor_sha256": "117f1b0ae3641bd24b6b9f3d585576a79b5aff968139c0dde86e6346f60ebaa0",
+    "frozen_lift_semantic_sha256": "8af0fdbc2572346b7519fbb4b29354fb5bc882a0c0020c8c3ace8376696ab324",
+    "frozen_lift_source_actor_sha256": "7757869eaa1df02f5f52c2dcd1353fb4a486b7512019650a8234d76702b9a1fb",
+    "search_checkpoint": "logs/rl_games/pick_tool_token/0_bootstrap_handoff_20260720/nn/pick_tool_stage7_dagger_full_iter3_bc.pth",
+    "search_checkpoint_sha256": "b91555d8227cf4e87e41ae858d7f8b1ee42ae920a9d829f2f5b1453b529f1f02",
+    "flashsac_fork_commit": "5ecf331fa11cd457dd39018b3d68af571b257666"
+  },
+  "fixed_intervention_contract": {
+    "name": "candidate39_fixed_episode_coherent_pre_latch_hand_residual",
+    "candidate": "Every treatment-assigned slot receives the exact same immutable fixed_z14; there is no per-slot latent redraw, sign flip, actor standard deviation, or learned update.",
+    "control": "Exact deterministic V6 action with zero residual.",
+    "handoff": {
+      "minimum_public_pregrasp_score": 0.3,
+      "consecutive_frames": 4,
+      "trigger_action_is_close_age_zero": true
+    },
+    "eligible_rows": "option_active and public_latch==0 and never_previously_latched and 0<=close_age<32",
+    "window_actions": 32,
+    "first_latch_retirement": "The first public latch permanently retires the residual for the rest of the episode, including after any later latch release.",
+    "pre_handoff_latch_retirement": "A SEARCH-side latch before handoff also permanently retires the residual; a later trigger is legal but has zero intervention rows and is excluded from common-exposure analyses.",
+    "arm_action": "Exact V6 authority output and exact zero throughout CLOSE; the residual never changes any of the seven arm coordinates.",
+    "hand_action": "tanh(atanh(clamp(exact deterministic V6 hand14 action)) + bounded_fixed_delta14)",
+    "token9_pre_tanh_scale": 0.05,
+    "distal5_pre_tanh_scale": 0.025,
+    "fixed_z_component_clip": 2.0,
+    "token9_component_abs_cap": 0.1,
+    "distal5_component_abs_cap": 0.05,
+    "delta14_l2_cap": 0.2,
+    "atanh_epsilon": 0.000001,
+    "after_window_without_latch": "Exact deterministic V6 CLOSE.",
+    "post_latch": "Exact common frozen LIFT sidecar.",
+    "search": "Exact frozen rl_games SEARCH.",
+    "actor_std": "not used",
+    "network_updates": 0,
+    "critic_or_shaped_reward_ranking": "forbidden"
+  },
+  "offline_fixed_direction_audit": {
+    "status": "passed_before_online_validation",
+    "domain": "All 2711 saved eligible-window action rows in the sealed Candidate39 seed-327/328 development artifacts, counterfactually overlaid with the exact fixed direction.",
+    "rows": 2711,
+    "bounded_pre_tanh_delta14_l2": 0.1741038561,
+    "bounded_pre_tanh_delta14_abs_max": 0.0993175656,
+    "post_tanh_hand14_drift_rms": 0.030184269,
+    "post_tanh_hand14_drift_abs_max": 0.094498709,
+    "candidate_action_abs_max": 0.96891624,
+    "new_abs_action_ge_098_elements": 0,
+    "new_abs_action_ge_098_element_fraction": 0.0,
+    "any_new_abs_action_ge_0999": false,
+    "component_and_l2_budget_violations": 0,
+    "interpretation": "The fixed direction stays inside the preregistered component and L2 budgets and introduced no near-boundary action on the complete offline window-row panel; this is a safety audit, not behavioral evidence."
+  },
+  "assignment": {
+    "contract": "candidate39_fixed_direction_sha256_rank_exact_balanced_complement_v1",
+    "salt": "pick_tool_candidate39_fixed_direction_validation_20260722_v1",
+    "salt_is_independent_of_discovery": true,
+    "num_envs": 64,
+    "sha256_message": "salt\\0rank\\0seed\\0env_slot encoded as UTF-8",
+    "ranking": "Sort env_slot by SHA256 digest bytes with env_slot as the deterministic tie-breaker.",
+    "replicate_a": "The first 32 ranked slots are treatment; the remaining 32 are control.",
+    "replicate_b": "Bit-exact complement of replicate a, with no reranking and no fixed_z change.",
+    "per_run_balance": "exactly 32 treatment and 32 control slots",
+    "per_seed_pairing": "Each stable env_slot is observed once with fixed_z treatment and once with exact V6 control across complementary replicates.",
+    "assignment_must_be_built_and_hashed_before_simulator_launch": true
+  },
+  "execution": {
+    "seeds": [329, 330],
+    "replicates": ["a", "b"],
+    "num_envs_per_run": 64,
+    "first_episode_only": true,
+    "save_successes_and_failures": true,
+    "run_order": ["329a", "329b", "330b", "330a"],
+    "output_pattern": "logs/flashsac/pick_tool/51_c39_fixed_direction_dev_s{seed}_{replicate}/trial",
+    "kit_args": "--/app/extensions/fsWatcherEnabled=false",
+    "prohibited_before_completion": [
+      "running seed 331, 332, or 333",
+      "changing fixed_z, scale, caps, handoff, horizon, assignment salt, estimator, gates, or run order after seeing any seed-329/330 outcome",
+      "selecting or discarding episodes based on outcome",
+      "continuing an episode past the registered terminal truth to alter its label"
+    ]
+  },
+  "estimands": {
+    "contrast": "fixed_z treatment minus exact V6 control",
+    "known_propensity": 0.5,
+    "seed_weighting": "Equal arithmetic mean of seed-329 and seed-330 estimates.",
+    "primary": {
+      "name": "conditional_latched_within_32_actions_delta",
+      "domain": "All first episodes that reached the immutable q=0.30 for four-frame handoff trigger in each run.",
+      "estimator": "Within each seed, Horvitz-Thompson treatment minus control using known propensity 0.5; then equal-weight the two seed estimates.",
+      "outcome": "First public latch occurs on a CLOSE action with close_age<32."
+    },
+    "secondary": [
+      "conditional ever_grasped delta",
+      "conditional success delta",
+      "conditional unlatched true-clearance>=5cm delta",
+      "treatment-triggered drop and unsafe-force counts",
+      "raw triggered grasp/latch/20cm/success funnels"
+    ],
+    "paired_common_exposure_sensitivity": {
+      "domain": "Same seed/env_slot triggered and produced at least one eligible window row in both complementary replicates; sticky-retired pre-handoff latch slots are excluded.",
+      "reported_outcomes": [
+        "latched_within_32_actions",
+        "ever_grasped",
+        "ever_true_clearance_ge_20cm",
+        "success"
+      ],
+      "role": "Power and consistency diagnostic only; it does not replace the preregistered HT primary estimand."
+    }
+  },
+  "development_validation_gates": {
+    "all_must_pass": true,
+    "primary_conditional_latched_within_32_actions_delta_min_exclusive": 0.0,
+    "positive_primary_delta_seeds_min": 1,
+    "per_seed_primary_delta_floor": -0.1,
+    "conditional_ever_grasped_delta_min": 0.0,
+    "conditional_success_delta_floor": -0.03,
+    "common_exposure_opportunity_slots_min_across_validation": 32,
+    "common_exposure_opportunity_slots_min_per_seed": 12,
+    "treatment_triggered_dropped_max": 0,
+    "treatment_triggered_unsafe_force_max": 0,
+    "conditional_unlatched_clearance_ge_5cm_delta_max": 0.02,
+    "new_abs_action_ge_098_element_fraction_max": 0.005,
+    "episodes_with_new_abs_action_ge_098_max_per_run": 1,
+    "any_new_abs_action_ge_0999": false,
+    "component_and_l2_budget_violations": 0,
+    "action_algebra_arm_latch_control_inactive_and_zero_exact": true,
+    "checkpoint_manifest_assignment_and_fixed_z_identity_exact": true
+  },
+  "artifact_and_analysis_requirements": {
+    "weights_only_artifact": true,
+    "reset_before_terminal_telemetry": true,
+    "episode_fields": [
+      "stable env_slot, treatment, assignment rank, seed, and replicate",
+      "treatment plus exact fixed_z14; the fixed-direction payload hash is bound in metadata",
+      "trigger and first-latch clocks plus latched_within_32_actions",
+      "intervention row count and sticky-retirement truth",
+      "terminal success, failure, timeout, drop, unsafe-force, and unlatched-5cm truth",
+      "ever_grasped, true 20cm clearance, trajectory maximum force, and maximum true clearance"
+    ],
+    "step_fields": [
+      "obs115 and exact V6 raw mean hand14",
+      "bounded applied pre-tanh delta14",
+      "baseline, candidate, and executed action21",
+      "close_age, public latch before action, residual active, and transition latch",
+      "transition grasp, grasp quality, hold quality, force, and true clearance"
+    ],
+    "cross_replicate_checks": [
+      "assignment masks are exact complements under the new fixed-direction salt",
+      "every treatment opportunity uses the exact manifest fixed_z and every control opportunity uses zero delta",
+      "SEARCH, V6 actor, task contract, bridge, frozen LIFT, source, and runtime assets are identical",
+      "every pre-trigger executed action is exact SEARCH with zero residual; trigger masks and clocks are measured independently per run and are not required to be bit-exact across nondeterministic GPU simulations"
+    ],
+    "publish_rule": "Publish the combined development report only after all four fixed-order artifacts independently and jointly pass strict schema, provenance, action-algebra, assignment, and complement validation.",
+    "fail_closed": true
+  },
+  "implementation_seal_requirements": {
+    "simulator_evidence_before_source_seal": false,
+    "collector_and_analyzer_must_be_committed_before_seed_329": true,
+    "collection_commit_must_descend_from": "9253c9304e8fd7d4385f2fce1d940ad4ad2f3ff8",
+    "collector_metadata_must_bind": [
+      "this plan path and SHA256",
+      "fixed-direction manifest path and SHA256",
+      "fixed_z payload path and SHA256",
+      "exact source commit and source manifest",
+      "all immutable policy and runtime asset hashes",
+      "assignment contract, salt, mask, and run identity"
+    ],
+    "required_simulation_free_tests": [
+      "SHA assignment is exactly balanced, deterministic, and complementary for both reserved seeds",
+      "all treated slots receive the same exact fixed_z and all controls receive zero residual",
+      "32-action sticky window and first-latch retirement match the sealed Candidate39 contract",
+      "component/L2 caps, tanh action algebra, arm invariance, and inactive-row exactness hold",
+      "artifact validators reject altered manifest, fixed_z, assignment, checkpoint, source, and complementary evidence",
+      "analysis tests exercise every pass/fail boundary without using seed-329/330 simulator outcomes"
+    ]
+  },
+  "decision_rule": {
+    "if_all_gates_pass": "Seal the four artifacts and development report, then write and commit a separate formal-acceptance plan and manifest before touching seeds 331-333. Passing this stage alone does not accept Candidate39.",
+    "if_any_gate_fails": "Reject the fixed direction and do not run seeds 331-333 under this candidate. Do not reinterpret the fixed direction, thresholds, or seed-329/330 evidence.",
+    "formal_seeds": [331, 332, 333],
+    "formal_status": "reserved and untouched; acceptance gates are intentionally not satisfied by this development plan"
+  }
+}
