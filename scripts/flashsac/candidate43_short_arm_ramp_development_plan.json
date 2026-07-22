@@ -5,9 +5,9 @@
   "branch": "flashsac-pick-tool-curriculum",
   "preregistration_parent_commit": "1afc375ab5546a55971e4c545423262b4a2eed32",
   "preregistration_receipt": {
-    "commit": null,
+    "commit": "87566ab4cd4af9137387c36c43135d13eb48c323",
     "tag": "pick-tool-candidate43-short-arm-ramp-plan-v1-20260723",
-    "sha256": null,
+    "sha256": "ab2533a6a96d133b1330c1fc7803d781fb515ff392ed68ac99f1a841beea26e8",
     "simulator_evidence_at_preregistration": false
   },
   "purpose": "Test one mechanism-only follow-up to sealed Candidate42: shorten the treatment live-stable public arm-authority ramp denominator and stable-count clamp from 15 to 8 so full authority is reached on the ninth consecutive currently-stable action. Candidate39 control, hand14, pre-treatment eligibility, the public stable predicate, same-action hard relock, route, estimator formulas, safety gates, transaction protocol, horizon, frozen weights and zero-update policy remain unchanged.",
@@ -410,6 +410,48 @@
       "the unchanged Horvitz-Thompson estimators, 15-action transport definition, safety/support/audit gates and all 32 acceptance boundaries execute without simulator outcomes",
       "complete runtime-source/runtime-asset authority and exact five-position order with registered pre-boundary retries pass"
     ]
+  },
+  "implementation_seal": {
+    "status": "complete_without_simulator_evidence",
+    "implementation_commit": "9fdf5f30aeded59baa9fb7c2baff812df008fe6e",
+    "source_sha256": {
+      "scripts/flashsac/analyze_candidate43_short_arm_ramp_validation.py": "0b0a32bd4ab102e9d851d11aeafc392742666833b829c724ee5e4b2ef35e61fa",
+      "scripts/flashsac/candidate43_short_arm_ramp.py": "f482aa8f71cca171c85e6c30a7cfc91bdaf268afe62634eaa689ab74898a4f62",
+      "scripts/flashsac/candidate43_short_arm_ramp_collection.py": "3129925b45d071f2c3f606721196e91dd205bac761f6870968efffd177657adc",
+      "scripts/flashsac/candidate43_short_arm_ramp_episode.py": "b622518b47846ac7a7a0454ab635c235a03d03e772a7f258e432599ea2b55a09",
+      "scripts/flashsac/candidate43_short_arm_ramp_science_test.py": "263e7afe09dc21719ba9b3e598a99de161c59b4168c30ff986b7aa4fad8625fb",
+      "scripts/flashsac/candidate43_short_arm_ramp_transaction_test.py": "542b2f96d8d5119e4449d97a93af030a68f5260491ad36016a195f095983b895",
+      "scripts/flashsac/collect_candidate43_short_arm_ramp_ab.py": "89a55a38e550866983a800979ecd5a6a8ce5cac76990bd0f703ed0053d5d0d68",
+      "scripts/flashsac/collect_candidate43_short_arm_ramp_child.py": "463ecdbeacc4d7d8f515c14de24e8869310a2bd8a6509e5d7beb7813b47640a6"
+    },
+    "simulator_evidence_before_source_seal": false,
+    "simulation_free_tests": {
+      "status": "passed",
+      "passed": 110,
+      "failed": 0,
+      "required_contracts_covered": [
+        "balanced deterministic complementary assignment on seeds 352, 353 and 354",
+        "C43 state, hand14, eligibility, stable predicate, hard relock and control outputs are bit-exact to C42/Candidate39 where registered",
+        "authority sequence is exactly 0,1/8,...,7/8,1 and current instability hard-relocks on the same action",
+        "D8 denominator and clamp are the only scientific tensor/control-flow change from C42",
+        "normalized C43 collection kernel AST equals C42 outside the registered supervisor and campaign bindings",
+        "the canonical transaction_protocol object hash equals sealed C42 exactly",
+        "all inherited C42 fast-exit, lock, hash-chain, retry, corruption, symlink, drift, partial-publication and no-clobber fault tests pass",
+        "artifact validators reject altered plans, assignments, clocks, scales, actions, telemetry, traces and complementary evidence",
+        "the unchanged Horvitz-Thompson estimators, 15-action transport definition, safety/support/audit gates and all 32 acceptance boundaries execute without simulator outcomes",
+        "complete runtime-source/runtime-asset authority and exact five-position order with registered pre-boundary retries pass"
+      ]
+    },
+    "static_audit": {
+      "status": "passed",
+      "blockers": 0,
+      "simulator_invocations": 0,
+      "runtime_assets": 8,
+      "runtime_source_files": 143
+    }
+  },
+  "collection_seal": {
+    "tag": "pick-tool-candidate43-short-arm-ramp-validation-v1-20260723"
   },
   "decision_rule": {
     "if_all_gates_pass": "Seal all development transaction evidence and write a separate formal-acceptance plan before touching seeds 355-357.",
