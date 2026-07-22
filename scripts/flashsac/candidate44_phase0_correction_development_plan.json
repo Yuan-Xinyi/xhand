@@ -1,0 +1,308 @@
+{
+  "kind": "pick_tool_candidate44_phase0_dagger_correction_development_plan_v1",
+  "status": "preregistered_before_implementation_data_projection_or_simulator_evidence",
+  "created_local_date": "2026-07-23",
+  "branch": "flashsac-pick-tool-curriculum",
+  "source_commit_before_plan": "9a248a2ad2a029c0afdcd32ecd84ea792f53681f",
+  "objective": "Repair the missing ordinary-reset APPROACH bridge in the monolithic C2 FlashSAC actor without changing reward, termination, observation, action, contact, clearance, grasp, or success semantics. Release a candidate to reverse curriculum only if correction-label fit improves on an episode-held-out DAgger split, the existing CLOSE/LIFT behavior is retained, and deterministic ordinary-reset physical grasp incidence improves.",
+  "causal_diagnosis": {
+    "full_task_dagger_source": "/tmp/pick_tool_ik_dagger_full_iter3_1685ep.pt",
+    "source_sha256": "e4aaf0eda6a33db4a2ed04bc4d7609639da9b0471408808a5dae1b67760ce57f",
+    "source_rows": 797450,
+    "source_episodes": 1685,
+    "source_phase_counts": {
+      "0": 275100,
+      "1": 101100,
+      "2": 117950,
+      "3": 269600,
+      "4": 33700
+    },
+    "eligible_phase0_rows": 275081,
+    "eligible_phase0_episodes": 917,
+    "selection": "phase == 0 and observation[106] == 0 exactly",
+    "excluded_phase0_latched_rows": 19,
+    "label_semantics": "The stored action is the corrective oracle label evaluated on the logged learner/mixed-policy state. It is not an outcome claim and is never critic replay.",
+    "c2_actor_error_on_all_eligible_phase0_rows": {
+      "action_rmse": 0.324213,
+      "arm_rmse": 0.428089,
+      "token_rmse": 0.255205,
+      "residual_rmse": 0.260158,
+      "target_action_rms": {
+        "arm": 0.4333,
+        "token": 0.7607,
+        "residual": 0.00957
+      },
+      "interpretation": "C2 does not reproduce the corrective APPROACH action on the states required by ordinary reset; the arm is the largest absolute error and the distal residual is badly nonzero despite a near-zero oracle target."
+    }
+  },
+  "single_candidate_mechanism": {
+    "name": "episode_held_out_phase0_dagger_action_correction",
+    "actor_initialization": "Exact full C2 checkpoint actor and optimizer.",
+    "critic_and_replay_initialization": "Exact full C2 checkpoint and replay resume with the same permanent transition demonstrations and demo fraction.",
+    "actor_update": "Exactly 250 scheduled actor slots are replaced by action-only behavior-cloning updates on phase 0. SAC actor and temperature updates are forbidden.",
+    "actor_rehearsal_sources": "The projected phase-0 rows from the three pinned successful transition demonstrations plus the new train-only DAgger correction projection.",
+    "critic_update": "The C2 critic and target continue for 500 updates on the exact resumed replay plus 250 vector steps of ordinary-reset online interaction. The critic is not used by deterministic release evaluations.",
+    "unchanged": [
+      "reward coefficients and potential definitions",
+      "terminal and success definitions",
+      "true convex-hull mesh clearance authority",
+      "contact sensor and fingertip geometric gate implementation",
+      "grasp latch, hold quality, force and safety semantics",
+      "115-D observation contract",
+      "21-D arm7 plus token9 plus distal-residual5 action contract",
+      "RetargetNN and XHand target mapping",
+      "C2 critic transition demonstration bytes and order",
+      "FlashSAC fork commit",
+      "main branch"
+    ]
+  },
+  "immutable_assets": {
+    "flashsac_fork_commit": "5ecf331fa11cd457dd39018b3d68af571b257666",
+    "c2_checkpoint": "logs/flashsac/pick_tool/12_c2_closestart_markov_burnin_s250_r3/checkpoint_final",
+    "c2_actor_sha256": "ccf3a22ae031b6bf4037a5226bfebeeb8699fe4c6ab485e00cc06ff077533e38",
+    "c2_critic_sha256": "cd8db7845f55464ef45d403d5a3ccb3cf61e1ed2c45cae1d33b9c6dd4eb1a8ce",
+    "c2_replay_sha256": "0817f3ab8dfd28b5be06d192d8cc3a8d41a467d68f72c24d115d76d8ac04c07f",
+    "c2_task_contract_sha256": "d47abe6f60627fa05937026e56fb4e44e05644a5a370e59c4e64eec57d142f7a",
+    "c2_actor_rehearsal_sha256": "fadf605c91ebd7233d059cf01709fb66833f4e51269350d27dccdb793d13f508",
+    "transition_demos_in_exact_order": [
+      {
+        "path": "logs/flashsac/pick_tool/demos/hierarchy_transition_smoke_s163.pt",
+        "sha256": "031f2d60c30628142308c5c5cc0b1ccb663d38386f2423761319c83af020c24d"
+      },
+      {
+        "path": "logs/flashsac/pick_tool/demos/hierarchy_transition_s164.pt",
+        "sha256": "316abdc0da18a038e4f3fe1915b1a5dec36003dfde5e142e47d3d73d021738c0"
+      },
+      {
+        "path": "logs/flashsac/pick_tool/demos/hierarchy_transition_s165.pt",
+        "sha256": "4d9bd2d1d721aaa9d792c22f2a25f59ddb5997b1bc64ce62bc94a49ddcfd3116"
+      }
+    ],
+    "close_start_train_dataset": {
+      "path": "logs/rl_games/pick_tool_token/0_close_option_handoff_20260720/datasets/base_handoff_close_train_s134_s135.pt",
+      "sha256": "2197eb4e694c90b75249d2e7cd29d84d076c5079f58503c88ff54b59c5252de8"
+    },
+    "close_start_holdout_dataset": {
+      "path": "logs/rl_games/pick_tool_token/0_close_option_handoff_20260720/datasets/base_handoff_close_holdout_s136.pt",
+      "sha256": "87b8adebe5f9bf37258192cbdf82259e6913bc58e84de6a79216d796db920609"
+    },
+    "contact_preflight_actor": {
+      "path": "logs/rl_games/pick_tool_token/0_bootstrap_handoff_20260720/nn/pick_tool_stage7_dagger_full_iter3_bc.pth",
+      "sha256": "b91555d8227cf4e87e41ae858d7f8b1ee42ae920a9d829f2f5b1453b529f1f02"
+    }
+  },
+  "data_projection_contract": {
+    "canonical_source_copy": "logs/flashsac/pick_tool/demos/source/pick_tool_ik_dagger_full_iter3_1685ep.pt",
+    "train_output": "logs/flashsac/pick_tool/demos/c44_dagger_phase0_train.pt",
+    "validation_output": "logs/flashsac/pick_tool/demos/c44_dagger_phase0_validation.pt",
+    "split_unit": "source episode",
+    "split_method": "sha256_rank_source_episode_80_20_v1",
+    "split_salt": "pick_tool_candidate44_phase0_correction_split_20260723_v1",
+    "hash_message": "split_salt + NUL + source_sha256 + NUL + decimal source_episode_id encoded as UTF-8",
+    "ranking": "Sort by raw SHA256 digest ascending with source_episode_id as integer tie-breaker.",
+    "train": {
+      "episodes": 734,
+      "rows": 220181
+    },
+    "validation": {
+      "episodes": 183,
+      "rows": 54900
+    },
+    "row_order": "Within each split, source episodes follow hash rank and retained rows preserve source order.",
+    "required_properties": [
+      "train and validation source episode IDs are disjoint",
+      "their union is all 917 eligible source episodes",
+      "every row has phase exactly 0",
+      "every row has observation[106] exactly 0",
+      "every action is finite and in normalized [-1,1]",
+      "episode_offsets are strict and episode_id is constant per segment",
+      "episode_success is absent",
+      "critic_replay_eligible metadata is false",
+      "the exact source SHA256 is stored and allowlisted",
+      "validation split is rejected by the training allowlist"
+    ],
+    "forbidden": [
+      "fabricating episode_success=true",
+      "adding reward, next_observation, done or discount fields",
+      "using validation rows for any optimizer update",
+      "inserting correction rows into critic replay"
+    ]
+  },
+  "implementation_before_evidence": {
+    "requirements": [
+      "Extend ActorRehearsalSourceContract with a default-successful episode mode and an explicit correction-label mode.",
+      "Correction-label mode requires episode_success to be absent; all old and generic loaders retain successful-only behavior.",
+      "Add separate exact train and validation phase-0 contracts; only train joins the full-task training allowlist.",
+      "Add a deterministic no-clobber projection utility and simulation-free tests for split, lineage, phase, latch, fake-success and allowlist failures.",
+      "Add an offline actor panel evaluator that compares C2 and candidate on validation phase 0 and pinned successful transition-demo phases 1 and 3.",
+      "Run actor rehearsal, train contract, generator, offline evaluator and relevant bridge tests before simulator launch.",
+      "Commit and tag the implementation before copying/projecting data or launching Isaac."
+    ],
+    "simulator_invocations_before_implementation_seal": 0
+  },
+  "seed_hygiene": {
+    "checked_before_preregistration": true,
+    "matching_repository_text_or_log_paths": {
+      "358": 0,
+      "359": 0,
+      "360": 0,
+      "361": 0,
+      "362": 0,
+      "363": 0,
+      "364": 0,
+      "365": 0,
+      "366": 0
+    },
+    "candidate44_preflight_seed": 358,
+    "candidate44_training_seed": 359,
+    "paired_ordinary_evaluation_seed": 360,
+    "paired_close_start_evaluation_seed": 361,
+    "reserved_for_a_new_reverse_curriculum_plan_only": [362, 363, 364, 365, 366]
+  },
+  "execution_order": [
+    {
+      "stage": 1,
+      "name": "seal_implementation_and_project_data",
+      "action": "Complete simulation-free implementation/tests; commit and tag. Copy the byte-identical DAgger source to the canonical disk2 path, project train/validation once, and seal their SHA256/count manifest before Isaac evidence."
+    },
+    {
+      "stage": 2,
+      "name": "training_scale_contact_preflight",
+      "seed": 358,
+      "num_envs": 1024,
+      "steps": 700,
+      "command_semantics": "Run isgrasped_diag.py with the pinned rl_games actor and --require_object_contact.",
+      "gate": "At 1024 environments the singleton object-filtered contact tensor has the expected [1024,1,3] family shape for every fingertip and at least one force exceeds the task threshold. Failure stops before baseline or training."
+    },
+    {
+      "stage": 3,
+      "name": "sealed_c2_baselines",
+      "ordinary": {
+        "seed": 360,
+        "episodes": 512,
+        "num_envs": 512,
+        "curriculum_probability": 0.0,
+        "max_vector_steps": 1001,
+        "output": "logs/flashsac/pick_tool/56_c44_phase0_correction_s359/baseline_c2_ordinary_s360_n512.json"
+      },
+      "close_start": {
+        "seed": 361,
+        "episodes": 512,
+        "num_envs": 512,
+        "curriculum_probability": 1.0,
+        "curriculum_boundary": "close_start",
+        "curriculum_joint_noise": 0.0,
+        "max_vector_steps": 1001,
+        "output": "logs/flashsac/pick_tool/56_c44_phase0_correction_s359/baseline_c2_closestart_s361_n512.json"
+      },
+      "rule": "Both baselines are immutable after creation. Candidate evaluations use the same seeds, widths, quotas, horizon, task and curriculum bytes in fresh processes."
+    },
+    {
+      "stage": 4,
+      "name": "one_phase0_correction_run",
+      "output_dir": "logs/flashsac/pick_tool/56_c44_phase0_correction_s359",
+      "seed": 359,
+      "steps": 250,
+      "num_envs": 1024,
+      "buffer": 1000000,
+      "batch": 2048,
+      "warmup": 10000,
+      "updates_per_vector_step": 2.0,
+      "critic_burnin_updates": 0,
+      "actor_update_period": 2,
+      "actor_lr_scale": 0.01,
+      "lr_decay_updates": 50000,
+      "lr_warmup_updates": 1000,
+      "n_step": 3,
+      "actor_blocks": 2,
+      "actor_hidden": 128,
+      "critic_blocks": 2,
+      "critic_hidden": 256,
+      "critic_bins": 101,
+      "checkpoint": "exact C2 full checkpoint",
+      "resume_replay": true,
+      "resume_actor_demo": false,
+      "save_replay": true,
+      "transition_demo_fraction": 0.25,
+      "actor_demo": "train-only phase0 DAgger correction projection",
+      "demo_bc_weight": 1.0,
+      "demo_bc_only_updates": 250,
+      "demo_bc_batch": 2048,
+      "demo_bc_phases": [0],
+      "demo_bc_target_std": 0.15,
+      "demo_bc_std_weight": 0.0,
+      "demo_bc_action_group_weights": {
+        "arm": 2.0,
+        "token": 1.0,
+        "residual": 1.0
+      },
+      "curriculum_probability": 0.0,
+      "exploration_noise_scales": {
+        "unlatched_arm": 1.0,
+        "unlatched_hand": 1.0,
+        "latched_arm": 1.0,
+        "latched_hand": 0.2
+      },
+      "validate_finite": true,
+      "metrics_every": 25,
+      "kit_args": "--/app/extensions/fsWatcherEnabled=false"
+    },
+    {
+      "stage": 5,
+      "name": "offline_release_gate",
+      "all_must_pass": true,
+      "integrity": {
+        "sac_actor_updates": 0,
+        "demo_bc_updates": 250,
+        "critic_updates": 500,
+        "actor_std_head_tensor_exact_c2": true,
+        "actor_std_head_adam_state_count": 0,
+        "temperature_semantically_exact_c2": true,
+        "task_contract_exact_c2": true,
+        "actor_sha256_must_differ_from_c2": true,
+        "all_checkpoint_tensors_finite": true
+      },
+      "held_out_phase0": {
+        "panel": "All 54900 validation rows, never sampled by the optimizer.",
+        "candidate_action_rmse_relative_to_c2_max": 0.85,
+        "candidate_arm_rmse_relative_to_c2_max": 0.85,
+        "candidate_token_rmse_relative_to_c2_max": 0.95,
+        "candidate_residual_rmse_relative_to_c2_max": 0.85
+      },
+      "successful_transition_retention": {
+        "panel": "All phase-1 and phase-3 rows from the three pinned strict-success transition demonstrations.",
+        "phase1_candidate_action_rmse_minus_c2_max": 0.03,
+        "phase3_candidate_action_rmse_minus_c2_max": 0.03
+      },
+      "failure_action": "Reject Candidate44 before candidate physical evaluation; do not tune thresholds, add updates, inspect reserved seeds, or call the failed actor a bootstrap."
+    },
+    {
+      "stage": 6,
+      "name": "paired_physical_release_gate",
+      "run_only_if_stage5_passes": true,
+      "candidate_ordinary_output": "logs/flashsac/pick_tool/56_c44_phase0_correction_s359/eval_candidate_ordinary_s360_n512.json",
+      "candidate_close_start_output": "logs/flashsac/pick_tool/56_c44_phase0_correction_s359/eval_candidate_closestart_s361_n512.json",
+      "ordinary_all_must_pass": {
+        "ever_grasped_count_delta_min": 26,
+        "strict_success_count_delta_min": 0,
+        "unlatched_clearance_ge_5cm_count_delta_max": 5,
+        "unsafe_force_count_delta_max": 5
+      },
+      "close_start_all_must_pass": {
+        "strict_success_rate_delta_min": -0.05,
+        "ever_grasped_rate_delta_min": -0.05,
+        "unlatched_clearance_ge_5cm_rate_delta_max": 0.03,
+        "unsafe_force_count_delta_max": 5
+      },
+      "decision_if_pass": "Candidate44 establishes a useful monolithic ordinary-reset approach bridge. Seal the result and create a new preregistered reverse-curriculum Candidate45 starting close to probability 1; no reverse-curriculum run is authorized by this plan.",
+      "decision_if_fail": "Reject Candidate44 and retain exact C2. Diagnose whether held-out action imitation failed to transfer physically or overwrote the close/lift basin; do not silently extend training."
+    }
+  ],
+  "interpretation_limits": [
+    "Passing offline correction metrics alone is not evidence of grasping or lifting.",
+    "Passing ordinary ever-grasped is evidence for the approach-to-grasp bridge, not yet 20 cm end-to-end success.",
+    "Only strict task success with true convex-hull clearance at least 20 cm may be called successful lift.",
+    "Candidate44 does not test entropy exploration from scratch; it tests whether FlashSAC can preserve C2 off-policy state while repairing a missing actor phase from DAgger correction labels.",
+    "No result from Candidate43 enters Candidate44 estimators."
+  ]
+}
