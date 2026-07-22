@@ -1,0 +1,108 @@
+{
+  "kind": "pick_tool_candidate41_public_arm_ramp_validation_result_v1",
+  "status": "sealed_rejected_at_smoke_before_development",
+  "sealed_local_date": "2026-07-22",
+  "branch": "flashsac-pick-tool-curriculum",
+  "collection_commit": "ef49acbdbae13a484d0a7184f06b44860088f1d8",
+  "implementation_commit": "22196d04a0696a728654ce8129add1771accd805",
+  "validation_plan": {
+    "path": "scripts/flashsac/candidate41_public_arm_ramp_development_plan.json",
+    "sha256": "afea0c6547205a5053a946bbf5766a1fc8e1170995c91acefdd96cfb6ae18e84",
+    "preregistration_commit": "02d4d40d2bf0a8095a652f177103576ebba924ca",
+    "preregistration_tag": "pick-tool-candidate41-public-arm-ramp-plan-v1-20260722",
+    "collection_seal_tag": "pick-tool-candidate41-public-arm-ramp-validation-v1-20260722"
+  },
+  "registered_intervention": {
+    "description": "Keep Candidate39's complete route and hand14 action unchanged. On treatment rows only, replace Candidate40's binary post-eligibility arm release with the registered float32 stable-count ramp 0/15 through 14/15 and then full authority, with immediate reset and relock on instability.",
+    "network_updates": 0,
+    "scientific_outcomes_observed": false,
+    "intervention_effect_estimated": false
+  },
+  "authoritative_smoke_attempt": {
+    "run": "340b",
+    "num_envs": 8,
+    "launch_local_time": "2026-07-22T22:57:19+09:00",
+    "classification": "post_env_step_provenance_failure",
+    "classification_rule": "The sealed first-attempt rule requires fail-closed rejection when evidence is consistent with post-env.step execution but no canonical artifact or durable failure receipt survives.",
+    "formal_step_counter_available": false,
+    "retry_permitted": false,
+    "canonical_artifact": {
+      "path": "logs/flashsac/pick_tool/53_c41_public_arm_ramp_smoke_s340_b/trial.pt",
+      "exists_after_attempt": false
+    },
+    "canonical_report": {
+      "path": "logs/flashsac/pick_tool/53_c41_public_arm_ramp_smoke_s340_b/trial.json",
+      "exists_after_attempt": false
+    },
+    "failure_receipt": {
+      "path": "logs/flashsac/pick_tool/53_c41_public_arm_ramp_smoke_s340_b/trial.failed_attempt_001.json",
+      "exists_after_attempt": false,
+      "retroactively_manufactured": false
+    }
+  },
+  "forensic_evidence": {
+    "candidate41_kit_log": {
+      "path": "/disk2/isaacsim/kit/logs/Kit/Isaac-Sim/5.1/kit_20260722_225719.log",
+      "sha256": "d7f677c1c2ec6c60dd80e8c4f0101249aaa5fcb87cf4e28662ce338bf07ed9ea",
+      "lines": 2377,
+      "last_initialization_event_elapsed_seconds": 8.297,
+      "close_began_elapsed_seconds": 37.125,
+      "silent_collection_window_seconds": 28.828,
+      "shutdown": "normal_quick_framework_shutdown"
+    },
+    "candidate41_isaaclab_log": {
+      "path": "/tmp/isaaclab/logs/isaaclab_2026-07-22_22-57-23.log",
+      "sha256": "ada5a79cba09e91a6b525dca77e6f050ab9894e943c6d1bf3dc4e7b392ed62ae",
+      "contains_python_traceback": false
+    },
+    "candidate41_process_lifetime": {
+      "session": "6825018130433821577",
+      "startup_utc": "2026-07-22T13:57:19.551110Z",
+      "exit_utc": "2026-07-22T13:57:57.076522Z",
+      "lifetime_seconds": 37.525412,
+      "exit_context": "quick framework shutdown"
+    },
+    "completed_candidate40_smoke_comparator": {
+      "run": "334b",
+      "report_path": "logs/flashsac/pick_tool/52_c40_verified_arm_smoke_s334_b/trial.json",
+      "reported_vector_steps": 999,
+      "kit_log_path": "/disk2/isaacsim/kit/logs/Kit/Isaac-Sim/5.1/kit_20260722_213627.log",
+      "kit_log_sha256": "0c9e57dfec23422f9128c9a64e1a14b20c670e9e363e79395ecf78325d0ebfcc",
+      "lines": 2377,
+      "silent_collection_window_seconds": 29.033,
+      "process_lifetime_seconds": 37.940024,
+      "candidate41_window_difference_seconds": -0.205,
+      "candidate41_window_relative_difference": -0.00706
+    },
+    "interpretation": "Candidate41's initialization sequence, 28.828-second silent execution window, and normal close are isomorphic to the known-complete 999-step Candidate40 smoke. This rules out treating the attempt as a retryable pre-step launch failure under the sealed fail-closed contract, even though the lost in-process progress object prevents reconstructing an exact step count."
+  },
+  "root_cause": {
+    "category": "collector_transaction_boundary",
+    "collector_path": "scripts/flashsac/collect_candidate41_public_arm_ramp_ab.py",
+    "collector_sha256": "617d4f1bbd2a79ce6fe74deb299586dcb36d2dc2119e008d7147aba7bd30a623",
+    "success_path": "The collector calls SimulationApp.close() before post-application authority validation and canonical publication.",
+    "failure_path": "The exception handler also calls SimulationApp.close() before publishing its durable failure receipt.",
+    "isaac_sim_contract": {
+      "source_path": "/disk2/isaacsim/exts/isaacsim.simulation_app/isaacsim/simulation_app/simulation_app.py",
+      "source_sha256": "7cbaa6f00e935a6f14bf1c28ec0db089fd924e931f3b0deee07a822f9b7d0090",
+      "default_fast_shutdown": true,
+      "documented_semantics": "exit process immediately"
+    },
+    "conclusion": "The registered rollout almost certainly finished, but fast shutdown terminated the process at close before either success evidence or failure evidence could be published. This is an infrastructure rejection, not evidence that the arm-ramp intervention helped or hurt."
+  },
+  "decision": {
+    "candidate41": "reject_without_scientific_effect_claim",
+    "reason": "The first authoritative smoke lost its complete evidence transaction after crossing the non-retryable boundary.",
+    "development_runs_341a_341b_342b_342a_touched": false,
+    "formal_seeds_343_344_345_touched": false,
+    "advance_to_formal_screen": false
+  },
+  "next_candidate_constraint": {
+    "name": "Candidate42",
+    "scientific_intervention_change_permitted": false,
+    "required_change": "Move collection into a child process that durably stages success or failure before SimulationApp.close(); let a non-Isaac parent validate child exit, authority, and staged hashes before publishing the canonical pair.",
+    "required_new_namespace_and_seals": true,
+    "candidate41_outputs_may_be_reused": false
+  },
+  "allowed_conclusion": "Candidate41 is rejected because its sealed collector placed durable publication after Isaac Sim's process-terminating fast shutdown. No Candidate41 performance claim is allowed. The unchanged public arm ramp may be tested only as a newly preregistered Candidate42 with a parent/child transaction boundary."
+}
