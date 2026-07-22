@@ -51,7 +51,10 @@ def _plan() -> dict[str, object]:
 def _metadata(seed: int, replicate: str) -> dict[str, object]:
     plan = _plan()
     policies = plan["immutable_policies"]
-    source = {"scripts/flashsac/source.py": SHA}
+    source = {
+        "scripts/flashsac/source.py": SHA,
+        **plan["implementation_seal"]["source_sha256"],
+    }
     assets = {"asset.usd": SHA}
     return {
         **contract.REQUIRED_METADATA,
