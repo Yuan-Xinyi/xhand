@@ -1,9 +1,24 @@
 {
-  "kind": "pick_tool_candidate44_phase0_dagger_correction_development_plan_v1",
+  "kind": "pick_tool_candidate44_phase0_dagger_correction_development_plan_v2",
   "status": "preregistered_before_implementation_data_projection_or_simulator_evidence",
   "created_local_date": "2026-07-23",
   "branch": "flashsac-pick-tool-curriculum",
   "source_commit_before_plan": "9a248a2ad2a029c0afdcd32ecd84ea792f53681f",
+  "preregistration_revision": {
+    "supersedes_tag": "pick-tool-candidate44-phase0-correction-plan-v1-20260723",
+    "reason": "A post-v1 simulation-free inspection found that the resumed C2 actor already has Adam state for all 20 actor parameters, including its two std-head parameters. The action-only invariant must therefore be exact preservation of the pre-existing std-head tensors and optimizer states, not an impossible zero state count.",
+    "evidence_touched_before_revision": {
+      "implementation_edits": 0,
+      "projected_datasets": 0,
+      "simulator_invocations": 0,
+      "network_updates": 0
+    },
+    "c2_actor_optimizer_state_count": 20,
+    "c2_actor_parameter_count": 20,
+    "c2_actor_scheduler_last_epoch": 3614,
+    "expected_candidate_actor_scheduler_last_epoch": 3864,
+    "scientific_mechanism_or_release_threshold_changed": false
+  },
   "objective": "Repair the missing ordinary-reset APPROACH bridge in the monolithic C2 FlashSAC actor without changing reward, termination, observation, action, contact, clearance, grasp, or success semantics. Release a candidate to reverse curriculum only if correction-label fit improves on an episode-held-out DAgger split, the existing CLOSE/LIFT behavior is retained, and deterministic ordinary-reset physical grasp incidence improves.",
   "causal_diagnosis": {
     "full_task_dagger_source": "/tmp/pick_tool_ik_dagger_full_iter3_1685ep.pt",
@@ -256,7 +271,9 @@
         "demo_bc_updates": 250,
         "critic_updates": 500,
         "actor_std_head_tensor_exact_c2": true,
-        "actor_std_head_adam_state_count": 0,
+        "actor_std_head_existing_adam_state_tensor_exact_c2": true,
+        "actor_std_head_adam_step_exact_c2": true,
+        "actor_scheduler_last_epoch": 3864,
         "temperature_semantically_exact_c2": true,
         "task_contract_exact_c2": true,
         "actor_sha256_must_differ_from_c2": true,
