@@ -251,6 +251,7 @@ _REQUIRED_TRANSITION_KEYS = (
     "truncated",
     "next_observation",
 )
+_MASKED_REPLAY_VALID_KEY = "_bridge_replay_valid_mask"
 
 
 def assert_transition_tensors(
@@ -1472,6 +1473,12 @@ class FlashSACTorchBridge(FlashSACAgent):
             observation_dim=self._critic_observation_dim,
             action_dim=self._action_dim,
         )
+        pending = getattr(self._replay_buffer, "_n_step_transitions", None)
+        if pending and _MASKED_REPLAY_VALID_KEY in pending[-1]:
+            raise RuntimeError(
+                "masked and unmasked transition processing cannot share one "
+                "pending n-step rollout; call start_fresh_rollout first"
+            )
         canonical_action = self.apply_action_authority(
             transition["action"], transition["observation"]
         )
@@ -1489,6 +1496,180 @@ class FlashSACTorchBridge(FlashSACAgent):
         after = getattr(self._replay_buffer, "total_materialized_rows", None)
         if not isinstance(after, int) or isinstance(after, bool) or after < before:
             raise RuntimeError("replay materialized-row counter is not monotonic")
+        return after - before
+
+    @torch.no_grad()
+    def process_transition_masked(
+        self,
+        transition: MutableMapping[str, Any],
+        *,
+        replay_valid_mask: torch.Tensor,
+    ) -> int:
+        """Insert only selected per-environment trajectories into replay.
+
+        The complete vector transition remains in the pending n-step window so
+        environment row identity and done handling stay identical to the pinned
+        Torch buffer.  Once a window matures, the mask from its *oldest*
+        transition selects the starting rows that are physically materialized.
+
+        Callers must use this method for every step of a masked rollout.  A row
+        that is valid and not done must remain valid on the following call;
+        this proves that an n-step sample cannot silently cross from the
+        controlled trajectory into an unrecorded policy phase.
+        """
+
+        assert_transition_tensors(
+            transition,
+            device=self._device,
+            observation_dim=self._critic_observation_dim,
+            action_dim=self._action_dim,
+        )
+        num_envs = transition["observation"].shape[0]
+        if not isinstance(replay_valid_mask, torch.Tensor):
+            raise TypeError("replay_valid_mask must be a torch.Tensor")
+        if replay_valid_mask.device != self._device:
+            raise ValueError(
+                f"replay_valid_mask is on {replay_valid_mask.device}, expected "
+                f"{self._device}; the bridge does not perform hidden host/device transfers."
+            )
+        if replay_valid_mask.dtype is not torch.bool:
+            raise TypeError("replay_valid_mask must have dtype torch.bool")
+        if replay_valid_mask.shape != (num_envs,):
+            raise ValueError(
+                f"replay_valid_mask must have shape ({num_envs},), got "
+                f"{tuple(replay_valid_mask.shape)}"
+            )
+
+        # Invalid rows may contain SEARCH actions that are intentionally not
+        # canonical for the option actor.  Validate only rows authored by the
+        # option and destined for replay.
+        if bool(replay_valid_mask.any()):
+            valid_action = transition["action"][replay_valid_mask]
+            canonical_action = self.apply_action_authority(
+                valid_action,
+                transition["observation"][replay_valid_mask],
+            )
+            if not torch.equal(canonical_action, valid_action):
+                mismatch = canonical_action != valid_action
+                raise ValueError(
+                    "valid transition action is not canonical under the configured "
+                    "public action authority/policy router "
+                    f"({int(mismatch.sum().item())} entries)"
+                )
+
+        replay = self._replay_buffer
+        pending = getattr(replay, "_n_step_transitions", None)
+        to_buffer_tensor = getattr(replay, "_to_tensor", None)
+        if pending is None or not callable(to_buffer_tensor):
+            raise TypeError("replay buffer does not expose the audited Torch n-step seam")
+        buffer_valid_mask = to_buffer_tensor(replay_valid_mask)
+        if pending:
+            previous = pending[-1]
+            previous_valid = previous.get(_MASKED_REPLAY_VALID_KEY)
+            if previous_valid is None:
+                raise RuntimeError(
+                    "masked and unmasked transition processing cannot share one "
+                    "pending n-step rollout; call start_fresh_rollout first"
+                )
+            previous_done = previous["terminated"].bool() | previous["truncated"].bool()
+            missing_continuation = previous_valid & (~previous_done) & (~buffer_valid_mask)
+            if bool(missing_continuation.any()):
+                raise ValueError(
+                    "replay_valid_mask dropped "
+                    f"{int(missing_continuation.sum().item())} live environment rows; "
+                    "a valid non-done transition must remain valid on the next frame"
+                )
+
+        # Invalid collection rows are explicit zero-reward truncation
+        # boundaries.  This both resets their return-normalizer accumulator and
+        # prevents their values from entering a later valid trajectory.
+        masked_transition = dict(transition)
+        invalid = ~replay_valid_mask
+        if bool(invalid.any()):
+            reward = transition["reward"].clone()
+            truncated = transition["truncated"].clone()
+            reward[invalid] = 0
+            truncated[invalid] = True
+            masked_transition["reward"] = reward
+            masked_transition["truncated"] = truncated
+        masked_transition[_MASKED_REPLAY_VALID_KEY] = replay_valid_mask
+
+        before = getattr(replay, "total_materialized_rows", None)
+        if not isinstance(before, int) or isinstance(before, bool) or before < 0:
+            raise TypeError("replay buffer has no monotonic materialized-row counter")
+
+        expected_materialized = 0
+        pending.append(
+            {key: to_buffer_tensor(value) for key, value in masked_transition.items()}
+        )
+        if len(pending) >= replay._n_step:
+            n_step_transition = replay._get_n_step_prev_transition()
+            oldest_valid = n_step_transition[_MASKED_REPLAY_VALID_KEY]
+            add_batch_size = int(oldest_valid.sum().item())
+            expected_materialized = add_batch_size
+            if add_batch_size:
+                end_idx = replay._current_idx + add_batch_size
+                if end_idx <= replay._max_length:
+                    idxs: Any = slice(replay._current_idx, end_idx)
+                else:
+                    idxs = (
+                        torch.arange(add_batch_size, device=replay._device)
+                        + replay._current_idx
+                    ) % replay._max_length
+                replay._observations[idxs] = n_step_transition["observation"][
+                    oldest_valid
+                ].to(replay._observations.dtype)
+                replay._next_observations[idxs] = n_step_transition[
+                    "next_observation"
+                ][oldest_valid].to(replay._next_observations.dtype)
+                replay._actions[idxs] = n_step_transition["action"][oldest_valid].to(
+                    replay._actions.dtype
+                )
+                replay._rewards[idxs] = n_step_transition["reward"][oldest_valid].to(
+                    replay._rewards.dtype
+                )
+                replay._terminateds[idxs] = n_step_transition["terminated"][
+                    oldest_valid
+                ].to(replay._terminateds.dtype)
+                replay._truncateds[idxs] = n_step_transition["truncated"][
+                    oldest_valid
+                ].to(replay._truncateds.dtype)
+                replay._num_in_buffer = min(
+                    replay._num_in_buffer + add_batch_size,
+                    replay._max_length,
+                )
+                replay._current_idx = (
+                    replay._current_idx + add_batch_size
+                ) % replay._max_length
+                replay._total_materialized_rows += add_batch_size
+
+        if self._cfg.normalize_reward:
+            if self.reward_normalizer is None:
+                raise RuntimeError("normalize_reward=True without a reward normalizer")
+            normalizer = self.reward_normalizer
+            reward = masked_transition["reward"]
+            done = masked_transition["terminated"].bool() | masked_transition[
+                "truncated"
+            ].bool()
+            normalizer.G_r = (
+                normalizer.gamma * (~done).float() * normalizer.G_r + reward
+            )
+            valid_returns = normalizer.G_r[replay_valid_mask]
+            if valid_returns.numel():
+                normalizer.G_r_max = torch.maximum(
+                    normalizer.G_r_max,
+                    valid_returns.abs().max(),
+                )
+                # Deliberately omit invalid zero rows from RMS sample count;
+                # otherwise a large SEARCH population would collapse the scale
+                # used for the much smaller option-controlled replay cohort.
+                normalizer.G_rms.update(valid_returns)
+
+        after = getattr(replay, "total_materialized_rows", None)
+        if not isinstance(after, int) or isinstance(after, bool) or after < before:
+            raise RuntimeError("replay materialized-row counter is not monotonic")
+        if after - before != expected_materialized:
+            raise RuntimeError("masked replay materialized-row accounting diverged")
         return after - before
 
     def update(

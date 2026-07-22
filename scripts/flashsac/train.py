@@ -34,31 +34,60 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import torch
 
+from online_handoff import (
+    online_handoff_metrics,
+    reset_online_handoff_state,
+    update_online_handoff,
+    validate_online_handoff_config,
+)
+
 
 @dataclass
 class FractionalUpdateBudget:
     """Exact fractional update accounting without floating-point drift."""
 
     updates_per_interaction: float
-    credit_numerator: int = 0
     _rate: Fraction = field(init=False, repr=False)
+    _credit: Fraction = field(default_factory=Fraction, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.updates_per_interaction) or self.updates_per_interaction < 0.0:
             raise ValueError("updates_per_interaction must be finite and non-negative")
         self._rate = Fraction(str(self.updates_per_interaction)).limit_denominator(1_000_000)
 
-    def grant(self, training_ready: bool) -> int:
+    def grant(
+        self,
+        training_ready: bool,
+        *,
+        weight_numerator: int = 1,
+        weight_denominator: int = 1,
+    ) -> int:
         """Return updates due for one vector interaction.
 
         Warm-up interactions earn no deferred credit, matching the upstream
-        FlashSAC loop rather than causing a burst of catch-up updates.
+        FlashSAC loop rather than causing a burst of catch-up updates.  An
+        optional exact rational weight lets masked online collection scale
+        updates by newly materialized replay rows instead of repeatedly
+        optimizing old data while SEARCH still owns every environment.
         """
 
+        if (
+            not isinstance(weight_numerator, int)
+            or isinstance(weight_numerator, bool)
+            or weight_numerator < 0
+            or not isinstance(weight_denominator, int)
+            or isinstance(weight_denominator, bool)
+            or weight_denominator < 1
+            or weight_numerator > weight_denominator
+        ):
+            raise ValueError(
+                "update-budget weight must satisfy 0 <= numerator <= denominator"
+            )
         if not training_ready:
             return 0
-        self.credit_numerator += self._rate.numerator
-        due, self.credit_numerator = divmod(self.credit_numerator, self._rate.denominator)
+        self._credit += self._rate * Fraction(weight_numerator, weight_denominator)
+        due = self._credit.numerator // self._credit.denominator
+        self._credit -= due
         return due
 
 
@@ -1797,6 +1826,7 @@ def validate_public_latch_arm_gate_config(
     curriculum_joint_noise: float,
     episode_length_s: float | None,
     randomize_episode_lengths: bool,
+    online_search_handoff: bool = False,
 ) -> None:
     """Keep latch-gated arm training on the close-to-lift conditional MDP."""
 
@@ -1804,6 +1834,11 @@ def validate_public_latch_arm_gate_config(
         return
     if task_mode != FULL_TASK_MODE:
         raise ValueError("--public_latch_arm_gate requires full_task mode")
+    if online_search_handoff:
+        # The live SEARCH prefix supplies the conditional state without a
+        # PhysX snapshot restore.  Its stricter collection contract is checked
+        # independently below.
+        return
     if curriculum_dataset is None:
         raise ValueError("--public_latch_arm_gate requires a close-start curriculum dataset")
     if curriculum_boundary != "close_start":
@@ -1821,6 +1856,57 @@ def validate_public_latch_arm_gate_config(
     if randomize_episode_lengths:
         raise ValueError(
             "--public_latch_arm_gate rejects --randomize_episode_lengths"
+        )
+
+
+def validate_online_search_handoff_training_config(
+    *,
+    search_checkpoint: Path | None,
+    min_score: float,
+    hold_steps: int,
+    task_mode: str,
+    public_latch_arm_gate: bool,
+    public_latch_frozen_lift_router: bool,
+    curriculum_dataset: Path | None,
+    curriculum_probability: float,
+    curriculum_joint_noise: float,
+    episode_length_s: float | None,
+    randomize_episode_lengths: bool,
+) -> None:
+    """Require live SEARCH handoff training to match deployment dynamics."""
+
+    validate_online_handoff_config(min_score=min_score, hold_steps=hold_steps)
+    if search_checkpoint is None:
+        return
+    if search_checkpoint.is_symlink() or not search_checkpoint.is_file():
+        raise FileNotFoundError(
+            "--search_handoff_checkpoint must be a regular non-symlink file: "
+            f"{search_checkpoint}"
+        )
+    if task_mode != FULL_TASK_MODE:
+        raise ValueError("online SEARCH handoff requires full_task mode")
+    if not public_latch_arm_gate or not public_latch_frozen_lift_router:
+        raise ValueError(
+            "online SEARCH handoff requires --public_latch_arm_gate and "
+            "--public_latch_frozen_lift_router so only CLOSE hand14 is trainable"
+        )
+    if (
+        curriculum_dataset is not None
+        or curriculum_probability != 0.0
+        or curriculum_joint_noise != 0.0
+    ):
+        raise ValueError(
+            "online SEARCH handoff rejects curriculum resets and joint noise"
+        )
+    if randomize_episode_lengths:
+        raise ValueError(
+            "online SEARCH handoff rejects randomized horizons"
+        )
+    if episode_length_s is not None and not math.isclose(
+        episode_length_s, 20.0, rel_tol=0.0, abs_tol=1.0e-9
+    ):
+        raise ValueError(
+            "online SEARCH handoff requires the authored 20 second full-task horizon"
         )
 
 
@@ -2095,6 +2181,31 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         ),
     )
     parser.add_argument(
+        "--search_handoff_checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Run this frozen rl_games SEARCH actor from each ordinary reset and switch "
+            "sticky to the routed FlashSAC option at the public-observation handoff. "
+            "Only option-controlled transitions enter replay."
+        ),
+    )
+    parser.add_argument(
+        "--search_handoff_min_score",
+        type=float,
+        default=0.30,
+        help=(
+            "Training-curriculum threshold for min(thumb proximity, second-best "
+            "non-thumb proximity). Stage 1 defaults to the recoverable high-readiness tail."
+        ),
+    )
+    parser.add_argument(
+        "--search_handoff_hold_steps",
+        type=int,
+        default=4,
+        help="Consecutive public-readiness frames required before FlashSAC takes control.",
+    )
+    parser.add_argument(
         "--episode_length_s",
         type=float,
         default=None,
@@ -2318,6 +2429,20 @@ def _validate_args(args: argparse.Namespace) -> None:
         task_mode=task_mode,
         curriculum_dataset=args.curriculum_dataset,
         curriculum_boundary=args.curriculum_boundary,
+        curriculum_probability=args.curriculum_probability,
+        curriculum_joint_noise=args.curriculum_joint_noise,
+        episode_length_s=args.episode_length_s,
+        randomize_episode_lengths=args.randomize_episode_lengths,
+        online_search_handoff=args.search_handoff_checkpoint is not None,
+    )
+    validate_online_search_handoff_training_config(
+        search_checkpoint=args.search_handoff_checkpoint,
+        min_score=args.search_handoff_min_score,
+        hold_steps=args.search_handoff_hold_steps,
+        task_mode=task_mode,
+        public_latch_arm_gate=args.public_latch_arm_gate,
+        public_latch_frozen_lift_router=args.public_latch_frozen_lift_router,
+        curriculum_dataset=args.curriculum_dataset,
         curriculum_probability=args.curriculum_probability,
         curriculum_joint_noise=args.curriculum_joint_noise,
         episode_length_s=args.episode_length_s,
@@ -3272,6 +3397,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         action_transform=teacher_prior,
         validate_finite=args.smoke or args.validate_finite,
     )
+    online_handoff_enabled = args.search_handoff_checkpoint is not None
+    search_handoff_actor = None
+    search_handoff_checkpoint_path: Path | None = None
+    search_handoff_checkpoint_sha256: str | None = None
+    if online_handoff_enabled:
+        from evaluate import _load_diagnostic_approach_actor
+
+        assert args.search_handoff_checkpoint is not None
+        search_handoff_checkpoint_path = args.search_handoff_checkpoint.resolve()
+        search_handoff_checkpoint_sha256 = _sha256(search_handoff_checkpoint_path)
+        search_handoff_actor = _load_diagnostic_approach_actor(
+            search_handoff_checkpoint_path,
+            device=torch.device(device),
+        ).eval()
+        if _sha256(search_handoff_checkpoint_path) != search_handoff_checkpoint_sha256:
+            raise RuntimeError(
+                "--search_handoff_checkpoint changed while its actor was loading"
+            )
     warmup_transitions = resolve_warmup_transitions(
         buffer=args.buffer,
         batch=args.batch,
@@ -3756,6 +3899,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = output_dir / "metrics.json"
     observation, _ = env.reset(randomize_episode_lengths=args.randomize_episode_lengths)
+    if observation.shape != (env.num_envs, env.observation_dim):
+        raise RuntimeError(
+            "environment reset violated its observation contract: "
+            f"got {tuple(observation.shape)}"
+        )
     agent.start_fresh_rollout(batch_size=env.num_envs)
     episodes = EpisodeAccumulator(env.num_envs, env.device)
     terminal_events = TerminalEventAccumulator(
@@ -3768,6 +3916,29 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     terminated_count = torch.zeros((), dtype=torch.long, device=env.device)
     truncated_count = torch.zeros((), dtype=torch.long, device=env.device)
     router_route_counts = torch.zeros(2, dtype=torch.long, device=env.device)
+    handoff_ready_count = torch.zeros(
+        env.num_envs, dtype=torch.long, device=env.device
+    )
+    handoff_option_active = torch.zeros(
+        env.num_envs, dtype=torch.bool, device=env.device
+    )
+    handoff_trigger_count = torch.zeros((), dtype=torch.long, device=env.device)
+    handoff_search_action_rows = torch.zeros(
+        (), dtype=torch.long, device=env.device
+    )
+    handoff_option_action_rows = torch.zeros(
+        (), dtype=torch.long, device=env.device
+    )
+    handoff_completed_triggered = torch.zeros(
+        (), dtype=torch.long, device=env.device
+    )
+    handoff_completed_search_only = torch.zeros(
+        (), dtype=torch.long, device=env.device
+    )
+    handoff_terminal_counts = {
+        name: torch.zeros((), dtype=torch.long, device=env.device)
+        for name in TERMINAL_EVENT_KEYS
+    }
     update_sums: dict[str, float] = {}
     update_metric_counts: dict[str, int] = {}
     actor_update_count = 0
@@ -3785,10 +3956,29 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     try:
         for interaction_step in range(1, args.steps + 1):
+            option_control_mask = torch.ones(
+                env.num_envs, dtype=torch.bool, device=env.device
+            )
+            if online_handoff_enabled:
+                handoff = update_online_handoff(
+                    observation,
+                    ready_count_before=handoff_ready_count,
+                    option_active_before=handoff_option_active,
+                    min_score=args.search_handoff_min_score,
+                    hold_steps=args.search_handoff_hold_steps,
+                )
+                handoff_ready_count = handoff["ready_count_after"]
+                handoff_option_active = handoff["option_active_after"]
+                option_control_mask = handoff_option_active
+                handoff_trigger_count.add_(handoff["trigger"].sum())
             if policy_router_enabled:
                 latch = observation[:, PICK_TOOL_LATCH_OBSERVATION_INDEX]
-                router_route_counts[0].add_((latch == 0.0).sum())
-                router_route_counts[1].add_((latch == 1.0).sum())
+                router_route_counts[0].add_(
+                    (option_control_mask & (latch == 0.0)).sum()
+                )
+                router_route_counts[1].add_(
+                    (option_control_mask & (latch == 1.0)).sum()
+                )
             training_ready = agent.can_start_training()
             if (
                 task_mode == COUPLED_TEACHER_RESIDUAL_TASK_MODE
@@ -3842,9 +4032,32 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             else:
                 action = env.sample_random_actions()
 
-            # Every proposal source converges here, including random warm-up.
-            # The same post-gate canonical action is executed and later stored.
-            action = agent.apply_action_authority(action, observation)
+            # Every option proposal source converges here, including random
+            # warm-up.  Canonicalize the option before merging it with SEARCH:
+            # applying latch authority after the merge would incorrectly zero
+            # SEARCH's arm command on pre-handoff rows.
+            option_action = agent.apply_action_authority(action, observation)
+            if online_handoff_enabled:
+                assert search_handoff_actor is not None
+                with torch.no_grad():
+                    search_action = search_handoff_actor(observation).clamp(-1.0, 1.0)
+                if search_action.shape != option_action.shape:
+                    raise RuntimeError(
+                        "SEARCH actor action shape disagrees with the routed option: "
+                        f"search={tuple(search_action.shape)}, "
+                        f"option={tuple(option_action.shape)}"
+                    )
+                if not bool(torch.isfinite(search_action).all()):
+                    raise FloatingPointError("frozen SEARCH actor produced NaN or infinity")
+                action = torch.where(
+                    option_control_mask.unsqueeze(-1),
+                    option_action,
+                    search_action,
+                )
+                handoff_option_action_rows.add_(option_control_mask.sum())
+                handoff_search_action_rows.add_((~option_control_mask).sum())
+            else:
+                action = option_action
             next_observation, reward, terminated, truncated, info = env.step(action)
             # Replay the exact canonical policy action that produced this
             # transition, never the 21-D teacher-composed environment command.
@@ -3862,11 +4075,38 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 info,
                 action_dim=env.action_dim,
             )
-            materialized_replay_rows = agent.process_transition(transition)
+            if online_handoff_enabled:
+                materialized_replay_rows = agent.process_transition_masked(
+                    transition,
+                    replay_valid_mask=option_control_mask,
+                )
+            else:
+                materialized_replay_rows = agent.process_transition(transition)
 
             done = terminated | truncated
             episodes.step(reward, done)
             terminal_events.step(info)
+            if online_handoff_enabled:
+                triggered_done = done & option_control_mask
+                search_only_done = done & (~option_control_mask)
+                handoff_completed_triggered.add_(triggered_done.sum())
+                handoff_completed_search_only.add_(search_only_done.sum())
+                terminal_truth = info.get("pick_tool_terminal")
+                if not isinstance(terminal_truth, Mapping):
+                    raise KeyError(
+                        "online SEARCH handoff requires pick_tool_terminal ground truth"
+                    )
+                for name, count in handoff_terminal_counts.items():
+                    value = terminal_truth.get(name)
+                    if (
+                        not isinstance(value, torch.Tensor)
+                        or value.shape != (env.num_envs,)
+                        or value.device != env.device
+                    ):
+                        raise RuntimeError(
+                            f"pick_tool_terminal[{name!r}] must be a device-local [N] tensor"
+                        )
+                    count.add_((triggered_done & value.bool()).sum())
             if (
                 task_mode == COUPLED_TEACHER_RESIDUAL_TASK_MODE
                 and not residual_actor_unlocked
@@ -3889,9 +4129,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             # Rollout continues from reset observations.  Replay has already
             # cloned the captured terminal observations in ``transition``.
             observation = next_observation
+            if online_handoff_enabled:
+                handoff_ready_count, handoff_option_active = (
+                    reset_online_handoff_state(
+                        ready_count=handoff_ready_count,
+                        option_active=handoff_option_active,
+                        done=done,
+                    )
+                )
             agent.reset_exploration(env_ids=done.nonzero(as_tuple=False).squeeze(-1))
 
-            for _ in range(update_budget.grant(agent.can_start_training())):
+            update_weight_numerator = (
+                materialized_replay_rows if online_handoff_enabled else env.num_envs
+            )
+            for _ in range(
+                update_budget.grant(
+                    agent.can_start_training(),
+                    weight_numerator=update_weight_numerator,
+                    weight_denominator=env.num_envs,
+                )
+            ):
                 update_info = agent.update(
                     actor_enabled=(
                         update_count >= args.critic_burnin_updates
@@ -3928,6 +4185,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     update_metric_counts[name] = update_metric_counts.get(name, 0) + 1
 
             if interaction_step % args.metrics_every == 0 or interaction_step == args.steps:
+                if (
+                    online_handoff_enabled
+                    and search_handoff_checkpoint_path is not None
+                    and _sha256(search_handoff_checkpoint_path)
+                    != search_handoff_checkpoint_sha256
+                ):
+                    raise RuntimeError(
+                        "--search_handoff_checkpoint changed during online training"
+                    )
                 elapsed = max(time.perf_counter() - started, 1.0e-9)
                 metrics: dict[str, Any] = {
                     "seed": args.seed,
@@ -4030,6 +4296,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     ),
                     "policy_router_close_rows": int(router_route_counts[0].item()),
                     "policy_router_frozen_rows": int(router_route_counts[1].item()),
+                    **online_handoff_metrics(
+                        enabled=online_handoff_enabled,
+                        search_checkpoint=(
+                            str(search_handoff_checkpoint_path)
+                            if search_handoff_checkpoint_path is not None
+                            else None
+                        ),
+                        search_checkpoint_sha256=search_handoff_checkpoint_sha256,
+                        min_score=args.search_handoff_min_score,
+                        hold_steps=args.search_handoff_hold_steps,
+                        trigger_count=handoff_trigger_count,
+                        search_action_rows=handoff_search_action_rows,
+                        option_action_rows=handoff_option_action_rows,
+                        completed_triggered_episodes=handoff_completed_triggered,
+                        completed_search_only_episodes=handoff_completed_search_only,
+                    ),
+                    **{
+                        f"online_search_handoff_terminal/{name}": int(count.item())
+                        for name, count in handoff_terminal_counts.items()
+                    },
                     "resumed_actor_demo": bool(args.resume_actor_demo),
                     "restore_checkpoint_rng": False,
                     "flashsac_upstream_commit": FLASH_SAC_COMMIT,
@@ -4081,6 +4367,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     )
                 atomic_write_json(metrics_path, metrics)
 
+        if (
+            online_handoff_enabled
+            and search_handoff_checkpoint_path is not None
+            and _sha256(search_handoff_checkpoint_path)
+            != search_handoff_checkpoint_sha256
+        ):
+            raise RuntimeError(
+                "--search_handoff_checkpoint changed before final checkpoint publication"
+            )
         final_residual_state = None
         if task_mode == COUPLED_TEACHER_RESIDUAL_TASK_MODE:
             final_residual_state = validate_teacher_residual_training_state(

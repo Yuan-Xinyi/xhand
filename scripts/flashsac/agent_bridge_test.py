@@ -1320,6 +1320,210 @@ def test_transition_contract_and_replay_are_torch_native() -> None:
     assert delayed.process_transition(transition) == NUM_ENVS
 
 
+def test_masked_replay_validates_only_selected_canonical_actions() -> None:
+    agent = _slice_authority_agent()
+    observation = torch.randn(NUM_ENVS, OBSERVATION_DIM)
+    observation[:, PUBLIC_LATCH_OBSERVATION_INDEX] = torch.tensor(
+        [0.0, 0.25, 1.0, 0.25]
+    )
+    action = torch.zeros(NUM_ENVS, ACTION_DIM)
+    action[[1, 3], :2] = 0.75
+    transition = _transition(observation, action)
+    valid = torch.tensor([True, False, True, False])
+
+    # Invalid SEARCH rows deliberately contain malformed authority features and
+    # non-canonical option actions.  They must neither fail option validation
+    # nor reach replay.
+    assert (
+        agent.process_transition_masked(
+            transition,
+            replay_valid_mask=valid,
+        )
+        == 2
+    )
+    replay = agent._replay_buffer  # noqa: SLF001
+    torch.testing.assert_close(
+        replay._observations[:2],  # noqa: SLF001
+        observation[valid],
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        replay._actions[:2],  # noqa: SLF001
+        action[valid],
+        rtol=0.0,
+        atol=0.0,
+    )
+
+    _expect_error(
+        TypeError,
+        agent.process_transition_masked,
+        transition,
+        replay_valid_mask=[True] * NUM_ENVS,
+    )
+    _expect_error(
+        TypeError,
+        agent.process_transition_masked,
+        transition,
+        replay_valid_mask=torch.ones(NUM_ENVS),
+    )
+    _expect_error(
+        ValueError,
+        agent.process_transition_masked,
+        transition,
+        replay_valid_mask=torch.ones(NUM_ENVS, 1, dtype=torch.bool),
+    )
+    _expect_error(
+        ValueError,
+        agent.process_transition_masked,
+        transition,
+        replay_valid_mask=torch.ones(NUM_ENVS, dtype=torch.bool, device="meta"),
+    )
+
+    noncanonical = _slice_authority_agent()
+    bad_transition = _transition(observation, action)
+    bad_transition["action"][0, 0] = 0.5
+    _expect_error(
+        ValueError,
+        noncanonical.process_transition_masked,
+        bad_transition,
+        replay_valid_mask=valid,
+    )
+
+
+def test_masked_replay_uses_oldest_mask_and_preserves_n_step_done() -> None:
+    agent = _agent(n_step=3, gamma=0.5)
+
+    def step_transition(step: int) -> dict[str, torch.Tensor]:
+        observation = (
+            torch.arange(NUM_ENVS * OBSERVATION_DIM, dtype=torch.float32).reshape(
+                NUM_ENVS, OBSERVATION_DIM
+            )
+            + 100.0 * step
+        )
+        result = _transition(observation, torch.zeros(NUM_ENVS, ACTION_DIM))
+        result["reward"] = torch.zeros(NUM_ENVS)
+        result["next_observation"] = observation + 10.0
+        return result
+
+    transition0 = step_transition(0)
+    transition0["reward"][2] = 5.0
+    transition1 = step_transition(1)
+    transition1["reward"][2] = 7.0
+    transition1["terminated"][2] = True
+    transition2 = step_transition(2)
+    transition2["reward"][0] = 11.0
+    transition3 = step_transition(3)
+    transition3["reward"][0] = 13.0
+    row2 = torch.tensor([False, False, True, False])
+    row0 = torch.tensor([True, False, False, False])
+
+    assert agent.process_transition_masked(
+        transition0, replay_valid_mask=row2
+    ) == 0
+    assert agent.process_transition_masked(
+        transition1, replay_valid_mask=row2
+    ) == 0
+    # The current mask selects row 0, but the mature window starts at t0, so
+    # the oldest t0 mask materializes row 2.  Its return stops at t1 done.
+    assert agent.process_transition_masked(
+        transition2, replay_valid_mask=row0
+    ) == 1
+    replay = agent._replay_buffer  # noqa: SLF001
+    torch.testing.assert_close(  # noqa: SLF001
+        replay._observations[0], transition0["observation"][2], rtol=0.0, atol=0.0
+    )
+    torch.testing.assert_close(  # noqa: SLF001
+        replay._next_observations[0],  # noqa: SLF001
+        transition1["next_observation"][2],
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert replay._rewards[0].item() == 8.5  # 5 + 0.5 * 7  # noqa: SLF001
+    assert replay._terminateds[0].item() == 1.0  # noqa: SLF001
+
+    assert agent.process_transition_masked(
+        transition3, replay_valid_mask=row0
+    ) == 1
+    torch.testing.assert_close(  # noqa: SLF001
+        replay._observations[1], transition1["observation"][2], rtol=0.0, atol=0.0
+    )
+    assert replay._rewards[1].item() == 7.0  # noqa: SLF001
+    assert replay.total_materialized_rows == 2
+
+    discontinuous = _agent(n_step=3)
+    live = step_transition(0)
+    discontinuous.process_transition_masked(live, replay_valid_mask=row2)
+    _expect_error(
+        ValueError,
+        discontinuous.process_transition_masked,
+        step_transition(1),
+        replay_valid_mask=row0,
+    )
+    assert len(discontinuous._replay_buffer._n_step_transitions) == 1  # noqa: SLF001
+
+    masked_then_plain = _agent(n_step=3)
+    masked_then_plain.process_transition_masked(live, replay_valid_mask=row2)
+    _expect_error(
+        RuntimeError,
+        masked_then_plain.process_transition,
+        step_transition(1),
+    )
+    assert len(masked_then_plain._replay_buffer._n_step_transitions) == 1  # noqa: SLF001
+
+    plain_then_masked = _agent(n_step=3)
+    plain_then_masked.process_transition(live)
+    _expect_error(
+        RuntimeError,
+        plain_then_masked.process_transition_masked,
+        step_transition(1),
+        replay_valid_mask=row2,
+    )
+    assert len(plain_then_masked._replay_buffer._n_step_transitions) == 1  # noqa: SLF001
+
+
+def test_masked_replay_excludes_invalid_rows_from_reward_normalizer() -> None:
+    agent = _agent(n_step=1, gamma=0.5, normalize_reward=True)
+    transition = _transition(
+        torch.randn(NUM_ENVS, OBSERVATION_DIM),
+        torch.zeros(NUM_ENVS, ACTION_DIM),
+    )
+    transition["reward"] = torch.tensor([1.0, 1000000.0, 3.0, -1000000.0])
+    valid = torch.tensor([True, False, True, False])
+    transition["terminated"][valid] = True
+
+    assert agent.process_transition_masked(
+        transition, replay_valid_mask=valid
+    ) == 2
+    assert agent.reward_normalizer is not None
+    torch.testing.assert_close(
+        agent.reward_normalizer.G_r,
+        torch.tensor([1.0, 0.0, 3.0, 0.0]),
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert agent.reward_normalizer.G_r_max.item() == 3.0
+    assert agent.reward_normalizer.G_rms.count.item() == 2.0
+    replay = agent._replay_buffer  # noqa: SLF001
+    torch.testing.assert_close(  # noqa: SLF001
+        replay._rewards[:2], torch.tensor([1.0, 3.0]), rtol=0.0, atol=0.0
+    )
+
+    all_invalid = _transition(
+        torch.randn(NUM_ENVS, OBSERVATION_DIM),
+        torch.zeros(NUM_ENVS, ACTION_DIM),
+    )
+    all_invalid["reward"].fill_(1.0e9)
+    assert agent.process_transition_masked(
+        all_invalid,
+        replay_valid_mask=torch.zeros(NUM_ENVS, dtype=torch.bool),
+    ) == 0
+    assert torch.count_nonzero(agent.reward_normalizer.G_r) == 0
+    assert agent.reward_normalizer.G_r_max.item() == 3.0
+    assert agent.reward_normalizer.G_rms.count.item() == 2.0
+    assert agent.replay_size == 2
+
+
 def test_fresh_rollout_discards_only_trajectory_local_state() -> None:
     agent = _agent(n_step=3, normalize_reward=True)
     observation = torch.randn(NUM_ENVS, OBSERVATION_DIM)
@@ -1929,6 +2133,10 @@ def main() -> None:
     print("[PASS] action-authority checkpoint configuration")
     test_transition_contract_and_replay_are_torch_native()
     print("[PASS] torch transition/replay contract")
+    test_masked_replay_validates_only_selected_canonical_actions()
+    test_masked_replay_uses_oldest_mask_and_preserves_n_step_done()
+    test_masked_replay_excludes_invalid_rows_from_reward_normalizer()
+    print("[PASS] masked per-environment replay contract")
     test_fresh_rollout_discards_only_trajectory_local_state()
     print("[PASS] fresh rollout boundary resets only trajectory-local state")
     test_critic_burnin_and_demo_only_actor_rehearsal()

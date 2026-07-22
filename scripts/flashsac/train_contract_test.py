@@ -73,6 +73,7 @@ from train import (  # noqa: E402
     validate_checkpoint_task_contract,
     validate_checkpoint_output_separation,
     validate_close_option_training_config,
+    validate_online_search_handoff_training_config,
     validate_public_latch_arm_gate_config,
     validate_actor_demo_curriculum_lineage,
     validate_teacher_residual_actor_demo_lineage,
@@ -163,6 +164,69 @@ def test_update_budget() -> None:
 
     budget = FractionalUpdateBudget(1.5)
     assert [budget.grant(True) for _ in range(4)] == [1, 2, 1, 2]
+
+    budget = FractionalUpdateBudget(2.0)
+    assert budget.grant(True, weight_numerator=0, weight_denominator=4) == 0
+    assert budget.grant(True, weight_numerator=2, weight_denominator=4) == 1
+    assert budget.grant(True, weight_numerator=1, weight_denominator=4) == 0
+    assert budget.grant(True, weight_numerator=1, weight_denominator=4) == 1
+    _expect_error(
+        ValueError,
+        budget.grant,
+        True,
+        weight_numerator=5,
+        weight_denominator=4,
+    )
+
+
+def test_online_search_handoff_training_contract() -> None:
+    with tempfile.TemporaryDirectory(prefix="flashsac_online_handoff_") as directory:
+        search = Path(directory) / "search.pth"
+        search.write_bytes(b"frozen-search")
+        valid = {
+            "search_checkpoint": search,
+            "min_score": 0.30,
+            "hold_steps": 4,
+            "task_mode": FULL_TASK_MODE,
+            "public_latch_arm_gate": True,
+            "public_latch_frozen_lift_router": True,
+            "curriculum_dataset": None,
+            "curriculum_probability": 0.0,
+            "curriculum_joint_noise": 0.0,
+            "episode_length_s": None,
+            "randomize_episode_lengths": False,
+        }
+        validate_online_search_handoff_training_config(**valid)
+        validate_public_latch_arm_gate_config(
+            enabled=True,
+            task_mode=FULL_TASK_MODE,
+            curriculum_dataset=None,
+            curriculum_boundary="close_start",
+            curriculum_probability=0.0,
+            curriculum_joint_noise=0.0,
+            episode_length_s=None,
+            randomize_episode_lengths=False,
+            online_search_handoff=True,
+        )
+        for override in (
+            {"task_mode": CLOSE_OPTION_TASK_MODE},
+            {"public_latch_arm_gate": False},
+            {"public_latch_frozen_lift_router": False},
+            {"curriculum_dataset": Path("close.pt")},
+            {"curriculum_probability": 0.5},
+            {"curriculum_joint_noise": 0.01},
+            {"episode_length_s": 5.0},
+            {"randomize_episode_lengths": True},
+            {"min_score": 0.0},
+            {"hold_steps": 0},
+        ):
+            invalid = dict(valid)
+            invalid.update(override)
+            _expect_error(
+                ValueError,
+                validate_online_search_handoff_training_config,
+                **invalid,
+            )
 
 
 def test_residual_actor_unlock_boundary() -> None:
@@ -2242,6 +2306,7 @@ def test_latch_conditioned_noise_scale() -> None:
 
 def main() -> None:
     test_update_budget()
+    test_online_search_handoff_training_contract()
     test_residual_actor_unlock_boundary()
     test_warmup_resolution()
     test_default_episode_horizons()
