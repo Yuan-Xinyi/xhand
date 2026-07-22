@@ -1,0 +1,149 @@
+{
+  "acceptance": {
+    "conditional_adverse_ht_upper_max": {
+      "dropped": 0.01,
+      "unlatched_clearance_ge_5cm": 0.01,
+      "unsafe_force": 0.01
+    },
+    "conditional_success_fisher_greater_p_max": 0.05,
+    "conditional_success_ht_lower_strict_min": 0.0,
+    "conditional_success_point_min": 0.05,
+    "itt_success_ht_lower_strict_min": 0.0,
+    "itt_success_point_min": 0.015,
+    "maximum_candidate_events_when_safety_underpowered": 0,
+    "minimum_baseline_events_for_safety_inference": 10,
+    "minimum_triggered_per_arm_total": 1000,
+    "minimum_triggered_per_run_arm": 100,
+    "minimum_triggered_per_seed_arm": 300,
+    "positive_seed_count_min": 3,
+    "require_every_condition": true,
+    "seed_meets_both_success_margins_count_min": 2
+  },
+  "data": {
+    "events": [
+      "success",
+      "dropped",
+      "unsafe_force",
+      "unlatched_clearance_ge_5cm"
+    ],
+    "identity": {
+      "artifact_format_version": 2,
+      "artifact_kind": "pick_tool_online_close_ab_trial_v2",
+      "assignment_contract": "sha256_rank_exact_balanced_complement_v1",
+      "assignment_salt": "pick_tool_online_close_ab_20260722_v2",
+      "baseline_actor_sha256": "d9aacbd48891c192c0d1491514137262b82990fa71440787076403de06606288",
+      "baseline_bridge_state_sha256": "78176bb99eb5dac80a2789b231d54db6cf2b86132bc7835a129dd7f5a7df978c",
+      "baseline_task_contract_sha256": "8a2a135fa1cd5bb01965fc7dc6d6a73978dffc1bf55941ae392146de1d17f61d",
+      "candidate_actor_sha256": "13ab01deb2bfd6f41fc410dce32e32676c5973b30f6bd339990dbaf491def5ce",
+      "candidate_bridge_state_sha256": "dc0f817569d24bed7597035c41f4bd23b55912789a288cc36673bf392ae84993",
+      "candidate_task_contract_sha256": "8a2a135fa1cd5bb01965fc7dc6d6a73978dffc1bf55941ae392146de1d17f61d",
+      "collection_contract": "search_q030_h4_then_randomized_close_then_common_lift_fswatchoff_v2",
+      "collector_git_branch": "flashsac-pick-tool-curriculum",
+      "common_frozen_lift_actor_sha256": "117f1b0ae3641bd24b6b9f3d585576a79b5aff968139c0dde86e6346f60ebaa0",
+      "common_frozen_lift_semantic_sha256": "8af0fdbc2572346b7519fbb4b29354fb5bc882a0c0020c8c3ace8376696ab324",
+      "common_frozen_lift_source_actor_sha256": "7757869eaa1df02f5f52c2dcd1353fb4a486b7512019650a8234d76702b9a1fb",
+      "flashsac_fork_commit": "5ecf331fa11cd457dd39018b3d68af571b257666",
+      "flashsac_upstream_commit": "87edc9061150ae9e962dd84e6544e27a1554b3ab",
+      "handoff_hold_steps": 4,
+      "handoff_min_score": 0.3,
+      "kit_args": "--/app/extensions/fsWatcherEnabled=false",
+      "report_kind": "pick_tool_online_close_ab_collection_report_v2",
+      "runtime_asset_sha256_digest": "0cd9229f6ad7f0053799927b409c23b637294611e36625f1339869c44a972604",
+      "runtime_static_sha256": "6b429910d3637ca5a04c46ebf6d7c3b0fdf4242b8615758693a9028393ee8cba",
+      "search_checkpoint_sha256": "b91555d8227cf4e87e41ae858d7f8b1ee42ae920a9d829f2f5b1453b529f1f02",
+      "source_path_count": 93,
+      "source_path_set_sha256": "c8b297dd8a73f1924f1badd7a9c22b1e691ba15817f21111f590b8433a3f5082",
+      "source_sha256_digest": "d05d33bd3996ea57bd457d704caf090eb7ec1783d02a430d8dff3817a6386a86"
+    },
+    "num_envs": 1024,
+    "replicates": [
+      "a",
+      "b"
+    ],
+    "runs": [
+      {
+        "artifact": "logs/flashsac/pick_tool/37_close_ab_prod_s290_a/trial.pt",
+        "replicate": "a",
+        "report": "logs/flashsac/pick_tool/37_close_ab_prod_s290_a/trial.json",
+        "seed": 290
+      },
+      {
+        "artifact": "logs/flashsac/pick_tool/37_close_ab_prod_s290_b/trial.pt",
+        "replicate": "b",
+        "report": "logs/flashsac/pick_tool/37_close_ab_prod_s290_b/trial.json",
+        "seed": 290
+      },
+      {
+        "artifact": "logs/flashsac/pick_tool/37_close_ab_prod_s291_b/trial.pt",
+        "replicate": "b",
+        "report": "logs/flashsac/pick_tool/37_close_ab_prod_s291_b/trial.json",
+        "seed": 291
+      },
+      {
+        "artifact": "logs/flashsac/pick_tool/37_close_ab_prod_s291_a/trial.pt",
+        "replicate": "a",
+        "report": "logs/flashsac/pick_tool/37_close_ab_prod_s291_a/trial.json",
+        "seed": 291
+      },
+      {
+        "artifact": "logs/flashsac/pick_tool/37_close_ab_prod_s292_a/trial.pt",
+        "replicate": "a",
+        "report": "logs/flashsac/pick_tool/37_close_ab_prod_s292_a/trial.json",
+        "seed": 292
+      },
+      {
+        "artifact": "logs/flashsac/pick_tool/37_close_ab_prod_s292_b/trial.pt",
+        "replicate": "b",
+        "report": "logs/flashsac/pick_tool/37_close_ab_prod_s292_b/trial.json",
+        "seed": 292
+      }
+    ],
+    "seeds": [
+      290,
+      291,
+      292
+    ]
+  },
+  "estimands": {
+    "conditional_population": "all first episodes whose public SEARCH handoff triggered",
+    "contrast": "candidate minus baseline",
+    "diagnostic_estimator": "hajek",
+    "domains": [
+      "conditional_triggered",
+      "itt_all_assigned"
+    ],
+    "itt_population": "all assigned first episodes",
+    "known_propensity": 0.5,
+    "primary_estimator": "horvitz_thompson",
+    "seed_weighting": "equal arithmetic mean of the three per-seed estimates"
+  },
+  "format_version": 1,
+  "inference": {
+    "bootstrap": {
+      "lower_rank": 1000,
+      "replicates": 20000,
+      "resampling_unit": "within each seed resample 1024 env_slot clusters with replacement; replicates a,b and their complementary assignments stay together",
+      "seed": 7896696248314150641,
+      "upper_rank": 19001
+    },
+    "fisher": {
+      "assignment": "independently per seed choose exactly 512 candidate env slots in replicate a; replicate b is the exact complement",
+      "p_value": "plus-one Monte Carlo; report greater, less, and two-sided absolute-tail probabilities",
+      "primary_statistic": "equal-seed-weight conditional success Horvitz-Thompson candidate-minus-baseline delta",
+      "replicates": 20000,
+      "seed": 747329780513645429
+    }
+  },
+  "kind": "pick_tool_online_close_ab_analysis_plan_v1",
+  "output": {
+    "report": "logs/flashsac/pick_tool/37_close_ab_prod_analysis/analysis.json"
+  },
+  "preregistration": {
+    "analysis_source_sha256": "c630f38f5fd1e283d0f87fbcc317a9579a83b353035eef315230a7b6d1afae8a",
+    "branch": "flashsac-pick-tool-curriculum",
+    "collector_base_commit": "5e4faa7994a2e294973151eef4dd75745657d564",
+    "implementation_commit": "b93b9c1adf22d917111bddcc8625d06602c9f8dd",
+    "seal_tag": "pick-tool-online-close-ab-analysis-v1-20260722"
+  },
+  "status": "preregistered"
+}
