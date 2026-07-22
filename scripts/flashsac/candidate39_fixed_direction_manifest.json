@@ -1,0 +1,98 @@
+{
+  "kind": "pick_tool_candidate39_fixed_direction_manifest_v1",
+  "status": "sealed_before_fixed_direction_validation",
+  "created_local_date": "2026-07-22",
+  "branch": "flashsac-pick-tool-curriculum",
+  "development_collection_git_commit": "23af851442f002aa27f585e61e113e3df9d88fcd",
+  "flashsac_fork_commit": "5ecf331fa11cd457dd39018b3d68af571b257666",
+  "development_plan": {
+    "path": "scripts/flashsac/candidate39_coherent_residual_development_plan.json",
+    "sha256": "658551672e011c3444b2f3198c8d4c0c764a05985c6ca918a87fddced96c72d4"
+  },
+  "sealed_source_sha256": {
+    "scripts/flashsac/option_residual_screen.py": "5a96b2e3e1fded40e62574a50616e6d8525584a84bd1b5f04a00b3ecc0c2dbba",
+    "scripts/flashsac/candidate39_episode_residual.py": "e037caadf2b4ff9864b1d2932e956df0f4e69d11ae4c81546a275d9091f72e6e",
+    "scripts/flashsac/collect_candidate39_episode_residual_ab.py": "73b4310e1eff1dab404f07ccb826f0e33cd1fa02f6d589911437f80e959f817a",
+    "scripts/flashsac/analyze_candidate39_residual_discovery.py": "0025c521eee87ca3057e920a3d4f7610829e4b3de0f05883aab4885d565b29f3"
+  },
+  "development_artifacts": {
+    "327a": {
+      "path": "logs/flashsac/pick_tool/50_c39_residual_dev_s327_a/trial.pt",
+      "sha256": "6b8189de2f04be982550d6393f5822cfc4df88c6868d12eacc31ae0c84d591ac",
+      "report_sha256": "4322d9f9383315508fbc3021f171b64c9133a46a814b919d9f583beaaac965c7"
+    },
+    "327b": {
+      "path": "logs/flashsac/pick_tool/50_c39_residual_dev_s327_b/trial.pt",
+      "sha256": "e464b548417c1dcd9f34a65177bbab2253658115f7833994d46e2ebf828f66fa",
+      "report_sha256": "8f3b41a5ad6809a79a95537f0bfaee838bcc7dfb6e9b86e6ca74957075ec70b7"
+    },
+    "328b": {
+      "path": "logs/flashsac/pick_tool/50_c39_residual_dev_s328_b/trial.pt",
+      "sha256": "609d33cb73e73ebbabfdb988bccb64ab15b08045635807fb3a93b7e5a86ef77a",
+      "report_sha256": "4a90fa9051baa1bc88a2f7ff2c4e97eb6b8c91fdb778cb45129842deeeb1ae78"
+    },
+    "328a": {
+      "path": "logs/flashsac/pick_tool/50_c39_residual_dev_s328_a/trial.pt",
+      "sha256": "28f49d7cb608efa369f0f3f39c2462fe1de67c20ffb3a39e98740aab5d6a876d",
+      "report_sha256": "39ba8da92d48c18ef4cd9428dafe342318b84e88af55338ea808e3cfdc38dfeb"
+    }
+  },
+  "discovery_report": {
+    "path": "logs/flashsac/pick_tool/50_c39_residual_development_discovery.json",
+    "sha256": "2cb4f72ca14dfe74066d0c9bca1c93a8cc754a5c27277edd606fef05490c063d",
+    "semantic_sha256": "417eae962a0d071bd3b966d253e777e4460cda3bcb0343eb335b6495bd68a9f1",
+    "all_gates_pass": true,
+    "decision": "extract_fixed_direction"
+  },
+  "fixed_direction": {
+    "path": "logs/flashsac/pick_tool/50_c39_residual_fixed_z.pt",
+    "sha256": "ca60397c7414e9710b3089f64855548b79ce9d92d0687c6eb014a4ae8934a304",
+    "payload_kind": "pick_tool_candidate39_fixed_residual_direction_v1",
+    "weights_only_loadable": true,
+    "dtype": "float32",
+    "shape": [14],
+    "l2_norm": 3.741657257080078,
+    "fixed_z": [
+      -0.3442349135875702,
+      -0.662828803062439,
+      -0.17566385865211487,
+      -0.953892171382904,
+      -0.3761844038963318,
+      -1.9863512516021729,
+      -1.886328935623169,
+      0.834323525428772,
+      -1.2883188724517822,
+      -0.14828261733055115,
+      0.12304867058992386,
+      1.2580629587173462,
+      0.5757084488868713,
+      0.7408758401870728
+    ]
+  },
+  "development_result": {
+    "common_exposure_opportunity_slots": 48,
+    "discordant_latched_within_window_slots": 8,
+    "treatment_only_latched": 1,
+    "control_only_latched": 7,
+    "equal_seed_ht_latched_within_window_delta": -0.08888888888888888,
+    "equal_seed_ht_ever_grasped_delta": 0.0407407407407408,
+    "equal_seed_ht_success_delta": 0.022222222222222227,
+    "equal_seed_ht_unlatched_clearance_ge_5cm_delta": 0.018518518518518517,
+    "treatment_triggered_dropped": 0,
+    "treatment_triggered_unsafe_force": 0,
+    "new_abs_action_ge_098_element_fraction": 0.0,
+    "component_and_l2_budget_violations": 0
+  },
+  "interpretation": [
+    "The randomized residual distribution is not an accepted policy: its equal-seed latch effect was negative.",
+    "The eight discordant paired outcomes identify a finite direction, with negative advantages correctly reversing harmful sampled residuals.",
+    "The fixed direction has not been evaluated online and must not be called an improvement before reserved-seed validation.",
+    "The unlatched-clearance safety gate passed by only 0.001481481481481483 above its failure boundary, so the next stage must retain the exact safety gate."
+  ],
+  "next_stage": {
+    "reserved_development_validation_seeds": [329, 330],
+    "requires_new_committed_plan_and_exact_fixed_direction_hash": true,
+    "network_updates": 0,
+    "formal_screen_seeds_remain_reserved": [331, 332, 333]
+  }
+}

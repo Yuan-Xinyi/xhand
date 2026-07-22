@@ -1,0 +1,434 @@
+{
+  "all_gates_pass": true,
+  "candidate_direction": {
+    "design_contract": "candidate39_sha256_rank_paired_antithetic_v1",
+    "design_salt": "pick_tool_candidate39_option_residual_20260722_v1",
+    "fixed_z": [
+      -0.3442349135875702,
+      -0.662828803062439,
+      -0.17566385865211487,
+      -0.953892171382904,
+      -0.3761844038963318,
+      -1.9863512516021729,
+      -1.886328935623169,
+      0.834323525428772,
+      -1.2883188724517822,
+      -0.14828261733055115,
+      0.12304867058992386,
+      1.2580629587173462,
+      0.5757084488868713,
+      0.7408758401870728
+    ],
+    "gradient": [
+      -1.3200438171625137,
+      -2.541761592030525,
+      -0.6736213639378548,
+      -3.657907336950302,
+      -1.4425610173493624,
+      -7.61709651350975,
+      -7.233539342880249,
+      3.1993953734636307,
+      -4.940339267253876,
+      -0.5686219930648804,
+      0.4718569442629814,
+      4.824316784739494,
+      2.2076794803142548,
+      2.841049924492836
+    ],
+    "gradient_rms": 3.8347179174191046,
+    "normalization": "float64 gradient=sum advantage*clamp(raw_z,-2,2); fixed_z=clip(gradient/RMS(gradient),-2,2).float32"
+  },
+  "decision": "extract_fixed_direction",
+  "development_only": true,
+  "equal_seed_horvitz_thompson": {
+    "dropped": {
+      "control": 0.0,
+      "delta": 0.0,
+      "treatment": 0.0
+    },
+    "ever_grasped": {
+      "control": 0.7037037037037037,
+      "delta": 0.0407407407407408,
+      "treatment": 0.7444444444444445
+    },
+    "latched_within_window": {
+      "control": 0.4888888888888889,
+      "delta": -0.08888888888888888,
+      "treatment": 0.4
+    },
+    "success": {
+      "control": 0.5037037037037037,
+      "delta": 0.022222222222222227,
+      "treatment": 0.5259259259259259
+    },
+    "unlatched_clearance_ge_5cm": {
+      "control": 0.16296296296296298,
+      "delta": 0.018518518518518517,
+      "treatment": 0.18148148148148147
+    },
+    "unsafe_force": {
+      "control": 0.0,
+      "delta": 0.0,
+      "treatment": 0.0
+    }
+  },
+  "estimand_note": "equal-seed Horvitz-Thompson values use known propensity 0.5 and are not within-arm observed proportions; raw observed proportions are reported separately in raw_funnel",
+  "format_version": 1,
+  "gates": {
+    "any_new_abs_action_ge_0999": {
+      "comparison": "==",
+      "pass": true,
+      "threshold": false,
+      "value": false
+    },
+    "common_exposure_opportunity_slots": {
+      "comparison": ">=",
+      "pass": true,
+      "threshold": 32,
+      "value": 48
+    },
+    "component_and_l2_budget_violations": {
+      "comparison": "==",
+      "pass": true,
+      "threshold": 0,
+      "value": 0
+    },
+    "conditional_ever_grasped_delta": {
+      "comparison": ">=",
+      "pass": true,
+      "threshold": -0.1,
+      "value": 0.0407407407407408
+    },
+    "conditional_unlatched_clearance_ge_5cm_delta": {
+      "comparison": "<=",
+      "pass": true,
+      "threshold": 0.02,
+      "value": 0.018518518518518517
+    },
+    "discordant_latched_within_window_slots": {
+      "comparison": ">=",
+      "pass": true,
+      "threshold": 8,
+      "value": 8
+    },
+    "episodes_with_new_abs_action_ge_098_per_run": {
+      "comparison": "<=",
+      "pass": true,
+      "threshold": 1,
+      "value": 0
+    },
+    "gradient_finite_nonzero": {
+      "comparison": "==",
+      "pass": true,
+      "threshold": true,
+      "value": true
+    },
+    "new_abs_action_ge_098_element_fraction": {
+      "comparison": "<=",
+      "pass": true,
+      "threshold": 0.005,
+      "value": 0.0
+    },
+    "treatment_triggered_dropped": {
+      "comparison": "<=",
+      "pass": true,
+      "threshold": 0,
+      "value": 0
+    },
+    "treatment_triggered_unsafe_force": {
+      "comparison": "<=",
+      "pass": true,
+      "threshold": 0,
+      "value": 0
+    }
+  },
+  "kind": "pick_tool_candidate39_residual_discovery_v1",
+  "paired_discovery": {
+    "common_exposure_opportunity_slots": 48,
+    "control_only_latched": 7,
+    "discordant_latched_within_window_slots": 8,
+    "domain": "same seed/env_slot triggered and possessing a residual-window row in both complementary replicates",
+    "gradient_finite_nonzero": true,
+    "per_seed": {
+      "327": {
+        "common_exposure_opportunity_slots": 22,
+        "control_only_latched": 4,
+        "discordant_latched_within_window_slots": 4,
+        "excluded_without_common_intervention_opportunity": 0,
+        "treatment_only_latched": 0,
+        "triggered_in_both_replicates": 22
+      },
+      "328": {
+        "common_exposure_opportunity_slots": 26,
+        "control_only_latched": 3,
+        "discordant_latched_within_window_slots": 4,
+        "excluded_without_common_intervention_opportunity": 0,
+        "treatment_only_latched": 1,
+        "triggered_in_both_replicates": 26
+      }
+    },
+    "primary_outcome": "latched_within_window",
+    "treatment_only_latched": 1
+  },
+  "per_seed_equal_seed_ht_inputs": {
+    "327": {
+      "dropped": {
+        "control": 0.0,
+        "control_count": 0,
+        "control_rows": 22,
+        "delta": 0.0,
+        "domain_rows": 45,
+        "treatment": 0.0,
+        "treatment_count": 0,
+        "treatment_rows": 23
+      },
+      "ever_grasped": {
+        "control": 0.6666666666666666,
+        "control_count": 15,
+        "control_rows": 22,
+        "delta": 0.04444444444444451,
+        "domain_rows": 45,
+        "treatment": 0.7111111111111111,
+        "treatment_count": 16,
+        "treatment_rows": 23
+      },
+      "latched_within_window": {
+        "control": 0.5333333333333333,
+        "control_count": 12,
+        "control_rows": 22,
+        "delta": -0.17777777777777776,
+        "domain_rows": 45,
+        "treatment": 0.35555555555555557,
+        "treatment_count": 8,
+        "treatment_rows": 23
+      },
+      "success": {
+        "control": 0.4888888888888889,
+        "control_count": 11,
+        "control_rows": 22,
+        "delta": 0.04444444444444445,
+        "domain_rows": 45,
+        "treatment": 0.5333333333333333,
+        "treatment_count": 12,
+        "treatment_rows": 23
+      },
+      "unlatched_clearance_ge_5cm": {
+        "control": 0.17777777777777778,
+        "control_count": 4,
+        "control_rows": 22,
+        "delta": 0.0,
+        "domain_rows": 45,
+        "treatment": 0.17777777777777778,
+        "treatment_count": 4,
+        "treatment_rows": 23
+      },
+      "unsafe_force": {
+        "control": 0.0,
+        "control_count": 0,
+        "control_rows": 22,
+        "delta": 0.0,
+        "domain_rows": 45,
+        "treatment": 0.0,
+        "treatment_count": 0,
+        "treatment_rows": 23
+      }
+    },
+    "328": {
+      "dropped": {
+        "control": 0.0,
+        "control_count": 0,
+        "control_rows": 26,
+        "delta": 0.0,
+        "domain_rows": 54,
+        "treatment": 0.0,
+        "treatment_count": 0,
+        "treatment_rows": 28
+      },
+      "ever_grasped": {
+        "control": 0.7407407407407407,
+        "control_count": 20,
+        "control_rows": 26,
+        "delta": 0.03703703703703709,
+        "domain_rows": 54,
+        "treatment": 0.7777777777777778,
+        "treatment_count": 21,
+        "treatment_rows": 28
+      },
+      "latched_within_window": {
+        "control": 0.4444444444444444,
+        "control_count": 12,
+        "control_rows": 26,
+        "delta": 0.0,
+        "domain_rows": 54,
+        "treatment": 0.4444444444444444,
+        "treatment_count": 12,
+        "treatment_rows": 28
+      },
+      "success": {
+        "control": 0.5185185185185185,
+        "control_count": 14,
+        "control_rows": 26,
+        "delta": 0.0,
+        "domain_rows": 54,
+        "treatment": 0.5185185185185185,
+        "treatment_count": 14,
+        "treatment_rows": 28
+      },
+      "unlatched_clearance_ge_5cm": {
+        "control": 0.14814814814814814,
+        "control_count": 4,
+        "control_rows": 26,
+        "delta": 0.037037037037037035,
+        "domain_rows": 54,
+        "treatment": 0.18518518518518517,
+        "treatment_count": 5,
+        "treatment_rows": 28
+      },
+      "unsafe_force": {
+        "control": 0.0,
+        "control_count": 0,
+        "control_rows": 26,
+        "delta": 0.0,
+        "domain_rows": 54,
+        "treatment": 0.0,
+        "treatment_count": 0,
+        "treatment_rows": 28
+      }
+    }
+  },
+  "raw_funnel": {
+    "control": {
+      "assigned": 128,
+      "dropped": {
+        "count": 0,
+        "rate_given_trigger_observed": 0.0
+      },
+      "ever_grasped": {
+        "count": 35,
+        "rate_given_trigger_observed": 0.7291666666666666
+      },
+      "latched_within_window": {
+        "count": 24,
+        "rate_given_trigger_observed": 0.5
+      },
+      "success": {
+        "count": 25,
+        "rate_given_trigger_observed": 0.5208333333333334
+      },
+      "trigger_rate_observed": 0.375,
+      "triggered": 48,
+      "unlatched_clearance_ge_5cm": {
+        "count": 8,
+        "rate_given_trigger_observed": 0.16666666666666666
+      },
+      "unsafe_force": {
+        "count": 0,
+        "rate_given_trigger_observed": 0.0
+      }
+    },
+    "treatment": {
+      "assigned": 128,
+      "dropped": {
+        "count": 0,
+        "rate_given_trigger_observed": 0.0
+      },
+      "ever_grasped": {
+        "count": 37,
+        "rate_given_trigger_observed": 0.7254901960784313
+      },
+      "latched_within_window": {
+        "count": 20,
+        "rate_given_trigger_observed": 0.39215686274509803
+      },
+      "success": {
+        "count": 26,
+        "rate_given_trigger_observed": 0.5098039215686274
+      },
+      "trigger_rate_observed": 0.3984375,
+      "triggered": 51,
+      "unlatched_clearance_ge_5cm": {
+        "count": 9,
+        "rate_given_trigger_observed": 0.17647058823529413
+      },
+      "unsafe_force": {
+        "count": 0,
+        "rate_given_trigger_observed": 0.0
+      }
+    }
+  },
+  "receipts": [
+    {
+      "artifact": "/disk2/xhand_inhand/xhand_inhand/logs/flashsac/pick_tool/50_c39_residual_dev_s327_a/trial.pt",
+      "artifact_sha256": "6b8189de2f04be982550d6393f5822cfc4df88c6868d12eacc31ae0c84d591ac",
+      "run": "327a"
+    },
+    {
+      "artifact": "/disk2/xhand_inhand/xhand_inhand/logs/flashsac/pick_tool/50_c39_residual_dev_s327_b/trial.pt",
+      "artifact_sha256": "e464b548417c1dcd9f34a65177bbab2253658115f7833994d46e2ebf828f66fa",
+      "run": "327b"
+    },
+    {
+      "artifact": "/disk2/xhand_inhand/xhand_inhand/logs/flashsac/pick_tool/50_c39_residual_dev_s328_b/trial.pt",
+      "artifact_sha256": "609d33cb73e73ebbabfdb988bccb64ab15b08045635807fb3a93b7e5a86ef77a",
+      "run": "328b"
+    },
+    {
+      "artifact": "/disk2/xhand_inhand/xhand_inhand/logs/flashsac/pick_tool/50_c39_residual_dev_s328_a/trial.pt",
+      "artifact_sha256": "28f49d7cb608efa369f0f3f39c2462fe1de67c20ffb3a39e98740aab5d6a876d",
+      "run": "328a"
+    }
+  ],
+  "status": "complete",
+  "step_audit": {
+    "aggregate": {
+      "any_new_abs_action_ge_0999": false,
+      "component_and_l2_budget_violations": 0,
+      "max_episodes_with_new_abs_action_ge_098_per_run": 0,
+      "new_abs_action_ge_098_element_fraction": 0.0,
+      "new_abs_action_ge_098_elements": 0,
+      "residual_active_hand_elements": 19544
+    },
+    "per_run": [
+      {
+        "any_new_abs_action_ge_0999": false,
+        "component_and_l2_budget_violations": 0,
+        "episodes_with_new_abs_action_ge_098": 0,
+        "new_abs_action_ge_098_element_fraction": 0.0,
+        "new_abs_action_ge_098_elements": 0,
+        "residual_active_hand_elements": 4620,
+        "residual_active_rows": 330,
+        "run": "327a"
+      },
+      {
+        "any_new_abs_action_ge_0999": false,
+        "component_and_l2_budget_violations": 0,
+        "episodes_with_new_abs_action_ge_098": 0,
+        "new_abs_action_ge_098_element_fraction": 0.0,
+        "new_abs_action_ge_098_elements": 0,
+        "residual_active_hand_elements": 4424,
+        "residual_active_rows": 316,
+        "run": "327b"
+      },
+      {
+        "any_new_abs_action_ge_0999": false,
+        "component_and_l2_budget_violations": 0,
+        "episodes_with_new_abs_action_ge_098": 0,
+        "new_abs_action_ge_098_element_fraction": 0.0,
+        "new_abs_action_ge_098_elements": 0,
+        "residual_active_hand_elements": 6328,
+        "residual_active_rows": 452,
+        "run": "328b"
+      },
+      {
+        "any_new_abs_action_ge_0999": false,
+        "component_and_l2_budget_violations": 0,
+        "episodes_with_new_abs_action_ge_098": 0,
+        "new_abs_action_ge_098_element_fraction": 0.0,
+        "new_abs_action_ge_098_elements": 0,
+        "residual_active_hand_elements": 4172,
+        "residual_active_rows": 298,
+        "run": "328a"
+      }
+    ]
+  }
+}
