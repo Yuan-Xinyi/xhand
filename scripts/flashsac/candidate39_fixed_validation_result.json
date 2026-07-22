@@ -1,0 +1,105 @@
+{
+  "kind": "pick_tool_candidate39_fixed_direction_development_validation_result_v1",
+  "status": "sealed_rejected_before_formal_screen",
+  "sealed_local_date": "2026-07-22",
+  "branch": "flashsac-pick-tool-curriculum",
+  "collection_commit": "d30e88d2ddf2efdc7ca36fb25ca52b189554d2c9",
+  "validation_plan": {
+    "path": "scripts/flashsac/candidate39_fixed_direction_validation_plan.json",
+    "sha256": "9f62df35dfdd8abeff76aaad943e978cdfc75e3380d9019ba99b707e9a0c4496",
+    "tag": "pick-tool-candidate39-fixed-validation-v1-20260722"
+  },
+  "fixed_direction": {
+    "manifest_path": "scripts/flashsac/candidate39_fixed_direction_manifest.json",
+    "manifest_sha256": "b4140aef4e9aae105028dcfd2ea416ba58d734cc8f3ddb951790e49ca94d8772",
+    "payload_path": "logs/flashsac/pick_tool/50_c39_residual_fixed_z.pt",
+    "payload_sha256": "ca60397c7414e9710b3089f64855548b79ce9d92d0687c6eb014a4ae8934a304",
+    "was_recomputed_or_modified": false
+  },
+  "non_evidence_smoke": {
+    "run": "326b",
+    "num_envs": 8,
+    "artifact_path": "logs/flashsac/pick_tool/51_c39_fixed_direction_smoke_s326_b/trial.pt",
+    "artifact_sha256": "54a1da08669a6350f09aacfcb06b4bae75f35bb5c882acf2ce9698f9a5d93e5f",
+    "report_path": "logs/flashsac/pick_tool/51_c39_fixed_direction_smoke_s326_b/trial.json",
+    "report_sha256": "8794fc31a4bc723b96931afdf4977e824551d74396311b076fcc75e33e68d8c0",
+    "registered_smoke_checks_passed": true,
+    "outcomes_used_to_change_direction_or_plan": false
+  },
+  "development_evidence": {
+    "run_order": ["329a", "329b", "330b", "330a"],
+    "artifacts": [
+      {
+        "run": "329a",
+        "path": "logs/flashsac/pick_tool/51_c39_fixed_direction_dev_s329_a/trial.pt",
+        "sha256": "21a2eaa49017e66293dace7b2c88b506337ef75739db16bc84978800bf58f8ef",
+        "collector_report_path": "logs/flashsac/pick_tool/51_c39_fixed_direction_dev_s329_a/trial.json",
+        "collector_report_sha256": "e0b3149c7e515ba62b38cb9a14c9a9771db67719562f4f6c0a32f982dcc51719"
+      },
+      {
+        "run": "329b",
+        "path": "logs/flashsac/pick_tool/51_c39_fixed_direction_dev_s329_b/trial.pt",
+        "sha256": "1ee69464660019c547dcd3a435b8b1f73c18ba60eba6cd7a4c9ca6243b2a27f9",
+        "collector_report_path": "logs/flashsac/pick_tool/51_c39_fixed_direction_dev_s329_b/trial.json",
+        "collector_report_sha256": "69a5be71156de347246476c3d34a647cf092047b562ef36359659f18a4bbc550"
+      },
+      {
+        "run": "330b",
+        "path": "logs/flashsac/pick_tool/51_c39_fixed_direction_dev_s330_b/trial.pt",
+        "sha256": "bd15601b0d403362c9cf11b8c4bfc05c194d86176068fc20f0b462e1e5f36518",
+        "collector_report_path": "logs/flashsac/pick_tool/51_c39_fixed_direction_dev_s330_b/trial.json",
+        "collector_report_sha256": "29b542fa890015c73d605dab2c6b8c4dff6797fd54fa175455f8d29b424faa47"
+      },
+      {
+        "run": "330a",
+        "path": "logs/flashsac/pick_tool/51_c39_fixed_direction_dev_s330_a/trial.pt",
+        "sha256": "17d8b7e7d26bb201450bf4285754fd5dcbdfe0a8698881b85626916e8caa59a6",
+        "collector_report_path": "logs/flashsac/pick_tool/51_c39_fixed_direction_dev_s330_a/trial.json",
+        "collector_report_sha256": "ef7da0d90a48db8a620f1b2a3cdbd737431298941a939867c426d68e2bde3ca6"
+      }
+    ],
+    "combined_report_path": "logs/flashsac/pick_tool/51_c39_fixed_direction_development_validation.json",
+    "combined_report_sha256": "fd4b72ebcb5711c241b2ec0f5fb6dc85105095d1accfa5c26cd25b2bf0fccaef"
+  },
+  "decision": {
+    "analyzer_decision": "reject_fixed_direction",
+    "all_gates_pass": false,
+    "gates_passed": 15,
+    "gates_total": 16,
+    "failing_gates": {
+      "conditional_unlatched_clearance_ge_5cm_delta_max": {
+        "value": 0.03260188087774294,
+        "comparison": "<=",
+        "threshold": 0.02
+      }
+    },
+    "primary_conditional_latched_within_32_actions_delta": 0.01630094043887148,
+    "per_seed_primary_delta": {
+      "329": 0.06896551724137928,
+      "330": -0.03636363636363632
+    },
+    "conditional_ever_grasped_delta": 0.12068965517241381,
+    "conditional_success_delta": 0.07084639498432602,
+    "conditional_unlatched_clearance_ge_5cm_delta": 0.03260188087774294,
+    "treatment_triggered_dropped": 0,
+    "treatment_triggered_unsafe_force": 0,
+    "component_and_l2_budget_violations": 0,
+    "new_abs_action_ge_098_element_fraction": 0.0,
+    "any_new_abs_action_ge_0999": false
+  },
+  "paired_common_exposure_diagnostic": {
+    "role": "diagnostic_only_and_cannot_override_registered_ht_gate",
+    "opportunity_slots": 54,
+    "latched_within_32_actions_delta": 0.0,
+    "ever_grasped_delta": 0.07407407407407407,
+    "success_delta": 0.05555555555555555,
+    "unlatched_clearance_ge_5cm_delta": 0.0
+  },
+  "formal_screen": {
+    "seeds": [331, 332, 333],
+    "touched": false,
+    "permitted_under_this_candidate": false,
+    "reason": "The all-must-pass development validation failed its preregistered unlatched-clearance gate."
+  },
+  "allowed_conclusion": "The immutable Candidate39 direction improved several development estimands but is rejected because it exceeded the preregistered unlatched-clearance risk limit; it is not eligible for formal screening or deployment."
+}
