@@ -1,0 +1,241 @@
+{
+  "kind": "pick_tool_candidate42_transactional_public_arm_ramp_development_validation_result_v1",
+  "status": "sealed_rejected_before_formal_screen",
+  "sealed_local_date": "2026-07-23",
+  "branch": "flashsac-pick-tool-curriculum",
+  "collection_commit": "5587ec7f352526b248d8616a63d9160824551806",
+  "implementation_commit": "bc8369c2a0913de6a5dbf473c07635c2b63ebff7",
+  "validation_plan": {
+    "path": "scripts/flashsac/candidate42_transactional_arm_ramp_development_plan.json",
+    "sha256": "242f40d844e6536d8cf030e612a2537e3785ad97a5c9c3d5737ab612e4be60fa",
+    "pristine_preregistration_sha256": "7b9e98d06aae1c992fb4ae7fe9c283f9b746228ab7d012f8cafcd8b3c20d3727",
+    "preregistration_commit": "6e46f567f7730a1ef296fd794ebaf10ea85dde13",
+    "preregistration_tag": "pick-tool-candidate42-transactional-arm-ramp-plan-v1-20260722",
+    "collection_seal_tag": "pick-tool-candidate42-transactional-arm-ramp-validation-v1-20260722"
+  },
+  "registered_intervention": {
+    "description": "Keep Candidate39's complete route and hand14 action unchanged. On treatment rows only after first option-active latch-visible eligibility, scale the exact common arm7 by float32(stable_count_before)/float32(15) while the current public stable predicate holds, reset authority and the count immediately on instability, and reach full authority on the sixteenth consecutive stable action.",
+    "control": "bit-exact Candidate39 common route and full common arm7",
+    "scientific_source_candidate": "Candidate41",
+    "network_updates": 0,
+    "fixed_direction_was_recomputed_or_modified": false
+  },
+  "transaction_validation": {
+    "contract": "candidate42_parent_child_fsync_no_clobber_commit_v1",
+    "registered_namespace_count": 5,
+    "committed_namespace_count": 5,
+    "analysis_transaction_prerequisite_passed": true,
+    "canonical_artifact_report_commit_hardlinks_verified": true,
+    "terminal_conflicts": 0,
+    "post_boundary_failures": 0,
+    "retryable_pre_boundary_failures": 1
+  },
+  "non_evidence_smoke": {
+    "run": "346b",
+    "seed": 346,
+    "replicate": "b",
+    "num_envs": 8,
+    "run_id": "ee69dbc489f0ed0772c4fdbc7ef32b081ecf3faf15ba353a9f95a43f06074a98",
+    "outcomes_used_to_change_plan_or_gates": false,
+    "registered_smoke_checks_passed": true,
+    "retryable_prior_attempt": {
+      "attempt_number": 1,
+      "attempt_id": "b10614eced2feab2fc2ed31270abc28d5cc4f8b63172027ec2ea4cf9273d7410",
+      "classification": "receipt_proven_pre_boundary_environment_import_failure",
+      "boundary_armed": false,
+      "retry_permitted": true,
+      "failure_receipt_path": "logs/flashsac/pick_tool/54_c42_txn_public_arm_ramp_smoke_s346_b/trial.failed_attempt_001.json",
+      "failure_receipt_sha256": "3024ea338f227f705b716fbf7368e88f22efc410fd8288201ae4f55928eefec0"
+    },
+    "successful_attempt": {
+      "attempt_number": 2,
+      "attempt_id": "001a1ac0084c7e62c36c60d8f0dd6ff6b2ecd9ad78a7e16ab5f2c2714d35cb62",
+      "artifact_path": "logs/flashsac/pick_tool/54_c42_txn_public_arm_ramp_smoke_s346_b/trial.pt",
+      "artifact_sha256": "50a37a42459c76620d7b033d86f4166f0f5383090fa1dad6a2a1edc4f4875fc5",
+      "report_path": "logs/flashsac/pick_tool/54_c42_txn_public_arm_ramp_smoke_s346_b/trial.json",
+      "report_sha256": "bc67184abb47a5edef8687fbdc39bb8ef21c6cdae0167ab860eb41865eaeadad",
+      "commit_path": "logs/flashsac/pick_tool/54_c42_txn_public_arm_ramp_smoke_s346_b/trial.commit.json",
+      "commit_sha256": "fbd8c223cc0509b327c71949444a3f1a8d5ccf25d70593c5d6fd17e6b307d901"
+    }
+  },
+  "development_evidence": {
+    "run_order": [
+      "347a",
+      "347b",
+      "348b",
+      "348a"
+    ],
+    "combined_report_path": "logs/flashsac/pick_tool/54_c42_txn_public_arm_ramp_development_validation.json",
+    "combined_report_sha256": "1e353c4e1694fe6d5fab032d3466b5b63b9e17f88ec798197802b7238802b8e9",
+    "combined_report_deterministic_recompute_exact": true,
+    "artifacts": [
+      {
+        "run": "347a",
+        "seed": 347,
+        "replicate": "a",
+        "run_id": "e07c4f307d0baea6a65ab4546e67ab31145674a077464ae7070e41bd7c82b30e",
+        "attempt_number": 1,
+        "attempt_id": "2d5f340cbd8643c5825323fe0081e9a8c55c530b8daa539eef02aeb26e760793",
+        "artifact_path": "logs/flashsac/pick_tool/54_c42_txn_public_arm_ramp_dev_s347_a/trial.pt",
+        "artifact_sha256": "96f73f14bff117a8b0011c5c3d8dd8f8f0d420e53b401fabc2d7705512b71a06",
+        "report_path": "logs/flashsac/pick_tool/54_c42_txn_public_arm_ramp_dev_s347_a/trial.json",
+        "report_sha256": "47946a2ece9791c7ab30aef4c033fe862c53378aefd46889eaff768e08f09849",
+        "commit_path": "logs/flashsac/pick_tool/54_c42_txn_public_arm_ramp_dev_s347_a/trial.commit.json",
+        "commit_sha256": "fa9e28f22c1777cc697160b7d8563b14ff6eee722c09eb7b3d8d8a3bb573abe1"
+      },
+      {
+        "run": "347b",
+        "seed": 347,
+        "replicate": "b",
+        "run_id": "3f2e005d5123c333c2a0695538158d31e3f4051ac5beb2c1f04cfeee07bef264",
+        "attempt_number": 1,
+        "attempt_id": "7cbc208410f499ae2e676fefff284300414a9c6eac05022b44d54c67d4d6c41b",
+        "artifact_path": "logs/flashsac/pick_tool/54_c42_txn_public_arm_ramp_dev_s347_b/trial.pt",
+        "artifact_sha256": "b7114e433a33fa3abd7fa9308eed344a0c5a5dc6f82b2cae37831c9cf12b0a23",
+        "report_path": "logs/flashsac/pick_tool/54_c42_txn_public_arm_ramp_dev_s347_b/trial.json",
+        "report_sha256": "fe43a4d9598f9fe34d1508be1c31b6a1a7725b48e9a1ab1d15658f406b3be079",
+        "commit_path": "logs/flashsac/pick_tool/54_c42_txn_public_arm_ramp_dev_s347_b/trial.commit.json",
+        "commit_sha256": "6517f498094178bb8a636f35e93f94968a86a0814d352991fa5c07bb12b0c177"
+      },
+      {
+        "run": "348b",
+        "seed": 348,
+        "replicate": "b",
+        "run_id": "f0e47ce6e505ed347ebe0861c1aa3544730aac2a23ce3116e03d6eb7cafa4087",
+        "attempt_number": 1,
+        "attempt_id": "73fc25ac132c4174ae6ce441c4c4b9a2f9fc3e62b1a5b8cde9547b8f05fa37a3",
+        "artifact_path": "logs/flashsac/pick_tool/54_c42_txn_public_arm_ramp_dev_s348_b/trial.pt",
+        "artifact_sha256": "0a4c58b6ffc716a39f996b6f13e120c16b8a848f5ca583d1f62c4badd523205b",
+        "report_path": "logs/flashsac/pick_tool/54_c42_txn_public_arm_ramp_dev_s348_b/trial.json",
+        "report_sha256": "219ba08d5e6cf70519ff99f254782bdc36c8880e40d6fc0fb762739d881655a9",
+        "commit_path": "logs/flashsac/pick_tool/54_c42_txn_public_arm_ramp_dev_s348_b/trial.commit.json",
+        "commit_sha256": "0a14b29e5e16e9a2c0a925f757e75dc67030e55b7a4fd95b68f36a124ec4b9e0"
+      },
+      {
+        "run": "348a",
+        "seed": 348,
+        "replicate": "a",
+        "run_id": "42bc7a01409e37e4dae4a585cfca1ddcc3ad16c7dbe5a63dffe56e77b7f5347b",
+        "attempt_number": 1,
+        "attempt_id": "ec6d4acf0e5c3df2fca7605e9cb3bc90459515180cdb3d43ce009c70ef63202e",
+        "artifact_path": "logs/flashsac/pick_tool/54_c42_txn_public_arm_ramp_dev_s348_a/trial.pt",
+        "artifact_sha256": "cda853e762b5a94676283b705779ed58e56758a7c381f6f1dfdba7cdc85c448f",
+        "report_path": "logs/flashsac/pick_tool/54_c42_txn_public_arm_ramp_dev_s348_a/trial.json",
+        "report_sha256": "81e3bd16cc014d33c6fe913e99722214a21722563585fd8b327bda6d90acb7a7",
+        "commit_path": "logs/flashsac/pick_tool/54_c42_txn_public_arm_ramp_dev_s348_a/trial.commit.json",
+        "commit_sha256": "32e1d095c3ea21a67ab829ff5151f2ec4fcfb1af058955ed8d96eb5f13b839d9"
+      }
+    ]
+  },
+  "decision": {
+    "analyzer_decision": "reject_candidate42",
+    "all_gates_pass": false,
+    "gates_passed": 25,
+    "gates_total": 32,
+    "action_clock_and_source_audits_exact": true,
+    "primary_conditional_safe_terminal_utility_delta": {
+      "equal_seed": 0.15897435897435896,
+      "per_seed": {
+        "347": -0.06666666666666665,
+        "348": 0.3846153846153846
+      }
+    },
+    "equal_seed_horvitz_thompson_deltas": {
+      "ever_grasped": 0.07692307692307687,
+      "stable_held_5cm_by_action96": -0.13333333333333336,
+      "stable_transport_restricted_mean": -0.206189807610943,
+      "ever_true_clearance_ge_20cm": -0.09999999999999998,
+      "success": -0.02820512820512827,
+      "terminal_utility": 0.15897435897435896,
+      "unlatched_clearance_ge_5cm": -0.18717948717948718
+    },
+    "per_seed_stable_transport_delta": {
+      "347": -0.36054088190333766,
+      "348": -0.051838733318548325
+    },
+    "raw_eligible_counts": {
+      "control": {
+        "eligible": 27,
+        "stable_held_5cm_by_action96": 22,
+        "ever_true_clearance_ge_20cm": 22,
+        "success": 19,
+        "unlatched_clearance_ge_5cm": 6
+      },
+      "treatment": {
+        "eligible": 29,
+        "stable_held_5cm_by_action96": 18,
+        "ever_true_clearance_ge_20cm": 19,
+        "success": 18,
+        "unlatched_clearance_ge_5cm": 1
+      }
+    },
+    "treatment_full_authority_by_action32": {
+      "347": 1,
+      "348": 3,
+      "total": 4
+    },
+    "treatment_partial_authority_rows": 716,
+    "failing_gates": {
+      "conditional_stable_held_5cm_by_action96_delta_floor": {
+        "comparison": ">=",
+        "threshold": -0.05,
+        "value": -0.13333333333333336
+      },
+      "conditional_stable_transport_restricted_mean_delta_floor": {
+        "comparison": ">=",
+        "threshold": -0.08,
+        "value": -0.206189807610943
+      },
+      "conditional_true_clearance_ge_20cm_delta_floor": {
+        "comparison": ">=",
+        "threshold": -0.03,
+        "value": -0.09999999999999998
+      },
+      "per_seed_primary_delta_floor": {
+        "comparison": ">=",
+        "threshold": -0.05,
+        "value": -0.06666666666666665
+      },
+      "per_seed_stable_transport_delta_floor": {
+        "comparison": ">=",
+        "threshold": -0.15,
+        "value": -0.36054088190333766
+      },
+      "treatment_eligible_full_authority_by_action32_min_across_validation": {
+        "comparison": ">=",
+        "threshold": 12,
+        "value": 4
+      },
+      "treatment_eligible_full_authority_by_action32_min_per_seed": {
+        "comparison": ">=",
+        "threshold": 3,
+        "value": 1
+      }
+    }
+  },
+  "paired_common_eligibility_diagnostic": {
+    "role": "The registered paired U5 row is an acceptance gate; all other rows are diagnostic and cannot override the Horvitz-Thompson decision.",
+    "common_eligible_slots": 25,
+    "minimum_common_eligible_slots_per_seed": 11,
+    "deltas": {
+      "stable_held_5cm_by_action96": -0.12,
+      "stable_transport_restricted_mean": -0.22697344247077125,
+      "ever_true_clearance_ge_20cm": -0.08,
+      "success": 0.0,
+      "terminal_utility": 0.2,
+      "unlatched_clearance_ge_5cm": -0.2
+    }
+  },
+  "formal_screen": {
+    "seeds": [
+      349,
+      350,
+      351
+    ],
+    "touched": false,
+    "permitted_under_this_candidate": false,
+    "advance_to_formal_screen": false,
+    "reason": "Seven of the 32 all-must-pass development gates failed."
+  },
+  "allowed_conclusion": "Candidate42's parent/child transaction succeeded and produced complete, independently validated development evidence. The registered live-stable arm ramp substantially reduced unlatched 5 cm lift and improved aggregate safe terminal utility, but it did not preserve stable transport, stable held 5 cm, or true 20 cm lift, and it rarely reached full authority by action 32. Candidate42 is rejected before formal screening; no formal, deployment, end-to-end learning, or generalization claim is allowed. The sealed traces may be used only to preregister a new mechanism candidate on fresh seeds."
+}
