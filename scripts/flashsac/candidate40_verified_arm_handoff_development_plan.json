@@ -1,0 +1,300 @@
+{
+  "kind": "pick_tool_candidate40_verified_arm_handoff_development_plan_v1",
+  "status": "preregistered_before_implementation_or_simulator_evidence",
+  "created_local_date": "2026-07-22",
+  "branch": "flashsac-pick-tool-curriculum",
+  "preregistration_parent_commit": "7d223ae8aff95ac466c4840d63110e2761178849",
+  "purpose": "Test one isolated post-latch mechanism: whether holding only the seven arm commands at exact zero until an actor-visible plus raw-tactile 15-frame stable-grasp verification reduces Candidate39's downstream unlatched-lift failures without suppressing true 20 cm transport. The frozen LIFT hand policy, Candidate39 pre-latch fixed residual, SEARCH policy, reward, task physics, and tactile shield remain unchanged.",
+  "development_only": {
+    "is_formal_acceptance": false,
+    "allowed_claim_if_all_gates_pass": "The verified-arm handoff is eligible for a separately preregistered formal A/B screen; Candidate40 is not yet accepted or deployable.",
+    "allowed_claim_if_any_gate_fails": "Reject this isolated arm-handoff mechanism on these settings. A later sticky-hand experiment must be a new candidate and must not reuse these development outcomes as acceptance evidence.",
+    "forbidden_claims": [
+      "formal end-to-end improvement",
+      "generalization outside the registered development seeds",
+      "proof that the frozen LIFT hand command is optimal",
+      "production or robot deployment readiness"
+    ],
+    "candidate39_formal_seeds_left_untouched_and_not_repurposed": [331, 332, 333],
+    "candidate40_reserved_formal_seeds_untouched": [337, 338, 339]
+  },
+  "causal_basis": {
+    "candidate39_result_manifest": {
+      "path": "scripts/flashsac/candidate39_fixed_validation_result.json",
+      "sha256": "911f263fce089759fa3d306038458cdefcb1ed6d0e602289df29720f73662e44",
+      "seal_commit": "7d223ae8aff95ac466c4840d63110e2761178849",
+      "decision": "reject_fixed_direction"
+    },
+    "candidate39_combined_report": {
+      "path": "logs/flashsac/pick_tool/51_c39_fixed_direction_development_validation.json",
+      "sha256": "fd4b72ebcb5711c241b2ec0f5fb6dc85105095d1accfa5c26cd25b2bf0fccaef"
+    },
+    "sealed_forensics": {
+      "unlatched_clearance_ge_5cm_episodes": 16,
+      "triggered_unlatched_clearance_ge_5cm_episodes": 14,
+      "triggered_events_with_search_close_first_latch_common_lift_release_chain": 14,
+      "events_inside_candidate39_residual_window": 0,
+      "triggered_events_with_drop": 0,
+      "triggered_events_with_unsafe_force": 0,
+      "first_latch_to_failure_actions_range": [11, 61],
+      "triggered_events_that_reached_true_20cm_before_latch_loss": 6,
+      "interpretation": "The fixed residual changes grasp acquisition posture, but every observed triggered U5 occurred only after residual retirement and immediate common frozen-LIFT routing. Existing artifacts cannot distinguish early arm acceleration from hand-command mismatch, so Candidate40 changes only live arm-authority timing and measures that supervisor's total effect."
+    },
+    "older_context_only_evidence": {
+      "warning": "These seed-187 close-start results used older checkpoints and are not acceptance evidence for Candidate40.",
+      "public_latch_arm_gate_success_rate": 0.619140625,
+      "public_latch_plus_memoryless_hand_hold_success_rate": 0.576171875,
+      "hierarchical_arm_hold_success_rate": 0.521484375,
+      "interpretation": "Freezing the hand is not bundled into Candidate40 because the older ablation reduced throughput and would confound attribution."
+    }
+  },
+  "immutable_policies_and_payloads": {
+    "v6_checkpoint": "logs/flashsac/pick_tool/16_v6_router_zero_actor_s254/checkpoint_final",
+    "v6_actor_sha256": "d9aacbd48891c192c0d1491514137262b82990fa71440787076403de06606288",
+    "v6_task_contract_sha256": "8a2a135fa1cd5bb01965fc7dc6d6a73978dffc1bf55941ae392146de1d17f61d",
+    "v6_bridge_state_sha256": "78176bb99eb5dac80a2789b231d54db6cf2b86132bc7835a129dd7f5a7df978c",
+    "frozen_lift_actor_sha256": "117f1b0ae3641bd24b6b9f3d585576a79b5aff968139c0dde86e6346f60ebaa0",
+    "frozen_lift_semantic_sha256": "8af0fdbc2572346b7519fbb4b29354fb5bc882a0c0020c8c3ace8376696ab324",
+    "frozen_lift_source_actor_sha256": "7757869eaa1df02f5f52c2dcd1353fb4a486b7512019650a8234d76702b9a1fb",
+    "search_checkpoint": "logs/rl_games/pick_tool_token/0_bootstrap_handoff_20260720/nn/pick_tool_stage7_dagger_full_iter3_bc.pth",
+    "search_checkpoint_sha256": "b91555d8227cf4e87e41ae858d7f8b1ee42ae920a9d829f2f5b1453b529f1f02",
+    "candidate39_fixed_direction_manifest": "scripts/flashsac/candidate39_fixed_direction_manifest.json",
+    "candidate39_fixed_direction_manifest_sha256": "b4140aef4e9aae105028dcfd2ea416ba58d734cc8f3ddb951790e49ca94d8772",
+    "candidate39_fixed_z_payload": "logs/flashsac/pick_tool/50_c39_residual_fixed_z.pt",
+    "candidate39_fixed_z_payload_sha256": "ca60397c7414e9710b3089f64855548b79ce9d92d0687c6eb014a4ae8934a304",
+    "flashsac_fork_commit": "5ecf331fa11cd457dd39018b3d68af571b257666",
+    "network_updates": 0,
+    "reward_or_critic_ranking": "forbidden"
+  },
+  "common_candidate39_route": {
+    "applies_to_control_and_treatment": true,
+    "search": "Exact frozen rl_games SEARCH.",
+    "handoff": {
+      "minimum_public_pregrasp_score": 0.3,
+      "consecutive_frames": 4,
+      "trigger_action_is_close_age_zero": true
+    },
+    "pre_latch_close": "Every slot, irrespective of Candidate40 assignment, receives the exact sealed Candidate39 fixed_z hand14 residual during the same 32-action pre-latch window. There is no zero-residual Candidate39 control in this experiment.",
+    "residual_retirement": "The first public latch anywhere in the episode permanently retires Candidate39's residual, including a SEARCH-side latch and all later latch loss and regrasp.",
+    "unlatched_after_retirement": "Exact deterministic V6 CLOSE with arm7 exactly zero and no residual.",
+    "latched_hand": "Exact frozen-LIFT hand14 on every option-active public-latched action in both groups.",
+    "latched_control_arm": "Exact frozen-LIFT arm7 immediately on every option-active public-latched action.",
+    "tactile_shield": "The unchanged environment tactile shield remains final authority over actions and joint targets in both groups."
+  },
+  "candidate40_intervention_contract": {
+    "name": "public_verified_live_arm_handoff_v1",
+    "only_randomized_difference": "On treatment slots only and only after the first option-active latch-visible decision, replace the exact Candidate39 baseline arm7 with zeros unless the public verifier authorizes arm motion; never change hand14 or any SEARCH routing.",
+    "public_observation_contract": "pick_tool_markov115_v1",
+    "actor_visible_features": {
+      "finger_force_strength_indices": [97, 102],
+      "strict_wrap_quality_index": 103,
+      "hold_quality_index": 104,
+      "public_latch_index": 106,
+      "force_encoding": "obs[97:102]=tanh(force_newtons/5.0)",
+      "float32_safe_force_strength_max": 0.9999877214431763
+    },
+    "public_force_counter_sidecar": {
+      "contract": "pick_tool_public_gate_state_v1",
+      "required_features": ["hard_force_count_progress", "overforce_count_progress"],
+      "stable_value_for_each": 0.0,
+      "routing_prohibition": "Raw transition force, true clearance, terminal truth, and any evaluator-only geometry may be recorded but must never enter the supervisor action decision."
+    },
+    "first_eligible_decision": "The first episode-active pre-action row with option_active==1 and obs[106]==1. Its truth is determined before the Candidate40 action, so it defines the pre-treatment causal domain even if the latch originally arose during SEARCH. All earlier rows execute exact Candidate39, and SEARCH rows always remain exact SEARCH.",
+    "stable_current": "option_active and obs[106]==1 and min(obs[103],obs[104])>=0.35 and obs[104]>=0.50 and max(obs[97:102])<=float32(tanh(30/5)) and both public force-counter progress values equal zero",
+    "row_state_machine": {
+      "stable_count_before": "The prior row's stable_count_after, initialized to zero and clamped to [0,15].",
+      "arm_enabled_this_action": "activated and stable_count_before==15 and stable_current.",
+      "treatment_arm7": "Exact Candidate39 baseline arm7 if arm_enabled_this_action, otherwise zeros7; this overlay is applied only after activation and never changes SEARCH.",
+      "control_arm7": "Exact Candidate39 baseline arm7 on every row; the shadow verifier never edits control.",
+      "hand14": "Exact Candidate39 baseline hand14 for both assignments on every row.",
+      "stable_count_after": "min(15, stable_count_before+1) if stable_current, otherwise zero."
+    },
+    "first_latch_clock": "Record the first public-latch transition separately from first_eligible_decision. Neither clock may be inferred from terminal physical-grasp telemetry.",
+    "enable_clock": "The first eligible stable row has stable_count_before=0 and executes arm7=0. The fifteenth consecutive stable row has stable_count_before=14, executes arm7=0, and sets stable_count_after=15. Only the next still-stable row may execute exact Candidate39 arm7.",
+    "live_relock": "After enablement, any latch loss, wrap-quality failure, hold-quality failure, or public force-limit failure zeros arm7 on that same action and resets the counter. A new sequence of 15 held-arm stable observations is required before re-enable.",
+    "control": "Exact common Candidate39 route with immediate frozen-LIFT arm7; verifier state is computed counterfactually for telemetry but never edits control actions.",
+    "treatment_hand_invariance": "Treatment hand14 must be bit-exact to the common Candidate39 route on every active action, including VERIFY, released LIFT, relock, and regrasp.",
+    "pre_release_launch_event": "For a treatment-eligible episode, either true clearance exceeding 0.015 m or true clearance increasing by at least 0.015 m above its first-eligible-decision clearance before its first arm-enabled action is a zero-tolerance development safety failure. This evaluator-only label never changes routing or environment termination semantics.",
+    "primary_metric_horizon_actions": 128,
+    "artifact_trace_horizon": "first eligible decision through authoritative terminal or timeout",
+    "network_updates": 0
+  },
+  "assignment": {
+    "contract": "candidate40_verified_arm_sha256_rank_exact_balanced_complement_v1",
+    "salt": "pick_tool_candidate40_verified_arm_handoff_development_20260722_v1",
+    "num_envs": 64,
+    "sha256_message": "salt\\0rank\\0seed\\0env_slot encoded as UTF-8",
+    "ranking": "Sort env_slot by SHA256 digest bytes with env_slot as deterministic tie-breaker.",
+    "replicate_a": "The first 32 ranked slots are verified-arm treatment; the remaining 32 are immediate-arm control.",
+    "replicate_b": "Bit-exact complement of replicate a, without reranking.",
+    "per_run_balance": "exactly 32 treatment and 32 control slots",
+    "per_seed_pairing": "Each stable env_slot is observed once under verified-arm treatment and once under immediate-arm control across complementary replicates.",
+    "assignment_must_be_built_and_hashed_before_simulator_launch": true
+  },
+  "execution": {
+    "seed_hygiene_checked_before_preregistration": {
+      "seeds": [331, 332, 333, 334, 335, 336, 337, 338, 339],
+      "matching_log_paths_per_seed": 0
+    },
+    "non_evidence_smoke": {
+      "seed": 334,
+      "replicate": "b",
+      "num_envs": 8,
+      "output": "logs/flashsac/pick_tool/52_c40_verified_arm_smoke_s334_b/trial",
+      "purpose": "Exercise the public verifier clock, first-divergent-action semantics, live relock, full post-eligibility trace, task-action reconstruction, and strict validators before consuming development seeds.",
+      "outcomes_must_not_change_the_plan": true,
+      "must_pass_before_development_collection": [
+        "artifact and report independently validate",
+        "pre-eligibility actions and all hand14 actions are exact",
+        "treatment arm gate and control immediate-arm route are exact",
+        "fifteenth stable observation is still held and arm enablement can begin only on the next stable observation",
+        "fixed residual budgets and action bounds have zero violations",
+        "treatment-eligible drop, unsafe-force, and pre-release-launch counts are zero"
+      ]
+    },
+    "development_seeds": [335, 336],
+    "replicates": ["a", "b"],
+    "num_envs_per_run": 64,
+    "first_episode_only": true,
+    "run_order": ["335a", "335b", "336b", "336a"],
+    "output_pattern": "logs/flashsac/pick_tool/52_c40_verified_arm_dev_s{seed}_{replicate}/trial",
+    "kit_args": "--/app/extensions/fsWatcherEnabled=false",
+    "prohibited_before_completion": [
+      "running seeds 337, 338, or 339",
+      "repurposing Candidate39 seeds 331, 332, or 333",
+      "changing verifier thresholds, count semantics, residual, handoff, assignment, estimator, gates, trace horizon, or run order after seeing smoke or development outcomes",
+      "adding sticky-hand or any learned update to Candidate40",
+      "selecting, discarding, or extending episodes based on outcome"
+    ]
+  },
+  "estimands": {
+    "contrast": "verified-arm treatment minus immediate-arm Candidate39 control",
+    "eligibility_domain": "First episodes that reach the first episode-active pre-action decision with option_active==1 and obs[106]==1. Eligibility is measured before the first Candidate40-dependent action. All preceding actions, including any SEARCH-side latch history, are exact common Candidate39.",
+    "known_propensity": 0.5,
+    "seed_weighting": "Equal arithmetic mean of seed-335 and seed-336 estimates.",
+    "primary": {
+      "name": "conditional_stable_transport_restricted_mean_delta",
+      "horizon_actions_after_eligible_latch": 128,
+      "per_transition_value": "x_h = I(public_latch and grasp_quality>=0.35 and hold_quality>=0.50 and max_force<=30N) * clip(true_mesh_clearance/0.20, 0, 1)",
+      "stable_value": "g_h is the minimum x over the current and preceding 14 transitions; g_h=0 until 15 post-latch transitions exist",
+      "episode_outcome": "mean(g_0...g_127); after authoritative strict success, unobserved suffix values are one, while failure, drop, unsafe, timeout, or ordinary horizon exhaustion contributes no absorbing credit",
+      "estimator": "Within each seed, Horvitz-Thompson treatment minus control on the pre-treatment eligibility domain using known propensity 0.5; then equal-weight the two seed estimates.",
+      "reason": "This rewards early sustained true transport, gives no credit to a fling or a sub-15-frame height spike, and makes holding forever without lifting score near zero."
+    },
+    "secondary": [
+      "conditional terminal utility (strict success minus unlatched true-clearance >=5 cm) delta",
+      "conditional strict success delta",
+      "conditional true clearance >=20 cm delta",
+      "conditional stable held true-clearance >=5 cm by action 96 delta",
+      "conditional ever-grasped delta",
+      "conditional unlatched true-clearance >=5 cm delta",
+      "verified-arm enable, relock, and re-enable counts and enable latency",
+      "treatment-eligible drop, unsafe-force, and pre-release-launch counts"
+    ],
+    "paired_common_eligibility_sensitivity": {
+      "domain": "Same seed/env_slot reaches the pre-treatment eligibility observation in both complementary replicates.",
+      "reported_outcomes": [
+        "stable transport restricted-mean utility",
+        "terminal success-minus-U5 utility",
+        "strict success",
+        "ever true clearance >=20 cm",
+        "ever unlatched true clearance >=5 cm"
+      ],
+      "role": "Consistency diagnostic and an explicit unlatched-failure gate; it does not replace the registered HT primary."
+    }
+  },
+  "development_validation_gates": {
+    "all_must_pass": true,
+    "primary_conditional_stable_transport_restricted_mean_delta_min_exclusive": 0.0,
+    "positive_primary_delta_seeds_min": 1,
+    "per_seed_primary_delta_floor": -0.1,
+    "conditional_unlatched_clearance_ge_5cm_delta_max": 0.0,
+    "paired_common_eligibility_unlatched_clearance_ge_5cm_delta_max": 0.0,
+    "conditional_success_delta_floor": -0.03,
+    "conditional_true_clearance_ge_20cm_delta_floor": -0.03,
+    "conditional_never_stable_held_5cm_by_action96_delta_max": 0.0,
+    "conditional_ever_grasped_delta_floor": -0.03,
+    "eligible_opportunity_slots_min_across_validation": 32,
+    "eligible_opportunity_slots_min_per_seed": 12,
+    "eligible_opportunity_slots_min_per_seed_arm": 8,
+    "paired_common_eligible_slots_min_across_validation": 16,
+    "paired_common_eligible_slots_min_per_seed": 6,
+    "treatment_eligible_first_arm_releases_by_action32_min_across_validation": 16,
+    "treatment_eligible_first_arm_releases_by_action32_min_per_seed": 4,
+    "treatment_eligible_stable_held_5cm_by_action96_min_across_validation": 8,
+    "treatment_eligible_stable_held_5cm_by_action96_min_per_seed": 2,
+    "pooled_option_active_pre_eligible_unlatched_clearance_ge_5cm_max": 0,
+    "treatment_eligible_dropped_max": 0,
+    "treatment_eligible_unsafe_force_max": 0,
+    "treatment_eligible_pre_release_launch_max": 0,
+    "treatment_pre_enable_nonzero_arm_rows_max": 0,
+    "treatment_eligible_post_latch_unlatched_clearance_ge_5cm_max": 0,
+    "fixed_residual_component_and_l2_budget_violations": 0,
+    "any_new_abs_action_ge_0999": false,
+    "pre_eligibility_action_and_state_machine_parity_exact": true,
+    "hand14_invariance_exact": true,
+    "verified_arm_clock_gate_and_live_relock_exact": true,
+    "control_candidate39_route_exact": true,
+    "checkpoint_manifest_assignment_and_source_identity_exact": true
+  },
+  "artifact_and_analysis_requirements": {
+    "weights_only_artifact": true,
+    "reset_before_terminal_telemetry": true,
+    "episode_fields": [
+      "stable env_slot, treatment, assignment rank, seed, and replicate",
+      "trigger, first public latch transition, first eligible action, verification complete, first arm-enabled action, each relock/re-enable, and terminal clocks",
+      "eligible, ever grasped, true 20 cm, strict success, U5, drop, unsafe-force, timeout, and pre-release-launch truth",
+      "stable-count maximum, arm-enable count, relock count, maximum true clearance, and trajectory maximum force",
+      "online aggregate action-algebra violation counters covering the full first episode"
+    ],
+    "step_fields_from_first_eligible_decision_through_authoritative_terminal": [
+      "obs115, public force-counter sidecar, episode step, option state, latch, public stable predicate, and stable_count_before/after",
+      "exact common Candidate39 action, requested Candidate40 action, and environment-shielded task action",
+      "pre-action arm target error and arm joint speed",
+      "treatment, activation, arm-enabled, verification-complete, relock, re-enable, and pre-enable status",
+      "transition latch, physical grasp, grasp quality, hold quality, force, object speed, and true clearance"
+    ],
+    "strict_checks": [
+      "assignment masks are exact balanced complements under the Candidate40 salt",
+      "all pre-activation Candidate39 actions, including SEARCH-side latch rows, are exact and assignment-invariant by construction",
+      "all treatment and control hand14 actions equal the common Candidate39 route exactly",
+      "treatment arm7 is zero exactly unless the registered public clock authorizes it; authorized arm7 equals frozen LIFT exactly",
+      "control arm7 always equals the exact common Candidate39 route",
+      "the environment-shielded task action is reconstructed from reset-before transition observation action history and is recorded separately from the requested action",
+      "all policy, payload, task, runtime, source, plan, and assignment hashes match"
+    ],
+    "publish_rule": "Publish the combined development report only after all four fixed-order artifacts independently and jointly pass schema, provenance, assignment, action-algebra, clock, trace, and complement validation.",
+    "fail_closed": true
+  },
+  "implementation_seal_requirements": {
+    "simulator_evidence_before_source_seal": false,
+    "collector_and_analyzer_must_be_committed_before_seed_334": true,
+    "collection_commit_must_descend_from": "7d223ae8aff95ac466c4840d63110e2761178849",
+    "collector_metadata_must_bind": [
+      "this plan path and final sealed SHA256",
+      "Candidate39 result, fixed-direction manifest, and fixed_z hashes",
+      "exact implementation commit and source hashes",
+      "all immutable policy and runtime asset hashes",
+      "assignment contract, salt, mask, and run identity"
+    ],
+    "required_simulation_free_tests": [
+      "balanced deterministic complementary assignment on seeds 334, 335, and 336",
+      "first through fifteenth stable observations hold arm and only the next stable observation enables it",
+      "each stability predicate failure relocks on the same action and resets the full 15-frame clock",
+      "control action equals common Candidate39 and treatment differs only in gated arm7",
+      "hand14, SEARCH, fixed residual, inactive rows, and post-retirement CLOSE remain exact",
+      "artifact validators reject altered plans, sources, policies, assignments, clocks, actions, target-error telemetry, and complementary evidence",
+      "stable transport utility rejects a one-frame or 14-frame height spike, credits a 15-frame held transport window, and applies success/failure suffix semantics exactly",
+      "analysis tests exercise every gate boundary without seed-334/335/336 simulator outcomes"
+    ]
+  },
+  "implementation_seal": {
+    "status": "pending_no_simulator_evidence"
+  },
+  "decision_rule": {
+    "if_all_gates_pass": "Seal the four artifacts and development report, then write and commit a separate formal-acceptance plan before touching seeds 337-339. Development pass alone does not accept Candidate40.",
+    "if_any_gate_fails": "Reject Candidate40 on the registered settings and do not run seeds 337-339. Do not reinterpret thresholds or outcomes. Diagnose the post-latch traces before proposing a separately named hand-controller candidate.",
+    "formal_seeds": [337, 338, 339],
+    "formal_status": "reserved and untouched"
+  }
+}
