@@ -1,0 +1,189 @@
+{
+  "kind": "pick_tool_candidate39_coherent_residual_development_plan_v1",
+  "status": "sealed_before_collection",
+  "created_local_date": "2026-07-22",
+  "branch": "flashsac-pick-tool-curriculum",
+  "source_commit_before_implementation": "240c5097e93e8beb17a58c4ec10299fa8de7d410",
+  "implementation_commit": "03dceab156f71feaebd340c961ae6e82baeda845",
+  "implementation_lineage": {
+    "coherent_residual_contract": "b28809fd4b8a1d27d7ff322147b05a05e9f70989",
+    "bounded_residual_norm": "240c5097e93e8beb17a58c4ec10299fa8de7d410",
+    "deterministic_mean_audit_boundary": "cd45e8c4724d8472ec07917e97ed92997b44b318",
+    "sticky_close_window": "59dc72608f0f9cda38a06149571445649ac7dd8b",
+    "artifact_collector_and_analyzer": "03dceab156f71feaebd340c961ae6e82baeda845"
+  },
+  "implementation_verification": {
+    "cpu_tests_passed": 20,
+    "test_suites": [
+      "scripts/flashsac/option_residual_screen_test.py",
+      "scripts/flashsac/candidate39_episode_residual_test.py",
+      "scripts/flashsac/analyze_candidate39_residual_discovery_test.py"
+    ],
+    "py_compile": "pass",
+    "git_diff_check": "pass",
+    "simulator_evidence_seen_before_seal": false
+  },
+  "hypothesis": "The useful tail in V6 exploration is temporally coherent at the grasp-option level. Keeping one small hand-only pre-tanh residual fixed from handoff through a short CLOSE window can create force closure more often than independent action noise, while exact V6 SEARCH, arm authority, public latch, and frozen LIFT remain unchanged.",
+  "why_not_more_behavior_cloning": {
+    "candidate38_result": "scripts/flashsac/candidate38_screen_result.json",
+    "candidate38_result_sha256": "c6eac67e9714d3ef73bcfe2a6c8fe2924b1b15bd1687bfb5f731f0f1914e91fa",
+    "candidate38_conditional_success_delta": -0.01720853858784895,
+    "candidate38_conditional_ever_grasped_delta": -0.047750410509031206,
+    "candidate38_success_given_grasp_delta_pp": 2.5498891352549884,
+    "conclusion": "The loss is before stable grasp, not in common frozen LIFT. Averaging successful noisy actions changed the action mean without increasing grasp incidence."
+  },
+  "mean_head_only_counterfactual": {
+    "status": "simulation_free_diagnostic_only",
+    "all_demo_hand14_rmse": 0.012606,
+    "deterministic_demo_hand14_rmse": 0.001785,
+    "relative_v6_drift_on_60153_unlatched_replay_rows": 0.005612,
+    "decision": "do_not_spend_online_screen_budget",
+    "reason": "It halves Candidate38 drift but retains the same success-conditioned mean target and provides no new exploration signal."
+  },
+  "immutable_policies": {
+    "v6_checkpoint": "logs/flashsac/pick_tool/16_v6_router_zero_actor_s254/checkpoint_final",
+    "v6_actor_sha256": "d9aacbd48891c192c0d1491514137262b82990fa71440787076403de06606288",
+    "v6_task_contract_sha256": "8a2a135fa1cd5bb01965fc7dc6d6a73978dffc1bf55941ae392146de1d17f61d",
+    "v6_bridge_state_sha256": "78176bb99eb5dac80a2789b231d54db6cf2b86132bc7835a129dd7f5a7df978c",
+    "frozen_lift_actor_sha256": "117f1b0ae3641bd24b6b9f3d585576a79b5aff968139c0dde86e6346f60ebaa0",
+    "search_checkpoint": "logs/rl_games/pick_tool_token/0_bootstrap_handoff_20260720/nn/pick_tool_stage7_dagger_full_iter3_bc.pth",
+    "search_checkpoint_sha256": "b91555d8227cf4e87e41ae858d7f8b1ee42ae920a9d829f2f5b1453b529f1f02"
+  },
+  "single_mechanism": {
+    "name": "episode_coherent_pre_latch_hand_residual",
+    "design_contract": "candidate39_sha256_rank_paired_antithetic_v1",
+    "design_salt": "pick_tool_candidate39_option_residual_20260722_v1",
+    "handoff": {
+      "minimum_public_pregrasp_score": 0.3,
+      "consecutive_frames": 4,
+      "trigger_action_is_close_age_zero": true
+    },
+    "active_rows": "option_active and public_latch==0 and never_previously_latched and close_age<32",
+    "window_actions": 32,
+    "first_latch_retirement": "sticky for the rest of the episode, including after any later latch release",
+    "arm_action": "exact V6 authority output; exact zero during CLOSE",
+    "hand_action": "tanh(atanh(clamp(exact_v6_hand_action)) + bounded_delta14)",
+    "raw_z_distribution": "SHA256-derived standard normal, one z14 per seed/env_slot, clipped symmetrically to [-2,2] only when applied",
+    "antithetic_pairing": "SHA256-ranked first and second halves are strict +z/-z pairs; replicate b complements treatment without redrawing z",
+    "token9_pre_tanh_scale": 0.05,
+    "distal5_pre_tanh_scale": 0.025,
+    "token9_component_abs_cap": 0.1,
+    "distal5_component_abs_cap": 0.05,
+    "delta14_l2_cap": 0.2,
+    "search": "exact frozen rl_games SEARCH",
+    "post_latch": "exact common frozen LIFT sidecar",
+    "after_window_without_latch": "exact deterministic V6 CLOSE",
+    "actor_std": "not used",
+    "network_updates": 0,
+    "critic_or_shaped_reward_ranking": "forbidden"
+  },
+  "scale_basis": {
+    "successful_exploration_observations": 598,
+    "offline_panel_sources": [
+      {
+        "path": "logs/flashsac/pick_tool/38_v6_success_si_smoke_s296_a/dataset.pt",
+        "sha256": "1a4bb77ed0b5f4c8a9bc5a8f5c651ab0929043527110bb075c4efae46ebdaa41"
+      },
+      {
+        "path": "logs/flashsac/pick_tool/39_v6_success_si_s297_b_512/dataset.pt",
+        "sha256": "d9e78d9791cc3fd358c572b7ba570f101873d97be8b62c010d478872522e0f94"
+      }
+    ],
+    "observed_exploratory_pre_tanh_token_rms": 0.056,
+    "observed_exploratory_pre_tanh_token_abs_p95": 0.124,
+    "observed_exploratory_pre_tanh_distal_rms": 0.0235,
+    "observed_exploratory_pre_tanh_distal_abs_p95": 0.0481,
+    "offline_scale_audit_z_seed": 327,
+    "offline_scale_audit_episodes": 26,
+    "offline_expected_post_tanh_hand_drift_rms": 0.02675729990005493,
+    "offline_expected_post_tanh_hand_drift_max": 0.09231239557266235,
+    "offline_applied_pre_tanh_delta_rms": 0.04262062534689903,
+    "offline_applied_pre_tanh_delta_abs_p95": 0.09238263964653015,
+    "offline_applied_pre_tanh_delta_l2_max": 0.20000000298023224,
+    "offline_new_action_abs_ge_098_fraction": 0.0,
+    "window_basis": "All 26 sealed safe-success CLOSE fragments first latched at close_age 11 through 31, i.e. within 12 through 32 actions when the trigger action at age zero is counted."
+  },
+  "artifact_requirements": {
+    "development_only": true,
+    "first_episode_only": true,
+    "save_successes_and_failures": true,
+    "episode_fields": [
+      "treatment and full raw_z14 design",
+      "trigger and first-latch clocks",
+      "latched_within_32_actions",
+      "terminal success/failure/timeout/drop/unsafe/unlatched-lift truth",
+      "ever_grasped and true 20cm clearance",
+      "trajectory maximum force and true-clearance maximum"
+    ],
+    "step_fields": [
+      "obs115 and exact V6 raw mean hand14",
+      "applied pre-tanh delta14",
+      "baseline, candidate, and executed action21",
+      "transition grasp, grasp quality, hold quality, force, and true clearance"
+    ],
+    "provenance": "clean committed source, exact checkpoint hashes, runtime asset hashes, FlashSAC fork commit, CUDA/Isaac/runtime versions",
+    "cross_replicate_checks": [
+      "assignment masks are exact complements",
+      "raw_z, antithetic pairing, and signs are bit-exact",
+      "SEARCH, V6 actor, task contract, and frozen LIFT hashes are identical"
+    ]
+  },
+  "execution_stages": {
+    "non_evidence_smoke": {
+      "seed": 326,
+      "replicate": "a",
+      "num_envs": 8,
+      "output": "logs/flashsac/pick_tool/49_c39_residual_smoke_s326_a/trial",
+      "purpose": "validate live action routing, budgets, first-latch retirement, artifact publication, and safety before evidence collection"
+    },
+    "randomized_development_discovery": {
+      "seeds": [327, 328],
+      "num_envs_per_run": 64,
+      "run_order": ["327a", "327b", "328b", "328a"],
+      "output_pattern": "logs/flashsac/pick_tool/50_c39_residual_dev_s{seed}_{replicate}/trial",
+      "estimand": "development-only effect of the fixed coherent-residual distribution, not a deployable deterministic policy"
+    },
+    "fixed_direction_development_validation_reserved_seeds": [329, 330],
+    "formal_fixed_direction_screen_reserved_seeds": [331, 332, 333]
+  },
+  "development_gates": {
+    "all_must_pass_before_direction_extraction": true,
+    "common_exposure_opportunity_slots_min_across_discovery": 32,
+    "discordant_latched_within_window_slots_min": 8,
+    "treatment_triggered_dropped_max": 0,
+    "treatment_triggered_unsafe_force_max": 0,
+    "conditional_unlatched_clearance_ge_5cm_delta_max": 0.02,
+    "conditional_ever_grasped_delta_floor": -0.1,
+    "new_abs_action_ge_098_element_fraction_max": 0.005,
+    "episodes_with_new_abs_action_ge_098_max_per_run": 1,
+    "any_new_abs_action_ge_0999": false,
+    "component_and_l2_budget_violations": 0
+  },
+  "direction_extraction_if_gates_pass": {
+    "domain": "same seed/env_slot triggered and produced at least one eligible 32-action-window row in both complementary replicates; SEARCH-before-handoff latch-and-release slots are excluded because the sticky intervention was already retired",
+    "primary_outcome": "first public latch occurs on a CLOSE action with close_age<32",
+    "paired_advantage": "treatment primary outcome minus control primary outcome for the same seed/env_slot",
+    "gradient": "sum over domain of paired_advantage * clamp(raw_z14,-2,2)",
+    "fixed_z_star": "clip(gradient / RMS(gradient), -2, 2), computed in float64 then sealed as exact float32",
+    "failure_if": "fewer than eight discordant outcomes or zero/non-finite gradient",
+    "next_evidence": "commit immutable fixed_z.pt plus manifest before using reserved seeds 329 and 330",
+    "no_claim": "randomized discovery cannot establish that fixed_z_star improves grasp or success"
+  },
+  "scale_escalation_rule": {
+    "current_evidence_is_never_reinterpreted": true,
+    "allowed_only_if": "main scale has no usable grasp direction and has zero drop, zero unsafe force, and zero saturation violations",
+    "requires_new_committed_plan": true,
+    "next_token_scale_and_cap": [0.075, 0.15],
+    "next_distal_scale_and_cap": [0.04, 0.08]
+  },
+  "formal_acceptance_rule": {
+    "status": "reserved_not_yet_sealed",
+    "require_fresh_fixed_z_manifest": true,
+    "candidate_must_be_deterministic": true,
+    "reuse_candidate38_gates": true,
+    "additional_primary_gate": "conditional latched-within-32 delta must be positive",
+    "prohibited_seeds": [323, 324, 325, 326, 327, 328, 329, 330]
+  },
+  "kit_args": "--/app/extensions/fsWatcherEnabled=false",
+  "decision_rule": "Implement and test without simulator evidence; seal this plan and exact source commit; run the non-evidence smoke; only then collect the fixed development runs in order. Do not tune thresholds, scale, horizon, z, or run order after seeing outcomes."
+}
