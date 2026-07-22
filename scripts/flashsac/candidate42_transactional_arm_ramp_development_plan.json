@@ -402,12 +402,12 @@
   },
   "implementation_seal": {
     "status": "complete_without_simulator_evidence",
-    "implementation_commit": "98d065a2a22a106846fcae6db4ccb9edb8964909",
+    "implementation_commit": "bc8369c2a0913de6a5dbf473c07635c2b63ebff7",
     "source_sha256": {
       "scripts/flashsac/candidate42_public_arm_ramp.py": "71cdc68fc852154ad086511f6e4b02381364d10bb79ba0f62d7b3f91687dd02e",
       "scripts/flashsac/candidate42_public_arm_ramp_test.py": "f8777f976638b7423759e61f114a33a2367df68493949f811395ee42640f1b6f",
       "scripts/flashsac/candidate42_public_arm_ramp_episode.py": "9ca3f5243518cfa13ac4e7b8d8b9de1972576737b5dce28e3cb8f3f7f30b096b",
-      "scripts/flashsac/candidate42_public_arm_ramp_episode_test.py": "1344fd01ca526a32ab152a65bc92f6616510b1dbd8bf9c7080446ec723dd9ed1",
+      "scripts/flashsac/candidate42_public_arm_ramp_episode_test.py": "f006db15d17c8691f7fe0fe12b7a3cbef966d767b6906e8d7ef3b680c3151fe8",
       "scripts/flashsac/candidate42_attempt_transaction.py": "2d70e3582eb4e1789bec564ffdc8aba54ca5097abd89d5420514b1c67efdf60a",
       "scripts/flashsac/candidate42_attempt_transaction_test.py": "c4bff9c4cdac7daefbb6ba4fbf04d1ab5d75e5c6e3f4a89212e069fc5087df7a",
       "scripts/flashsac/candidate42_public_arm_ramp_collection.py": "61ce242b171629935746b46356648ba655d5ea8dd07888ea69d525f2afd7f631",
