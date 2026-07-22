@@ -501,7 +501,10 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
             "git": git_provenance(root, tuple(fingerprints)),
             "runtime": {
                 "python": platform.python_version(),
-                "torch": torch.__version__,
+                # ``torch.__version__`` is a TorchVersion subclass on current
+                # releases.  Persist a plain string so the artifact remains
+                # loadable under the weights_only=True evidence contract.
+                "torch": str(torch.__version__),
                 "cuda": torch.version.cuda,
                 "cudnn": torch.backends.cudnn.version(),
                 "cuda_device_name": torch.cuda.get_device_name(device),

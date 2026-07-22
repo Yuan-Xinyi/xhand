@@ -200,9 +200,22 @@ def test_atomic_publication_is_strict_and_no_clobber() -> None:
         assert not invalid.exists()
 
 
+def test_published_trace_is_weights_only_loadable() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        trace_path = root / "trace.pt"
+        report_path = root / "trace.json"
+        publish_trace_and_report_no_clobber(
+            _trace(), {"status": "complete"}, trace_path, report_path
+        )
+        loaded = torch.load(trace_path, map_location="cpu", weights_only=True)
+        assert loaded["metadata"]["runtime"]["torch"] == "2.7"
+
+
 if __name__ == "__main__":
     test_public_readiness_is_public_sticky_and_stratified()
     test_trace_validation_and_tolerance_comparison()
     test_terminal_and_contract_mismatch_fail_closed()
     test_atomic_publication_is_strict_and_no_clobber()
+    test_published_trace_is_weights_only_loadable()
     print("search replay trace tests passed")
