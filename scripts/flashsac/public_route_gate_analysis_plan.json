@@ -148,7 +148,7 @@
     "development_ledger_tag": "pick-tool-public-route-development-ledger-v1-20260722",
     "frozen_model_tag": "pick-tool-public-route-frozen-gate-v1-20260722",
     "implementation_base_commit": "c0da68cf6fb05cb57e9f53ddc65385cd2e1c2f3b",
-    "implementation_commit": "SET_AFTER_DRAFT_IMPLEMENTATION_COMMIT",
+    "implementation_commit": "42eb5a218f536d41a4dd4269e1ad90825e2e746b",
     "seal_tag": "pick-tool-public-route-gate-analysis-v1-20260722",
     "train_ledger_tag": "pick-tool-public-route-train-ledger-v1-20260722",
     "trial_manifest_sha256": "1235bea10a1a8488dee40a56548a6d0bea897bd56a3f961f4cbe8e06ae204ad7",
@@ -178,5 +178,5 @@
     },
     "safety_events_do_not_cancel": true
   },
-  "status": "draft_until_seal_commit"
+  "status": "preregistered"
 }
