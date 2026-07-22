@@ -367,7 +367,7 @@ def apply_verified_arm_handoff(
     treatment: torch.Tensor,
     state: VerifiedArmState,
     *,
-    reset_mask: torch.Tensor | None = None,
+    reset_mask: torch.Tensor,
 ) -> VerifiedArmStep:
     """Overlay Candidate40 arm authority on an exact Candidate39 action.
 
@@ -405,9 +405,10 @@ def apply_verified_arm_handoff(
         "treatment", treatment, rows=rows, device=device
     )
     validate_verified_arm_state(state, rows=rows, device=device)
-    working = state
-    if reset_mask is not None:
-        working = reset_verified_arm_state(state, reset_mask)
+    # Requiring this mask on every call makes the authoritative auto-reset
+    # boundary explicit at the integration site.  A caller cannot silently
+    # carry arm authority into the next episode by omitting reset handling.
+    working = reset_verified_arm_state(state, reset_mask)
 
     public = public_stable_state(
         observation, public_force_counters, option, active

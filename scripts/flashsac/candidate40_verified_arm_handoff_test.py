@@ -49,6 +49,11 @@ def _step(
     reset_mask: torch.Tensor | None = None,
 ) -> verifier.VerifiedArmStep:
     rows = int(state.activated.numel())
+    reset = (
+        torch.zeros(rows, dtype=torch.bool)
+        if reset_mask is None
+        else reset_mask
+    )
     return verifier.apply_verified_arm_handoff(
         _baseline(rows) if baseline is None else baseline,
         _observation(rows) if observation is None else observation,
@@ -61,7 +66,7 @@ def _step(
         else episode_active,
         torch.ones(rows, dtype=torch.bool) if treatment is None else treatment,
         state,
-        reset_mask=reset_mask,
+        reset_mask=reset,
     )
 
 
@@ -290,6 +295,35 @@ def test_live_relock_never_changes_search_even_after_activation() -> None:
     assert int(result.stable_count_after[0]) == 0
 
 
+def test_relock_requires_full_fifteen_frame_reverification_before_reenable() -> None:
+    rows = 1
+    baseline = _baseline(rows)
+    state = _enabled_state(rows)
+    unstable = _observation(rows)
+    unstable[:, verifier.PUBLIC_LATCH_INDEX] = 0.0
+    failed = _step(state, observation=unstable, baseline=baseline)
+    assert bool(failed.relock[0])
+    state = failed.next_state
+
+    for index in range(verifier.VERIFY_STEPS):
+        held = _step(state, baseline=baseline)
+        assert int(held.stable_count_before[0]) == index
+        assert not bool(held.arm_enabled_this_action[0])
+        assert not bool(held.newly_enabled[0])
+        assert torch.equal(
+            held.action[0, : verifier.ARM_ACTION_DIM],
+            torch.zeros(verifier.ARM_ACTION_DIM),
+        )
+        state = held.next_state
+
+    reenabled = _step(state, baseline=baseline)
+    assert int(reenabled.stable_count_before[0]) == verifier.VERIFY_STEPS
+    assert bool(reenabled.arm_enabled_this_action[0])
+    assert bool(reenabled.newly_enabled[0])
+    assert bool(reenabled.next_state.ever_enabled[0])
+    assert torch.equal(reenabled.action, baseline)
+
+
 def test_reset_clears_activation_clock_and_enablement_before_current_row() -> None:
     rows = 2
     state = _enabled_state(rows)
@@ -308,6 +342,45 @@ def test_reset_clears_activation_clock_and_enablement_before_current_row() -> No
     assert int(result.next_state.stable_count[1]) == 0
     assert not bool(result.next_state.arm_enabled_previous[1])
     assert bool(result.next_state.ever_enabled[1])
+
+
+def test_reset_prevents_old_authority_on_immediately_eligible_new_episode() -> None:
+    rows = 1
+    state = _enabled_state(rows)
+    baseline = _baseline(rows)
+    result = _step(
+        state,
+        baseline=baseline,
+        reset_mask=torch.ones(rows, dtype=torch.bool),
+    )
+    assert not bool(result.activated_before[0])
+    assert bool(result.first_eligible[0])
+    assert int(result.stable_count_before[0]) == 0
+    assert int(result.stable_count_after[0]) == 1
+    assert not bool(result.arm_enabled_this_action[0])
+    assert not bool(result.next_state.arm_enabled_previous[0])
+    assert not bool(result.next_state.ever_enabled[0])
+    assert torch.equal(
+        result.action[0, : verifier.ARM_ACTION_DIM],
+        torch.zeros(verifier.ARM_ACTION_DIM),
+    )
+
+
+def test_inactive_reset_clears_all_state_and_preserves_common_action() -> None:
+    rows = 1
+    state = _enabled_state(rows)
+    baseline = _baseline(rows)
+    result = _step(
+        state,
+        episode_active=torch.zeros(rows, dtype=torch.bool),
+        baseline=baseline,
+        reset_mask=torch.ones(rows, dtype=torch.bool),
+    )
+    assert torch.equal(result.action, baseline)
+    assert not bool(result.next_state.activated.any())
+    assert not bool(result.next_state.stable_count.any())
+    assert not bool(result.next_state.arm_enabled_previous.any())
+    assert not bool(result.next_state.ever_enabled.any())
 
 
 def test_inactive_rows_preserve_state_and_action() -> None:
