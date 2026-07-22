@@ -643,6 +643,106 @@ def test_public_latch_router_routes_mixed_collection_and_trainable_targets() -> 
         )
 
 
+def test_deterministic_actor_mean_is_raw_close_policy_and_state_free() -> None:
+    torch.manual_seed(20540)
+    observation = torch.randn(NUM_ENVS, OBSERVATION_DIM)
+    observation[:, PUBLIC_LATCH_OBSERVATION_INDEX] = torch.tensor(
+        [0.0, 1.0, 0.0, 1.0]
+    )
+    close_rows = observation[:, PUBLIC_LATCH_OBSERVATION_INDEX] == 0.0
+    frozen_rows = ~close_rows
+
+    with tempfile.TemporaryDirectory(prefix="flashsac_raw_actor_mean_") as directory:
+        source_checkpoint = Path(directory) / "frozen_source"
+        frozen_source = _public_latch_agent(routed=False)
+        frozen_source.save(str(source_checkpoint))
+
+        # Keep the independently initialized trainable CLOSE actor and load the
+        # source checkpoint only into the frozen LIFT side of the router.
+        agent = _public_latch_agent(routed=True)
+        agent.load_frozen_lift_actor(str(source_checkpoint))
+
+        # Materialize nontrivial exploration state before proving that the
+        # diagnostic API changes neither its cache/clocks nor Torch RNG.
+        _ = agent.sample_actions(
+            0, {"next_observation": observation}, training=True
+        )
+        cached_noise = agent._cached_noise.clone()  # noqa: SLF001
+        repeat_count = agent._cur_noise_repeat_count.clone()  # noqa: SLF001
+        repeat_n = agent._cur_noise_repeat_n.clone()  # noqa: SLF001
+        cpu_rng_state = torch.get_rng_state().clone()
+
+        first_mean = agent.deterministic_actor_mean(observation)
+        second_mean = agent.deterministic_actor_mean(observation)
+        assert first_mean.device == observation.device == agent.device
+        assert first_mean.shape == (NUM_ENVS, ROUTER_ACTION_DIM)
+        assert first_mean.dtype == torch.float32
+        assert bool(torch.isfinite(first_mean).all())
+        assert first_mean.data_ptr() != second_mean.data_ptr()
+        torch.testing.assert_close(first_mean, second_mean, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(
+            agent._cached_noise, cached_noise, rtol=0.0, atol=0.0  # noqa: SLF001
+        )
+        torch.testing.assert_close(
+            agent._cur_noise_repeat_count,  # noqa: SLF001
+            repeat_count,
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            agent._cur_noise_repeat_n, repeat_n, rtol=0.0, atol=0.0  # noqa: SLF001
+        )
+        torch.testing.assert_close(
+            torch.get_rng_state(), cpu_rng_state, rtol=0.0, atol=0.0
+        )
+
+        raw_close_action = torch.tanh(first_mean)
+        canonical = agent.apply_action_authority(raw_close_action, observation)
+        sampled = agent.sample_actions(
+            1, {"next_observation": observation}, training=False
+        )
+        # Before latch, the public mean plus explicit authority projection is
+        # exactly the deterministic collection path.
+        torch.testing.assert_close(
+            sampled[close_rows], canonical[close_rows], rtol=0.0, atol=0.0
+        )
+        # After latch, the public API remains the raw CLOSE actor while the
+        # collection API routes execution to the immutable LIFT actor.
+        frozen_action = agent.frozen_lift_actions(observation)
+        torch.testing.assert_close(
+            sampled[frozen_rows], frozen_action[frozen_rows], rtol=0.0, atol=0.0
+        )
+        assert not torch.equal(
+            sampled[frozen_rows], raw_close_action[frozen_rows]
+        ), "latched deterministic collection unexpectedly exposed the CLOSE actor"
+
+    # Asymmetric observations must be validated at critic width, then sliced
+    # to the public actor prefix before inference.
+    critic_observation_dim = OBSERVATION_DIM + 3
+    observation_space = gym.spaces.Box(
+        -1.0, 1.0, shape=(critic_observation_dim,), dtype="float32"
+    )
+    action_space = gym.spaces.Box(
+        -1.0, 1.0, shape=(ACTION_DIM,), dtype="float32"
+    )
+    asymmetric = FlashSACTorchBridge(
+        observation_space,
+        action_space,
+        {"actor_observation_size": (OBSERVATION_DIM,)},
+        _config(asymmetric_observation=True),
+        noise_groups=(ActionNoiseGroup("all", 0, ACTION_DIM),),
+    )
+    full_observation = torch.randn(NUM_ENVS, critic_observation_dim)
+    actual = asymmetric.deterministic_actor_mean(full_observation)
+    with torch.no_grad():
+        expected, _ = asymmetric._actor.apply(  # noqa: SLF001
+            "get_mean_and_std",
+            observations=full_observation[:, :OBSERVATION_DIM],
+            training=False,
+        )
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+
 def test_public_latch_router_checkpoint_sidecar_is_strict_and_bit_exact() -> None:
     torch.manual_seed(2055)
     observation = torch.randn(9, OBSERVATION_DIM)
@@ -1832,6 +1932,38 @@ def test_compiled_cuda_demo_rehearsal_preserves_diagnostic_output() -> None:
         noise_groups=_groups(),
     )
     observation = torch.randn(32, OBSERVATION_DIM, device="cuda:0")
+    cached_noise = agent._cached_noise.clone()  # noqa: SLF001
+    repeat_count = agent._cur_noise_repeat_count.clone()  # noqa: SLF001
+    repeat_n = agent._cur_noise_repeat_n.clone()  # noqa: SLF001
+    cpu_rng_state = torch.get_rng_state().clone()
+    cuda_rng_state = torch.cuda.get_rng_state(agent.device).clone()
+    diagnostic_mean = agent.deterministic_actor_mean(observation)
+    diagnostic_snapshot = diagnostic_mean.clone()
+    _ = agent.deterministic_actor_mean(observation.add(0.125))
+    torch.testing.assert_close(
+        diagnostic_mean, diagnostic_snapshot, rtol=0.0, atol=0.0
+    )
+    torch.testing.assert_close(
+        agent._cached_noise, cached_noise, rtol=0.0, atol=0.0  # noqa: SLF001
+    )
+    torch.testing.assert_close(
+        agent._cur_noise_repeat_count,  # noqa: SLF001
+        repeat_count,
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        agent._cur_noise_repeat_n, repeat_n, rtol=0.0, atol=0.0  # noqa: SLF001
+    )
+    torch.testing.assert_close(
+        torch.get_rng_state(), cpu_rng_state, rtol=0.0, atol=0.0
+    )
+    torch.testing.assert_close(
+        torch.cuda.get_rng_state(agent.device),
+        cuda_rng_state,
+        rtol=0.0,
+        atol=0.0,
+    )
     with torch.no_grad():
         mean, _ = agent._actor.apply(  # noqa: SLF001
             "get_mean_and_std",
@@ -2235,6 +2367,8 @@ def main() -> None:
     print("[PASS] public slice authority masks SAC updates and checkpoints")
     test_public_latch_router_routes_mixed_collection_and_trainable_targets()
     print("[PASS] public-latch router collection and trainable-target authority")
+    test_deterministic_actor_mean_is_raw_close_policy_and_state_free()
+    print("[PASS] raw deterministic CLOSE actor mean and state-free diagnostics")
     test_public_latch_router_checkpoint_sidecar_is_strict_and_bit_exact()
     print("[PASS] public-latch router sidecar integrity and exact roundtrip")
     test_public_latch_router_zero_update_matches_v5_gate_elementwise()

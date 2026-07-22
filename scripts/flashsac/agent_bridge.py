@@ -1210,6 +1210,41 @@ class FlashSACTorchBridge(FlashSACAgent):
             )
         return observations.to(dtype=torch.float32)
 
+    @torch.no_grad()
+    def deterministic_actor_mean(self, observations: torch.Tensor) -> torch.Tensor:
+        """Return the trainable actor's raw deterministic mean on its device.
+
+        This is an observation-to-diagnostic boundary, not an environment action
+        boundary: it deliberately applies neither action authority nor the
+        public-latch frozen-actor router.  Callers that need an executable action
+        can apply ``tanh`` and then :meth:`apply_action_authority` explicitly.
+        The clone owns its storage so a later compiled actor invocation cannot
+        overwrite the returned diagnostic tensor.
+        """
+
+        full_observations = self._validate_observations(observations)
+        actor_observations = (
+            full_observations[:, : self._actor_observation_dim]
+            if self._cfg.asymmetric_observation
+            else full_observations
+        )
+        mean, _ = self._actor.apply(
+            "get_mean_and_std",
+            observations=actor_observations,
+            training=False,
+        )
+        mean = mean.detach().clone()
+        expected_shape = (full_observations.shape[0], self._action_dim)
+        if mean.device != self._device or mean.shape != expected_shape:
+            raise RuntimeError(
+                "FlashSAC actor returned an invalid deterministic mean; "
+                f"expected device {self._device} and shape {expected_shape}, "
+                f"got device {mean.device} and shape {tuple(mean.shape)}"
+            )
+        if not bool(torch.isfinite(mean).all()):
+            raise FloatingPointError("FlashSAC actor returned a non-finite deterministic mean")
+        return mean
+
     def _environment_action_active_rows(
         self,
         actor_observation: torch.Tensor,
