@@ -1,0 +1,300 @@
+{
+  "assignment": {
+    "algorithm": "sha256_rank_balanced_v1",
+    "canonical_bytes": "UTF-8(salt + NUL + cohort + NUL + decimal_seed + NUL + decimal_env_slot + NUL + episode=0)",
+    "complement_pair_missing_rule": "dataset publication requires both successful immutable replicates; never impute or retain one side alone",
+    "episode_index": 0,
+    "known_route_propensity": 0.5,
+    "rank_rule": "lexicographic (sha256_digest_bytes, env_slot); first num_envs/2 route in replicate a; ties break by env_slot",
+    "randomization_block": "cohort_x_seed_x_first_episode_vector_run",
+    "randomization_unit": "cohort_x_seed_x_env_slot_x_episode0",
+    "replicates": [
+      "a",
+      "b"
+    ],
+    "replicate_b_semantics": "exact_boolean_complement_of_replicate_a",
+    "run_order": "a_then_b_for_even_seed__b_then_a_for_odd_seed",
+    "salt": "pick-tool-public-route-trial-v1-20260722-883bab4"
+  },
+  "checkpoints": {
+    "route_v6": {
+      "actor_sha256": "d9aacbd48891c192c0d1491514137262b82990fa71440787076403de06606288",
+      "frozen_lift_actor_sha256": "117f1b0ae3641bd24b6b9f3d585576a79b5aff968139c0dde86e6346f60ebaa0",
+      "path": "logs/flashsac/pick_tool/16_v6_router_zero_actor_s254/checkpoint_final",
+      "task_contract_sha256": "8a2a135fa1cd5bb01965fc7dc6d6a73978dffc1bf55941ae392146de1d17f61d",
+      "torch_bridge_state_sha256": "78176bb99eb5dac80a2789b231d54db6cf2b86132bc7835a129dd7f5a7df978c"
+    },
+    "search": {
+      "path": "logs/rl_games/pick_tool_token/0_bootstrap_handoff_20260720/nn/pick_tool_stage7_dagger_full_iter3_bc.pth",
+      "sha256": "b91555d8227cf4e87e41ae858d7f8b1ee42ae920a9d829f2f5b1453b529f1f02"
+    }
+  },
+  "claim_boundary": {
+    "allowed": "randomized factual-arm eligible-trigger intent-to-treat effects and held-out deployed-policy event rates",
+    "causal_counterfactual_claim_allowed": false,
+    "forbidden": [
+      "same simulator transition twin",
+      "individual treatment effect label",
+      "hidden contact-state equality inferred from public-feature proximity"
+    ],
+    "pairing_semantics": "independent_gpu_randomized_factual_arm_trial_v1"
+  },
+  "cohorts": {
+    "blind": {
+      "collector_access_before_model_freeze": false,
+      "evaluations_after_model_freeze": [
+        "fixed_continue",
+        "fixed_route",
+        "frozen_gate"
+      ],
+      "acceptance": "aggregate frozen_gate success >= fixed_route success + 10; frozen_gate adds zero dropped and zero unsafe_force events versus fixed_route under non-cancelling counts",
+      "first_output_rule": "first immutable blind output freezes model, normalization, decision rule and thresholds; no tuning or replacement seeds",
+      "locked_until_model_freeze": true,
+      "num_envs": 512,
+      "seeds": [
+        278,
+        279,
+        280,
+        281
+      ],
+      "run_order": "cyclically rotate fixed_continue, fixed_route, frozen_gate by seed index",
+      "use": "final_policy_evaluation_only"
+    },
+    "development": {
+      "num_envs": 512,
+      "replicates": [
+        "a",
+        "b"
+      ],
+      "seeds": [
+        274,
+        275,
+        276,
+        277
+      ],
+      "use": "grouped_model_selection_only"
+    },
+    "pilot": {
+      "num_envs": 512,
+      "replicates": [
+        "a",
+        "b"
+      ],
+      "seeds": [
+        266,
+        267
+      ],
+      "use": "collector_validation_excluded_from_training_and_model_selection"
+    },
+    "train": {
+      "num_envs": 512,
+      "replicates": [
+        "a",
+        "b"
+      ],
+      "seeds": [
+        268,
+        269,
+        270,
+        271,
+        272,
+        273
+      ],
+      "use": "treatment_specific_head_fitting"
+    }
+  },
+  "collection_acceptance": {
+    "development_min_factual_rows_per_arm": 180,
+    "development_min_factual_rows_per_seed_arm": 20,
+    "development_min_factual_rows_total": 400,
+    "minimum_rows_per_stratum_arm": 5,
+    "pilot_changes_allowed": "implementation bug fixes only; any fix increments manifest/version and old pilot artifacts remain archived and excluded",
+    "train_min_factual_rows_per_arm": 270,
+    "train_min_factual_rows_per_seed_arm": 20,
+    "train_min_factual_rows_total": 600
+  },
+  "feature_contract": {
+    "candidate_action_semantics": {
+      "route": "complete checkpoint-native V6 router via sample_actions(training=False)",
+      "search": "frozen rl_games deterministic clamped mean"
+    },
+    "directly_excluded_observation_indices": [
+      86
+    ],
+    "feature_dim": 165,
+    "feature_output_slices": {
+      "fork_used_before": [
+        119,
+        120
+      ],
+      "observation_0_85": [
+        0,
+        86
+      ],
+      "observation_87_114": [
+        86,
+        114
+      ],
+      "public_safety": [
+        121,
+        123
+      ],
+      "ready_count_after_one_hot_0_4": [
+        114,
+        119
+      ],
+      "route_action": [
+        144,
+        165
+      ],
+      "search_action": [
+        123,
+        144
+      ],
+      "zero_based_episode_progress": [
+        120,
+        121
+      ]
+    },
+    "gate_state_dim_before_actions": 123,
+    "kind": "pick_tool_public_route_gate_feature165_v1",
+    "note": "candidate actors consume obs115; exclusion means obs86 is absent as a direct gate feature, not mathematical independence",
+    "ordered_layout": [
+      "observation[0:86]",
+      "observation[87:115]",
+      "ready_count_after_one_hot[0:5]",
+      "fork_used_before",
+      "zero_based_episode_step/999",
+      "hard_force_count_progress",
+      "overforce_count_progress",
+      "search_action[0:21]",
+      "route_v6_action[0:21]"
+    ]
+  },
+  "flashsac": {
+    "fork_commit": "5ecf331fa11cd457dd39018b3d68af571b257666",
+    "use_compile": false
+  },
+  "format_version": 1,
+  "gate": {
+    "close_quality_stratum_threshold": 0.2,
+    "consecutive_eligible_steps": 4,
+    "eligibility": "obs[106]==0 and min(obs[96], second_largest(obs[92:96]))>=0.10",
+    "grasp_score_stratum_threshold": 0.35,
+    "once_per_episode": true,
+    "direct_private_candidate_inputs_forbidden": [
+      "direct raw true mesh clearance (obs86)",
+      "raw max force",
+      "private pregrasp geometry",
+      "evaluator state"
+    ],
+    "frozen_action_indirect_dependency": "SEARCH and V6 actions consume obs115, so indirect dependence on obs86 is allowed and explicitly not called clearance-independent"
+  },
+  "kind": "pick_tool_public_route_trial_manifest_v1",
+  "outputs": {
+    "artifact_template": "{cohort}_s{seed}_{replicate}.pt",
+    "failure_report_template": "{cohort}_s{seed}_{replicate}.failed_attempt_{attempt:03d}.json",
+    "global_run_order": "pilot_then_train_then_development; within_cohort_manifest_seed_order; within_seed_even_a_then_b__odd_b_then_a; every_predecessor_requires_immutable_complete_receipt",
+    "report_template": "{cohort}_s{seed}_{replicate}.json",
+    "repository_relative_root": "logs/flashsac/pick_tool/28_public_route_trial_v1_20260722",
+    "run_order_enforced": true
+  },
+  "preregistration": {
+    "branch": "flashsac-pick-tool-curriculum",
+    "implementation_commit": "SET_AFTER_DRAFT_IMPLEMENTATION_COMMIT",
+    "implementation_base_commit": "883bab473bb72522cb61dfdc4efd5a4f5e648985",
+    "manifest_sha256_receipt": "recorded by every immutable artifact because a file cannot contain its own SHA256",
+    "partial_or_failed_run_rule": "retain every no-clobber numbered failure report; an exception before pair publication leaves canonical outputs free for retry; a crash-created partial canonical pair fails closed for manual audit and a version bump",
+    "seal_rule": "pilot may start only from the annotated seal tag whose sole parent is implementation_commit; current execution bytes must equal that tag for every bound source",
+    "seal_tag": "pick-tool-public-route-trial-v1-20260722",
+    "source_binding": "each artifact hashes collector, feature contract, manifest, task, adapter, bridge, FlashSAC tree, robot/tool/retarget assets and checkpoints"
+  },
+  "runtime_assets": {
+    "contract": "exact_regular_nonsymlink_sha256_before_and_after_simulation_v1",
+    "files": {
+      "/tmp/xhand_inhand/pick_tool_token/.asset_hash": "3341d37631e4617824f4ccfd71bbdcd2a23feafd00c597458dec592050787706",
+      "/tmp/xhand_inhand/pick_tool_token/Props/instanceable_meshes.usd": "66b81c836ba3f2df9cd0b1b29bc4dd0080ad78604147daa374b923a8f082b126",
+      "/tmp/xhand_inhand/pick_tool_token/tool_hammer.usd": "e176f0aa83f6978334e89451a7d19c16c85bb83cb6f09d8aff394445960117f2",
+      "source/xhand_inhand/xhand_inhand/assets/xarm7_xhand/configuration/xarm7_xhand_base.usd": "96c1dc55b920dd06360da7e4f5347a8dfd37d9e99aceaff80157c1e4893e2e01",
+      "source/xhand_inhand/xhand_inhand/assets/xarm7_xhand/configuration/xarm7_xhand_physics.usd": "7bc6170eedce5219a943a2b79161dbf572338beadfe9d78cfa6a183fdcc6dd50",
+      "source/xhand_inhand/xhand_inhand/assets/xarm7_xhand/configuration/xarm7_xhand_robot.usd": "e76cd219931d54ac841de1bf166284f8d14951c1696e7735d98eadf4cef9c3f2",
+      "source/xhand_inhand/xhand_inhand/assets/xarm7_xhand/configuration/xarm7_xhand_sensor.usd": "332110c8bd4afd45ecab6289b46640a4dd371b4b47500905260434c41c6139ae",
+      "source/xhand_inhand/xhand_inhand/assets/xarm7_xhand/xarm7_xhand.usd": "c361d7879735cf31107f0089a68bed014b1401eda4d340a14a8ae4630a9d756c"
+    }
+  },
+  "status": "draft_until_seal_commit",
+  "task": {
+    "action_dim": 21,
+    "close_option_mode": false,
+    "coupled_power_align_close_option_mode": false,
+    "curriculum_dataset": "",
+    "curriculum_joint_noise": 0.0,
+    "curriculum_reset_probability": 0.0,
+    "episode_length_s": 20.0,
+    "hard_force_limit_n": 30.0,
+    "hard_force_terminate_steps": 10,
+    "grasp_confirm_steps": 4,
+    "grasp_release_steps": 6,
+    "max_episode_steps": 1000,
+    "observation_contract": "pick_tool_markov115_v1",
+    "observation_dim": 115,
+    "overforce_limit_n": 60.0,
+    "overforce_terminate_steps": 2,
+    "hold_arm_until_stable_grasp": false,
+    "power_close_option_mode": false,
+    "public_gate_state_contract": "pick_tool_public_gate_state_v1",
+    "success_hold_steps": 15,
+    "success_true_clearance_m": 0.2,
+    "task_mode": "full_task"
+  },
+  "training": {
+    "architecture": "five-member ensemble; each member Linear(165,128)-SiLU-Linear(128,128)-SiLU-Linear(128,6)",
+    "decision_rule": "continue iff success_continue_LCB - success_route_UCB >= 0.05 AND drop_continue_UCB <= drop_route_LCB AND unsafe_continue_UCB <= unsafe_route_LCB; otherwise route",
+    "ensemble_bound": "mean plus_or_minus one population standard deviation across five deterministic members, clipped to [0,1]",
+    "factual_loss": "unweighted binary cross entropy on only the three heads belonging to the assigned arm; missing counterfactual labels have zero mask and are never filled",
+    "factual_labels_only": true,
+    "heads": [
+      "continue_success",
+      "continue_drop",
+      "continue_unsafe_force",
+      "route_success",
+      "route_drop",
+      "route_unsafe_force"
+    ],
+    "model_members": {
+      "batch_size": 128,
+      "epochs": 200,
+      "gradient_clip_norm": 1.0,
+      "learning_rate": 0.0003,
+      "optimizer": "AdamW",
+      "seeds": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "weight_decay": 0.0001
+    },
+    "model_selection": "no hyperparameter or threshold search; train cohort fits fixed ensemble, development cohort is acceptance audit only",
+    "normalization": "per-feature train-cohort float64 mean/std, std floor 1e-6, frozen in artifact",
+    "offline_primary_estimand": "balanced randomized difference in factual event means among public-gate-triggered episodes",
+    "offline_secondary_estimands": "IPW and doubly robust policy value",
+    "randomization_inference": "cluster bootstrap and permutation by seed_x_env_slot complementary pair; report success, drop and unsafe separately",
+    "safety_events_do_not_cancel": true,
+    "training_group": "whole seed and both complementary replicates remain together",
+    "underpowered_or_nan_rule": "fail closed to fixed-route baseline and do not open blind cohort",
+    "development_acceptance": "frozen decision rule must have success delta 95% lower bound >=0, added-drop 95% upper bound <=0, added-unsafe 95% upper bound <=0, and continue rate in [0.02,0.25]"
+  },
+  "trial_population": {
+    "assignment_generation": "all env slots are assigned before simulation; assignment is not regenerated from trigger or outcome rows",
+    "continue_treatment": "from the first four-frame public trigger through episode end, execute frozen SEARCH every step",
+    "eligibility_timing": "four consecutive public-eligible SEARCH states before any treatment action",
+    "estimand_population": "episodes that reach the once-only public trigger under common pre-treatment SEARCH",
+    "missing_trigger": "report in all-episode ITT summaries but exclude from eligible-trigger gate fitting because neither treatment was activated",
+    "observation_window": "first episode only, from reset through authored terminal or native timeout",
+    "outcome_authority": "reset-before pick_tool_terminal plus true-convex-hull clearance episode maxima",
+    "post_trigger_filtering_forbidden": true,
+    "route_treatment": "from the assigned trigger action through episode end, execute complete checkpoint-native V6 router every step"
+  }
+}
