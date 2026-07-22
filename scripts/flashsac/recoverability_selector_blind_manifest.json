@@ -1,0 +1,9 @@
+{
+  "format_version": 1,
+  "kind": "pick_tool_recoverability_blind_runtime_manifest_v1",
+  "review_scope": "Strict blind simulation source pin after recoverability selector runtime review; any evaluator or runtime edit requires an explicit manifest revision.",
+  "source_sha256": {
+    "scripts/flashsac/evaluate.py": "c0cc3062492cf1380383baaa91e93bdc49de0f4cb9aed94a53a69ee2c4d6cc4d",
+    "scripts/flashsac/recoverability_selector_runtime.py": "56a71c1f82c99d63ac6dfefc160d5292fa556431d8adb0946c99279d76545876"
+  }
+}

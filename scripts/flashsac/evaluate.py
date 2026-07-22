@@ -3199,6 +3199,31 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         ),
     )
     parser.add_argument(
+        "--recoverability_selector_checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Accepted recoverability selector .pt used only at the existing private "
+            "diagnostic handoff candidate. Its default is FlashSAC; it may veto once "
+            "and continue SEARCH for the remainder of that episode."
+        ),
+    )
+    parser.add_argument(
+        "--recoverability_selector_report",
+        type=Path,
+        default=None,
+        help="Companion JSON report for --recoverability_selector_checkpoint.",
+    )
+    parser.add_argument(
+        "--recoverability_selector_blind",
+        action="store_true",
+        help=(
+            "Enable the strict held-out claim contract: reject train/development "
+            "seeds, require collection-matched episodes/num_envs, and pin the "
+            "reviewed evaluator/runtime source manifest."
+        ),
+    )
+    parser.add_argument(
         "--architecture",
         choices=("production", "smoke", "auto"),
         default="production",
@@ -3475,6 +3500,41 @@ def validate_public_latch_arm_gate_evaluation_config(
         )
 
 
+def validate_recoverability_selector_evaluation_config(
+    *,
+    selector_checkpoint: Path | None,
+    selector_report: Path | None,
+    approach_checkpoint: Path | None,
+    approach_base_only: bool,
+    approach_handoff_output: Path | None,
+    selector_blind: bool = False,
+) -> None:
+    """Restrict a selector to one live private-gate blind evaluation."""
+
+    if (selector_checkpoint is None) != (selector_report is None):
+        raise ValueError(
+            "recoverability selector checkpoint and report must be provided together"
+        )
+    if selector_blind and selector_checkpoint is None:
+        raise ValueError(
+            "--recoverability_selector_blind requires a recoverability selector"
+        )
+    if selector_checkpoint is None:
+        return
+    if approach_checkpoint is None:
+        raise ValueError(
+            "--recoverability_selector_checkpoint requires --approach_checkpoint"
+        )
+    if approach_base_only:
+        raise ValueError(
+            "recoverability selector cannot be combined with --approach_base_only"
+        )
+    if approach_handoff_output is not None:
+        raise ValueError(
+            "recoverability selector cannot be combined with --approach_handoff_output"
+        )
+
+
 def _validate_args(args: argparse.Namespace) -> None:
     task_mode = task_mode_from_option_flags(
         close_option_mode=args.close_option_mode,
@@ -3486,6 +3546,14 @@ def _validate_args(args: argparse.Namespace) -> None:
     )
     if args.episodes < 1 or args.num_envs < 1:
         raise ValueError("--episodes and --num_envs must be positive")
+    validate_recoverability_selector_evaluation_config(
+        selector_checkpoint=args.recoverability_selector_checkpoint,
+        selector_report=args.recoverability_selector_report,
+        approach_checkpoint=args.approach_checkpoint,
+        approach_base_only=args.approach_base_only,
+        approach_handoff_output=args.approach_handoff_output,
+        selector_blind=args.recoverability_selector_blind,
+    )
     if args.approach_base_only and args.approach_checkpoint is None:
         raise ValueError("--approach_base_only requires --approach_checkpoint")
     if args.approach_handoff_output is not None:
@@ -3674,6 +3742,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     # Import the sibling contract reader before agent_bridge prepends the
     # upstream FlashSAC directory to sys.path; both trees contain train.py.
     from train import read_checkpoint_task_contract
+    from recoverability_selector_runtime import (
+        DEFAULT_BLIND_MANIFEST_PATH,
+        load_blind_runtime_manifest,
+        load_recoverability_selector,
+    )
 
     from adapter import make_pick_tool_env
     from agent_bridge import (
@@ -3690,6 +3763,39 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     device = torch.device(device_string)
     if device.type != "cuda" or not torch.cuda.is_available():
         raise RuntimeError(f"PickTool FlashSAC evaluation requires CUDA, got {device_string}")
+
+    recoverability_selector = (
+        load_recoverability_selector(
+            args.recoverability_selector_checkpoint,
+            args.recoverability_selector_report,
+            device=device,
+        )
+        if args.recoverability_selector_checkpoint is not None
+        else None
+    )
+    recoverability_evaluator_source_sha256 = (
+        _sha256(Path(__file__).resolve())
+        if recoverability_selector is not None
+        else None
+    )
+    recoverability_blind_audit = (
+        recoverability_selector.validate_blind_configuration(
+            seed=int(args.seed),
+            episodes=int(args.episodes),
+            num_envs=int(args.num_envs),
+            strict_blind=bool(args.recoverability_selector_blind),
+        )
+        if recoverability_selector is not None
+        else None
+    )
+    recoverability_blind_manifest = (
+        load_blind_runtime_manifest(
+            DEFAULT_BLIND_MANIFEST_PATH,
+            evaluator_path=Path(__file__).resolve(),
+        )
+        if args.recoverability_selector_blind
+        else None
+    )
 
     checkpoint = resolve_checkpoint_directory(args.checkpoint)
     repository_root = Path(__file__).resolve().parents[2]
@@ -3995,6 +4101,32 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         and _sha256(approach_checkpoint) != approach_checkpoint_sha256
     ):
         raise RuntimeError("approach checkpoint changed while its actor was loading")
+    if recoverability_selector is not None:
+        assert approach_checkpoint_sha256 is not None
+        recoverability_selector.validate_live_evaluation_contract(
+            approach_checkpoint_sha256=approach_checkpoint_sha256,
+            flashsac_actor_sha256=checkpoint_actor_sha256,
+            flashsac_task_contract_sha256=checkpoint_task_contract_sha256,
+            flashsac_fork_commit=FLASH_SAC_FORK_COMMIT,
+            flashsac_upstream_commit=FLASH_SAC_COMMIT,
+            use_compile=bool(args.use_compile),
+            supervisor={
+                "minimum_zero_based_episode_step": args.approach_handoff_min_step,
+                "pregrasp_score_threshold": args.approach_handoff_score,
+                "minimum_proximity_quality": args.approach_handoff_min_proximity,
+                "hold_steps": args.approach_handoff_hold_steps,
+                "safe_force_limit_n": close_option_safe_force_limit,
+                "requires_unlatched": True,
+                "requires_abs_true_clearance_le_m": 0.005,
+            },
+            collection_source_sha256=diagnostic_handoff_source_fingerprints(
+                repository_root
+            ),
+            # evaluate.py necessarily differs because this is the new consumer;
+            # every task, robot, retargeter, policy bridge and FlashSAC byte must
+            # remain identical to the audited collection process.
+            allowed_source_drift=frozenset({"scripts/flashsac/evaluate.py"}),
+        )
     # A deterministic evaluation never consumes cached noise.  Reset it anyway
     # so a checkpoint trained with another num_envs cannot leak stale shape.
     agent.reset_exploration(batch_size=args.num_envs)
@@ -4029,10 +4161,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     approach_handoff_seen = torch.zeros(
         args.num_envs, dtype=torch.bool, device=env.device
     )
+    # Candidate and executed route are deliberately distinct: a selector veto
+    # leaves ``seen`` true but keeps SEARCH active for the rest of the episode.
+    approach_handoff_routed = torch.zeros(
+        args.num_envs, dtype=torch.bool, device=env.device
+    )
     approach_handoff_step = torch.full(
         (args.num_envs,), -1, dtype=torch.long, device=env.device
     )
     approach_ever_post_handoff_latch = torch.zeros(
+        args.num_envs, dtype=torch.bool, device=env.device
+    )
+    approach_ever_post_candidate_latch = torch.zeros(
         args.num_envs, dtype=torch.bool, device=env.device
     )
     approach_max_pregrasp_score = torch.zeros(
@@ -4064,6 +4204,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     approach_handoff_true_clearance_m = torch.full_like(
         approach_handoff_pregrasp_score, float("nan")
+    )
+    approach_selector_probabilities = torch.full(
+        (args.num_envs, 2),
+        float("nan"),
+        dtype=torch.float64,
+        device=env.device,
+    )
+    approach_selector_continue = torch.zeros(
+        args.num_envs, dtype=torch.bool, device=env.device
     )
     approach_handoff_rows: list[dict[str, Any]] = []
     hierarchy_approach_rows = torch.zeros((), dtype=torch.long, device=env.device)
@@ -4123,8 +4272,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     approach_handoff_step,
                 )
                 approach_ready_steps = handoff.ready_steps
-                if not args.approach_base_only:
-                    approach_active = handoff.approach_active
                 if bool(new_handoff.any()):
                     approach_handoff_observation[new_handoff] = observation[
                         new_handoff, :OBSERVATION_DIM
@@ -4141,16 +4288,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     approach_handoff_true_clearance_m[new_handoff] = (
                         true_clearance_m[new_handoff]
                     )
-                approach_ever_post_handoff_latch |= (
+                approach_ever_post_candidate_latch |= (
                     tracker.active & approach_handoff_seen & physical_latch
                 )
-            flashsac_active = tracker.active & (~approach_active)
-            if checkpoint_native_router:
-                active_latch = observation[
-                    flashsac_active, FULL_TASK_GRASP_LATCH_OBSERVATION_INDEX
-                ]
-                router_route_counts[0].add_((active_latch == 0.0).sum())
-                router_route_counts[1].add_((active_latch == 1.0).sum())
+                approach_ever_post_handoff_latch |= (
+                    tracker.active & approach_handoff_routed & physical_latch
+                )
             if args.prior_only:
                 action = observation.new_zeros(
                     (args.num_envs, int(target_policy_contract["policy_action_dim"]))
@@ -4179,6 +4322,30 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     approach_handoff_flashsac_action[new_handoff] = (
                         flashsac_candidate_action[new_handoff]
                     )
+                    if recoverability_selector is not None:
+                        selector_decision = recoverability_selector.decide(
+                            observation[new_handoff, :OBSERVATION_DIM],
+                            approach_action[new_handoff],
+                            flashsac_candidate_action[new_handoff],
+                        )
+                        approach_selector_probabilities[new_handoff] = (
+                            selector_decision.probabilities
+                        )
+                        approach_selector_continue[new_handoff] = (
+                            selector_decision.continue_search
+                        )
+                        continue_new = new_handoff.clone()
+                        continue_new[new_handoff] = (
+                            selector_decision.continue_search
+                        )
+                    else:
+                        continue_new = new_handoff & args.approach_base_only
+                    route_new = new_handoff & (~continue_new)
+                    approach_handoff_routed |= route_new
+                    approach_active = torch.where(
+                        new_handoff, continue_new, approach_active
+                    )
+                flashsac_active = tracker.active & (~approach_active)
                 action = select_diagnostic_approach_action(
                     search_action=approach_action,
                     flashsac_action=action,
@@ -4188,6 +4355,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     (tracker.active & approach_active).sum()
                 )
                 hierarchy_flashsac_rows.add_(flashsac_active.sum())
+            else:
+                flashsac_active = tracker.active
+            if checkpoint_native_router:
+                active_latch = observation[
+                    flashsac_active, FULL_TASK_GRASP_LATCH_OBSERVATION_INDEX
+                ]
+                router_route_counts[0].add_((active_latch == 0.0).sum())
+                router_route_counts[1].add_((active_latch == 1.0).sum())
             if controller_ablation is not None:
                 assert teacher_prior is not None
                 teacher_action = teacher_prior.teacher_action(observation)
@@ -4241,34 +4416,79 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             active_before_step = tracker.active
             accepted_done = active_before_step & (terminated | truncated)
             if approach_actor is not None:
-                approach_ever_post_handoff_latch |= (
+                approach_ever_post_candidate_latch |= (
                     active_before_step
                     & approach_handoff_seen
                     & transition_truth.grasped
                 )
-                done_hierarchy = {
-                    int(env_id): {
-                        "hierarchy_handoff": bool(
-                            approach_handoff_seen[env_id].item()
-                            and not args.approach_base_only
-                        ),
-                        "hierarchy_handoff_candidate": bool(
-                            approach_handoff_seen[env_id].item()
-                        ),
+                approach_ever_post_handoff_latch |= (
+                    active_before_step
+                    & approach_handoff_routed
+                    & transition_truth.grasped
+                )
+                done_hierarchy = {}
+                done_env_ids = (
+                    accepted_done.nonzero(as_tuple=False)
+                    .squeeze(-1)
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                for env_id_value in done_env_ids:
+                    env_id = int(env_id_value)
+                    candidate = bool(approach_handoff_seen[env_id].item())
+                    routed = bool(approach_handoff_routed[env_id].item())
+                    if routed and not candidate:
+                        raise RuntimeError("executed hierarchy route lacks a candidate")
+                    entry: dict[str, Any] = {
+                        "hierarchy_handoff": routed,
+                        "hierarchy_handoff_candidate": candidate,
                         "hierarchy_handoff_step": int(
                             approach_handoff_step[env_id].item()
                         ),
                         "hierarchy_ever_post_handoff_latch": bool(
-                            approach_ever_post_handoff_latch[env_id].item()
+                            (
+                                approach_ever_post_handoff_latch[env_id]
+                                if recoverability_selector is not None
+                                else approach_ever_post_candidate_latch[env_id]
+                            ).item()
                         ),
                         "hierarchy_max_pregrasp_score": float(
                             approach_max_pregrasp_score[env_id].item()
                         ),
                     }
-                    for env_id in accepted_done.nonzero(
-                        as_tuple=False
-                    ).squeeze(-1).detach().cpu().tolist()
-                }
+                    if recoverability_selector is not None and candidate:
+                        entry["hierarchy_ever_post_candidate_latch"] = bool(
+                            approach_ever_post_candidate_latch[env_id].item()
+                        )
+                        probabilities = approach_selector_probabilities[env_id]
+                        if not bool(torch.isfinite(probabilities).all()):
+                            raise RuntimeError(
+                                "selector candidate terminated without probabilities"
+                            )
+                        continued = bool(
+                            approach_selector_continue[env_id].item()
+                        )
+                        if routed == continued:
+                            raise RuntimeError(
+                                "selector decision disagrees with executed hierarchy route"
+                            )
+                        entry.update(
+                            {
+                                "hierarchy_selector_decision": (
+                                    "continue_search"
+                                    if continued
+                                    else "route_flashsac"
+                                ),
+                                "hierarchy_selector_p_continue": float(
+                                    probabilities[0].item()
+                                ),
+                                "hierarchy_selector_p_route": float(
+                                    probabilities[1].item()
+                                ),
+                            }
+                        )
+                    done_hierarchy[env_id] = entry
             else:
                 done_hierarchy = {}
             # DirectRLEnv has already reset done rows at this point.  This read
@@ -4393,10 +4613,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 approach_ready_steps.masked_fill_(accepted_done, 0)
                 approach_handoff_seen.masked_fill_(accepted_done, False)
+                approach_handoff_routed.masked_fill_(accepted_done, False)
                 approach_handoff_step.masked_fill_(accepted_done, -1)
                 approach_ever_post_handoff_latch.masked_fill_(
                     accepted_done, False
                 )
+                approach_ever_post_candidate_latch.masked_fill_(
+                    accepted_done, False
+                )
+                approach_selector_continue.masked_fill_(accepted_done, False)
+                approach_selector_probabilities[accepted_done] = float("nan")
                 approach_max_pregrasp_score.masked_fill_(accepted_done, 0.0)
                 for buffer in (
                     approach_handoff_observation,
@@ -4604,6 +4830,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 raise RuntimeError(
                     "approach checkpoint changed during strict evaluation; refusing metrics"
                 )
+            if recoverability_selector is not None:
+                recoverability_selector.verify_unchanged()
+                if recoverability_blind_manifest is not None:
+                    recoverability_blind_manifest.verify_unchanged()
+                assert recoverability_evaluator_source_sha256 is not None
+                if (
+                    _sha256(Path(__file__).resolve())
+                    != recoverability_evaluator_source_sha256
+                ):
+                    raise RuntimeError(
+                        "evaluator source changed during recoverability-selector evaluation"
+                    )
             hierarchy_records = tracker.records
             candidate_records = [
                 record
@@ -4620,6 +4858,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 for record in hierarchy_records
                 if not bool(record["hierarchy_handoff"])
             ]
+            continue_records = [
+                record
+                for record in candidate_records
+                if not bool(record["hierarchy_handoff"])
+            ]
+            no_candidate_records = [
+                record
+                for record in hierarchy_records
+                if not bool(record["hierarchy_handoff_candidate"])
+            ]
+            if len(candidate_records) != len(handoff_records) + len(continue_records):
+                raise RuntimeError("hierarchy candidate decisions do not form a partition")
 
             def hierarchy_cohort(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
                 count = len(records)
@@ -4653,7 +4903,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "mode": (
                     "frozen_rlgames_base_only"
                     if args.approach_base_only
-                    else "frozen_rlgames_search_then_flashsac_close_lift"
+                    else (
+                        "frozen_rlgames_search_recoverability_selector_then_"
+                        "flashsac_close_lift"
+                        if recoverability_selector is not None
+                        else "frozen_rlgames_search_then_flashsac_close_lift"
+                    )
                 ),
                 "markov_policy": bool(args.approach_base_only),
                 "deployment_claim_allowed": bool(args.approach_base_only),
@@ -4680,7 +4935,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     for record in handoff_records
                 ),
                 "post_candidate_latch_count": sum(
-                    bool(record["hierarchy_ever_post_handoff_latch"])
+                    bool(
+                        record.get(
+                            "hierarchy_ever_post_candidate_latch",
+                            record["hierarchy_ever_post_handoff_latch"],
+                        )
+                    )
                     for record in candidate_records
                 ),
                 "candidate_step": (
@@ -4729,9 +4989,118 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             metrics["policy"] = (
                 "diagnostic_frozen_rlgames_base_only"
                 if args.approach_base_only
-                else "diagnostic_frozen_rlgames_search_then_"
-                "checkpoint_native_flashsac_close_lift"
+                else (
+                    "diagnostic_frozen_rlgames_search_recoverability_selector_then_"
+                    "checkpoint_native_flashsac_close_lift"
+                    if recoverability_selector is not None
+                    else "diagnostic_frozen_rlgames_search_then_"
+                    "checkpoint_native_flashsac_close_lift"
+                )
             )
+            if recoverability_selector is not None:
+                assert recoverability_blind_audit is not None
+                selector_candidate_records = candidate_records
+                for record in selector_candidate_records:
+                    if record.get("hierarchy_selector_decision") not in {
+                        "continue_search",
+                        "route_flashsac",
+                    }:
+                        raise RuntimeError("selector candidate lacks an audited decision")
+                probability_pairs = [
+                    (
+                        float(record["hierarchy_selector_p_continue"]),
+                        float(record["hierarchy_selector_p_route"]),
+                    )
+                    for record in selector_candidate_records
+                ]
+
+                def selector_probability_summary(
+                    records: Sequence[Mapping[str, Any]],
+                ) -> dict[str, Any] | None:
+                    if not records:
+                        return None
+                    continue_probability = [
+                        float(record["hierarchy_selector_p_continue"])
+                        for record in records
+                    ]
+                    route_probability = [
+                        float(record["hierarchy_selector_p_route"])
+                        for record in records
+                    ]
+                    return {
+                        "p_continue": summarize(continue_probability),
+                        "p_route": summarize(route_probability),
+                        "p_continue_minus_p_route": summarize(
+                            [
+                                p_continue - p_route
+                                for p_continue, p_route in zip(
+                                    continue_probability,
+                                    route_probability,
+                                    strict=True,
+                                )
+                            ]
+                        ),
+                    }
+
+                if any(
+                    not math.isfinite(value)
+                    for pair in probability_pairs
+                    for value in pair
+                ):
+                    raise RuntimeError("selector record contains a non-finite probability")
+                metrics["diagnostic_approach_hierarchy"][
+                    "non_routed_outcomes"
+                ] = hierarchy_cohort(base_only_records)
+                metrics["diagnostic_approach_hierarchy"][
+                    "base_only_outcomes_compatibility_note"
+                ] = (
+                    "legacy field name retained; under selector evaluation this is the "
+                    "non-routed cohort (continue decisions plus no-candidate episodes), "
+                    "not an independently evaluated base-only policy arm"
+                )
+                metrics["diagnostic_approach_hierarchy"][
+                    "cross_cohort_comparison_claim_allowed"
+                ] = False
+                metrics["diagnostic_approach_hierarchy"][
+                    "blind_claim_allowed"
+                ] = bool(recoverability_blind_audit["blind_claim_allowed"])
+                metrics["diagnostic_approach_hierarchy"][
+                    "recoverability_selector"
+                ] = {
+                    **recoverability_selector.audit_metadata(),
+                    "evaluator_source_sha256": (
+                        recoverability_evaluator_source_sha256
+                    ),
+                    "candidate_count": len(selector_candidate_records),
+                    "route_count": len(handoff_records),
+                    "continue_count": len(continue_records),
+                    "no_candidate_count": len(no_candidate_records),
+                    "blind_claim_allowed": bool(
+                        recoverability_blind_audit["blind_claim_allowed"]
+                    ),
+                    "blind_evaluation": recoverability_blind_audit,
+                    "blind_runtime_manifest": (
+                        recoverability_blind_manifest.audit_metadata()
+                        if recoverability_blind_manifest is not None
+                        else None
+                    ),
+                    "candidate_outcomes": hierarchy_cohort(
+                        selector_candidate_records
+                    ),
+                    "route_outcomes": hierarchy_cohort(handoff_records),
+                    "continue_outcomes": hierarchy_cohort(continue_records),
+                    "non_routed_outcomes": hierarchy_cohort(base_only_records),
+                    "probabilities": {
+                        "candidate": selector_probability_summary(
+                            selector_candidate_records
+                        ),
+                        "route": selector_probability_summary(handoff_records),
+                        "continue": selector_probability_summary(continue_records),
+                    },
+                    "candidate_gate": "existing_private_diagnostic_supervisor",
+                    "cross_cohort_comparison_claim_allowed": False,
+                    "deployment_claim_allowed": False,
+                }
             if args.approach_handoff_output is not None:
                 if len(approach_handoff_rows) != len(candidate_records):
                     raise RuntimeError(

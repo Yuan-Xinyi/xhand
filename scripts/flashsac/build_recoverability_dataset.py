@@ -477,9 +477,6 @@ def validate_companion_metrics(
         "outcome_ever_unlatched_clearance_ge_5cm": (
             "ever_unlatched_clearance_ge_5cm"
         ),
-        "outcome_ever_post_candidate_latch": (
-            "hierarchy_ever_post_handoff_latch"
-        ),
     }
     for key, row in artifact_index.items():
         record = candidate_records[key]
@@ -500,6 +497,21 @@ def validate_companion_metrics(
                 raise ValueError(
                     f"{source} companion {record_name} mismatch for key {key}"
                 )
+        # New evaluator records distinguish a shadow-gate candidate from an
+        # actually executed route.  Historical records used the latter name
+        # for candidate-relative latch truth, so retain a strict fallback for
+        # already-published evidence while preferring the corrected field.
+        candidate_latch_name = (
+            "hierarchy_ever_post_candidate_latch"
+            if "hierarchy_ever_post_candidate_latch" in record
+            else "hierarchy_ever_post_handoff_latch"
+        )
+        if bool(artifact["outcome_ever_post_candidate_latch"][row]) != bool(
+            record[candidate_latch_name]
+        ):
+            raise ValueError(
+                f"{source} companion {candidate_latch_name} mismatch for key {key}"
+            )
         if not math.isclose(
             float(artifact["outcome_max_true_clearance_m"][row]),
             float(record["max_true_clearance_m"]),

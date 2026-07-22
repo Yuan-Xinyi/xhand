@@ -59,6 +59,7 @@ from evaluate import (
     validate_curriculum_config,
     validate_hierarchical_arm_hold_evaluation_config,
     validate_public_latch_arm_gate_evaluation_config,
+    validate_recoverability_selector_evaluation_config,
     validate_arm_hold_handoff_state,
     validate_terminal_events,
     validate_checkpoint_evaluation_contract,
@@ -2355,6 +2356,62 @@ def test_local_train_contract_import_precedes_upstream_path_mutation() -> None:
     assert router_metrics < v5_metrics
 
 
+def test_recoverability_selector_evaluation_argument_contract() -> None:
+    selector = Path("selector.pt")
+    report = Path("selector.json")
+    approach = Path("search.pth")
+    validate_recoverability_selector_evaluation_config(
+        selector_checkpoint=None,
+        selector_report=None,
+        approach_checkpoint=None,
+        approach_base_only=False,
+        approach_handoff_output=None,
+    )
+    validate_recoverability_selector_evaluation_config(
+        selector_checkpoint=selector,
+        selector_report=report,
+        approach_checkpoint=approach,
+        approach_base_only=False,
+        approach_handoff_output=None,
+    )
+    _expect_error(
+        ValueError,
+        validate_recoverability_selector_evaluation_config,
+        selector_checkpoint=selector,
+        selector_report=None,
+        approach_checkpoint=approach,
+        approach_base_only=False,
+        approach_handoff_output=None,
+    )
+    _expect_error(
+        ValueError,
+        validate_recoverability_selector_evaluation_config,
+        selector_checkpoint=selector,
+        selector_report=report,
+        approach_checkpoint=None,
+        approach_base_only=False,
+        approach_handoff_output=None,
+    )
+    _expect_error(
+        ValueError,
+        validate_recoverability_selector_evaluation_config,
+        selector_checkpoint=selector,
+        selector_report=report,
+        approach_checkpoint=approach,
+        approach_base_only=True,
+        approach_handoff_output=None,
+    )
+    _expect_error(
+        ValueError,
+        validate_recoverability_selector_evaluation_config,
+        selector_checkpoint=selector,
+        selector_report=report,
+        approach_checkpoint=approach,
+        approach_base_only=False,
+        approach_handoff_output=Path("capture.pt"),
+    )
+
+
 def test_strict_json_and_summary() -> None:
     summary = summarize([0.0, 1.0, 2.0])
     assert summary["min"] == 0.0
@@ -2393,6 +2450,7 @@ def main() -> None:
     test_curriculum_argument_contract()
     test_checkpoint_architecture_and_path_contract()
     test_checkpoint_task_mode_evaluation_contract()
+    test_recoverability_selector_evaluation_argument_contract()
     test_local_train_contract_import_precedes_upstream_path_mutation()
     test_strict_json_and_summary()
     print("evaluate contract tests passed")

@@ -228,6 +228,9 @@ def _write_artifact_pair(
                         "hierarchy_handoff_candidate": True,
                         "hierarchy_handoff": treatment == "handoff_to_flashsac",
                         "hierarchy_handoff_step": row["handoff_step"],
+                        "hierarchy_ever_post_candidate_latch": row[
+                            "outcome_ever_post_candidate_latch"
+                        ],
                         "hierarchy_ever_post_handoff_latch": row[
                             "outcome_ever_post_candidate_latch"
                         ],
@@ -332,6 +335,51 @@ def test_build_dataset_checks_companions_and_cross_seed_leakage() -> None:
             "tie_semantics": "invalid_for_direct_preference",
         }
 
+        # Historical evaluator JSON used the handoff-named field for latch
+        # truth relative to any shadow-gate candidate.  It must remain
+        # readable after the evaluator starts recording both concepts.
+        for artifact_path in pair_257:
+            metrics_path = Path(
+                str(
+                    torch.load(
+                        artifact_path, map_location="cpu", weights_only=True
+                    )["metadata"]["hierarchy_metrics_output"]
+                )
+            )
+            legacy_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            for record in legacy_metrics["episodes"]:
+                record.pop("hierarchy_ever_post_candidate_latch", None)
+            metrics_path.write_text(
+                json.dumps(legacy_metrics, sort_keys=True, allow_nan=False),
+                encoding="utf-8",
+            )
+        legacy_payload, _ = build_dataset([pair_257], **kwargs)
+        assert legacy_payload["metadata"]["strong_rows"] == 2
+
+        # If both names exist, the corrected candidate-relative truth is
+        # authoritative and a stale handoff-relative value cannot mask it.
+        routed_metrics_path = Path(
+            str(
+                torch.load(pair_257[0], map_location="cpu", weights_only=True)[
+                    "metadata"
+                ]["hierarchy_metrics_output"]
+            )
+        )
+        routed_metrics = json.loads(routed_metrics_path.read_text(encoding="utf-8"))
+        routed_candidate = next(
+            record
+            for record in routed_metrics["episodes"]
+            if record.get("hierarchy_handoff_candidate", False)
+        )
+        routed_candidate["hierarchy_ever_post_candidate_latch"] = not bool(
+            routed_candidate["hierarchy_ever_post_handoff_latch"]
+        )
+        routed_metrics_path.write_text(
+            json.dumps(routed_metrics, sort_keys=True, allow_nan=False),
+            encoding="utf-8",
+        )
+        _expect_error(ValueError, build_dataset, [pair_257], **kwargs)
+
         pair_258_mismatch = _write_artifact_pair(
             directory, seed=258, source_digest="f"
         )
@@ -358,6 +406,11 @@ def test_build_dataset_checks_companions_and_cross_seed_leakage() -> None:
             )
         )
         metrics = json.loads(bad_metrics.read_text(encoding="utf-8"))
+        for record in metrics["episodes"]:
+            if "hierarchy_ever_post_candidate_latch" in record:
+                record["hierarchy_ever_post_candidate_latch"] = record[
+                    "hierarchy_ever_post_handoff_latch"
+                ]
         metrics["status"] = "partial"
         bad_metrics.write_text(json.dumps(metrics), encoding="utf-8")
         _expect_error(ValueError, build_dataset, [pair_257], **kwargs)
