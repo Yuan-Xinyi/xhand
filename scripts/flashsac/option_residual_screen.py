@@ -53,6 +53,14 @@ class OptionResidualResult:
     eligible: torch.Tensor
 
 
+@dataclass(frozen=True)
+class OptionResidualWindow:
+    """Sticky first-latch intervention clock for one vector step."""
+
+    close_age: torch.Tensor
+    active: torch.Tensor
+
+
 def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -217,6 +225,70 @@ def grouped_pre_tanh_scale(
         dtype=dtype,
         device=device,
     )
+
+
+def option_residual_window(
+    *,
+    episode_active: torch.Tensor,
+    option_active: torch.Tensor,
+    public_latch: torch.Tensor,
+    ever_latched: torch.Tensor,
+    episode_step: torch.Tensor,
+    trigger_step: torch.Tensor,
+    window_steps: int,
+) -> OptionResidualWindow:
+    """Return the trigger-relative window, retired forever after first latch.
+
+    The trigger action has age zero.  ``ever_latched`` is intentionally
+    separate from the current public latch: once it becomes true, a later
+    latch release cannot reactivate the intervention.
+    """
+
+    if (
+        not isinstance(window_steps, int)
+        or isinstance(window_steps, bool)
+        or window_steps < 1
+    ):
+        raise ValueError("window_steps must be a positive integer")
+    if not isinstance(episode_active, torch.Tensor) or episode_active.ndim != 1:
+        raise ValueError("episode_active must be a rank-one tensor")
+    batch = episode_active.shape[0]
+    device = episode_active.device
+    for name, value in (
+        ("episode_active", episode_active),
+        ("option_active", option_active),
+        ("public_latch", public_latch),
+        ("ever_latched", ever_latched),
+    ):
+        if (
+            not isinstance(value, torch.Tensor)
+            or value.shape != (batch,)
+            or value.dtype != torch.bool
+            or value.device != device
+        ):
+            raise ValueError(f"{name} must be a co-located bool[{batch}] tensor")
+    for name, value in (("episode_step", episode_step), ("trigger_step", trigger_step)):
+        if (
+            not isinstance(value, torch.Tensor)
+            or value.shape != (batch,)
+            or value.dtype != torch.long
+            or value.device != device
+        ):
+            raise ValueError(f"{name} must be a co-located int64[{batch}] tensor")
+    if bool((episode_step < 0).any()):
+        raise ValueError("episode_step must be non-negative")
+    if bool((option_active & (trigger_step < 0)).any()):
+        raise ValueError("an active option must have a non-negative trigger_step")
+    close_age = episode_step - trigger_step
+    active = (
+        episode_active
+        & option_active
+        & (~public_latch)
+        & (~ever_latched)
+        & (close_age >= 0)
+        & (close_age < window_steps)
+    )
+    return OptionResidualWindow(close_age=close_age, active=active)
 
 
 def _validate_action_inputs(
@@ -443,9 +515,11 @@ __all__ = [
     "DESIGN_SALT",
     "OptionResidualDesign",
     "OptionResidualResult",
+    "OptionResidualWindow",
     "exact_balanced_treatment_mask",
     "episode_coherent_raw_z",
     "build_option_design",
     "grouped_pre_tanh_scale",
+    "option_residual_window",
     "apply_option_residual",
 ]

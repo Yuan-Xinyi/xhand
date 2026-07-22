@@ -16,6 +16,7 @@ from option_residual_screen import (
     episode_coherent_raw_z,
     exact_balanced_treatment_mask,
     grouped_pre_tanh_scale,
+    option_residual_window,
 )
 
 
@@ -99,6 +100,46 @@ def test_episode_coherence_and_grouped_scale_contract() -> None:
     )
 
 
+def test_trigger_relative_window_and_sticky_first_latch_retirement() -> None:
+    state = option_residual_window(
+        episode_active=torch.tensor([True, True, True, True, True, True, False]),
+        option_active=torch.tensor([True, True, True, True, True, False, True]),
+        public_latch=torch.tensor([False, False, False, True, False, False, False]),
+        ever_latched=torch.tensor([False, False, False, True, True, False, False]),
+        episode_step=torch.tensor([10, 41, 42, 11, 12, 8, 9]),
+        trigger_step=torch.tensor([10, 10, 10, 10, 10, -1, 9]),
+        window_steps=32,
+    )
+    assert torch.equal(state.close_age, torch.tensor([0, 31, 32, 1, 2, 9, 0]))
+    assert torch.equal(
+        state.active,
+        torch.tensor([True, True, False, False, False, False, False]),
+    )
+
+    # A latch release cannot reactivate the residual because ever_latched is
+    # sticky even when the current public latch is false.
+    released = option_residual_window(
+        episode_active=torch.ones(1, dtype=torch.bool),
+        option_active=torch.ones(1, dtype=torch.bool),
+        public_latch=torch.zeros(1, dtype=torch.bool),
+        ever_latched=torch.ones(1, dtype=torch.bool),
+        episode_step=torch.tensor([15]),
+        trigger_step=torch.tensor([10]),
+        window_steps=32,
+    )
+    assert not bool(released.active.item())
+
+    _expect(
+        ValueError,
+        option_residual_window,
+        episode_active=torch.ones(1, dtype=torch.bool),
+        option_active=torch.ones(1, dtype=torch.bool),
+        public_latch=torch.zeros(1, dtype=torch.bool),
+        ever_latched=torch.zeros(1, dtype=torch.bool),
+        episode_step=torch.tensor([0]),
+        trigger_step=torch.tensor([-1]),
+        window_steps=32,
+    )
 def _action_fixture() -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
@@ -394,6 +435,7 @@ def test_fail_closed_validation() -> None:
 if __name__ == "__main__":
     test_assignment_determinism_complement_and_antithetic_pairs()
     test_episode_coherence_and_grouped_scale_contract()
+    test_trigger_relative_window_and_sticky_first_latch_retirement()
     test_zero_sigma_is_bit_exact_everywhere()
     test_arm_latch_control_and_option_invariants()
     test_saturated_actions_are_finite_bounded_and_auditable()
