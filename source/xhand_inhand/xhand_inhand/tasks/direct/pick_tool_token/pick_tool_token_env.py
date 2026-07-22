@@ -53,6 +53,7 @@ from .hybrid_action import (
     zero_action_prefix,
 )
 from .pick_tool_token_env_cfg import PickToolTokenEnvCfg
+from .public_gate_state import PUBLIC_GATE_STATE_EXTRAS_KEY, build_public_gate_state
 
 
 class PickToolTokenEnv(PickCubeTokenEnv):
@@ -1269,6 +1270,11 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             raise RuntimeError(
                 f"Built {obs.shape[1]} observations, cfg declares {self.cfg.observation_space}."
             )
+        # This is evaluated after DirectRLEnv auto-reset.  The side channel is
+        # therefore aligned with the returned observation: survivors see their
+        # post-update counters and reset rows see zero.  Reset-before outcome
+        # truth remains exclusively in extras["pick_tool_terminal"].
+        self.extras[PUBLIC_GATE_STATE_EXTRAS_KEY] = self.get_public_gate_state_v1()
         self._policy_obs_cache = obs
         return {"policy": obs, "critic": obs}
 
@@ -1882,6 +1888,16 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         )
 
     # ------------------------------------------------------------------ termination
+    def get_public_gate_state_v1(self) -> dict[str, torch.Tensor]:
+        """Return the gate-only safety state without changing the 115-D policy observation."""
+
+        return build_public_gate_state(
+            self._hard_force_steps,
+            self._overforce_steps,
+            hard_terminate_steps=self.cfg.tactile_hard_terminate_steps,
+            overforce_terminate_steps=self.cfg.tactile_terminate_steps,
+        )
+
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         self._compute_intermediate_values()
         cfg = self.cfg
