@@ -1,0 +1,182 @@
+{
+  "data": {
+    "allowed_fit_cohort": "train",
+    "development_use": "one-shot acceptance audit after the train-only model is immutably frozen",
+    "factual_events": [
+      "success",
+      "dropped",
+      "unsafe_force"
+    ],
+    "factual_rows_only": true,
+    "loader_checks": [
+      "canonical manifest-derived paths only",
+      "regular non-symlink artifact and report files",
+      "weights_only artifact load and public-route contract validation",
+      "raw artifact SHA256 equals complete report receipt",
+      "manifest/cohort/seed/replicate/num_envs provenance equality",
+      "complete seed by complementary replicate matrix in registered order",
+      "replicate assignment vectors are exact Boolean complements",
+      "artifact candidate counts and factual summaries equal the report",
+      "sealed source/runtime/checkpoint/git receipts agree across every run",
+      "all candidate rows retained with no post-trigger filter"
+    ],
+    "pilot_use": "collector validation only; excluded from fitting, normalization, selection, and acceptance",
+    "replicates": [
+      "a",
+      "b"
+    ],
+    "semantic_hash_fields": [
+      "feature",
+      "factual_treatment_route",
+      "outcome_success",
+      "outcome_dropped",
+      "outcome_unsafe_force",
+      "seed",
+      "env_slot",
+      "replicate_index",
+      "candidate_step",
+      "stratum",
+      "artifact_sha256_receipts",
+      "report_sha256_receipts"
+    ],
+    "train_seeds": [
+      268,
+      269,
+      270,
+      271,
+      272,
+      273
+    ]
+  },
+  "development": {
+    "acceptance": {
+      "added_drop_95pct_upper_max": 0.0,
+      "added_unsafe_force_95pct_upper_max": 0.0,
+      "continue_rate_max": 0.25,
+      "continue_rate_min": 0.02,
+      "success_delta_95pct_lower_min": 0.0
+    },
+    "blind_rule": "blind collection remains closed unless the immutable development audit passes every acceptance condition",
+    "doubly_robust_nuisance": "frozen five-member ensemble probability mean for each event and arm, clipped to [1e-6,1-1e-6]",
+    "estimators": {
+      "fixed_route": "mean(2 * I(factual_route) * outcome)",
+      "frozen_gate": "mean(2 * I(factual_arm equals frozen_gate_decision) * outcome)",
+      "known_propensity": 0.5
+    },
+    "seeds": [
+      274,
+      275,
+      276,
+      277
+    ]
+  },
+  "format_version": 1,
+  "inference": {
+    "bound": "population mean plus_or_minus one population standard deviation across five members, clipped to [0,1]",
+    "decision": "continue iff continue_success_LCB - route_success_UCB >= 0.05 AND continue_drop_UCB <= route_drop_LCB AND continue_unsafe_UCB <= route_unsafe_LCB; otherwise route",
+    "equality_is_continue": true,
+    "failure_default": "fixed route for non-finite values, invalid model, or underpowered data",
+    "success_margin": 0.05
+  },
+  "kind": "pick_tool_public_route_gate_analysis_plan_v1",
+  "model": {
+    "architecture": [
+      "Linear(165,128)",
+      "SiLU",
+      "Linear(128,128)",
+      "SiLU",
+      "Linear(128,6)"
+    ],
+    "ensemble_members": 5,
+    "heads": [
+      "continue_success",
+      "continue_drop",
+      "continue_unsafe_force",
+      "route_success",
+      "route_drop",
+      "route_unsafe_force"
+    ],
+    "member_seeds": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ]
+  },
+  "normalization": {
+    "fit_rows": "all and only train-cohort factual candidate rows",
+    "mean_dtype": "float64",
+    "population_std_correction": 0,
+    "std_floor": 1e-06,
+    "training_cast_after_normalization": "float32"
+  },
+  "optimization": {
+    "adamw_betas": [
+      0.9,
+      0.999
+    ],
+    "adamw_amsgrad": false,
+    "adamw_capturable": false,
+    "adamw_eps": 1e-08,
+    "adamw_foreach": false,
+    "adamw_fused": false,
+    "adamw_maximize": false,
+    "batch_size": 128,
+    "epochs": 200,
+    "gradient_clip_norm": 1.0,
+    "initialization": "PyTorch Linear default initialization after torch.manual_seed(member_seed)",
+    "last_batch": "included without padding or dropping",
+    "learning_rate": 0.0003,
+    "loss": "unweighted BCEWithLogits over exactly the assigned arm's three factual heads; the other three masks are zero",
+    "optimizer": "AdamW",
+    "runtime": "CPU float32 model, one intra-op thread, one inter-op thread, torch deterministic algorithms enabled",
+    "shuffle": "one CPU torch.Generator seeded by member_seed; one randperm over all rows at each epoch",
+    "weight_decay": 0.0001
+  },
+  "outputs": {
+    "development_audit": "logs/flashsac/pick_tool/29_public_route_trial_v2_20260722/analysis/development_acceptance_v1.json",
+    "development_ledger": "logs/flashsac/pick_tool/29_public_route_trial_v2_20260722/analysis/development_evidence_ledger_v1.json",
+    "frozen_model": "logs/flashsac/pick_tool/29_public_route_trial_v2_20260722/analysis/frozen_public_route_gate_train_v1.pt",
+    "train_ledger": "logs/flashsac/pick_tool/29_public_route_trial_v2_20260722/analysis/train_evidence_ledger_v1.json",
+    "training_report": "logs/flashsac/pick_tool/29_public_route_trial_v2_20260722/analysis/frozen_public_route_gate_train_v1.json"
+  },
+  "preregistration": {
+    "branch": "flashsac-pick-tool-curriculum",
+    "collection_training_contract_sha256": "f76cffea274651547f0c47efcd6226a8b0a91d9716fe1b10b8a9f8cc8aca7f37",
+    "development_audit_tag": "pick-tool-public-route-development-audit-v1-20260722",
+    "development_ledger_tag": "pick-tool-public-route-development-ledger-v1-20260722",
+    "frozen_model_tag": "pick-tool-public-route-frozen-gate-v1-20260722",
+    "implementation_base_commit": "c0da68cf6fb05cb57e9f53ddc65385cd2e1c2f3b",
+    "implementation_commit": "SET_AFTER_DRAFT_IMPLEMENTATION_COMMIT",
+    "seal_tag": "pick-tool-public-route-gate-analysis-v1-20260722",
+    "train_ledger_tag": "pick-tool-public-route-train-ledger-v1-20260722",
+    "trial_manifest_sha256": "1235bea10a1a8488dee40a56548a6d0bea897bd56a3f961f4cbe8e06ae204ad7",
+    "trial_seal_tag": "pick-tool-public-route-trial-v2-20260722"
+  },
+  "randomization_inference": {
+    "bootstrap": {
+      "ci": "sort 20000 estimates ascending and use fixed one-based order-statistic ranks 500 and 19500",
+      "replicates": 20000,
+      "resampling_unit": "within each development seed, resample its observed seed_x_env_slot clusters with replacement to the same observed-cluster count; every available a/b row stays together and multiplicity is preserved",
+      "seed": "unsigned big-endian integer from the first 8 bytes of SHA256(trial_manifest_sha256 + NUL + development_cluster_bootstrap_v1)"
+    },
+    "cluster_key": [
+      "seed",
+      "env_slot"
+    ],
+    "events_reported_separately": [
+      "success",
+      "dropped",
+      "unsafe_force"
+    ],
+    "permutation": {
+      "p_value": "two-sided plus-one Monte Carlo: (1 + count(abs(permuted)>=abs(observed))) / (replicates + 1)",
+      "replicates": 20000,
+      "seed": "unsigned big-endian integer from the first 8 bytes of SHA256(trial_manifest_sha256 + NUL + development_cluster_permutation_v1)",
+      "swap": "independently for each development seed and Monte Carlo replicate, choose exactly 256 of 512 env slots as replicate-a route; replicate-b is the exact complement; apply those arm labels to every available row without changing features or outcomes"
+    },
+    "safety_events_do_not_cancel": true
+  },
+  "status": "draft_until_seal_commit"
+}
