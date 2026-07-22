@@ -246,6 +246,114 @@ def _coupled_power_actor_payload() -> dict[str, Any]:
     }
 
 
+def _v6_success_self_imitation_payload() -> dict[str, Any]:
+    episodes = 4
+    episode_steps = 3
+    rows = episodes * episode_steps
+    observation = torch.randn(
+        rows, 115, generator=torch.Generator().manual_seed(17)
+    )
+    observation[:, 106] = 0.0
+    action = torch.linspace(-0.8, 0.8, rows * 21).reshape(rows, 21)
+    action[:, :7] = 0.0
+    return {
+        "obs": observation,
+        "action": action,
+        "phase": torch.ones(rows, dtype=torch.uint8),
+        "episode_id": torch.arange(episodes).repeat_interleave(episode_steps),
+        "episode_offsets": torch.arange(
+            0, rows + 1, episode_steps, dtype=torch.int64
+        ),
+        "episode_success": torch.ones(episodes, dtype=torch.bool),
+        "episode_native_success": torch.ones(episodes, dtype=torch.bool),
+        "episode_dropped": torch.zeros(episodes, dtype=torch.bool),
+        "episode_unsafe_force": torch.zeros(episodes, dtype=torch.bool),
+        "episode_unlatched_clearance_ge_5cm": torch.zeros(
+            episodes, dtype=torch.bool
+        ),
+        "episode_ever_grasped": torch.ones(episodes, dtype=torch.bool),
+        "episode_triggered": torch.ones(episodes, dtype=torch.bool),
+        "episode_ever_latched": torch.ones(episodes, dtype=torch.bool),
+        "episode_latch_released_after_first": torch.zeros(
+            episodes, dtype=torch.bool
+        ),
+        "episode_cohort": torch.tensor([0, 1, 0, 1], dtype=torch.int64),
+        "episode_hand_noise_scale": torch.tensor(
+            [0.0, 0.25, 0.0, 0.25], dtype=torch.float32
+        ),
+        "episode_trigger_step": torch.tensor(
+            [400, 410, 420, 430], dtype=torch.int64
+        ),
+        "episode_trigger_score": torch.tensor(
+            [0.30, 0.42, 0.75, 1.0], dtype=torch.float32
+        ),
+        "episode_first_latch_step": torch.tensor(
+            [403, 414, 425, 431], dtype=torch.int64
+        ),
+        "episode_terminal_step": torch.tensor(
+            [520, 530, 540, 550], dtype=torch.int64
+        ),
+        "episode_trajectory_max_force": torch.tensor(
+            [22.0, 25.0, 29.0, 30.0], dtype=torch.float32
+        ),
+        "episode_max_true_clearance_m": torch.tensor(
+            [0.20, 0.21, 0.22, 0.25], dtype=torch.float32
+        ),
+        "meta": {
+            "format_version": 1,
+            "task_mode": "full_task",
+            "observation_dim": 115,
+            "observation_contract": "pick_tool_markov115_v1",
+            "action_dim": 21,
+            "action_layout": "arm_delta7|crossdex_token9|distal_residual5",
+            "action_projection": "identity_v1",
+            "observation_layout": (
+                "legacy_prefix87|distal_action5|grasp_transport23"
+            ),
+            "phase_names": ["approach", "close", "micro", "lift", "settle"],
+            "collector": "pick_tool_v6_success_self_imitation_v1",
+            "dataset_phase": "close",
+            "close_arm_mode": "zero",
+            "action_semantics": (
+                "executed_v6_action_with_latch_conditioned_exploration_v1"
+            ),
+            "stored_row_window": (
+                "trigger_frame_through_first_latch_transition_v1"
+            ),
+            "trajectory_acceptance": (
+                "initial_episode_triggered_true_success_safe_first_latch_persistent_v1"
+            ),
+            "clearance_authority": (
+                "true_mesh_convex_hull_min_z_minus_table_v1"
+            ),
+            "terminal_observation": "not_saved_auto_reset_excluded_v1",
+            "search_handoff_contract": "pick_tool_public_online_handoff_v1",
+            "trigger_action_semantics": (
+                "option_controls_the_trigger_frame_and_remains_sticky_until_reset"
+            ),
+            "policy_router": "public_latch_frozen_actor_v1",
+            "cohort_assignment": "balanced_sha256_slot_v1",
+            "cohort_names": ["deterministic", "exploratory"],
+            "kit_args": "--/app/extensions/fsWatcherEnabled=false",
+            "handoff_min_score": 0.30,
+            "handoff_hold_steps": 4,
+            "exploratory_hand_noise_scale": 0.25,
+            "unlatched_arm_noise_scale": 0.0,
+            "latched_arm_noise_scale": 0.0,
+            "latched_hand_noise_scale": 0.0,
+            "search_checkpoint_sha256": "1" * 64,
+            "v6_actor_sha256": "2" * 64,
+            "v6_task_contract_sha256": "3" * 64,
+            "v6_bridge_state_sha256": "8" * 64,
+            "frozen_lift_actor_sha256": "4" * 64,
+            "frozen_lift_semantic_sha256": "9" * 64,
+            "frozen_lift_source_actor_sha256": "5" * 64,
+            "source_manifest_sha256": "6" * 64,
+            "runtime_asset_manifest_sha256": "7" * 64,
+        },
+    }
+
+
 def test_pick_tool_actor_demo_allowlist_and_phase_contracts() -> None:
     with tempfile.TemporaryDirectory(prefix="actor_rehearsal_allowlist_") as directory:
         root = Path(directory)
@@ -337,6 +445,162 @@ def test_pick_tool_actor_demo_allowlist_and_phase_contracts() -> None:
             observation_dim=OBSERVATION_DIM,
             action_dim=ACTION_DIM,
             allowed_contracts=PICK_TOOL_ACTOR_DEMO_CONTRACTS,
+        )
+
+
+def test_v6_success_self_imitation_contract() -> None:
+    with tempfile.TemporaryDirectory(prefix="v6_self_imitation_") as directory:
+        root = Path(directory)
+        valid_path = root / "valid.pt"
+        source = _write_payload(valid_path, _v6_success_self_imitation_payload())
+        batch, phase, audit = load_actor_rehearsal(
+            valid_path,
+            device="cpu",
+            observation_dim=115,
+            action_dim=21,
+            allowed_contracts=PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS,
+        )
+        assert phase is not None and bool((phase == 1).all())
+        assert audit["source_contract"] == (
+            "pick_tool_v6_success_self_imitation_v1"
+        )
+        assert audit["episodes"] == 4
+        assert audit["phase_counts"] == {"1": 12}
+        assert audit["search_checkpoint_sha256"] == "1" * 64
+        assert audit["v6_actor_sha256"] == "2" * 64
+        assert audit["v6_task_contract_sha256"] == "3" * 64
+        assert audit["v6_bridge_state_sha256"] == "8" * 64
+        assert audit["frozen_lift_actor_sha256"] == "4" * 64
+        assert audit["frozen_lift_semantic_sha256"] == "9" * 64
+        assert audit["frozen_lift_source_actor_sha256"] == "5" * 64
+        assert audit["source_manifest_sha256"] == "6" * 64
+        assert audit["runtime_asset_manifest_sha256"] == "7" * 64
+        torch.testing.assert_close(batch["action"], source["action"])
+
+        nonzero_arm = _v6_success_self_imitation_payload()
+        nonzero_arm["action"][0, 6] = torch.finfo(torch.float32).eps
+        nonzero_arm_path = root / "nonzero_arm.pt"
+        _write_payload(nonzero_arm_path, nonzero_arm)
+        _expect_error(
+            ValueError,
+            load_actor_rehearsal,
+            nonzero_arm_path,
+            device="cpu",
+            observation_dim=115,
+            action_dim=21,
+            allowed_contracts=PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS,
+        )
+
+        latched_observation = _v6_success_self_imitation_payload()
+        latched_observation["obs"][0, 106] = 1.0
+        latched_observation_path = root / "latched_observation.pt"
+        _write_payload(latched_observation_path, latched_observation)
+        _expect_error(
+            ValueError,
+            load_actor_rehearsal,
+            latched_observation_path,
+            device="cpu",
+            observation_dim=115,
+            action_dim=21,
+            allowed_contracts=PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS,
+        )
+
+        malformed_hash = _v6_success_self_imitation_payload()
+        malformed_hash["meta"]["runtime_asset_manifest_sha256"] = "A" * 64
+        malformed_hash_path = root / "malformed_hash.pt"
+        _write_payload(malformed_hash_path, malformed_hash)
+        _expect_error(
+            ValueError,
+            load_actor_rehearsal,
+            malformed_hash_path,
+            device="cpu",
+            observation_dim=115,
+            action_dim=21,
+            allowed_contracts=PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS,
+        )
+
+        wrong_metadata_type = _v6_success_self_imitation_payload()
+        wrong_metadata_type["meta"]["handoff_hold_steps"] = 4.0
+        wrong_metadata_path = root / "wrong_metadata_type.pt"
+        _write_payload(wrong_metadata_path, wrong_metadata_type)
+        _expect_error(
+            ValueError,
+            load_actor_rehearsal,
+            wrong_metadata_path,
+            device="cpu",
+            observation_dim=115,
+            action_dim=21,
+            allowed_contracts=PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS,
+        )
+
+        rejected_episode_evidence = {
+            "episode_native_success": False,
+            "episode_dropped": True,
+            "episode_unsafe_force": True,
+            "episode_unlatched_clearance_ge_5cm": True,
+            "episode_ever_grasped": False,
+            "episode_triggered": False,
+            "episode_ever_latched": False,
+            "episode_latch_released_after_first": True,
+            "episode_cohort": 2,
+            "episode_hand_noise_scale": 0.2501,
+            "episode_trigger_step": -1,
+            "episode_trigger_score": 0.2999,
+            "episode_first_latch_step": -1,
+            "episode_terminal_step": -1,
+            "episode_trajectory_max_force": 30.001,
+            "episode_max_true_clearance_m": 0.1999,
+        }
+        for index, (field, rejected_value) in enumerate(
+            rejected_episode_evidence.items()
+        ):
+            rejected = _v6_success_self_imitation_payload()
+            rejected[field][0] = rejected_value
+            rejected_path = root / f"rejected_episode_{index}.pt"
+            _write_payload(rejected_path, rejected)
+            _expect_error(
+                ValueError,
+                load_actor_rehearsal,
+                rejected_path,
+                device="cpu",
+                observation_dim=115,
+                action_dim=21,
+                allowed_contracts=PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS,
+            )
+
+        relationship_violations = (
+            ("deterministic_noise", "episode_hand_noise_scale", 0, 0.25),
+            ("exploratory_noise", "episode_hand_noise_scale", 1, 0.0),
+            ("latch_before_trigger", "episode_first_latch_step", 0, 399),
+            ("terminal_before_latch", "episode_terminal_step", 0, 402),
+        )
+        for name, field, episode, rejected_value in relationship_violations:
+            rejected = _v6_success_self_imitation_payload()
+            rejected[field][episode] = rejected_value
+            rejected_path = root / f"relationship_{name}.pt"
+            _write_payload(rejected_path, rejected)
+            _expect_error(
+                ValueError,
+                load_actor_rehearsal,
+                rejected_path,
+                device="cpu",
+                observation_dim=115,
+                action_dim=21,
+                allowed_contracts=PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS,
+            )
+
+        missing_evidence = _v6_success_self_imitation_payload()
+        del missing_evidence["episode_trigger_score"]
+        missing_evidence_path = root / "missing_evidence.pt"
+        _write_payload(missing_evidence_path, missing_evidence)
+        _expect_error(
+            TypeError,
+            load_actor_rehearsal,
+            missing_evidence_path,
+            device="cpu",
+            observation_dim=115,
+            action_dim=21,
+            allowed_contracts=PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS,
         )
 
 
@@ -771,6 +1035,8 @@ def main() -> None:
     print("[PASS] obs/action loader and successful-episode audit")
     test_pick_tool_actor_demo_allowlist_and_phase_contracts()
     print("[PASS] PickTool actor-demo allowlist and phase contracts")
+    test_v6_success_self_imitation_contract()
+    print("[PASS] V6 successful self-imitation source contract")
     test_coupled_power_multiphase_contract_and_canonical_actions()
     print("[PASS] coupled-power multi-phase and canonical-action contract")
     test_loader_rejects_ambiguous_failed_or_malformed_sources()

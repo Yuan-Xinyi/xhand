@@ -72,8 +72,13 @@ class ActorRehearsalSourceContract:
     optional_phases: tuple[int, ...] = ()
     required_sha256_metadata: tuple[str, ...] = ()
     required_zero_action_slices: tuple[tuple[int, int, int], ...] = ()
+    required_observation_values: tuple[tuple[int, float], ...] = ()
     strict_metadata_types: bool = False
     required_episode_tensors: tuple[EpisodeTensorContract, ...] = ()
+    required_episode_conditional_values: tuple[
+        tuple[str, float | int, str, float | int], ...
+    ] = ()
+    required_episode_orderings: tuple[tuple[str, str], ...] = ()
     phase_observation_state_indices: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
@@ -136,9 +141,61 @@ class ActorRehearsalSourceContract:
                 or stop <= start
             ):
                 raise ValueError("zero-action slices must use integer 0 <= start < stop")
+        observation_indices = [
+            index for index, _expected in self.required_observation_values
+        ]
+        if len(set(observation_indices)) != len(observation_indices):
+            raise ValueError("required observation-value indices must not repeat")
+        for index, expected in self.required_observation_values:
+            if (
+                not isinstance(index, int)
+                or isinstance(index, bool)
+                or index < 0
+            ):
+                raise ValueError(
+                    "required observation values need non-negative integer indices"
+                )
+            if (
+                not isinstance(expected, (int, float))
+                or isinstance(expected, bool)
+                or not math.isfinite(float(expected))
+            ):
+                raise ValueError(
+                    "required observation values need finite numeric expectations"
+                )
         episode_field_names = [field.name for field in self.required_episode_tensors]
         if len(set(episode_field_names)) != len(episode_field_names):
             raise ValueError("required episode tensor names must not contain duplicates")
+        episode_fields = set(episode_field_names)
+        if len(set(self.required_episode_conditional_values)) != len(
+            self.required_episode_conditional_values
+        ):
+            raise ValueError("required episode conditional values must not repeat")
+        for condition_name, condition_value, target_name, target_value in (
+            self.required_episode_conditional_values
+        ):
+            if condition_name not in episode_fields or target_name not in episode_fields:
+                raise ValueError(
+                    "episode conditional values must reference required episode tensors"
+                )
+            for value in (condition_value, target_value):
+                if (
+                    not isinstance(value, (int, float))
+                    or isinstance(value, bool)
+                    or not math.isfinite(float(value))
+                ):
+                    raise ValueError(
+                        "episode conditional values must use finite numeric scalars"
+                    )
+        if len(set(self.required_episode_orderings)) != len(
+            self.required_episode_orderings
+        ):
+            raise ValueError("required episode orderings must not repeat")
+        for earlier_name, later_name in self.required_episode_orderings:
+            if earlier_name not in episode_fields or later_name not in episode_fields:
+                raise ValueError(
+                    "episode orderings must reference required episode tensors"
+                )
         if self.phase_observation_state_indices is not None:
             if (
                 len(self.phase_observation_state_indices) != 2
@@ -221,6 +278,167 @@ PICK_TOOL_ACTOR_DEMO_CONTRACTS = (
             "option_teacher_arm_action_abs_max": 0.0,
         },
         required_phase=1,
+    ),
+    ActorRehearsalSourceContract(
+        # Successful actions executed by the frozen V6 routed policy, with a
+        # preregistered deterministic/exploratory cohort assignment.  Unlike
+        # the historical CLOSE teacher datasets, these labels are policy
+        # actions sampled on the exact public SEARCH handoff distribution and
+        # are retained only when the native task subsequently reaches a safe
+        # true-mesh 20 cm success.  Every lineage digest is mandatory so a
+        # similarly shaped dataset from another SEARCH/V6/LIFT stack cannot be
+        # admitted by this allowlist entry.
+        name="pick_tool_v6_success_self_imitation_v1",
+        required_metadata={
+            "format_version": 1,
+            "task_mode": "full_task",
+            "observation_dim": 115,
+            "observation_contract": "pick_tool_markov115_v1",
+            "action_dim": 21,
+            "action_layout": _PICK_TOOL_ACTION_LAYOUT,
+            "action_projection": "identity_v1",
+            "observation_layout": _PICK_TOOL_OBSERVATION_LAYOUT,
+            "phase_names": _PICK_TOOL_PHASE_NAMES,
+            "collector": "pick_tool_v6_success_self_imitation_v1",
+            "dataset_phase": "close",
+            "close_arm_mode": "zero",
+            "action_semantics": (
+                "executed_v6_action_with_latch_conditioned_exploration_v1"
+            ),
+            "stored_row_window": (
+                "trigger_frame_through_first_latch_transition_v1"
+            ),
+            "trajectory_acceptance": (
+                "initial_episode_triggered_true_success_safe_first_latch_persistent_v1"
+            ),
+            "clearance_authority": (
+                "true_mesh_convex_hull_min_z_minus_table_v1"
+            ),
+            "terminal_observation": "not_saved_auto_reset_excluded_v1",
+            "search_handoff_contract": "pick_tool_public_online_handoff_v1",
+            "trigger_action_semantics": (
+                "option_controls_the_trigger_frame_and_remains_sticky_until_reset"
+            ),
+            "policy_router": "public_latch_frozen_actor_v1",
+            "cohort_assignment": "balanced_sha256_slot_v1",
+            "cohort_names": ["deterministic", "exploratory"],
+            "kit_args": "--/app/extensions/fsWatcherEnabled=false",
+            "handoff_min_score": 0.30,
+            "handoff_hold_steps": 4,
+            "exploratory_hand_noise_scale": 0.25,
+            "unlatched_arm_noise_scale": 0.0,
+            "latched_arm_noise_scale": 0.0,
+            "latched_hand_noise_scale": 0.0,
+        },
+        required_phase=1,
+        required_sha256_metadata=(
+            "search_checkpoint_sha256",
+            "v6_actor_sha256",
+            "v6_task_contract_sha256",
+            "v6_bridge_state_sha256",
+            "frozen_lift_actor_sha256",
+            "frozen_lift_semantic_sha256",
+            "frozen_lift_source_actor_sha256",
+            "source_manifest_sha256",
+            "runtime_asset_manifest_sha256",
+        ),
+        required_zero_action_slices=((1, 0, 7),),
+        required_observation_values=((106, 0.0),),
+        strict_metadata_types=True,
+        required_episode_tensors=(
+            EpisodeTensorContract(
+                "episode_native_success",
+                torch.bool,
+                expected_bool=True,
+            ),
+            EpisodeTensorContract(
+                "episode_dropped",
+                torch.bool,
+                expected_bool=False,
+            ),
+            EpisodeTensorContract(
+                "episode_unsafe_force",
+                torch.bool,
+                expected_bool=False,
+            ),
+            EpisodeTensorContract(
+                "episode_unlatched_clearance_ge_5cm",
+                torch.bool,
+                expected_bool=False,
+            ),
+            EpisodeTensorContract(
+                "episode_ever_grasped",
+                torch.bool,
+                expected_bool=True,
+            ),
+            EpisodeTensorContract(
+                "episode_triggered",
+                torch.bool,
+                expected_bool=True,
+            ),
+            EpisodeTensorContract(
+                "episode_ever_latched",
+                torch.bool,
+                expected_bool=True,
+            ),
+            EpisodeTensorContract(
+                "episode_latch_released_after_first",
+                torch.bool,
+                expected_bool=False,
+            ),
+            EpisodeTensorContract(
+                "episode_cohort",
+                torch.int64,
+                minimum=0,
+                maximum=1,
+            ),
+            EpisodeTensorContract(
+                "episode_hand_noise_scale",
+                torch.float32,
+                minimum=0.0,
+                maximum=0.25,
+            ),
+            EpisodeTensorContract(
+                "episode_trigger_step",
+                torch.int64,
+                minimum=0,
+            ),
+            EpisodeTensorContract(
+                "episode_trigger_score",
+                torch.float32,
+                minimum=0.30,
+                maximum=1.0,
+            ),
+            EpisodeTensorContract(
+                "episode_first_latch_step",
+                torch.int64,
+                minimum=0,
+            ),
+            EpisodeTensorContract(
+                "episode_terminal_step",
+                torch.int64,
+                minimum=0,
+            ),
+            EpisodeTensorContract(
+                "episode_trajectory_max_force",
+                torch.float32,
+                minimum=0.0,
+                maximum=30.0,
+            ),
+            EpisodeTensorContract(
+                "episode_max_true_clearance_m",
+                torch.float32,
+                minimum=0.20,
+            ),
+        ),
+        required_episode_conditional_values=(
+            ("episode_cohort", 0, "episode_hand_noise_scale", 0.0),
+            ("episode_cohort", 1, "episode_hand_noise_scale", 0.25),
+        ),
+        required_episode_orderings=(
+            ("episode_trigger_step", "episode_first_latch_step"),
+            ("episode_first_latch_step", "episode_terminal_step"),
+        ),
     ),
 )
 
@@ -703,6 +921,37 @@ def audit_actor_rehearsal_action_semantics(
             )
 
 
+def audit_actor_rehearsal_observation_semantics(
+    observation: torch.Tensor,
+    source_contract: ActorRehearsalSourceContract | None,
+) -> None:
+    """Verify exact actor-state values required by a demonstration source.
+
+    The V6 self-imitation source stores only pre-latch CLOSE observations.  A
+    phase label by itself cannot prove that fact, so the public latch bit is
+    audited directly on every saved row.
+    """
+
+    if source_contract is None or not source_contract.required_observation_values:
+        return
+    if observation.ndim != 2:
+        raise ValueError("observation must be two-dimensional for semantics audit")
+    for index, expected in source_contract.required_observation_values:
+        if index >= observation.shape[1]:
+            raise ValueError(
+                f"source contract {source_contract.name!r} observation index "
+                f"{index} exceeds observation_dim={observation.shape[1]}"
+            )
+        value = observation[:, index]
+        if bool((value != expected).any()):
+            mismatch = int((value != expected).nonzero(as_tuple=False)[0])
+            raise ValueError(
+                f"source contract {source_contract.name!r} requires exact "
+                f"observation[{index}]={expected}, got {float(value[mismatch])} "
+                f"at row {mismatch}"
+            )
+
+
 def audit_actor_rehearsal_phase_observation_semantics(
     payload: Mapping[str, Any],
     observation: torch.Tensor,
@@ -827,6 +1076,33 @@ def audit_actor_rehearsal_episode_semantics(
                 f"{requirement.name}<={requirement.maximum}"
             )
 
+    for condition_name, condition_value, target_name, target_value in (
+        source_contract.required_episode_conditional_values
+    ):
+        condition = payload[condition_name]
+        target = payload[target_name]
+        selected = condition == condition_value
+        if not bool(selected.any()):
+            raise ValueError(
+                f"source contract {source_contract.name!r} requires at least one "
+                f"episode with {condition_name}={condition_value}"
+            )
+        if bool((target[selected] != target_value).any()):
+            raise ValueError(
+                f"source contract {source_contract.name!r} requires "
+                f"{target_name}={target_value} whenever "
+                f"{condition_name}={condition_value}"
+            )
+
+    for earlier_name, later_name in source_contract.required_episode_orderings:
+        earlier = payload[earlier_name]
+        later = payload[later_name]
+        if bool((earlier > later).any()):
+            raise ValueError(
+                f"source contract {source_contract.name!r} requires every "
+                f"{earlier_name}<={later_name}"
+            )
+
 
 def load_actor_rehearsal(
     path: str | os.PathLike[str],
@@ -882,8 +1158,12 @@ def load_actor_rehearsal(
         allowed_contracts=allowed_contracts,
     )
     audit_actor_rehearsal_action_semantics(
-        batch["action"],
+        raw_batch["action"],
         phase,
+        source_contract,
+    )
+    audit_actor_rehearsal_observation_semantics(
+        raw_batch["observation"],
         source_contract,
     )
     audit_actor_rehearsal_phase_observation_semantics(
