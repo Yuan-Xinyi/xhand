@@ -1,6 +1,6 @@
 {
   "kind": "pick_tool_candidate39_fixed_direction_development_validation_plan_v1",
-  "status": "preregistered_before_implementation_and_collection",
+  "status": "sealed_before_smoke_and_collection",
   "created_local_date": "2026-07-22",
   "branch": "flashsac-pick-tool-curriculum",
   "fixed_direction_seal_commit": "9253c9304e8fd7d4385f2fce1d940ad4ad2f3ff8",
@@ -234,6 +234,32 @@
       "artifact validators reject altered manifest, fixed_z, assignment, checkpoint, source, and complementary evidence",
       "analysis tests exercise every pass/fail boundary without using seed-329/330 simulator outcomes"
     ]
+  },
+  "implementation_seal": {
+    "status": "complete_without_simulator_evidence",
+    "implementation_commit": "6a56815a1c073578d0e990636c47e35cde183409",
+    "source_sha256": {
+      "scripts/flashsac/candidate39_fixed_episode_residual.py": "4b90e10fa8a2d78d04e74fbe78180de87b2b17e6d3e70b480c793dd5a5f0da63",
+      "scripts/flashsac/candidate39_fixed_episode_residual_test.py": "20c8c31916dc94c0c906838e065735e28139213d15da0f349c1314e7f78e1175",
+      "scripts/flashsac/collect_candidate39_fixed_residual_ab.py": "cd133382192895f39efc252069d746213891fd321f5a174fba7f82a7dd6c6caa",
+      "scripts/flashsac/analyze_candidate39_fixed_validation.py": "906eb5717cc0a0a0e3a6783999241b1cf80b1763523d710d0b097c6189929425",
+      "scripts/flashsac/analyze_candidate39_fixed_validation_test.py": "65caa62f197bedc511b13dbd8c039dfb7210062fe4871008105fcbaf6eb48eb1"
+    },
+    "simulation_free_tests": {
+      "pytest_passed": 67,
+      "pytest_suites": [
+        "scripts/flashsac/option_residual_screen_test.py",
+        "scripts/flashsac/candidate39_episode_residual_test.py",
+        "scripts/flashsac/analyze_candidate39_residual_discovery_test.py",
+        "scripts/flashsac/agent_bridge_test.py",
+        "scripts/flashsac/candidate39_fixed_episode_residual_test.py",
+        "scripts/flashsac/analyze_candidate39_fixed_validation_test.py"
+      ],
+      "py_compile": "pass",
+      "git_diff_check": "pass",
+      "collector_build_spec_exact_check": "pass",
+      "simulator_evidence_seen_before_seal": false
+    }
   },
   "decision_rule": {
     "if_all_gates_pass": "Seal the four artifacts and development report, then write and commit a separate formal-acceptance plan and manifest before touching seeds 331-333. Passing this stage alone does not accept Candidate39.",
