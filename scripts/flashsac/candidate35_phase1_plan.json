@@ -1,0 +1,134 @@
+{
+  "kind": "pick_tool_candidate35_phase1_screen_plan_v1",
+  "status": "sealed_before_training",
+  "created_local_date": "2026-07-22",
+  "branch": "flashsac-pick-tool-curriculum",
+  "source_commit_before_plan": "34b467e66d2fcfc9b7be415601c3f0d3665cdad4",
+  "hypothesis": "successful V6 CLOSE self-imitation plus materially larger conservative actor updates can improve stable grasp and true 20 cm lift without changing SEARCH or frozen LIFT",
+  "baseline": {
+    "checkpoint": "logs/flashsac/pick_tool/16_v6_router_zero_actor_s254/checkpoint_final",
+    "actor_sha256": "d9aacbd48891c192c0d1491514137262b82990fa71440787076403de06606288",
+    "task_contract_sha256": "8a2a135fa1cd5bb01965fc7dc6d6a73978dffc1bf55941ae392146de1d17f61d",
+    "torch_bridge_state_sha256": "78176bb99eb5dac80a2789b231d54db6cf2b86132bc7835a129dd7f5a7df978c",
+    "frozen_lift_actor_sha256": "117f1b0ae3641bd24b6b9f3d585576a79b5aff968139c0dde86e6346f60ebaa0"
+  },
+  "search": {
+    "checkpoint": "logs/rl_games/pick_tool_token/0_bootstrap_handoff_20260720/nn/pick_tool_stage7_dagger_full_iter3_bc.pth",
+    "sha256": "b91555d8227cf4e87e41ae858d7f8b1ee42ae920a9d829f2f5b1453b529f1f02",
+    "min_score": 0.3,
+    "hold_steps": 4
+  },
+  "actor_demo": [
+    {
+      "path": "logs/flashsac/pick_tool/38_v6_success_si_smoke_s296_a/dataset.pt",
+      "sha256": "1a4bb77ed0b5f4c8a9bc5a8f5c651ab0929043527110bb075c4efae46ebdaa41",
+      "episodes": 3,
+      "transitions": 68,
+      "deterministic_episodes": 1,
+      "exploratory_episodes": 2
+    },
+    {
+      "path": "logs/flashsac/pick_tool/39_v6_success_si_s297_b_512/dataset.pt",
+      "sha256": "d9e78d9791cc3fd358c572b7ba570f101873d97be8b62c010d478872522e0f94",
+      "episodes": 23,
+      "transitions": 530,
+      "deterministic_episodes": 14,
+      "exploratory_episodes": 9
+    }
+  ],
+  "actor_demo_acceptance": {
+    "collector": "pick_tool_v6_success_self_imitation_v1",
+    "native_true_20cm_success": true,
+    "maximum_force_n": 30.0,
+    "reject_drop": true,
+    "reject_unsafe_force": true,
+    "reject_unlatched_clearance_ge_5cm": true,
+    "require_persistent_public_latch": true,
+    "saved_action_arm7": "exact_zero",
+    "saved_observation_public_latch": 0.0
+  },
+  "phase1": {
+    "output_dir": "logs/flashsac/pick_tool/40_v6_success_si_phase1_s310",
+    "seed": 310,
+    "steps": 2000,
+    "num_envs": 256,
+    "buffer": 250000,
+    "batch": 2048,
+    "warmup_transitions": 10000,
+    "updates_per_vector_step": 4.0,
+    "critic_burnin_updates": 500,
+    "actor_update_period": 8,
+    "actor_lr_scale": 0.01,
+    "lr_decay_updates": 50000,
+    "lr_warmup_updates": 1000,
+    "n_step": 3,
+    "actor_blocks": 2,
+    "actor_hidden": 128,
+    "critic_blocks": 2,
+    "critic_hidden": 256,
+    "critic_bins": 101,
+    "checkpoint": "exact_full_v6",
+    "resume_replay": false,
+    "resume_actor_demo": false,
+    "save_replay": true,
+    "demo_bc_weight": 0.5,
+    "demo_bc_batch": 512,
+    "demo_bc_phases": [1],
+    "demo_bc_target_std": 0.15,
+    "demo_bc_std_weight": 0.05,
+    "demo_bc_arm_weight": 0.0,
+    "demo_bc_token_weight": 1.0,
+    "demo_bc_residual_weight": 1.0,
+    "public_latch_arm_gate": true,
+    "public_latch_frozen_lift_router": true,
+    "unlatched_arm_noise_scale": 0.0,
+    "unlatched_hand_noise_scale": 0.1,
+    "latched_arm_noise_scale": 0.0,
+    "latched_hand_noise_scale": 0.0,
+    "metrics_every": 100,
+    "validate_finite": true,
+    "kit_args": "--/app/extensions/fsWatcherEnabled=false"
+  },
+  "protocol_corrections_before_seal": [
+    {
+      "field": "phase1.updates_per_vector_step",
+      "draft_value": 2.0,
+      "sealed_value": 4.0,
+      "reason": "at the candidate34 measured option-row fraction 0.1319, fresh warmup 10000 plus critic burn-in 500 would project fewer than 500 total updates and therefore zero actor rehearsal updates; value 4 projects about 900 total updates and about 50 actor updates while preserving the 500-update critic burn-in"
+    }
+  ],
+  "phase1_screen": {
+    "collector": "scripts/flashsac/collect_online_close_ab.py",
+    "num_envs_per_run": 64,
+    "run_order": [
+      "320a",
+      "320b",
+      "321b",
+      "321a",
+      "322a",
+      "322b"
+    ],
+    "candidate_checkpoint": "logs/flashsac/pick_tool/40_v6_success_si_phase1_s310/checkpoint_final",
+    "output_pattern": "logs/flashsac/pick_tool/41_close_ab_c35_p1_s{seed}_{replicate}/trial",
+    "equal_seed_horvitz_thompson": true,
+    "gates": {
+      "conditional_success_delta_min": 0.03,
+      "itt_success_delta_min": 0.01,
+      "conditional_ever_grasped_delta_min": 0.0,
+      "positive_conditional_success_seeds_min": 2,
+      "per_seed_conditional_success_delta_floor": -0.1,
+      "candidate_triggered_dropped_max": 0,
+      "candidate_triggered_unsafe_force_max": 0,
+      "conditional_unlatched_clearance_ge_5cm_delta_max": 0.02
+    }
+  },
+  "phase2_if_all_gates_pass": {
+    "seed": 311,
+    "additional_steps": 2000,
+    "checkpoint": "phase1_checkpoint_final",
+    "resume_replay": true,
+    "resume_actor_demo": true,
+    "all_other_training_parameters": "identical_to_phase1"
+  },
+  "decision_rule": "run phase2 only if every phase1 screen gate passes; otherwise retain exact V6 and diagnose the failed funnel without threshold changes"
+}
