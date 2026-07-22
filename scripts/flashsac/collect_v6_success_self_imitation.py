@@ -391,9 +391,10 @@ def run_collection(
             latch = observation[:, contract.PUBLIC_LATCH_INDEX]
             if not bool(((latch == 0.0) | (latch == 1.0)).all()):
                 raise RuntimeError("public grasp latch is not binary")
-            latch_released_after_first |= (
-                active_before & ever_latched & (latch == 0.0)
-            )
+            if bool((active_before & (~ever_latched) & (latch == 1.0)).any()):
+                raise RuntimeError(
+                    "public latch edge was not audited on the preceding action"
+                )
             noise_scale = contract.build_cohort_noise_scale(
                 observation,
                 exploratory,
@@ -491,17 +492,21 @@ def run_collection(
                 grasp_quality_threshold=float(cfg.grasp_quality_high),
                 safe_force_limit=float(cfg.grasp_bonus_max_force),
             )
-            latched_before_transition = ever_latched.clone()
-            newly_latched = active_before & (~ever_latched) & transition_truth.grasped
-            latch_released_after_first |= (
-                active_before
-                & latched_before_transition
-                & (~transition_truth.grasped)
+            transition_observation = info.get("transition_next_observation")
+            if not isinstance(transition_observation, torch.Tensor):
+                raise KeyError("adapter omitted transition_next_observation")
+            newly_latched, newly_released = (
+                contract.public_latch_transition_masks(
+                    transition_observation=transition_observation,
+                    active_before=active_before,
+                    ever_latched_before=ever_latched,
+                )
             )
+            latch_released_after_first |= newly_released
             first_latch_step = torch.where(
                 newly_latched, episode_step, first_latch_step
             )
-            ever_latched |= active_before & transition_truth.grasped
+            ever_latched |= newly_latched
             post_reset_truth = _read_physical_truth(
                 env.unwrapped, task_mode=FULL_TASK_MODE
             )

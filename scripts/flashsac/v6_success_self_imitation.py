@@ -145,6 +145,7 @@ REQUIRED_METADATA = {
     "search_handoff_contract": "pick_tool_public_online_handoff_v1",
     "trigger_action_semantics": "option_controls_the_trigger_frame_and_remains_sticky_until_reset",
     "policy_router": "public_latch_frozen_actor_v1",
+    "latch_transition_clock": "post_action_transition_observation_public_latch_v1",
     "cohort_assignment": COHORT_ASSIGNMENT,
     "cohort_names": ["deterministic", "exploratory"],
     "handoff_min_score": HANDOFF_MIN_SCORE,
@@ -332,6 +333,53 @@ def select_executed_action(
     ):
         raise FloatingPointError("a policy action contains NaN or infinity")
     return torch.where(option_active.unsqueeze(-1), routed_v6_action, search_action)
+
+
+def public_latch_transition_masks(
+    *,
+    transition_observation: torch.Tensor,
+    active_before: torch.Tensor,
+    ever_latched_before: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Audit latch edges on the observation clock used by the policy router.
+
+    ``DirectRLEnv.step`` snapshots task terminal fields before ``_get_rewards``
+    and computes policy observations afterwards.  PickTool updates its grasp
+    latch in ``_get_rewards``, so the task terminal mapping can lag the public
+    observation by one action.  The adapter's transition observation preserves
+    this post-reward public observation even on auto-reset rows.  The action
+    that first produces index 106 equal to one is therefore the first
+    latch-transition action retained by this dataset.
+    """
+
+    if (
+        not isinstance(transition_observation, torch.Tensor)
+        or transition_observation.ndim != 2
+        or transition_observation.shape[1] != OBSERVATION_DIM
+        or not transition_observation.dtype.is_floating_point
+    ):
+        raise ValueError(
+            f"transition_observation must be floating [N,{OBSERVATION_DIM}]"
+        )
+    batch = transition_observation.shape[0]
+    for name, value in (
+        ("active_before", active_before),
+        ("ever_latched_before", ever_latched_before),
+    ):
+        if (
+            not isinstance(value, torch.Tensor)
+            or value.shape != (batch,)
+            or value.dtype != torch.bool
+            or value.device != transition_observation.device
+        ):
+            raise ValueError(f"{name} must be a co-located bool[N] tensor")
+    latch = transition_observation[:, PUBLIC_LATCH_INDEX]
+    if not bool(((latch == 0.0) | (latch == 1.0)).all()):
+        raise ValueError("transition public latch must be exactly binary")
+    latched_after = latch == 1.0
+    newly_latched = active_before & (~ever_latched_before) & latched_after
+    released_after_first = active_before & ever_latched_before & (~latched_after)
+    return newly_latched, released_after_first
 
 
 def _require_cpu_vector(

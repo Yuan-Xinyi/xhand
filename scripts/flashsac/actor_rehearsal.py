@@ -320,6 +320,9 @@ PICK_TOOL_ACTOR_DEMO_CONTRACTS = (
                 "option_controls_the_trigger_frame_and_remains_sticky_until_reset"
             ),
             "policy_router": "public_latch_frozen_actor_v1",
+            "latch_transition_clock": (
+                "post_action_transition_observation_public_latch_v1"
+            ),
             "cohort_assignment": "balanced_sha256_slot_v1",
             "cohort_names": ["deterministic", "exploratory"],
             "kit_args": "--/app/extensions/fsWatcherEnabled=false",

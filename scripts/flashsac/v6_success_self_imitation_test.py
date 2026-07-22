@@ -23,6 +23,7 @@ from v6_success_self_imitation import (
     exploratory_cohort_mask,
     manifest_sha256,
     publish_dataset_and_report_no_clobber,
+    public_latch_transition_masks,
     select_executed_action,
     summarize_dataset,
     validate_dataset,
@@ -217,6 +218,38 @@ def test_assignment_and_noise_contract() -> None:
     torch.testing.assert_close(selected[1], routed[1])
 
 
+def test_public_latch_transition_uses_post_action_observation_clock() -> None:
+    obs = torch.zeros((4, OBSERVATION_DIM), dtype=torch.float32)
+    obs[0, PUBLIC_LATCH_INDEX] = 1.0
+    obs[1, PUBLIC_LATCH_INDEX] = 1.0
+    obs[3, PUBLIC_LATCH_INDEX] = 1.0
+    newly, released = public_latch_transition_masks(
+        transition_observation=obs,
+        active_before=torch.tensor([True, True, True, True]),
+        ever_latched_before=torch.tensor([False, True, True, False]),
+    )
+    # Row 0's current action caused the first observable latch edge.  Row 2
+    # released a previously seen latch.  Row 3 demonstrates that the adapter's
+    # captured transition observation remains authoritative on a done row.
+    assert torch.equal(newly, torch.tensor([True, False, False, True]))
+    assert torch.equal(released, torch.tensor([False, False, True, False]))
+    episode_step = torch.full((4,), 5, dtype=torch.int64)
+    first_before = torch.full((4,), -1, dtype=torch.int64)
+    first_after = torch.where(newly, episode_step, first_before)
+    assert int(first_after[0]) == 5
+    assert torch.equal(torch.arange(3, int(first_after[0]) + 1), torch.tensor([3, 4, 5]))
+
+    malformed = obs.clone()
+    malformed[0, PUBLIC_LATCH_INDEX] = 0.5
+    _expect(
+        ValueError,
+        public_latch_transition_masks,
+        transition_observation=malformed,
+        active_before=torch.ones(4, dtype=torch.bool),
+        ever_latched_before=torch.zeros(4, dtype=torch.bool),
+    )
+
+
 def test_dataset_cross_tensor_contract_and_buckets() -> None:
     payload = _payload()
     validated = validate_dataset(payload)
@@ -286,6 +319,7 @@ def test_transactional_publication_is_weights_only_and_no_clobber() -> None:
 
 def main() -> None:
     test_assignment_and_noise_contract()
+    test_public_latch_transition_uses_post_action_observation_clock()
     test_dataset_cross_tensor_contract_and_buckets()
     test_transactional_publication_is_weights_only_and_no_clobber()
     print("v6 success self-imitation contract tests passed")
