@@ -111,6 +111,20 @@
     "assignment_must_be_built_and_hashed_before_simulator_launch": true
   },
   "execution": {
+    "non_evidence_smoke": {
+      "seed": 326,
+      "replicate": "b",
+      "num_envs": 8,
+      "output": "logs/flashsac/pick_tool/51_c39_fixed_direction_smoke_s326_b/trial",
+      "purpose": "Exercise the new fixed-direction routing, transition-latch clock, artifact publication, and action/safety audits before consuming reserved validation seeds.",
+      "outcomes_must_not_change_the_fixed_direction_or_validation_plan": true,
+      "must_pass_before_reserved_seed_collection": [
+        "artifact and report validate independently",
+        "arm, control, inactive, SEARCH, post-latch LIFT, and window retirement contracts remain exact",
+        "component/L2/saturation budget violations are zero",
+        "treated-triggered drop and unsafe-force counts are zero"
+      ]
+    },
     "seeds": [329, 330],
     "replicates": ["a", "b"],
     "num_envs_per_run": 64,
@@ -121,7 +135,7 @@
     "kit_args": "--/app/extensions/fsWatcherEnabled=false",
     "prohibited_before_completion": [
       "running seed 331, 332, or 333",
-      "changing fixed_z, scale, caps, handoff, horizon, assignment salt, estimator, gates, or run order after seeing any seed-329/330 outcome",
+      "changing fixed_z, scale, caps, handoff, horizon, assignment salt, estimator, gates, or run order after seeing the smoke or any seed-329/330 outcome",
       "selecting or discarding episodes based on outcome",
       "continuing an episode past the registered terminal truth to alter its label"
     ]
