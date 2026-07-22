@@ -1,0 +1,202 @@
+{
+  "kind": "pick_tool_candidate40_verified_arm_development_validation_result_v1",
+  "status": "sealed_rejected_before_formal_screen",
+  "sealed_local_date": "2026-07-22",
+  "branch": "flashsac-pick-tool-curriculum",
+  "collection_commit": "c4fd2d9d57779b24c8ffb4467a466a6e41cc93e6",
+  "implementation_commit": "a5fb54a4d26ba1c7f2aeda6e39246a387380eae0",
+  "validation_plan": {
+    "path": "scripts/flashsac/candidate40_verified_arm_handoff_development_plan.json",
+    "sha256": "71b9ba24d1972d71f6a34f2f45e473d8b96ad76aeb30fbf0c6b7cb5c82025df8",
+    "preregistration_commit": "4ba0578f356a602c6902c0c29e25ddfba4c49e93",
+    "preregistration_tag": "pick-tool-candidate40-verified-arm-plan-v1-20260722",
+    "collection_seal_tag": "pick-tool-candidate40-verified-arm-validation-v1-20260722"
+  },
+  "treatment": {
+    "description": "After first option-active public-latch eligibility, hold arm7 at zero until 15 consecutive stable pre-action observations; enable the exact frozen-LIFT arm on the sixteenth stable action and relock immediately on live instability. Keep hand14, SEARCH, fixed residual, and all other routing identical to Candidate39.",
+    "network_updates": 0,
+    "arm_enabled_used_as_causal_domain": false,
+    "fixed_direction_was_recomputed_or_modified": false
+  },
+  "non_evidence_smoke": {
+    "run": "334b",
+    "num_envs": 8,
+    "artifact_path": "logs/flashsac/pick_tool/52_c40_verified_arm_smoke_s334_b/trial.pt",
+    "artifact_sha256": "e6ba7a61c6427e62580a1b43aa18f6d04c9cc54cb5a775c09c30bcce17e2b1fe",
+    "report_path": "logs/flashsac/pick_tool/52_c40_verified_arm_smoke_s334_b/trial.json",
+    "report_sha256": "0118fc167b83b2b865fb47eba3bd4dc0daf5d52052d0d2d0e507d6edaa638302",
+    "registered_smoke_checks_passed": true,
+    "outcomes_used_to_change_plan": false
+  },
+  "development_evidence": {
+    "run_order": ["335a", "335b", "336b", "336a"],
+    "artifacts": [
+      {
+        "run": "335a",
+        "path": "logs/flashsac/pick_tool/52_c40_verified_arm_dev_s335_a/trial.pt",
+        "sha256": "caa00dc2f1402d698fed38a5c46e5a32e17bda779a76b1d4778b3a42e59c6888",
+        "collector_report_path": "logs/flashsac/pick_tool/52_c40_verified_arm_dev_s335_a/trial.json",
+        "collector_report_sha256": "77b2f0c12d0136a4d7847237988b6d41da2cca495f3ea5939d3b0c022bce2c83"
+      },
+      {
+        "run": "335b",
+        "path": "logs/flashsac/pick_tool/52_c40_verified_arm_dev_s335_b/trial.pt",
+        "sha256": "087421af3f1530f9680766d8557673de67ac9407c70b9c361c45fd3be139f603",
+        "collector_report_path": "logs/flashsac/pick_tool/52_c40_verified_arm_dev_s335_b/trial.json",
+        "collector_report_sha256": "2983b1c19cde5057738f05b28aa14b98fbc85ac5e2aeb7c77a9a20400846cbfa"
+      },
+      {
+        "run": "336b",
+        "path": "logs/flashsac/pick_tool/52_c40_verified_arm_dev_s336_b/trial.pt",
+        "sha256": "a054a872ee27a971c53cd6450f688426f95cb0387f2a483926f53cedb3fe728e",
+        "collector_report_path": "logs/flashsac/pick_tool/52_c40_verified_arm_dev_s336_b/trial.json",
+        "collector_report_sha256": "ebfd8b9b9a974b56e4f15270518f58591518597ce2202b99ce8a73539bba8f48"
+      },
+      {
+        "run": "336a",
+        "path": "logs/flashsac/pick_tool/52_c40_verified_arm_dev_s336_a/trial.pt",
+        "sha256": "cb81aa9e56d32654871f2e940eb16505b071b22c26a51e1fd14a9de1cb0eb734",
+        "collector_report_path": "logs/flashsac/pick_tool/52_c40_verified_arm_dev_s336_a/trial.json",
+        "collector_report_sha256": "00cc6cd3579d96e3a7313841879cfebb80c68ce4aeea082d84504b81af103834"
+      }
+    ],
+    "combined_report_path": "logs/flashsac/pick_tool/52_c40_verified_arm_development_validation.json",
+    "combined_report_sha256": "8c03f040794b390afe4f086093bd08d2aba5ab91b5cc795ca6a4d0416b26aa50"
+  },
+  "decision": {
+    "analyzer_decision": "reject_candidate40",
+    "all_gates_pass": false,
+    "gates_passed": 25,
+    "gates_total": 31,
+    "failing_gates": {
+      "conditional_never_stable_held_5cm_by_action96_delta_max": {
+        "value": 0.21598877980364659,
+        "comparison": "<=",
+        "threshold": 0.0
+      },
+      "conditional_true_clearance_ge_20cm_delta_floor": {
+        "value": -0.14025245441795237,
+        "comparison": ">=",
+        "threshold": -0.03
+      },
+      "per_seed_primary_delta_floor": {
+        "value": -0.30891423817252694,
+        "comparison": ">=",
+        "threshold": -0.1
+      },
+      "positive_primary_delta_seeds_min": {
+        "value": 0,
+        "comparison": ">=",
+        "threshold": 1
+      },
+      "primary_conditional_stable_transport_restricted_mean_delta_min_exclusive": {
+        "value": -0.27273348009788,
+        "comparison": ">",
+        "threshold": 0.0
+      },
+      "treatment_eligible_post_latch_unlatched_clearance_ge_5cm_max": {
+        "value": 1,
+        "comparison": "<=",
+        "threshold": 0
+      }
+    },
+    "equal_seed_horvitz_thompson": {
+      "stable_transport_restricted_mean": {
+        "treatment": 0.19047740575565852,
+        "control": 0.46321088585353853,
+        "delta": -0.27273348009788
+      },
+      "success": {
+        "treatment": 0.573632538569425,
+        "control": 0.5946704067321178,
+        "delta": -0.021037868162692902
+      },
+      "ever_true_clearance_ge_20cm": {
+        "treatment": 0.605890603085554,
+        "control": 0.7461430575035064,
+        "delta": -0.14025245441795237
+      },
+      "stable_held_5cm_by_action96": {
+        "treatment": 0.4544179523141655,
+        "control": 0.6591865357643759,
+        "delta": -0.20476858345021043
+      },
+      "never_stable_held_5cm_by_action96": {
+        "treatment": 0.5511921458625526,
+        "control": 0.335203366058906,
+        "delta": 0.21598877980364659
+      },
+      "ever_grasped": {
+        "treatment": 1.0056100981767182,
+        "control": 0.9943899018232819,
+        "delta": 0.011220196353436185
+      },
+      "unlatched_clearance_ge_5cm": {
+        "treatment": 0.03225806451612903,
+        "control": 0.335203366058906,
+        "delta": -0.302945301542777
+      },
+      "terminal_utility_success_minus_unlatched_5cm": {
+        "treatment": 0.541374474053296,
+        "control": 0.2594670406732118,
+        "delta": 0.28190743338008417
+      }
+    },
+    "per_seed_primary_delta": {
+      "335": -0.23655272202323313,
+      "336": -0.30891423817252694
+    },
+    "raw_eligible_counts": {
+      "treatment": {
+        "eligible": 27,
+        "success": 15,
+        "ever_true_clearance_ge_20cm": 16,
+        "stable_held_5cm_by_action96": 12,
+        "unlatched_clearance_ge_5cm": 1
+      },
+      "control": {
+        "eligible": 27,
+        "success": 16,
+        "ever_true_clearance_ge_20cm": 20,
+        "stable_held_5cm_by_action96": 18,
+        "unlatched_clearance_ge_5cm": 9
+      }
+    },
+    "eligibility_support": {
+      "335": {"total": 23, "treatment": 12, "control": 11},
+      "336": {"total": 31, "treatment": 15, "control": 16}
+    },
+    "treatment_first_arm_releases_by_action32": {
+      "335": 6,
+      "336": 11,
+      "total": 17
+    },
+    "treatment_stable_held_5cm_by_action96": {
+      "335": 6,
+      "336": 6,
+      "total": 12
+    },
+    "treatment_eligible_dropped": 0,
+    "treatment_eligible_unsafe_force": 0,
+    "treatment_eligible_pre_release_launch": 0,
+    "action_clock_and_source_audits_exact": true
+  },
+  "paired_common_eligibility_diagnostic": {
+    "role": "diagnostic_only_except_for_the_registered_paired_unlatched_5cm_gate_and_cannot_override_the_HT_primary",
+    "opportunity_slots": 24,
+    "minimum_slots_per_seed": 11,
+    "stable_transport_restricted_mean_delta": -0.28316408032454393,
+    "success_delta": -0.041666666666666664,
+    "ever_true_clearance_ge_20cm_delta": -0.16666666666666666,
+    "stable_held_5cm_by_action96_delta": -0.16666666666666666,
+    "unlatched_clearance_ge_5cm_delta": -0.2916666666666667
+  },
+  "formal_screen": {
+    "seeds": [337, 338, 339],
+    "touched": false,
+    "permitted_under_this_candidate": false,
+    "candidate39_formal_seeds_331_332_333_untouched": true,
+    "reason": "The all-must-pass Candidate40 development validation failed six preregistered gates."
+  },
+  "allowed_conclusion": "Candidate40's 15-frame hard arm freeze substantially reduced unlatched 5 cm events, but it also reduced stable transport and true 20 cm lift. It is rejected before formal screening; the development evidence supports diagnosing an over-conservative handoff, not deploying or formally screening this candidate."
+}
