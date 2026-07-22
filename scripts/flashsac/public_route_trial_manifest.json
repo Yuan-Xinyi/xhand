@@ -201,7 +201,7 @@
   },
   "preregistration": {
     "branch": "flashsac-pick-tool-curriculum",
-    "implementation_commit": "SET_AFTER_DRAFT_IMPLEMENTATION_COMMIT",
+    "implementation_commit": "8840639cd1a53fcfff1e5821c6731ae135d50d65",
     "implementation_base_commit": "883bab473bb72522cb61dfdc4efd5a4f5e648985",
     "manifest_sha256_receipt": "recorded by every immutable artifact because a file cannot contain its own SHA256",
     "partial_or_failed_run_rule": "retain every no-clobber numbered failure report; an exception before pair publication leaves canonical outputs free for retry; a crash-created partial canonical pair fails closed for manual audit and a version bump",
@@ -222,7 +222,7 @@
       "source/xhand_inhand/xhand_inhand/assets/xarm7_xhand/xarm7_xhand.usd": "c361d7879735cf31107f0089a68bed014b1401eda4d340a14a8ae4630a9d756c"
     }
   },
-  "status": "draft_until_seal_commit",
+  "status": "preregistered",
   "task": {
     "action_dim": 21,
     "close_option_mode": false,
