@@ -1,13 +1,13 @@
 {
   "kind": "pick_tool_candidate41_public_arm_ramp_development_plan_v1",
-  "status": "preregistered_before_implementation_or_simulator_evidence",
+  "status": "sealed_before_smoke_and_collection",
   "created_local_date": "2026-07-22",
   "branch": "flashsac-pick-tool-curriculum",
   "preregistration_parent_commit": "16cd4e8260afb6378cc8c0861f02a20d4a8bf7c2",
   "preregistration_receipt": {
-    "commit": null,
+    "commit": "02d4d40d2bf0a8095a652f177103576ebba924ca",
     "tag": "pick-tool-candidate41-public-arm-ramp-plan-v1-20260722",
-    "sha256": null,
+    "sha256": "f817a478aee3e1a2e34bac802d39d3c00f25919d5390c022d9be13b5003ac032",
     "simulator_evidence_at_preregistration": false
   },
   "purpose": "Test one isolated post-latch mechanism against the exact Candidate39 route: replace Candidate40's binary zero-or-full treatment arm authority with a public-state linear ramp while keeping the same stable predicate, the same 15-count clock, the same full-authority action, and same-action hard relock. The goal is to retain Candidate40's reduction in unlatched lift while recovering early coordinated transport and true 20 cm lift.",
@@ -338,6 +338,45 @@
       "all registered estimator and gate boundaries are tested without simulator outcomes",
       "complete runtime-source and runtime-asset authority passes"
     ]
+  },
+  "implementation_seal": {
+    "status": "complete_without_simulator_evidence",
+    "implementation_commit": "22196d04a0696a728654ce8129add1771accd805",
+    "source_sha256": {
+      "scripts/flashsac/candidate41_public_arm_ramp.py": "580e115395f6cb7f335b71bea981b8ee39a21ce8311515e77b14ec3b14102cf7",
+      "scripts/flashsac/candidate41_public_arm_ramp_test.py": "41de8cea070ff24d91ee92dc473ac7ebc1b8a55fad6af5c6669aea635cafb1ad",
+      "scripts/flashsac/candidate41_public_arm_ramp_episode.py": "b90530975a5f23926c28039cd5d7ecfd0fdce86bd8ecd9eb6f74c93d0f7dfb21",
+      "scripts/flashsac/candidate41_public_arm_ramp_episode_test.py": "d5f5c88625621216ae5ea1018d442b2b848fa94b2096f36f1f8b17eeef193c43",
+      "scripts/flashsac/collect_candidate41_public_arm_ramp_ab.py": "617d4f1bbd2a79ce6fe74deb299586dcb36d2dc2119e008d7147aba7bd30a623",
+      "scripts/flashsac/collect_candidate41_public_arm_ramp_ab_test.py": "5e7e435a07fe15a3365b5af8e15dd1225858473ca39433fa2e3e5424fd0ccf84",
+      "scripts/flashsac/analyze_candidate41_public_arm_ramp_validation.py": "3475345ff3cd08958b2529e694d9edbd0c8df0622c26cac90e7765e8c12957a9",
+      "scripts/flashsac/analyze_candidate41_public_arm_ramp_validation_test.py": "122885050db5564935a0b69928d28dbd27f7b6b3b0fd713fc54c90fee431419e"
+    },
+    "simulator_evidence_before_source_seal": false,
+    "simulation_free_tests": {
+      "status": "passed",
+      "passed": 81,
+      "failed": 0,
+      "required_contracts_covered": [
+        "balanced deterministic complementary assignment on seeds 340, 341, and 342",
+        "authority sequence is exactly 0,1/15,...,14/15,1 across sixteen stable actions",
+        "current instability zeros authority and resets the clock on the same action",
+        "control, hand14, SEARCH, fixed residual, inactive rows, and post-retirement CLOSE remain exact",
+        "artifact validators reject altered plans, sources, assignments, clocks, scales, actions, telemetry, and complementary evidence",
+        "all registered estimator and gate boundaries are tested without simulator outcomes",
+        "complete runtime-source and runtime-asset authority passes"
+      ]
+    },
+    "static_audit": {
+      "status": "passed",
+      "blockers": 0,
+      "simulator_invocations": 0,
+      "runtime_assets": 8,
+      "runtime_source_files": 140
+    }
+  },
+  "collection_seal": {
+    "tag": "pick-tool-candidate41-public-arm-ramp-validation-v1-20260722"
   },
   "decision_rule": {
     "if_all_gates_pass": "Seal development evidence and write a separate formal-acceptance plan before touching seeds 343-345.",
