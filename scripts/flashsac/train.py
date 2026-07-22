@@ -2290,6 +2290,16 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         default=None,
         help="Demo-only actor rehearsal weight (default: 1 with any actor demo source).",
     )
+    parser.add_argument(
+        "--demo_bc_only_updates",
+        type=int,
+        default=None,
+        help=(
+            "Replace scheduled SAC actor/temperature steps with exactly this many "
+            "demo-only actor corrections, then keep the actor frozen. Critic and "
+            "target updates continue normally. Requires an actor demo source."
+        ),
+    )
     parser.add_argument("--demo_bc_target_std", type=float, default=0.15)
     parser.add_argument("--demo_bc_std_weight", type=float, default=0.05)
     parser.add_argument("--demo_bc_arm_weight", type=float, default=1.0)
@@ -2481,6 +2491,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--critic_burnin_updates must be non-negative")
     if args.actor_update_period < 1:
         raise ValueError("--actor_update_period must be positive")
+    if args.demo_bc_only_updates is not None and args.demo_bc_only_updates < 1:
+        raise ValueError("--demo_bc_only_updates must be positive")
     if args.actor_lr_scale is not None and (
         not math.isfinite(args.actor_lr_scale) or args.actor_lr_scale <= 0.0
     ):
@@ -2542,6 +2554,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         if args.demo_bc_phases is not None:
             if len(set(args.demo_bc_phases)) != len(args.demo_bc_phases):
                 raise ValueError("--demo_bc_phases must not contain duplicates")
+        if args.demo_bc_only_updates is not None and args.demo_bc_weight == 0.0:
+            raise ValueError(
+                "--demo_bc_only_updates requires a positive --demo_bc_weight"
+            )
     else:
         if args.demo_bc_weight not in (None, 0.0):
             raise ValueError("--demo_bc_weight must be 0 without an actor demo source")
@@ -2549,6 +2565,10 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--demo_bc_phases requires --demo or --actor_demo")
         if args.resume_actor_demo:
             raise ValueError("--resume_actor_demo requires --demo or --actor_demo")
+        if args.demo_bc_only_updates is not None:
+            raise ValueError(
+                "--demo_bc_only_updates requires --demo or --actor_demo"
+            )
     for name in (
         "unlatched_arm_noise_scale",
         "unlatched_hand_noise_scale",
@@ -3971,6 +3991,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     update_metric_counts: dict[str, int] = {}
     actor_update_count = 0
     demo_bc_update_count = 0
+    demo_bc_only_deferred_slots = 0
     instant_strict: dict[str, float] = {}
     run_max_strict: dict[str, float] = {}
     started = time.perf_counter()
@@ -4208,12 +4229,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     weight_denominator=env.num_envs,
                 )
             ):
+                actor_training_enabled = bool(
+                    update_count >= args.critic_burnin_updates
+                    and residual_actor_unlocked
+                )
+                demo_bc_only_mode = args.demo_bc_only_updates is not None
                 update_info = agent.update(
-                    actor_enabled=(
-                        update_count >= args.critic_burnin_updates
-                        and residual_actor_unlocked
-                    ),
+                    actor_enabled=actor_training_enabled,
                     policy_actions_enabled=residual_actor_unlocked,
+                    defer_actor_update=demo_bc_only_mode,
                 )
                 update_count += 1
                 actor_was_updated = (
@@ -4224,6 +4248,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     > 0.5
                 )
                 if actor_was_updated:
+                    if demo_bc_only_mode:
+                        raise RuntimeError(
+                            "demo-BC-only mode unexpectedly ran a SAC actor update"
+                        )
                     actor_update_count += 1
                     if actor_rehearsal is not None and demo_bc_weight > 0.0:
                         rehearsal_batch = actor_rehearsal.sample()
@@ -4236,6 +4264,41 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                                 std_weight=args.demo_bc_std_weight,
                             )
                         )
+                        demo_bc_update_count += 1
+                actor_was_deferred = update_info.get("actor/deferred", 0.0) > 0.5
+                if actor_was_deferred:
+                    if not demo_bc_only_mode:
+                        raise RuntimeError(
+                            "agent deferred an actor update outside demo-BC-only mode"
+                        )
+                    demo_bc_only_deferred_slots += 1
+                    assert args.demo_bc_only_updates is not None
+                    if demo_bc_update_count < args.demo_bc_only_updates:
+                        if actor_rehearsal is None or demo_bc_weight <= 0.0:
+                            raise RuntimeError(
+                                "demo-BC-only actor slot has no rehearsal source"
+                            )
+                        rehearsal_batch = actor_rehearsal.sample()
+                        rehearsal_info = agent.demo_bc_rehearsal(
+                            rehearsal_batch,
+                            weight=demo_bc_weight,
+                            group_weights=demo_bc_group_weights,
+                            target_std=args.demo_bc_target_std,
+                            std_weight=args.demo_bc_std_weight,
+                            advance_scheduler=True,
+                        )
+                        if (
+                            rehearsal_info.get("demo_bc/updated", 0.0) != 1.0
+                            or rehearsal_info.get(
+                                "demo_bc/scheduler_advanced", 0.0
+                            )
+                            != 1.0
+                        ):
+                            raise FloatingPointError(
+                                "demo-BC-only actor correction did not complete "
+                                "one optimizer and scheduler step"
+                            )
+                        update_info.update(rehearsal_info)
                         demo_bc_update_count += 1
                 for name, value in update_info.items():
                     update_sums[name] = update_sums.get(name, 0.0) + _scalar(
@@ -4262,6 +4325,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "environment_steps": interaction_step * env.num_envs,
                     "gradient_updates": update_count,
                     "actor_updates": actor_update_count,
+                    "sac_actor_updates": actor_update_count,
                     "actor_update_period": args.actor_update_period,
                     "actor_lr_scale": actor_lr_scale,
                     "critic_burnin_updates": args.critic_burnin_updates,
@@ -4285,6 +4349,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         else None
                     ),
                     "demo_bc_updates": demo_bc_update_count,
+                    "demo_bc_only_updates_target": args.demo_bc_only_updates,
+                    "demo_bc_only_deferred_slots": demo_bc_only_deferred_slots,
                     "demo_bc_weight": demo_bc_weight,
                     "demo_bc_group_weights": demo_bc_group_weights,
                     "lr_decay_updates": lr_decay_updates,
@@ -4447,6 +4513,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     )
                 atomic_write_json(metrics_path, metrics)
 
+        if (
+            args.demo_bc_only_updates is not None
+            and demo_bc_update_count != args.demo_bc_only_updates
+        ):
+            raise RuntimeError(
+                "demo-BC-only run did not execute its exact preregistered update "
+                f"count: actual={demo_bc_update_count}, "
+                f"expected={args.demo_bc_only_updates}"
+            )
         if (
             online_handoff_enabled
             and search_handoff_checkpoint_path is not None

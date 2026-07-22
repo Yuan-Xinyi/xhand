@@ -1681,19 +1681,28 @@ class FlashSACTorchBridge(FlashSACAgent):
         *,
         actor_enabled: bool = True,
         policy_actions_enabled: bool = True,
+        defer_actor_update: bool = False,
     ) -> dict[str, float]:
         """Run one upstream update, optionally withholding actor/temperature.
 
         A short critic-only burn-in is useful after loading a BC actor around a
         fresh critic.  The replay, reward normalization, critic/target update,
         AMP behavior, schedulers, and global update counter otherwise match the
-        pinned upstream implementation exactly.
+        pinned upstream implementation exactly.  ``defer_actor_update`` keeps
+        the ordinary actor cadence and replay-authority test, but leaves that
+        scheduled optimizer slot unused so a caller can replace it with one
+        explicit demonstration-only correction.
         """
 
-        if not isinstance(actor_enabled, bool) or not isinstance(
-            policy_actions_enabled, bool
+        if (
+            not isinstance(actor_enabled, bool)
+            or not isinstance(policy_actions_enabled, bool)
+            or not isinstance(defer_actor_update, bool)
         ):
-            raise TypeError("actor_enabled and policy_actions_enabled must be bool")
+            raise TypeError(
+                "actor_enabled, policy_actions_enabled, and defer_actor_update "
+                "must be bool"
+            )
         if (
             not policy_actions_enabled
             and self._actor_action_active_observation_index is None
@@ -1719,7 +1728,7 @@ class FlashSACTorchBridge(FlashSACAgent):
                 raise RuntimeError("normalize_reward=True without a reward normalizer")
             batch["reward"] = self.reward_normalizer.normalize_rewards(batch["reward"])
 
-        do_actor_update = bool(
+        actor_update_scheduled = bool(
             actor_enabled
             and policy_actions_enabled
             and self._update_step % self._cfg.actor_update_period == 0
@@ -1737,6 +1746,13 @@ class FlashSACTorchBridge(FlashSACAgent):
                 )
             actor_action_active = torch.zeros_like(actor_action_active)
             actor_next_action_active = torch.zeros_like(actor_next_action_active)
+        actor_has_authority = bool(
+            actor_action_active is None or actor_action_active.any()
+        )
+        actor_update_deferred = bool(
+            defer_actor_update and actor_update_scheduled and actor_has_authority
+        )
+        do_actor_update = bool(actor_update_scheduled and not defer_actor_update)
         next_action_override: torch.Tensor | None = None
         next_action_override_rows: torch.Tensor | None = None
         if self._public_latch_frozen_actor_router is not None:
@@ -1781,6 +1797,11 @@ class FlashSACTorchBridge(FlashSACAgent):
                 next_action_override=next_action_override,
                 next_action_override_rows=next_action_override_rows,
             )
+        raw_info["actor/deferred"] = torch.tensor(
+            float(actor_update_deferred),
+            dtype=batch["action"].dtype,
+            device=self._device,
+        )
         self._update_step += 1
         return {
             key: float(value.detach().item()) if isinstance(value, torch.Tensor) else float(value)
@@ -1797,6 +1818,7 @@ class FlashSACTorchBridge(FlashSACAgent):
         std_weight: float = 0.05,
         atanh_epsilon: float = 1.0e-4,
         gradient_clip: float = 10.0,
+        advance_scheduler: bool = False,
     ) -> dict[str, float]:
         """Apply one explicit demo-only actor correction after a SAC actor step.
 
@@ -1806,6 +1828,8 @@ class FlashSACTorchBridge(FlashSACAgent):
         the same explicit standard-deviation prior used by BC bootstrap.
         """
 
+        if not isinstance(advance_scheduler, bool):
+            raise TypeError("demo BC advance_scheduler must be bool")
         for name, value in {
             "weight": weight,
             "target_std": target_std,
@@ -1888,6 +1912,7 @@ class FlashSACTorchBridge(FlashSACAgent):
                 "demo_bc/grad_norm": 0.0,
                 "demo_bc/grad_overflow": 0.0,
                 "demo_bc/updated": 0.0,
+                "demo_bc/scheduler_advanced": 0.0,
                 "demo_bc/active_action_fraction": 0.0,
             }
             for group in self._noise_groups:
@@ -1983,9 +2008,18 @@ class FlashSACTorchBridge(FlashSACAgent):
                 )
             optimizer.step()
             grad_overflow = False
+        scheduler_advanced = False
+        if advance_scheduler and not grad_overflow:
+            scheduler = self._actor.scheduler
+            if scheduler is None:
+                raise RuntimeError("FlashSAC actor has no LR scheduler")
+            scheduler.step()
+            scheduler_advanced = True
         # The SAC scheduler advances once for the corresponding environment
-        # update.  Rehearsal is a correction within that update, not a second
-        # unit of the global learning-rate schedule.
+        # update.  Ordinary rehearsal is a correction within that update, not
+        # a second unit of the global learning-rate schedule.  A deferred SAC
+        # actor slot has no such step, so its BC-only replacement explicitly
+        # requests ``advance_scheduler=True`` above.
         self._actor.normalize_parameters()
         with torch.no_grad():
             if active_actions is None:
@@ -2014,6 +2048,7 @@ class FlashSACTorchBridge(FlashSACAgent):
             "demo_bc/grad_norm": reported_grad_norm,
             "demo_bc/grad_overflow": float(grad_overflow),
             "demo_bc/updated": float(not grad_overflow),
+            "demo_bc/scheduler_advanced": float(scheduler_advanced),
         }
         if active_actions is not None:
             metrics["demo_bc/active_action_fraction"] = float(

@@ -1616,6 +1616,66 @@ def test_critic_burnin_and_demo_only_actor_rehearsal() -> None:
     )
 
 
+def test_deferred_sac_actor_slot_is_replaced_by_one_bc_scheduler_step() -> None:
+    torch.manual_seed(206)
+    agent = _agent(actor_update_period=1)
+    observation = torch.randn(NUM_ENVS, OBSERVATION_DIM)
+    action = torch.zeros(NUM_ENVS, ACTION_DIM)
+    agent.process_transition(_transition(observation, action))
+    actor_before = _actor_parameters(agent)
+    temperature_before = {
+        key: value.detach().clone()
+        for key, value in agent._temperature.network.state_dict().items()  # noqa: SLF001
+    }
+    scheduler = agent._actor.scheduler  # noqa: SLF001
+    assert scheduler is not None
+    scheduler_epoch_before = scheduler.last_epoch
+
+    deferred = agent.update(actor_enabled=True, defer_actor_update=True)
+
+    assert deferred["actor/deferred"] == 1.0
+    assert "actor/loss" not in deferred
+    assert "temperature/loss" not in deferred
+    for key, expected in actor_before.items():
+        torch.testing.assert_close(
+            agent._actor.network.state_dict()[key],  # noqa: SLF001
+            expected,
+            rtol=0.0,
+            atol=0.0,
+        )
+    for key, expected in temperature_before.items():
+        torch.testing.assert_close(
+            agent._temperature.network.state_dict()[key],  # noqa: SLF001
+            expected,
+            rtol=0.0,
+            atol=0.0,
+        )
+    assert scheduler.last_epoch == scheduler_epoch_before
+
+    with torch.no_grad():
+        mean, _ = agent._actor.apply(  # noqa: SLF001
+            "get_mean_and_std", observations=observation, training=False
+        )
+    demo_action = torch.tanh(mean + 0.2)
+    rehearsal = agent.demo_bc_rehearsal(
+        {"observation": observation, "action": demo_action},
+        advance_scheduler=True,
+    )
+    assert rehearsal["demo_bc/updated"] == 1.0
+    assert rehearsal["demo_bc/scheduler_advanced"] == 1.0
+    assert scheduler.last_epoch == scheduler_epoch_before + 1
+    assert any(
+        not torch.equal(agent._actor.network.state_dict()[key], expected)  # noqa: SLF001
+        for key, expected in actor_before.items()
+    )
+    _expect_error(
+        TypeError,
+        agent.demo_bc_rehearsal,
+        {"observation": observation, "action": demo_action},
+        advance_scheduler=1,
+    )
+
+
 def test_sac_actor_update_uses_frozen_deployment_batch_norm() -> None:
     """SAC must optimize the deployed actor without adapting actor BN buffers."""
 
@@ -2166,6 +2226,8 @@ def main() -> None:
     print("[PASS] fresh rollout boundary resets only trajectory-local state")
     test_critic_burnin_and_demo_only_actor_rehearsal()
     print("[PASS] critic burn-in and demo-only actor rehearsal")
+    test_deferred_sac_actor_slot_is_replaced_by_one_bc_scheduler_step()
+    print("[PASS] deferred SAC actor slot is replaced by one BC scheduler step")
     test_sac_actor_update_uses_frozen_deployment_batch_norm()
     print("[PASS] SAC actor update uses frozen deployment BatchNorm")
     test_demo_rehearsal_optimizes_deployment_path_without_bn_drift()
