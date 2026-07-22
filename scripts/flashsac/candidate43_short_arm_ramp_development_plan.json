@@ -1,0 +1,571 @@
+{
+  "kind": "pick_tool_candidate43_short_public_arm_ramp_development_plan_v1",
+  "status": "preregistered_before_implementation_or_simulator_evidence",
+  "created_local_date": "2026-07-23",
+  "branch": "flashsac-pick-tool-curriculum",
+  "preregistration_parent_commit": "1afc375ab5546a55971e4c545423262b4a2eed32",
+  "preregistration_receipt": {
+    "commit": null,
+    "tag": "pick-tool-candidate43-short-arm-ramp-plan-v1-20260723",
+    "sha256": null,
+    "simulator_evidence_at_preregistration": false
+  },
+  "purpose": "Test one mechanism-only follow-up to sealed Candidate42: shorten the treatment live-stable public arm-authority ramp denominator and stable-count clamp from 15 to 8 so full authority is reached on the ninth consecutive currently-stable action. Candidate39 control, hand14, pre-treatment eligibility, the public stable predicate, same-action hard relock, route, estimator formulas, safety gates, transaction protocol, horizon, frozen weights and zero-update policy remain unchanged.",
+  "development_only": {
+    "is_formal_acceptance": false,
+    "allowed_claim_if_all_gates_pass": "The registered D8 live-stable arm ramp is eligible for a separately preregistered Candidate43 formal A/B screen; it is not yet accepted or deployable.",
+    "allowed_claim_if_any_gate_fails": "Reject Candidate43 on the registered settings, do not run formal seeds 355-357, and diagnose only complete sealed traces and transaction receipts before defining another candidate.",
+    "forbidden_claims": [
+      "formal end-to-end improvement",
+      "generalization outside registered development seeds",
+      "proof that any denominator other than exactly 8 would work",
+      "use of the post-hoc C42 D8 replay or diagnosis as Candidate43 acceptance evidence",
+      "proof that FlashSAC learning has solved the task; Candidate43 performs zero network updates",
+      "production or robot deployment readiness"
+    ],
+    "candidate39_formal_seeds_left_untouched_and_not_repurposed": [
+      331,
+      332,
+      333
+    ],
+    "candidate40_formal_seeds_left_untouched_and_not_repurposed": [
+      337,
+      338,
+      339
+    ],
+    "candidate41_development_and_formal_seeds_not_reused": [
+      341,
+      342,
+      343,
+      344,
+      345
+    ],
+    "candidate42_smoke_and_development_seeds_not_reused": [
+      346,
+      347,
+      348
+    ],
+    "candidate42_formal_seeds_left_untouched_and_not_repurposed": [
+      349,
+      350,
+      351
+    ],
+    "candidate43_reserved_formal_seeds_untouched": [
+      355,
+      356,
+      357
+    ]
+  },
+  "causal_basis": {
+    "candidate42_validation_plan": {
+      "path": "scripts/flashsac/candidate42_transactional_arm_ramp_development_plan.json",
+      "sha256": "242f40d844e6536d8cf030e612a2537e3785ad97a5c9c3d5737ab612e4be60fa",
+      "pristine_preregistration_sha256": "7b9e98d06aae1c992fb4ae7fe9c283f9b746228ab7d012f8cafcd8b3c20d3727",
+      "preregistration_commit": "6e46f567f7730a1ef296fd794ebaf10ea85dde13",
+      "preregistration_tag": "pick-tool-candidate42-transactional-arm-ramp-plan-v1-20260722",
+      "collection_seal_commit": "5587ec7f352526b248d8616a63d9160824551806",
+      "collection_seal_tag": "pick-tool-candidate42-transactional-arm-ramp-validation-v1-20260722"
+    },
+    "candidate42_rejection_result": {
+      "path": "scripts/flashsac/candidate42_transactional_arm_ramp_validation_result.json",
+      "sha256": "8552a12c505d3e404ccfdf5bd8b609fba9c88a3c10a3a024b1979ad9d49154de",
+      "result_commit": "1afc375ab5546a55971e4c545423262b4a2eed32",
+      "result_tag": "pick-tool-candidate42-transactional-arm-ramp-validation-rejected-v1-20260723",
+      "result_tag_object_oid": "516091723b8f44488e22fe64014006fc6dbdcde3",
+      "decision": "reject_candidate42",
+      "formal_seeds_349_351_touched": false
+    },
+    "candidate42_combined_report": {
+      "path": "logs/flashsac/pick_tool/54_c42_txn_public_arm_ramp_development_validation.json",
+      "sha256": "1e353c4e1694fe6d5fab032d3466b5b63b9e17f88ec798197802b7238802b8e9",
+      "deterministic_recompute_exact": true
+    },
+    "registered_candidate42_findings_used_to_motivate_the_hypothesis": {
+      "stable_transport_restricted_mean_delta": -0.206189807610943,
+      "stable_held_5cm_by_action96_delta": -0.13333333333333336,
+      "true_clearance_ge_20cm_delta": -0.09999999999999998,
+      "safe_terminal_utility_delta": 0.15897435897435896,
+      "unlatched_clearance_ge_5cm_delta": -0.18717948717948718,
+      "treatment_full_authority_by_action32_total": 4,
+      "treatment_full_authority_by_action32_per_seed": {
+        "347": 1,
+        "348": 3
+      },
+      "interpretation": "Candidate42 improved the registered anti-fling utility signal but failed stable transport and often did not reach full arm authority early enough. These are sealed C42 outcomes, not Candidate43 outcomes."
+    },
+    "posthoc_d8_hypothesis_generation_only": {
+      "status": "posthoc_not_acceptance_evidence",
+      "immutable_source": "Only the sealed Candidate42 artifacts, plan, result and combined report bound above.",
+      "frozen_history_recalculation_contract": "For each sealed Candidate42 treatment trace row, recompute authority as float32(min(stable_count_before,8))/float32(8.0) when stable_current and exact zero otherwise; equivalently for support only, classify full authority when stable_current and stable_count_before>=8. Count an eligible episode as full-by-action32 only at eligible age 0..31 inclusive. Do not reroute actions, resimulate transitions, recompute outcomes or treat the counterfactual authority as delivered authority.",
+      "d8_frozen_history_full_by_action32": {
+        "total": 12,
+        "per_seed": {
+          "347": 9,
+          "348": 3
+        },
+        "per_run_by_explicit_label": {
+          "347a": 2,
+          "347b": 7,
+          "348a": 1,
+          "348b": 2
+        }
+      },
+      "selection_boundary": "Among shorter integer denominators examined only to generate the next hypothesis, D8 is the closest to D15 that exactly reaches both old support gates: total>=12 and every seed>=3. D7 would yield total=16 with seed counts 11 and 5, but it is not the registered Candidate43 intervention.",
+      "hypothesis": "Changing only the live-stable ramp denominator/clamp from 15 to 8 may expose useful arm authority earlier while preserving the exact same current-stability hard relock and anti-fling route.",
+      "permitted_use": "Select exactly D8 as the one Candidate43 mechanism before fresh-seed evidence.",
+      "forbidden_uses": [
+        "counting any post-hoc D8 replay, recomputation, trace reweighting or diagnostic as a Candidate43 observation",
+        "using post-hoc D8 values to pass an acceptance decision or to select, relax or reinterpret any gate or threshold",
+        "inferring stable transport, terminal utility, success, force, clearance performance or safety margin from frozen-history support counts",
+        "mixing Candidate42 episodes into Candidate43 estimators",
+        "claiming the D8 hypothesis worked before all registered Candidate43 development evidence is sealed"
+      ],
+      "acceptance_evidence": "Only the fresh fixed-order Candidate43 seeds 353 and 354, after the registered smoke and transaction checks, may enter development estimators."
+    }
+  },
+  "immutable_policies_and_payloads": {
+    "v6_checkpoint": "logs/flashsac/pick_tool/16_v6_router_zero_actor_s254/checkpoint_final",
+    "v6_actor_sha256": "d9aacbd48891c192c0d1491514137262b82990fa71440787076403de06606288",
+    "v6_task_contract_sha256": "8a2a135fa1cd5bb01965fc7dc6d6a73978dffc1bf55941ae392146de1d17f61d",
+    "v6_bridge_state_sha256": "78176bb99eb5dac80a2789b231d54db6cf2b86132bc7835a129dd7f5a7df978c",
+    "frozen_lift_actor_sha256": "117f1b0ae3641bd24b6b9f3d585576a79b5aff968139c0dde86e6346f60ebaa0",
+    "frozen_lift_semantic_sha256": "8af0fdbc2572346b7519fbb4b29354fb5bc882a0c0020c8c3ace8376696ab324",
+    "frozen_lift_source_actor_sha256": "7757869eaa1df02f5f52c2dcd1353fb4a486b7512019650a8234d76702b9a1fb",
+    "search_checkpoint": "logs/rl_games/pick_tool_token/0_bootstrap_handoff_20260720/nn/pick_tool_stage7_dagger_full_iter3_bc.pth",
+    "search_checkpoint_sha256": "b91555d8227cf4e87e41ae858d7f8b1ee42ae920a9d829f2f5b1453b529f1f02",
+    "candidate39_fixed_direction_manifest": "scripts/flashsac/candidate39_fixed_direction_manifest.json",
+    "candidate39_fixed_direction_manifest_sha256": "b4140aef4e9aae105028dcfd2ea416ba58d734cc8f3ddb951790e49ca94d8772",
+    "candidate39_fixed_z_payload": "logs/flashsac/pick_tool/50_c39_residual_fixed_z.pt",
+    "candidate39_fixed_z_payload_sha256": "ca60397c7414e9710b3089f64855548b79ce9d92d0687c6eb014a4ae8934a304",
+    "flashsac_fork_commit": "5ecf331fa11cd457dd39018b3d68af571b257666",
+    "network_updates": 0,
+    "reward_or_critic_ranking": "forbidden"
+  },
+  "common_candidate39_route": {
+    "applies_to_control_and_treatment": true,
+    "search": "Exact frozen rl_games SEARCH.",
+    "handoff": {
+      "minimum_public_pregrasp_score": 0.3,
+      "consecutive_frames": 4,
+      "trigger_action_is_close_age_zero": true
+    },
+    "pre_latch_close": "Every slot receives the exact sealed Candidate39 fixed_z hand14 residual during the same 32-action pre-latch window.",
+    "residual_retirement": "The first public latch anywhere in the episode permanently retires Candidate39's residual.",
+    "unlatched_after_retirement": "Exact deterministic V6 CLOSE with arm7 exactly zero and no residual.",
+    "latched_hand": "Exact frozen-LIFT hand14 on every option-active public-latched action in both groups.",
+    "latched_control_arm": "Exact frozen-LIFT arm7 immediately on every option-active public-latched action.",
+    "tactile_shield": "The unchanged environment tactile shield remains final authority over actions and joint targets in both groups."
+  },
+  "assignment": {
+    "contract": "candidate43_short_public_arm_ramp_sha256_rank_exact_balanced_complement_v1",
+    "salt": "pick_tool_candidate43_short_public_arm_ramp_development_20260723_v1",
+    "allowed_run_num_envs": [
+      8,
+      64
+    ],
+    "sha256_message": "salt\\0rank\\0seed\\0env_slot encoded as UTF-8",
+    "ranking": "For each integer env_slot in [0,run_num_envs), compute SHA256 message digest bytes, then sort ascending by the raw 32-byte digest with env_slot as the deterministic integer tie-breaker.",
+    "replicate_a": "For the current run_num_envs, the first run_num_envs/2 ranked slots are D8-ramp treatment and the remainder are exact Candidate39 control; smoke is therefore exactly 4/4 and development exactly 32/32.",
+    "replicate_b": "Bit-exact complement of replicate a without reranking.",
+    "per_run_balance": "exactly run_num_envs/2 treatment and run_num_envs/2 control slots",
+    "per_seed_pairing": "Each stable env_slot is observed once under D8 treatment and once under immediate-arm Candidate39 control across complementary replicates.",
+    "assignment_must_be_built_and_hashed_before_parent_launches_child": true
+  },
+  "execution": {
+    "seed_hygiene_checked_before_preregistration": {
+      "seeds": [
+        349,
+        350,
+        351,
+        352,
+        353,
+        354,
+        355,
+        356,
+        357
+      ],
+      "matching_repository_log_or_script_output_paths_per_seed": 0,
+      "note": "Candidate42 formal seeds 349-351 and Candidate43 smoke/development/formal seeds 352-357 had no matching repository log or script output path before this pristine plan was written."
+    },
+    "non_evidence_smoke": {
+      "seed": 352,
+      "replicate": "b",
+      "num_envs": 8,
+      "output": "logs/flashsac/pick_tool/55_c43_short_arm_ramp_smoke_s352_b/trial",
+      "purpose": "Exercise the exact inherited transaction, source authority, D8 partial/full authority algebra, action reconstruction, trace, reset handling and strict validators before consuming development seeds.",
+      "outcomes_must_not_be_printed_or_change_plan_or_gates": true,
+      "canonical_outputs_are_no_clobber": true,
+      "first_attempt_rule": "The first attempt that durably arms the inherited first-step boundary is authoritative. A boundary-armed failure rejects Candidate43. A receipt-proven pre-boundary failure may retry only with the identical run id, commit, user-visible parent argv, assignment, authority manifests and canonical namespace, using the next monotonically numbered attempt and a new attempt id while permanently retaining all earlier evidence. A verified staged success may resume parent publication without rerunning the simulator."
+    },
+    "development_seeds": [
+      353,
+      354
+    ],
+    "replicates": [
+      "a",
+      "b"
+    ],
+    "num_envs_per_run": 64,
+    "first_episode_only": true,
+    "run_order": [
+      "353a",
+      "353b",
+      "354b",
+      "354a"
+    ],
+    "output_pattern": "logs/flashsac/pick_tool/55_c43_short_arm_ramp_dev_s{seed}_{replicate}/trial",
+    "kit_args": "--/app/extensions/fsWatcherEnabled=false",
+    "isaac_fast_shutdown_expected": true,
+    "exact_permitted_app_launcher_positions": [
+      "seed352 replicate-b num_envs-8 first-episode-only canonical smoke namespace",
+      "seed353 replicate-a num_envs-64 first-episode-only canonical development namespace",
+      "seed353 replicate-b num_envs-64 first-episode-only canonical development namespace",
+      "seed354 replicate-b num_envs-64 first-episode-only canonical development namespace",
+      "seed354 replicate-a num_envs-64 first-episode-only canonical development namespace"
+    ],
+    "development_attempt_rule": "The five sequence positions are smoke352b, dev353a, dev353b, dev354b and dev354a. They are not an unconditional limit of five process launches: a position may have multiple permanently recorded receipt-proven pre-boundary attempts but at most one boundary-armed attempt. The next position is forbidden until the current position has a canonical commit. Post-boundary, semantic, provenance, reset, trace, algebra, terminal-manifest, exit-status or transaction failure rejects Candidate43. Only an inherited-protocol receipt-proven pre-boundary failure may retry with the same run id and next attempt id; a verified staged success may only resume publication.",
+    "interim_analysis_prohibited": "Do not compute or inspect treatment effects, success rates, reward, clearance or gate values until all four fixed-order development canonical commits exist. Smoke stdout and parent summaries may expose only transaction status, counts needed for validation, and cryptographic hashes.",
+    "prohibited_before_development_completion": [
+      "running seeds 355, 356, or 357",
+      "running or repurposing Candidate42 formal seeds 349, 350, or 351",
+      "reusing Candidate39 seeds 331-333, Candidate40 seeds 337-339, Candidate41 seeds 341-345, or Candidate42 seeds 346-348",
+      "launching any simulator seed, replicate, num_envs, episode selection, namespace, diagnostic rollout, or AppLauncher position outside the exact five-position order and registered inherited pre-boundary retry rule",
+      "directly invoking the child without a sealed parent intent, run id, attempt id and inherited lock capability",
+      "changing denominator/clamp 8, clock, stable predicate, hard relock, route, hand14, eligibility, thresholds, estimator, gates, horizon, transaction protocol, run order or frozen weights after smoke or development evidence",
+      "adding leaky evidence, sticky hand, reward changes or any learned update",
+      "selecting, discarding, extending or rerunning episodes based on outcome"
+    ]
+  },
+  "estimands": {
+    "contrast": "D8 live-stable public arm-ramp treatment minus immediate-arm exact Candidate39 control",
+    "eligibility_domain": "First episodes that reach the pre-treatment option-active latch-visible decision.",
+    "known_propensity": 0.5,
+    "seed_weighting": "Equal arithmetic mean of seed-353 and seed-354 Horvitz-Thompson estimates.",
+    "primary": {
+      "name": "conditional_stable_transport_restricted_mean_delta",
+      "definition": "Reuse Candidate42 exactly: over eligible ages 0..127, take the 15-action rolling minimum of I(public valid grasp and <=30N)*clip(true clearance/0.20,0,1), with registered success/failure suffix semantics.",
+      "estimand_role": "Primary noninferiority endpoint; the 15-action rolling window is unchanged and is unrelated to the D8 arm-ramp denominator.",
+      "estimator": "Within each seed, Horvitz-Thompson treatment minus control on pre-treatment eligibility with propensity 0.5, then equal-weight seeds.",
+      "registered_floor": -0.08,
+      "registered_per_seed_floor": -0.15
+    },
+    "secondary_terminal_utility": {
+      "name": "conditional_safe_terminal_utility_delta",
+      "episode_outcome": "strict_success minus ever_unlatched_true_clearance_ge_5cm",
+      "reason": "Retained with the exact C42 estimator and all three exact C42 acceptance comparisons. It is labeled secondary, but remains all-must-pass and cannot override any primary, noninferiority, safety, support or audit failure.",
+      "estimator": "Within each seed, Horvitz-Thompson treatment minus control on pre-treatment eligibility with propensity 0.5, then equal-weight seeds.",
+      "acceptance_role": "secondary_but_all_must_pass"
+    },
+    "secondary": [
+      "conditional safe terminal utility delta",
+      "conditional strict success delta",
+      "conditional true clearance >=20 cm delta",
+      "conditional stable held 5 cm by action 96 delta",
+      "conditional ever-grasped delta",
+      "conditional unlatched true-clearance >=5 cm delta",
+      "authority onset, partial-authority exposure, full-authority latency, relock, and re-ramp counts",
+      "treatment drop, unsafe force, and unlatched-lift counts"
+    ],
+    "paired_common_eligibility_sensitivity": "Same seed/env_slot eligible in both complementary replicates; diagnostic except for the explicitly registered paired U5 gate."
+  },
+  "truth_and_estimator_contract": {
+    "binding": "Reuse Candidate42's reset-before terminal and transition truth definitions, success/failure suffix semantics, public-latch reconstruction, 128-action utility implementation, Horvitz-Thompson formulas and paired-common sensitivity exactly; Candidate43 may change only the treatment D15 clock to D8 and add corresponding authority telemetry labels.",
+    "strict_success": "The authoritative task strict-success terminal flag from the first episode, reconstructed before auto-reset and requiring the task's held true-mesh 20 cm success condition.",
+    "unlatched_clearance_ge_5cm": "True iff any authoritative pre-reset transition in the first episode has true mesh clearance >=0.05 m while the transition public latch is false; this is evaluator-only and never routes actions.",
+    "ever_true_clearance_ge_20cm": "True iff any authoritative pre-reset transition in the first episode has true mesh clearance >=0.20 m.",
+    "ever_grasped": "Exact Candidate40 first-episode authoritative physical-grasp aggregate, derived from the task's reset-before grasp telemetry without changing its thresholds.",
+    "drop_and_unsafe_force": "Exact authoritative first-episode task terminal labels and force counters used by Candidate42; no Candidate43-specific threshold or relabeling is permitted.",
+    "eligible_opportunity": "One stable env_slot first episode that reaches the exact Candidate42 pre-action option-active latch-visible eligibility row before any Candidate43-dependent action.",
+    "eligibility_support_aggregation": {
+      "across_validation": "Sum eligible opportunities across all four fixed-order development runs.",
+      "per_seed": "Sum both complementary replicates within one seed.",
+      "per_seed_arm": "Within one seed, count treatment-eligible and control-eligible opportunities separately; the registered minimum applies to each assignment."
+    },
+    "horvitz_thompson": "For each seed and outcome y, compute mean over all eligible-domain opportunities of treatment*y/0.5 minus control*y/0.5, then take the equal arithmetic mean of the two seed estimates.",
+    "paired_common_u5": "Pool all same-seed same-env_slot opportunities eligible in both complementary replicates; for each pair identify treatment and control from the sealed complementary assignment and report the unweighted arithmetic mean of treatment_U5 minus control_U5 across pooled pairs.",
+    "action_age_boundaries": {
+      "positive_authority_by_action16": "At least one treatment authority_scale>0 on eligible ages 0..15 inclusive.",
+      "full_authority_by_action32": "At least one treatment authority_scale==1 on eligible ages 0..31 inclusive.",
+      "stable_held_5cm_by_action96": "Inspect eligible ages 0..95 inclusive using the Candidate40 15-transition rolling minimum.",
+      "partial_authority_row": "A treatment-eligible trace row with 0<authority_scale<1; the registered across-validation count is the sum of such rows over all four fixed-order development artifacts."
+    }
+  },
+  "development_validation_gates": {
+    "all_must_pass": true,
+    "primary_conditional_stable_transport_restricted_mean_delta_floor": -0.08,
+    "per_seed_primary_stable_transport_delta_floor": -0.15,
+    "secondary_conditional_safe_terminal_utility_delta_min_exclusive": 0.1,
+    "positive_secondary_terminal_utility_delta_seeds_min": 1,
+    "per_seed_secondary_terminal_utility_delta_floor": -0.05,
+    "conditional_unlatched_clearance_ge_5cm_delta_max": -0.08,
+    "paired_common_eligibility_unlatched_clearance_ge_5cm_delta_max": -0.08,
+    "conditional_success_delta_floor": -0.03,
+    "conditional_true_clearance_ge_20cm_delta_floor": -0.03,
+    "conditional_stable_held_5cm_by_action96_delta_floor": -0.05,
+    "conditional_ever_grasped_delta_floor": -0.03,
+    "eligible_opportunity_slots_min_across_validation": 32,
+    "eligible_opportunity_slots_min_per_seed": 12,
+    "eligible_opportunity_slots_min_per_seed_arm": 8,
+    "paired_common_eligible_slots_min_across_validation": 16,
+    "paired_common_eligible_slots_min_per_seed": 6,
+    "treatment_eligible_positive_authority_by_action16_min_across_validation": 16,
+    "treatment_eligible_positive_authority_by_action16_min_per_seed": 4,
+    "treatment_eligible_full_authority_by_action32_min_across_validation": 12,
+    "treatment_eligible_full_authority_by_action32_min_per_seed": 3,
+    "treatment_partial_authority_rows_min_across_validation": 32,
+    "treatment_eligible_unlatched_clearance_ge_5cm_max": 3,
+    "pooled_option_active_pre_eligible_unlatched_clearance_ge_5cm_max": 0,
+    "treatment_eligible_dropped_max": 0,
+    "treatment_eligible_unsafe_force_max": 0,
+    "fixed_residual_component_and_l2_budget_violations": 0,
+    "any_new_abs_action_ge_0999": false,
+    "pre_eligibility_action_and_state_machine_parity_exact": true,
+    "hand14_invariance_exact": true,
+    "short_linear_authority_clock_and_action_algebra_exact": true,
+    "control_candidate39_route_exact": true,
+    "checkpoint_manifest_assignment_and_source_identity_exact": true
+  },
+  "artifact_and_analysis_requirements": {
+    "weights_only_artifact": true,
+    "reset_before_terminal_telemetry": true,
+    "episode_fields": [
+      "stable env_slot, treatment, assignment rank, seed, and replicate",
+      "trigger, first latch, first eligibility, first positive authority, first full authority, first relock, first reramp, terminal, and intervention clocks",
+      "eligible, strict success, true20, stable5, U5, drop, unsafe-force, timeout, and maximum true clearance",
+      "maximum stable count, authority sum, partial-authority row count, full-authority row count, relock count, and online algebra violations"
+    ],
+    "pre_eligibility_trace_scope": "Record every option-active pre-eligibility action. If a trigger occurs, record exactly one trigger witness; if a first public latch occurs, record exactly one first-latch witness even when it occurs on SEARCH, and every eligible episode must therefore have exactly one first-latch witness. Retain observation, common/requested/task actions, transition observation/truth, reset status, and state-machine clocks needed to independently reconstruct the first treatment-dependent row.",
+    "post_eligibility_trace_scope": "Record every row from first eligibility through the authoritative terminal or timeout with contiguous eligible ages and no post-reset rows.",
+    "step_fields_from_first_eligible_through_terminal": [
+      "obs115, public force-counter sidecar, option/latch/stable state, stable_count_before/after, and authority_scale",
+      "exact common action, requested ramp action, and shielded task action",
+      "arm target error and velocity",
+      "transition latch, physical grasp, quality, force, object speed, and true mesh clearance"
+    ],
+    "strict_checks": [
+      "assignments are exact balanced complements under the Candidate43 salt",
+      "all pre-eligibility actions and state-machine history are assignment invariant and eligibility is exact to Candidate42",
+      "treatment hand14 and all control actions are bit-exact to Candidate39",
+      "treatment arm7 equals elementwise float32((float32 stable_count_before)/(float32 8.0))*common float32 arm7 exactly on stable rows and zeros exactly otherwise, all on the action device",
+      "full authority occurs no earlier than the ninth consecutive stable action; denominator/clamp 8 is the only scientific change from Candidate42",
+      "the current public stable predicate and same-action hard relock are bit-exact to Candidate42",
+      "all reset, action reconstruction, source, task, checkpoint, payload, plan and runtime-asset receipts match",
+      "the inherited parent import graph excludes Isaac/AppLauncher and every child write is proven by the stage-only capability to resolve below the sealed attempt directory, with injected canonical targets rejected",
+      "the inherited first-step marker is durably committed before the unique first env.step call",
+      "the exact Candidate42 intent, staged terminal, close, child-exit, verified and canonical-commit receipt protocol is unchanged"
+    ],
+    "authoritative_reset_contract": "Every supervisor call requires the prior transition's authoritative reset mask. Activation, stable count, prior authority, and ever-authority memory are cleared before the next episode's first action; artifacts must prove no cross-episode leakage and terminal telemetry must be captured before auto-reset.",
+    "publish_rule": "Use the exact Candidate42 parent/child transaction protocol without modification. Child stages and validates only attempt evidence before close. The non-Isaac parent publishes a canonical run only after normal child exit and independent post-exit validation. Publish the combined development report only after all four fixed-order canonical transaction commits validate jointly.",
+    "fail_closed": true,
+    "canonical_commit_required": "Canonical <output_stem>.pt and <output_stem>.json are evidence only when canonical <output_stem>.commit.json exists, is a hardlink of the registered successful attempt-local 60_committed.json, binds both hashes, and that successful attempt has no 70 failure receipt or terminal conflict. Every lower-numbered attempt in the same namespace must have a repaired samefile canonical failure receipt with boundary_armed=false and retry_permitted=true; any lower non-retryable failure, missing attempt number, or higher-numbered attempt rejects. Analyzers never accept 60 alone or a slash-separated alternative path."
+  },
+  "implementation_seal_requirements": {
+    "simulator_evidence_before_source_seal": false,
+    "parent_child_collector_and_analyzer_must_be_committed_before_seed_352": true,
+    "collection_commit_must_descend_from": "1afc375ab5546a55971e4c545423262b4a2eed32",
+    "final_plan_allowed_mutations": [
+      "fill preregistration receipt commit and SHA",
+      "add implementation_seal",
+      "add collection_seal"
+    ],
+    "required_source_roles": [
+      "C43 D8 supervisor changing only Candidate42 ramp denominator/clamp 15 to 8",
+      "C43 assignment wrapper, artifact contract and corruption tests preserving C42 hand14, eligibility, stable predicate and hard relock",
+      "exact reuse of the C42 pure CPU/stdlib attempt transaction implementation and its fault-injection contract",
+      "C43 collection kernel normalized to C42 with only campaign bindings and the registered D8 supervisor difference",
+      "non-Isaac parent collector and AppLauncher child preserving the exact C42 capability boundary",
+      "C43 analyzer preserving estimator formulas and all 32 C42 numerical/comparison gate boundaries while labeling stable transport primary and terminal utility secondary but all-must-pass",
+      "C43 scientific artifact metadata and 31_report_core kinds may be campaign-specific, while inherited transaction 55_final_report and the canonical final envelope must retain exact C42 FINAL_REPORT_KIND pick_tool_candidate42_transactional_public_arm_ramp_final_report_v1"
+    ],
+    "transaction_protocol_equivalence": "The Candidate43 transaction_protocol object must canonical-hash exactly to the sealed Candidate42 transaction_protocol object. Reuse or exact aliasing is required; changing marker schemas, hash chain, retry classification, lock lifetime, staged/canonical paths, fsync, no-clobber, publication or recovery semantics is forbidden.",
+    "transaction_envelope_kind_inheritance": "Artifact metadata and 31_report_core may identify Candidate43, but 55_final_report.json and the canonical final report envelope must use exact inherited C42 FINAL_REPORT_KIND=pick_tool_candidate42_transactional_public_arm_ramp_final_report_v1. Renaming this transport envelope is a transaction-protocol change and is forbidden.",
+    "rollout_kernel_equivalence": "After normalizing Candidate42/Candidate43 campaign imports, registered paths, strings and the supervisor call symbol, Candidate43 run_collection AST must equal Candidate42. The only scientific tensor difference is the separately tested D8 supervisor. Transaction staging, route, truth, estimator inputs and manifests remain unchanged.",
+    "collector_metadata_must_bind": [
+      "this plan path, pristine preregistration SHA and final sealed SHA",
+      "the exact C42 plan/result/report hashes and result tag/commit registered in causal_basis",
+      "exact implementation and collection commits and complete runtime source hashes",
+      "all immutable policy/runtime asset hashes, assignment identity and the inherited transaction protocol hash",
+      "scientific artifact metadata and report-core kinds may identify Candidate43 and bind only plan, sources, policies, assignment and pre-close authority; they do not contain future transaction receipts",
+      "55_final_report and the canonical final report envelope retain exact inherited C42 FINAL_REPORT_KIND pick_tool_candidate42_transactional_public_arm_ramp_final_report_v1",
+      "the unchanged transaction chain binds run/attempt identity, first-step, payload/report, close request, child exit, post-exit report, verification and canonical commit in temporal order"
+    ],
+    "pre_child_fail_closed_authority": [
+      "HEAD equals the separately sealed Candidate43 collection commit on the attached flashsac-pick-tool-curriculum branch",
+      "superproject worktree and every submodule are clean and at registered commits",
+      "the Candidate43 pristine preregistration tag is an ancestor and the D8 intervention, inherited transaction, gates, seeds and run order are unchanged",
+      "the sealed Candidate42 result tag resolves exactly to commit 1afc375ab5546a55971e4c545423262b4a2eed32 and every registered C42 input hash still matches",
+      "complete transitive parent, child, collection, task, inherited C42 and FlashSAC runtime source closure is fingerprinted",
+      "Git-LFS objects and generated USD/runtime assets are bound by oid, size and content hashes",
+      "all eight inherited runtime assets are checked before child spawn, during collection, before child close and by the parent after child exit"
+    ],
+    "required_simulation_free_tests": [
+      "balanced deterministic complementary assignment on seeds 352, 353 and 354",
+      "C43 state, hand14, eligibility, stable predicate, hard relock and control outputs are bit-exact to C42/Candidate39 where registered",
+      "authority sequence is exactly 0,1/8,...,7/8,1 and current instability hard-relocks on the same action",
+      "D8 denominator and clamp are the only scientific tensor/control-flow change from C42",
+      "normalized C43 collection kernel AST equals C42 outside the registered supervisor and campaign bindings",
+      "the canonical transaction_protocol object hash equals sealed C42 exactly",
+      "all inherited C42 fast-exit, lock, hash-chain, retry, corruption, symlink, drift, partial-publication and no-clobber fault tests pass",
+      "artifact validators reject altered plans, assignments, clocks, scales, actions, telemetry, traces and complementary evidence",
+      "the unchanged Horvitz-Thompson estimators, 15-action transport definition, safety/support/audit gates and all 32 acceptance boundaries execute without simulator outcomes",
+      "complete runtime-source/runtime-asset authority and exact five-position order with registered pre-boundary retries pass"
+    ]
+  },
+  "decision_rule": {
+    "if_all_gates_pass": "Seal all development transaction evidence and write a separate formal-acceptance plan before touching seeds 355-357.",
+    "if_any_gate_fails": "Reject Candidate43 on the registered settings and leave seeds 355-357 untouched. Any scientific or transaction change is a new candidate.",
+    "candidate42_formal_seeds_forbidden": [
+      349,
+      350,
+      351
+    ],
+    "formal_seeds": [
+      355,
+      356,
+      357
+    ],
+    "formal_status": "reserved and untouched",
+    "scientific_gate_count": 32,
+    "all_scientific_gates_must_pass": true,
+    "primary_endpoint": "conditional_stable_transport_restricted_mean_delta",
+    "secondary_terminal_utility_remains_all_must_pass": true,
+    "transaction_validation_is_a_prerequisite_and_cannot_override_a_scientific_failure": true
+  },
+  "scientific_contract_inheritance": {
+    "source_candidate": "Candidate42",
+    "source_plan_path": "scripts/flashsac/candidate42_transactional_arm_ramp_development_plan.json",
+    "source_plan_sha256": "242f40d844e6536d8cf030e612a2537e3785ad97a5c9c3d5737ab612e4be60fa",
+    "canonical_section_hash": "SHA256((json.dumps(section,sort_keys=True,separators=(',',':'))+'\\n').encode('utf-8'))",
+    "source_section_sha256": {
+      "immutable_policies_and_payloads": "2ab74509901fff758d38ab474ee6d62c5b19d64719d215ffcf990cc7cec2fed7",
+      "common_candidate39_route": "3d5d43bea745676c3c62d354d696d32af5009dc65517f1dd09e1f7b7e7f4f17b",
+      "candidate42_intervention_contract": "358a6177fdae453a5882a95fccc4c946c318845f69beaaf553018dbe07a250b6",
+      "estimands": "cf6d4459e4cec94919295965feb22082f3b63e22312e8a02e3c7f65e838e9966",
+      "truth_and_estimator_contract": "f1184e58043619294c9e953ab9585c2ce2c377332b21fa39cdf688d860806863",
+      "development_validation_gates": "9382d341d7c0084b6d0d4194122547d8e89fdac47efb6f9a1e50fed36a6190bc",
+      "transaction_protocol": "8b6a3fca3ab44eb24e8e5ce8ad648ac5fe9742b585a6c5d2cbda97f6eddb54a4"
+    },
+    "required_exact_objects": [
+      "immutable_policies_and_payloads",
+      "common_candidate39_route",
+      "transaction_protocol"
+    ],
+    "exact_semantics_after_registered_label_normalization": [
+      "Candidate39 route and control arm7",
+      "hand14 for both assignments",
+      "pre-treatment eligibility and known propensity 0.5",
+      "public stable predicate and same-action hard relock",
+      "reset-before truth, suffix semantics, Horvitz-Thompson formulas and 15-action stable-transport outcome",
+      "all 32 C42 numerical and Boolean gate comparisons, including secondary terminal utility pooled>0.10, at least one positive seed, per-seed>=-0.05, plus stable transport, stable held 5 cm, true 20 cm, success, U5 safety, force/drop, support, action algebra and full-by-action32 total>=12 and per-seed>=3",
+      "128-action horizon, frozen assets, zero network updates and transaction protocol"
+    ],
+    "only_scientific_numeric_substitution": "In treatment authority only: stable-count clamp 15 -> 8 and float32 denominator 15.0 -> 8.0; full authority moves from the sixteenth to the ninth consecutive currently-stable action.",
+    "registered_non_scientific_substitutions": [
+      "Candidate42 -> Candidate43 campaign labels, scientific artifact metadata kinds and report-core kinds only; inherited 55/canonical final envelope kind remains exact C42 FINAL_REPORT_KIND pick_tool_candidate42_transactional_public_arm_ramp_final_report_v1",
+      "seed labels 347/348 -> 353/354 and fixed fresh run order",
+      "new balanced-complement assignment salt and output namespaces",
+      "estimand hierarchy labels stable transport primary and terminal utility secondary; terminal utility remains all-must-pass and every gate value/comparison and estimator formula remains unchanged"
+    ],
+    "any_other_numeric_or_algorithmic_substitution_permitted": false,
+    "network_updates": 0
+  },
+  "transaction_protocol": {
+    "contract": "candidate42_parent_child_fsync_no_clobber_commit_v1",
+    "attempt_directory": "<output_stem>.c42_txn/attempt_<three_digit_attempt>/, where output_stem is the registered path before the .pt/.json/.commit.json suffixes",
+    "exclusive_parent_lock": "The exact lock path is <output_stem>.c42_txn/namespace.lock, outside every attempt directory but inside the registered output namespace. Before inspecting or creating an attempt, the parent opens this registered regular non-symlink lock and holds an exclusive flock through child wait, validation and commit. It passes a duplicate of the same locked file descriptor to the child with pass_fds, and the child retains it until process exit. If the parent dies while the child runs, the child therefore preserves liveness exclusion; a recovery parent may classify or recover the attempt only after acquiring the lock. A second parent may wait or inspect after lock acquisition but may never allocate another attempt while the prior attempt is live or unclassified.",
+    "deterministic_run_id": "SHA256 of strict canonical JSON containing collection commit, the user-visible parent argv receipt, assignment hash, checkpoint/source/runtime-asset manifests, canonical paths, seed, replicate and run_num_envs. It excludes all derived child argv, attempt directories and attempt ids, remains identical across an allowed pre-boundary retry, and prevents self-reference.",
+    "deterministic_attempt_id": "SHA256 of strict canonical JSON plus a trailing newline for {attempt_number:<monotonically increasing integer>,run_id:<deterministic run id>}; it is unique for each permanent attempt directory and has no ambiguous string concatenation.",
+    "parent_import_rule": "The parent may import stdlib, torch and CPU artifact validators but must never import isaacsim, omni, pxr, isaaclab.app, AppLauncher, or the child module.",
+    "child_rule": "The child is the only AppLauncher owner, must validate the sealed parent intent, run id, attempt id and inherited lock capability. Immediately after validating the inherited locked descriptor it sets FD_CLOEXEC while retaining the descriptor itself until child exit, preventing Kit or other exec descendants from leaking the namespace lock. It must not import the parent canonical publisher or contain canonical path constants. Every child write API receives a stage-only capability whose resolved targets must remain below the sealed attempt directory and reject symlinks, traversal and injected canonical paths.",
+    "durable_write_primitive": "Write a same-directory temporary regular file with O_CREAT|O_EXCL, flush and fsync it, hard-link it no-clobber to the registered final marker name, fsync the directory, and retain both evidence and hashes; reject symlinks and non-regular files.",
+    "files": {
+      "00_intent.json": "parent PREPARED intent before spawn",
+      "05_parent_pre_spawn_failed.json": "optional parent receipt only for a caught failure after intent but before Popen/child creation succeeds, when no child PID exists and no inherited lock descriptor was transferred; boundary false and retry may be permitted",
+      "10_child_started.json": "child identity and intent acknowledgement",
+      "15_app_started.json": "child AppLauncher ownership receipt recording and asserting effective simulation_app.config.fast_shutdown is exactly true",
+      "18_child_preboundary_failed.json": "child terminal for a caught failure before first-step arming; valid only when 20 and all staged files are absent",
+      "19_close_requested_preboundary.json": "optional child pre-boundary cleanup marker written after 18 and before close when an app exists",
+      "20_first_step_armed.json": "durable conservative boundary written immediately before the only first env.step call",
+      "30_payload.pt": "validated staged CPU weights-only artifact",
+      "31_report_core.json": "validated staged report core without post-exit claims",
+      "32_prepared.json": "staged-success terminal manifest binding intent, boundary, payload/report hashes, sizes and authority manifests; mutually exclusive with a pre-staging 45_child_failed",
+      "40_close_requested.json": "success-only child marker with reason success binding 32_prepared, written immediately before SimulationApp.close",
+      "45_child_failed.json": "post-boundary child failure terminal written only while 32_prepared is absent",
+      "46_close_requested_failure.json": "post-boundary failure cleanup marker binding 45, or recording an error after 32 as an explicit success/failure conflict that parent must reject",
+      "50_child_exit.json": "parent waitpid status plus separately fsynced stdout.log, stderr.log and marker hashes",
+      "55_final_report.json": "parent report binding post-exit validation and canonical artifact hash/path",
+      "56_verified.json": "parent verification commit authorizing canonical publication",
+      "60_committed.json": "attempt-local immutable commit manifest written after both canonical artifact hardlinks validate and then hard-linked as canonical trial.commit.json; it is successful only after that canonical hardlink and directory fsync validate and no 70 or terminal conflict exists",
+      "70_parent_failed.json": "parent failure terminal binding boundary classification, nullable raw wait status, observed marker hashes, authority failure and retry_permitted. It is normally exclusive with 60, but may coexist with and bind an orphan/incomplete 60 or partial canonical publication when commit-link creation, validation or durability fails; any such coexistence is a terminal conflict, never success. It is hard-linked as canonical trial.failed_attempt_<attempt>.json",
+      "stdout.log": "child stdout written directly to a regular stage file, never an unbounded pipe",
+      "stderr.log": "child stderr written directly to a regular stage file, never an unbounded pipe",
+      "canonical_trial.commit.json": "exact canonical path <output_stem>.commit.json, a hardlink of attempt-local 60_committed.json and the only commit point accepted by analyzers",
+      "canonical_trial.failed_attempt.json": "exact canonical path <output_stem>.failed_attempt_<three_digit_attempt>.json, a hardlink of attempt-local 70_parent_failed.json"
+    },
+    "boundary_semantics": "authoritative_env_step creates and fully fsyncs 20_first_step_armed.json only when progress.first_env_step_invoked is false, then sets that flag true and enters the first env.step; later steps do not write the marker again. Marker existence or corruption is conservatively post-boundary and never retryable. A caught 05 or 18 failure, or an abrupt pre-boundary child/parent death before either receipt, may permit retry only when 20 and every later child/staged/canonical-success object (30, 31, 32, 40, 45, 46, 55, 56, 60 and the canonical artifact pair/commit) are absolutely absent. For 05, Popen must never have succeeded and no child PID or inherited lock holder may exist. For a spawn-successful abrupt failure, the original parent must have waited for child exit, or a recovery parent must have acquired namespace.lock after the child-held duplicate was released; 50 then records the available raw wait status or null recovery status, logs and observed 10/15 markers, and 70 records boundary_armed=false and retry_permitted=true. Caught 18 may additionally have 19; all retryable branches may have parent-written 50/70. Any other child/staged evidence is non-retryable.",
+    "attempt_sequence_validation": "Attempt directories are a gap-free sequence starting at 001. Before allocating or accepting attempt N, the lock-holding parent and analyzer validate every lower attempt: its attempt-local 70 and canonical failure receipt are samefile/hash-identical, boundary_armed is false, retry_permitted is true, and no staged or canonical-success evidence belonging to or cryptographically bound to that lower attempt exists. Namespace-global canonical artifacts belonging to the final higher attempt are not attributed to a lower attempt. A lower non-retryable or conflicting attempt rejects the candidate. A successful or publication-recovery attempt must be the highest and final attempt; any higher-numbered attempt, gap or unclassified prior attempt rejects.",
+    "child_success_order": [
+      "intent validation",
+      "child/app markers",
+      "first-step marker",
+      "rollout and in-process validators",
+      "payload and report core",
+      "32_prepared.json",
+      "40_close_requested.json",
+      "SimulationApp.close"
+    ],
+    "child_failure_order": [
+      "before boundary: capture Python error, write 18_child_preboundary_failed.json, optionally write 19_close_requested_preboundary.json, then close",
+      "after boundary and before prepared: capture Python error, write 45_child_failed.json, write 46_close_requested_failure.json, then close",
+      "after prepared: write 46_close_requested_failure.json without 45, producing an explicit conflict with 32 that parent rejects, then close"
+    ],
+    "parent_success_requirements": [
+      "waitpid reports WIFEXITED and exact exit code zero with no signal",
+      "started, app-started, first-step, prepared and success close-requested markers form one valid hash chain and every failure marker is absent",
+      "staged hashes, sizes, schemas, assignment, trace, action algebra, plan, checkpoints, sources and runtime assets validate independently after child exit",
+      "Git commit, branch, tags, clean worktree, submodules and all post-exit authority exactly match the intent"
+    ],
+    "hash_chain": "Every arrow A <- B means the later receipt B contains the SHA-256 of predecessor A; an earlier object never predicts or binds a future receipt. Success is 00 <- 10 <- 15 <- 20 <- 32 <- 40 <- 50 <- 55 <- 56 <- 60, with 32 also binding 30/31 and 50 binding separately fsynced logs plus raw wait status. A caught parent pre-spawn failure is 00 <- 05 <- 70. A caught child pre-boundary failure is 00 <- 10 [<- 15] <- 18 [<- 19] <- 50 <- 70. An abrupt pre-boundary failure uses the longest observed 00 <- [10] <- [15] tip, then 50 <- 70; 50 binds the observed tip, logs, and raw wait status or the lock-release recovery proof. A post-boundary failure first has 00 <- 10 <- 15 <- 20; any 45/46 and 50 extend the applicable observed tip, and 70 binds every terminal observed tip as a failure DAG when evidence is missing or conflicting. A publication failure extends 56 with any observed canonical pair/60 state and then 70 binds every observed tip.",
+    "canonical_publish": "After 56_verified.json, the parent hard-links the exact 30_payload.pt and 55_final_report.json in order to canonical trial.pt and trial.json with no-clobber semantics, fsyncs and validates both, writes attempt-local 60_committed.json, then hard-links that exact inode as canonical <output_stem>.commit.json and fsyncs the canonical directory. The canonical commit hardlink is the sole visible commit point accepted by analyzers; canonical pair presence without it is never complete evidence.",
+    "partial_publish_recovery": "A later lock-holding parent may fill only missing canonical hardlinks from the same immutable verified attempt, and only when that verified attempt has no valid attempt-local or canonical 70 failure receipt; lower-numbered attempts may contain only the fully repaired retryable pre-boundary 70 receipts required by attempt_sequence_validation. Every existing canonical path must be a regular non-symlink file, samefile with its registered staged source, and match its hash. If both pair links exist but 60 does not, recovery may revalidate the same 56 and pair, create 60 no-clobber, and link it as canonical commit. If 60 exists but canonical commit is missing, it may link it; after linking it must fsync and validate the directory before success. Recovery may never launch another child. Foreign, changed or symlink paths produce 70 and reject the candidate. If attempt-local 70 exists but its canonical failure hardlink is missing, the next lock holder must first validate 70 and create only that failure hardlink; an existing link must be samefile and hash-identical, a foreign collision rejects, and no next attempt or partial-success recovery is permitted before this repair. Once repaired, retry is allowed only when that exact 70 says retry_permitted=true; otherwise the candidate is sealed rejected.",
+    "failure_classification": "Any marker conflict, missing post-boundary evidence, staged corruption, nonzero or signaled exit, post-exit authority drift, validator failure, or canonical collision produces attempt-local 70_parent_failed.json and its canonical failure-receipt hardlink. The receipt records boundary_armed and retry_permitted plus every observed predecessor hash. A normal success has 60 plus its fully durable canonical commit and no 70. A 70 may coexist with an orphan/incomplete 60, partial canonical artifact pair, or a canonical commit whose creation/validation/directory-fsync failed; it binds all such evidence and makes the attempt a terminal conflict. An analyzer must reject the same run/attempt if it observes 70 or any success/failure terminal conflict even when canonical commit exists. Boundary armed means Candidate42 rejection; only the exact registered caught or abrupt pre-boundary cases may set retry_permitted true.",
+    "attempt_evidence_retention": "All attempt directories, markers, staged payloads, logs, exit receipts and failure receipts are permanent and no-clobber."
+  },
+  "candidate43_intervention_contract": {
+    "name": "public_short_linear_arm_authority_ramp_d8_v1",
+    "source_candidate": "Candidate42",
+    "only_scientific_difference_from_candidate42": "Change live-stable treatment stable-count clamp from 15 to 8 and its float32 authority denominator from 15.0 to 8.0.",
+    "only_randomized_difference_from_control": "On treatment slots only and only after first option-active latch-visible eligibility, multiply the exact Candidate39 common arm7 by the deterministic D8 public authority scale. Never change hand14 or SEARCH routing.",
+    "public_observation_contract": "pick_tool_markov115_v1",
+    "public_force_counter_contract": "pick_tool_public_gate_state_v1",
+    "stable_current": "Bit-exact Candidate42 predicate: option_active and obs[106]==1 and min(obs[103],obs[104])>=0.35 and obs[104]>=0.50 and max(obs[97:102])<=0.9999877214431763 and both public force-counter progress values equal zero.",
+    "clock_state_machine": {
+      "stable_count_before": "Prior row's stable_count_after, initialized to zero and clamped to [0,8].",
+      "stable_count_after": "min(8, stable_count_before+1) if stable_current, otherwise zero; all other clock semantics are bit-exact to Candidate42.",
+      "authority_scale": "When stable_current, convert stable_count_before to float32 on the action device and divide by a float32 8.0 scalar using PyTorch float32 semantics; otherwise return an exact float32 zero.",
+      "treatment_arm7": "Elementwise float32 multiplication of authority_scale into the exact float32 Candidate39 common arm7 on the same device, with no cast through float64.",
+      "control_arm7": "Exact Candidate39 common arm7 with implicit authority one on every row.",
+      "hand14": "Exact Candidate39 common hand14 for both assignments on every row."
+    },
+    "clock_examples": [
+      "The first consecutive stable action has count_before=0 and authority=0.",
+      "The second consecutive stable action has count_before=1 and authority=1/8.",
+      "The eighth consecutive stable action has count_before=7 and authority=7/8.",
+      "The ninth and later consecutive stable actions have count_before=8 and authority=1.",
+      "Any current stability failure sets authority to zero on that same action and resets count_after to zero, bit-exactly preserving Candidate42 hard-relock semantics."
+    ],
+    "explicitly_not_tested": [
+      "any denominator or clamp other than exactly 8",
+      "count_after/8, which would move full authority one action earlier",
+      "shorter binary verification",
+      "leaky or hysteretic evidence decay",
+      "nonzero authority while stable_current is false",
+      "sticky or scripted hand commands",
+      "learned supervisor or policy update"
+    ],
+    "eligibility_domain": "First episode-active pre-action row with option_active==1 and obs[106]==1, before the first Candidate43-dependent action; bit-exact to Candidate42.",
+    "evaluator_only_truth_prohibition": "Raw transition force, true clearance, terminal truth, mesh geometry and all future observations may be recorded but cannot enter authority routing.",
+    "primary_metric_horizon_actions": 128,
+    "network_updates": 0
+  }
+}
