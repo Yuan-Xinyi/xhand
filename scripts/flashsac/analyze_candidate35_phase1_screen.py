@@ -47,6 +47,18 @@ SEEDS = (320, 321, 322)
 REPLICATES = ("a", "b")
 RUN_ORDER = ("320a", "320b", "321b", "321a", "322a", "322b")
 NUM_ENVS = 64
+PLAN_FIELD = "phase1_plan"
+PLAN_SHA_FIELD = "phase1_plan_sha256"
+PLAN_LABEL = "phase-one plan"
+OUTPUT_PATTERN = (
+    "logs/flashsac/pick_tool/41_close_ab_c35_p1_s{seed}_{replicate}/trial"
+)
+ANALYSIS_OUTPUT = "logs/flashsac/pick_tool/41_close_ab_c35_p1_screen.json"
+PROTECTED_ANALYZER_PATHS = (
+    "scripts/flashsac/analyze_candidate35_phase1_screen.py",
+)
+PASS_DECISION = "continue_phase2"
+FAIL_DECISION = "reject_phase2"
 EVENTS = (
     "success",
     "ever_grasped",
@@ -147,8 +159,8 @@ def validate_manifest_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     expected_top = {
         "kind",
         "status",
-        "phase1_plan",
-        "phase1_plan_sha256",
+        PLAN_FIELD,
+        PLAN_SHA_FIELD,
         "branch",
         "collector",
         "baseline",
@@ -168,9 +180,7 @@ def validate_manifest_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("screen branch changed")
     if payload["run_order"] != list(RUN_ORDER):
         raise ValueError("screen run order changed")
-    if payload["output_pattern"] != (
-        "logs/flashsac/pick_tool/41_close_ab_c35_p1_s{seed}_{replicate}/trial"
-    ):
+    if payload["output_pattern"] != OUTPUT_PATTERN:
         raise ValueError("screen evidence path pattern changed")
     if payload["gates"] != EXPECTED_GATES:
         raise ValueError("screen gates changed")
@@ -235,10 +245,8 @@ def validate_manifest_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     _sha(search["sha256"], name="search.sha256")
     if search["min_score"] != HANDOFF_MIN_SCORE or search["hold_steps"] != HANDOFF_HOLD_STEPS:
         raise ValueError("screen SEARCH handoff changed")
-    _sha(payload["phase1_plan_sha256"], name="phase1_plan_sha256")
-    if payload["analysis_output"] != (
-        "logs/flashsac/pick_tool/41_close_ab_c35_p1_screen.json"
-    ):
+    _sha(payload[PLAN_SHA_FIELD], name=PLAN_SHA_FIELD)
+    if payload["analysis_output"] != ANALYSIS_OUTPUT:
         raise ValueError("screen analysis output changed")
     return dict(payload)
 
@@ -260,7 +268,7 @@ def load_manifest(path: Path) -> tuple[dict[str, Any], str, str]:
         raise ValueError("screen manifest differs from its committed HEAD blob")
     protected = (
         relative,
-        "scripts/flashsac/analyze_candidate35_phase1_screen.py",
+        *PROTECTED_ANALYZER_PATHS,
         "scripts/flashsac/collect_online_close_ab.py",
         "scripts/flashsac/online_close_ab.py",
     )
@@ -270,9 +278,9 @@ def load_manifest(path: Path) -> tuple[dict[str, Any], str, str]:
         check=False,
     ).returncode:
         raise ValueError("screen or collection source is dirty")
-    plan = _resolve(payload["phase1_plan"], label="phase-one plan")
-    if sha256_file(plan) != payload["phase1_plan_sha256"]:
-        raise ValueError("phase-one plan changed")
+    plan = _resolve(payload[PLAN_FIELD], label=PLAN_LABEL)
+    if sha256_file(plan) != payload[PLAN_SHA_FIELD]:
+        raise ValueError(f"{PLAN_LABEL} changed")
 
     for arm in ("baseline", "candidate"):
         checkpoint = _resolve(payload[arm]["checkpoint"], label=f"{arm} checkpoint")
@@ -619,7 +627,7 @@ def analyze(manifest_path: Path) -> tuple[dict[str, Any], Path]:
         "receipts": receipts,
         **screen,
         "decision": (
-            "continue_phase2" if screen["all_gates_pass"] else "reject_phase2"
+            PASS_DECISION if screen["all_gates_pass"] else FAIL_DECISION
         ),
     }
     for value in report["aggregate"].values():

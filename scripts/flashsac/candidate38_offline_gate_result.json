@@ -1,0 +1,75 @@
+{
+  "kind": "pick_tool_candidate38_offline_gate_result_v1",
+  "status": "evaluated_after_formal_training",
+  "decision": "release_to_fixed_online_ab",
+  "evaluated_local_date": "2026-07-22",
+  "branch": "flashsac-pick-tool-curriculum",
+  "training_source_commit": "59dd2ed57c09604d88a5f1e058850c0d40e0bed6",
+  "plan": "scripts/flashsac/candidate38_strict_action_only_plan.json",
+  "plan_sha256": "f77bf7b75a62f07ba5e62e05bfd6c1c2048fc5c28664d1962af659b444b0690c",
+  "candidate": {
+    "checkpoint": "logs/flashsac/pick_tool/47_v6_success_si_strict_action_only_s310/checkpoint_final",
+    "metrics_sha256": "684b3fb39fc49478327456f180db61dc40bac582c483bacccba616291721bf1f",
+    "actor_sha256": "1d0ce05ce5893a7309ee2d55fc1b74a1f7301b61448a9f4b741399db5aedb697",
+    "task_contract_sha256": "8a2a135fa1cd5bb01965fc7dc6d6a73978dffc1bf55941ae392146de1d17f61d",
+    "torch_bridge_state_sha256": "a81c17377a310e25d344a9e1db0cd90a243ede2f75d5e9ba08b6499ee42a5018",
+    "frozen_lift_actor_sha256": "117f1b0ae3641bd24b6b9f3d585576a79b5aff968139c0dde86e6346f60ebaa0",
+    "temperature_sha256": "7decaa945a7ce7e21f7b97824895b2deabc3dfdb4965ecb3a8a66c4f770e2189",
+    "replay_buffer_sha256": "484bc7eddd1362b3af0afb23990a49753c384f257ed0deb20f755c5674a5a98b"
+  },
+  "identity_and_optimizer_gate": {
+    "all_pass": true,
+    "task_contract_exact_baseline": true,
+    "frozen_lift_file_exact_baseline": true,
+    "search_sha256_exact": true,
+    "actor_sha256_differs_from_baseline": true,
+    "sac_actor_updates": 0,
+    "demo_bc_updates": 50,
+    "actor_action_path_adam_state_count": 18,
+    "actor_action_path_adam_states_at_step_50": 18,
+    "actor_std_head_adam_state_count": 0,
+    "actor_scheduler_last_epoch": 50,
+    "actor_std_head_tensors_exact_baseline": true,
+    "temperature_semantically_exact_baseline": true,
+    "demo_bc_grad_overflow": 0.0,
+    "demo_bc_scheduler_advanced": 1.0,
+    "all_checkpoint_tensors_finite": true
+  },
+  "behavior_gate": {
+    "all_pass": true,
+    "demo_rows": 598,
+    "deterministic_demo_rows": 363,
+    "exploratory_demo_rows": 235,
+    "all_demo_hand14_rmse": {
+      "value": 0.01199324894696474,
+      "maximum": 0.02,
+      "pass": true
+    },
+    "deterministic_demo_hand14_rmse": {
+      "value": 0.00285745388828218,
+      "maximum": 0.01,
+      "pass": true
+    },
+    "exploratory_demo_hand14_rmse_diagnostic": 0.01879918947815895,
+    "candidate_replay_rows": 67645,
+    "candidate_replay_unlatched_rows": 60153,
+    "candidate_replay_latched_rows": 7492,
+    "baseline_hand14_rms_on_unlatched_replay": 0.4329308569431305,
+    "candidate_minus_baseline_hand14_rms_on_unlatched_replay": 0.005326870828866959,
+    "relative_actor_drift": {
+      "value": 0.012304207310080528,
+      "minimum_exclusive": 0.0,
+      "maximum": 0.05,
+      "pass": true
+    }
+  },
+  "diagnostic_equivalence": {
+    "candidate37_network_tensor_count": 30,
+    "candidate38_network_tensor_count": 30,
+    "network_tensors_bit_exact": true,
+    "maximum_network_tensor_difference": 0.0,
+    "deployment_action_difference_rms": 0.0,
+    "interpretation": "Candidate38 preserves the behaviorally accepted Candidate37 actor exactly and changes only disabled std-head optimizer bookkeeping."
+  },
+  "release_condition": "all sealed offline gates passed; collect only the predeclared six 64-env complementary A/B trials"
+}
