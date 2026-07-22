@@ -92,3 +92,4 @@ removing the arm or swapping in a gripper makes the current plain-PPO task strai
 - Training runs: `logs/rl_games/pick_tool_token/0_ablation_{baseline,floating}_300ep_s42`
 - Final corrected gripper run: `logs/rl_games/pick_tool_token/0_ablation_gripper_safe_500ep_s42`
 - Finite evaluation support: `scripts/rl_games/play.py --max_steps ... --eval_json ...`
+- Policy rollout videos: [`docs/assets/ppo_arm_hand_ablation/README.md`](assets/ppo_arm_hand_ablation/README.md)
