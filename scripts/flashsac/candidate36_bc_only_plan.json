@@ -1,0 +1,178 @@
+{
+  "kind": "pick_tool_candidate36_bc_only_plan_v1",
+  "status": "sealed_before_formal_training",
+  "created_local_date": "2026-07-22",
+  "branch": "flashsac-pick-tool-curriculum",
+  "source_commit_before_plan": "489b8573f0140818e6f175406e89ae0a2c56aa4b",
+  "hypothesis": "Candidate35 regressed because an inaccurate critic pushed the CLOSE actor away from the exact V6 success policy; replacing the same scheduled actor slots with demonstration-only corrections should remove the pre-latch regression without changing SEARCH, LIFT, rewards, data, or actor dose.",
+  "candidate35_failure_evidence": {
+    "screen_report": "logs/flashsac/pick_tool/41_close_ab_c35_p1_screen.json",
+    "screen_report_sha256": "53afd1db4f3a480ca10f2d12c35987a58c357eefcc34bfc5232c1932c47b74dc",
+    "conditional_success_delta": -0.07283359914938863,
+    "conditional_ever_grasped_delta": -0.08798511430090382,
+    "itt_success_delta": -0.020833333333333332,
+    "candidate_triggered_dropped": 0,
+    "candidate_triggered_unsafe_force": 0,
+    "failure_location": "CLOSE_before_public_latch",
+    "candidate35_sac_actor_updates": 50,
+    "candidate35_demo_bc_updates": 50,
+    "candidate35_demo_hand14_rmse": 0.05749940499663353,
+    "exact_v6_demo_hand14_rmse": 0.012870067730545998,
+    "candidate35_replay_relative_actor_drift": 0.1882
+  },
+  "single_mechanism_change": {
+    "candidate35": "each scheduled actor slot applies one SAC actor/temperature optimizer step followed by one demo BC optimizer step",
+    "candidate36": "each scheduled actor slot defers SAC actor/temperature and applies one demo BC optimizer step; after exactly 50 BC steps the actor stays frozen",
+    "unchanged": [
+      "exact V6 initialization",
+      "critic and target updates",
+      "reward and terminal definitions",
+      "SEARCH checkpoint and q0.30/h4 handoff",
+      "public latch authority and frozen LIFT router",
+      "both self-imitation datasets and sampler seed",
+      "BC loss including target_std=0.15 and std_weight=0.05",
+      "actor LR, update cadence, burn-in, exploration noise, and training horizon"
+    ]
+  },
+  "implementation": {
+    "commit": "489b8573f0140818e6f175406e89ae0a2c56aa4b",
+    "flag": "--demo_bc_only_updates 50",
+    "deferred_slot_metric": "actor/deferred",
+    "bc_scheduler_semantics": "one scheduler step for each completed BC-only optimizer step",
+    "overflow_semantics": "fail immediately unless each BC-only slot completes both optimizer and scheduler step",
+    "simulation_free_tests": [
+      "scripts/flashsac/agent_bridge_test.py",
+      "scripts/flashsac/train_contract_test.py"
+    ]
+  },
+  "mechanism_smoke": {
+    "output_dir": "logs/flashsac/pick_tool/42_c36_demo_only_mechanism_smoke_s330",
+    "actor_sha256": "629a26150395afa2684c425325963f1baa6d4ce55bcda24efc1ca92dbf35910d",
+    "metrics_sha256": "7f63556caeb3038b52559f27b693fb275e6a3b5528e79f072b1c52d983d6b884",
+    "critic_updates": 30,
+    "sac_actor_updates": 0,
+    "demo_bc_updates": 3,
+    "actor_adam_step": 3,
+    "actor_scheduler_last_epoch": 3,
+    "demo_bc_grad_overflow": 0.0,
+    "demo_bc_scheduler_advanced": 1.0,
+    "task_contract_and_frozen_lift_exact": true
+  },
+  "baseline": {
+    "checkpoint": "logs/flashsac/pick_tool/16_v6_router_zero_actor_s254/checkpoint_final",
+    "actor_sha256": "d9aacbd48891c192c0d1491514137262b82990fa71440787076403de06606288",
+    "task_contract_sha256": "8a2a135fa1cd5bb01965fc7dc6d6a73978dffc1bf55941ae392146de1d17f61d",
+    "torch_bridge_state_sha256": "78176bb99eb5dac80a2789b231d54db6cf2b86132bc7835a129dd7f5a7df978c",
+    "frozen_lift_actor_sha256": "117f1b0ae3641bd24b6b9f3d585576a79b5aff968139c0dde86e6346f60ebaa0"
+  },
+  "search": {
+    "checkpoint": "logs/rl_games/pick_tool_token/0_bootstrap_handoff_20260720/nn/pick_tool_stage7_dagger_full_iter3_bc.pth",
+    "sha256": "b91555d8227cf4e87e41ae858d7f8b1ee42ae920a9d829f2f5b1453b529f1f02",
+    "min_score": 0.3,
+    "hold_steps": 4
+  },
+  "actor_demo": [
+    {
+      "path": "logs/flashsac/pick_tool/38_v6_success_si_smoke_s296_a/dataset.pt",
+      "sha256": "1a4bb77ed0b5f4c8a9bc5a8f5c651ab0929043527110bb075c4efae46ebdaa41",
+      "episodes": 3,
+      "transitions": 68
+    },
+    {
+      "path": "logs/flashsac/pick_tool/39_v6_success_si_s297_b_512/dataset.pt",
+      "sha256": "d9e78d9791cc3fd358c572b7ba570f101873d97be8b62c010d478872522e0f94",
+      "episodes": 23,
+      "transitions": 530
+    }
+  ],
+  "formal_training": {
+    "output_dir": "logs/flashsac/pick_tool/43_v6_success_si_bc_only_s310",
+    "seed": 310,
+    "steps": 2000,
+    "num_envs": 256,
+    "buffer": 250000,
+    "batch": 2048,
+    "warmup_transitions": 10000,
+    "updates_per_vector_step": 4.0,
+    "critic_burnin_updates": 500,
+    "actor_update_period": 8,
+    "actor_lr_scale": 0.01,
+    "lr_decay_updates": 50000,
+    "lr_warmup_updates": 1000,
+    "n_step": 3,
+    "actor_blocks": 2,
+    "actor_hidden": 128,
+    "critic_blocks": 2,
+    "critic_hidden": 256,
+    "critic_bins": 101,
+    "checkpoint": "exact_full_v6",
+    "resume_replay": false,
+    "resume_actor_demo": false,
+    "save_replay": true,
+    "demo_bc_weight": 0.5,
+    "demo_bc_only_updates": 50,
+    "demo_bc_batch": 512,
+    "demo_bc_phases": [1],
+    "demo_bc_target_std": 0.15,
+    "demo_bc_std_weight": 0.05,
+    "demo_bc_arm_weight": 0.0,
+    "demo_bc_token_weight": 1.0,
+    "demo_bc_residual_weight": 1.0,
+    "public_latch_arm_gate": true,
+    "public_latch_frozen_lift_router": true,
+    "unlatched_arm_noise_scale": 0.0,
+    "unlatched_hand_noise_scale": 0.1,
+    "latched_arm_noise_scale": 0.0,
+    "latched_hand_noise_scale": 0.0,
+    "metrics_every": 100,
+    "validate_finite": true,
+    "kit_args": "--/app/extensions/fsWatcherEnabled=false"
+  },
+  "offline_release_gate": {
+    "all_must_pass": true,
+    "identity": {
+      "task_contract_exact_baseline": true,
+      "frozen_lift_file_exact_baseline": true,
+      "search_sha256_exact": true,
+      "actor_sha256_must_differ_from_baseline": true
+    },
+    "optimizer": {
+      "sac_actor_updates": 0,
+      "demo_bc_updates": 50,
+      "actor_adam_step_every_state": 50,
+      "actor_scheduler_last_epoch": 50,
+      "temperature_semantically_exact_baseline": true,
+      "demo_bc_grad_overflow": 0.0,
+      "demo_bc_scheduler_advanced": 1.0
+    },
+    "behavior": {
+      "panel": "all 598 fixed self-imitation rows; deterministic cohort is episode_cohort=0",
+      "all_demo_hand14_rmse_max": 0.02,
+      "deterministic_demo_hand14_rmse_max": 0.01,
+      "replay_panel": "all unlatched rows in Candidate36 replay_buffer.pt",
+      "relative_actor_drift_definition": "RMS(candidate_hand14-baseline_hand14)/RMS(baseline_hand14)",
+      "relative_actor_drift_min_exclusive": 0.0,
+      "relative_actor_drift_max": 0.05
+    },
+    "failure_action": "reject before online A/B; do not alter thresholds or extend training"
+  },
+  "formal_screen_if_offline_gate_passes": {
+    "collector": "scripts/flashsac/collect_online_close_ab.py",
+    "num_envs_per_run": 64,
+    "seeds": [323, 324, 325],
+    "run_order": ["323a", "323b", "324b", "324a", "325a", "325b"],
+    "output_pattern": "logs/flashsac/pick_tool/44_close_ab_c36_s{seed}_{replicate}/trial",
+    "equal_seed_horvitz_thompson": true,
+    "gates": {
+      "conditional_success_delta_min": 0.03,
+      "itt_success_delta_min": 0.01,
+      "conditional_ever_grasped_delta_min": 0.0,
+      "positive_conditional_success_seeds_min": 2,
+      "per_seed_conditional_success_delta_floor": -0.1,
+      "candidate_triggered_dropped_max": 0,
+      "candidate_triggered_unsafe_force_max": 0,
+      "conditional_unlatched_clearance_ge_5cm_delta_max": 0.02
+    }
+  },
+  "decision_rule": "train once; run the fixed A/B screen only if every offline release gate passes; otherwise return to exact V6 and test the next isolated mechanism"
+}
