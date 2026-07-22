@@ -1541,16 +1541,20 @@ class FlashSACTorchBridge(FlashSACAgent):
             )
 
         # Invalid rows may contain SEARCH actions that are intentionally not
-        # canonical for the option actor.  Validate only rows authored by the
-        # option and destined for replay.
+        # canonical for the option actor.  Re-run authority on the *complete*
+        # vector batch, then compare only option-owned rows.  Keeping the
+        # original batch shape is required for exact frozen-router replay:
+        # GEMM kernels can differ by a few ulps when the same actor is evaluated
+        # on a boolean-selected sub-batch.
         if bool(replay_valid_mask.any()):
-            valid_action = transition["action"][replay_valid_mask]
             canonical_action = self.apply_action_authority(
-                valid_action,
-                transition["observation"][replay_valid_mask],
+                transition["action"],
+                transition["observation"],
             )
-            if not torch.equal(canonical_action, valid_action):
-                mismatch = canonical_action != valid_action
+            mismatch = (canonical_action != transition["action"]) & (
+                replay_valid_mask.unsqueeze(-1)
+            )
+            if bool(mismatch.any()):
                 raise ValueError(
                     "valid transition action is not canonical under the configured "
                     "public action authority/policy router "

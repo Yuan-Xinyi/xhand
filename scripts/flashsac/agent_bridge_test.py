@@ -1324,16 +1324,16 @@ def test_masked_replay_validates_only_selected_canonical_actions() -> None:
     agent = _slice_authority_agent()
     observation = torch.randn(NUM_ENVS, OBSERVATION_DIM)
     observation[:, PUBLIC_LATCH_OBSERVATION_INDEX] = torch.tensor(
-        [0.0, 0.25, 1.0, 0.25]
+        [0.0, 0.0, 1.0, 1.0]
     )
     action = torch.zeros(NUM_ENVS, ACTION_DIM)
     action[[1, 3], :2] = 0.75
     transition = _transition(observation, action)
     valid = torch.tensor([True, False, True, False])
 
-    # Invalid SEARCH rows deliberately contain malformed authority features and
-    # non-canonical option actions.  They must neither fail option validation
-    # nor reach replay.
+    # Invalid SEARCH rows deliberately contain non-canonical option actions.
+    # They must neither fail option-action comparison nor reach replay.  Public
+    # latch validity remains a whole-environment observation contract.
     assert (
         agent.process_transition_masked(
             transition,
@@ -1389,6 +1389,31 @@ def test_masked_replay_validates_only_selected_canonical_actions() -> None:
         bad_transition,
         replay_valid_mask=valid,
     )
+
+    # A frozen router evaluated on a boolean-selected sub-batch is not
+    # bit-exact with its original full-batch action on CPU or CUDA.  Masked
+    # replay must preserve the execution batch shape before selecting rows.
+    with tempfile.TemporaryDirectory(prefix="flashsac_masked_router_") as directory:
+        source_path = Path(directory) / "source"
+        source = _public_latch_agent(routed=False)
+        source.save(str(source_path))
+        routed = _public_latch_agent(routed=True)
+        _load_same_actor_into_router(routed, source_path)
+        router_observation = torch.randn(NUM_ENVS, OBSERVATION_DIM)
+        router_observation[:, PUBLIC_LATCH_OBSERVATION_INDEX] = torch.tensor(
+            [0.0, 1.0, 0.0, 1.0]
+        )
+        routed_action = routed.sample_actions(
+            1, {"next_observation": router_observation}, training=False
+        )
+        router_transition = _transition(router_observation, routed_action)
+        router_transition["next_observation"][
+            :, PUBLIC_LATCH_OBSERVATION_INDEX
+        ] = router_observation[:, PUBLIC_LATCH_OBSERVATION_INDEX]
+        assert routed.process_transition_masked(
+            router_transition,
+            replay_valid_mask=torch.tensor([True, True, False, False]),
+        ) == 2
 
 
 def test_masked_replay_uses_oldest_mask_and_preserves_n_step_done() -> None:
