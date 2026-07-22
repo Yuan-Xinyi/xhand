@@ -253,3 +253,39 @@ GPU PhysX 接触 rollout 存在小幅非确定性，因此表中保留完整 see
 state -> 完整 scripted close -> load-bearing 验证」成功轨迹，按整段 option 接管而不是逐 action
 随机 DAgger 混合；先把 handoff→close 提到稳定的高成功率，再训练一个小型 selector 或高层 PPO。
 在此之前不应解冻三个低层 actor 做端到端联合更新。
+
+---
+
+## 十、FlashSAC 在线 close 续训的封存 A/B 结论（2026-07-22）
+
+为排除跨进程 PhysX 非确定性和训练日志中的选择偏差，本轮把冻结 SEARCH、随机分配的 CLOSE
+actor、以及 latch 后完全相同的冻结 LIFT 放进同一个 1024-env 进程。每个 seed 使用 `a/b`
+精确互补分配，且只记录每个环境槽的第一个 episode。正式顺序在看结果前封存为
+`290a -> 290b -> 291b -> 291a -> 292a -> 292b`；pilot seed 293--295 不进入统计。
+
+分析 plan 位于
+`scripts/flashsac/online_close_ab_analysis_plan.json`，SHA-256 为
+`afe844413dec3f72579baec41b7506d0ccb507e41789976ec08dd6c19385ab26`，seal tag 为
+`pick-tool-online-close-ab-analysis-v1-20260722`。六份 artifact/report 均通过 v2 schema、模型与任务
+SHA、运行时、Git/FlashSAC clean、逐槽互补和 report receipt 校验；所有正式 Kit 日志均没有
+`Failed to create change watch`。完整分析报告位于
+`logs/flashsac/pick_tool/37_close_ab_prod_analysis/analysis.json`，SHA-256 为
+`c47875cbb2effc3f29e6d1a52d6bd3eed22818692cea354ed67e5a9da19ff055`。
+
+| 估计域 | V6 baseline | FlashSAC candidate 34 | HT 差值 | 预注册单侧 95% 下/上界 | Fisher greater p |
+|---|---:|---:|---:|---:|---:|
+| handoff 后条件成功 | 45.935% | 46.000% | **+0.065 pp** | [-1.802, +1.948] pp | 0.4861 |
+| 全部分配 episode（ITT） | 16.732% | 16.797% | **+0.065 pp** | [-0.618, +0.749] pp | 0.4691 |
+
+触发支持数为 baseline 1118、candidate 1116，所有 total/seed/run 样本门都通过。条件成功差值按
+seed 分别为 -0.520、+2.670、-1.955 pp，只有 1/3 seed 为正，0/3 seed 同时达到预注册的
+条件 +5 pp 与 ITT +1.5 pp 工程门。`dropped` 为 0/0；未 latch 却超过 5 cm 的事件从
+193 降到 179，其 +1 pp safety 上界门通过；`unsafe_force` 为 1/1，因为 baseline 少于 10 次，
+按预注册低功效规则要求 candidate 必须为 0，因此该安全项失败。
+
+### 决策
+
+candidate 34 **不替换 V6，也不作为继续端到端训练的起点**。正式效应接近零，置信界排除了
+此前 pilot 所暗示的稳定大幅收益；这说明 FlashSAC 框架本身虽然能承载分层 replay、冻结路由和
+示范约束，但当前这次 CLOSE 续训没有学到可复现的新控制能力。后续实验必须新建 plan/seed，
+不得追加本轮 seed、覆盖 artifact 或修改门槛来重新解释本结果。
