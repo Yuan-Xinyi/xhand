@@ -1,0 +1,166 @@
+{
+  "kind": "pick_tool_candidate38_strict_action_only_plan_v1",
+  "status": "sealed_before_formal_training",
+  "created_local_date": "2026-07-22",
+  "branch": "flashsac-pick-tool-curriculum",
+  "source_commit_before_plan": "698173c6bdee46afaa8f8c72a1e2fffece620903",
+  "hypothesis": "Candidate37 passed every behavioral retention gate. Its only failure was zero-valued Adam bookkeeping on the disabled std head. Removing the std output from the loss graph and clearing compiler-materialized zero gradients should preserve Candidate37 behavior while satisfying the strict action-only optimizer contract.",
+  "candidate37_evidence": {
+    "result": "scripts/flashsac/candidate37_offline_gate_result.json",
+    "result_sha256": "a924d3559f54c3444b5ea82a220242609ac6eb3a2957e8e29eb06315d3bf0607",
+    "actor_sha256": "87c4bf9cd5379ec16276d9da855112b445068fcc852940a864e72ede48a6e702",
+    "all_demo_hand14_rmse": 0.01199324894696474,
+    "deterministic_demo_hand14_rmse": 0.00285745388828218,
+    "replay_relative_actor_drift": 0.012373155914247036,
+    "behavior_gate_passed": true,
+    "optimizer_gate_failed": "two disabled std-head parameters acquired zero-valued Adam state at step 50"
+  },
+  "single_mechanism_change": {
+    "candidate37": "std_weight=0 excludes std_loss numerically but leaves a zero-gradient std branch visible to Adam",
+    "candidate38": "std_weight=0 detaches the diagnostic std output, excludes std_loss from the optimizer loss, and clears compiled zero std-head gradients before Adam",
+    "implementation_commit": "698173c6bdee46afaa8f8c72a1e2fffece620903",
+    "unchanged": [
+      "exact V6 initialization",
+      "zero SAC actor and temperature updates",
+      "50 BC-only optimizer and scheduler steps",
+      "demo_bc_std_weight=0 and every other BC hyperparameter",
+      "critic and target updates",
+      "reward and terminal definitions",
+      "SEARCH checkpoint and q0.30/h4 handoff",
+      "public latch authority and frozen LIFT router",
+      "both fixed self-imitation datasets and sampler seed",
+      "actor LR, update cadence, burn-in, exploration noise, and training horizon"
+    ]
+  },
+  "implementation_verification": {
+    "simulation_free_tests": [
+      "scripts/flashsac/agent_bridge_test.py",
+      "scripts/flashsac/train_contract_test.py"
+    ],
+    "eager_cpu_regression": "eight action-only BC steps leave both std-head tensors exact and create no std-head Adam state",
+    "compiled_cuda_amp_regression": "one action-only BC step leaves both std-head parameters absent from Adam state",
+    "full_bridge_suite": "pass",
+    "train_contract_suite": "pass",
+    "py_compile": "pass"
+  },
+  "baseline": {
+    "checkpoint": "logs/flashsac/pick_tool/16_v6_router_zero_actor_s254/checkpoint_final",
+    "actor_sha256": "d9aacbd48891c192c0d1491514137262b82990fa71440787076403de06606288",
+    "task_contract_sha256": "8a2a135fa1cd5bb01965fc7dc6d6a73978dffc1bf55941ae392146de1d17f61d",
+    "torch_bridge_state_sha256": "78176bb99eb5dac80a2789b231d54db6cf2b86132bc7835a129dd7f5a7df978c",
+    "frozen_lift_actor_sha256": "117f1b0ae3641bd24b6b9f3d585576a79b5aff968139c0dde86e6346f60ebaa0"
+  },
+  "search": {
+    "checkpoint": "logs/rl_games/pick_tool_token/0_bootstrap_handoff_20260720/nn/pick_tool_stage7_dagger_full_iter3_bc.pth",
+    "sha256": "b91555d8227cf4e87e41ae858d7f8b1ee42ae920a9d829f2f5b1453b529f1f02",
+    "min_score": 0.3,
+    "hold_steps": 4
+  },
+  "actor_demo": [
+    {
+      "path": "logs/flashsac/pick_tool/38_v6_success_si_smoke_s296_a/dataset.pt",
+      "sha256": "1a4bb77ed0b5f4c8a9bc5a8f5c651ab0929043527110bb075c4efae46ebdaa41",
+      "episodes": 3,
+      "transitions": 68
+    },
+    {
+      "path": "logs/flashsac/pick_tool/39_v6_success_si_s297_b_512/dataset.pt",
+      "sha256": "d9e78d9791cc3fd358c572b7ba570f101873d97be8b62c010d478872522e0f94",
+      "episodes": 23,
+      "transitions": 530
+    }
+  ],
+  "formal_training": {
+    "output_dir": "logs/flashsac/pick_tool/47_v6_success_si_strict_action_only_s310",
+    "seed": 310,
+    "steps": 2000,
+    "num_envs": 256,
+    "buffer": 250000,
+    "batch": 2048,
+    "warmup_transitions": 10000,
+    "updates_per_vector_step": 4.0,
+    "critic_burnin_updates": 500,
+    "actor_update_period": 8,
+    "actor_lr_scale": 0.01,
+    "lr_decay_updates": 50000,
+    "lr_warmup_updates": 1000,
+    "n_step": 3,
+    "actor_blocks": 2,
+    "actor_hidden": 128,
+    "critic_blocks": 2,
+    "critic_hidden": 256,
+    "critic_bins": 101,
+    "checkpoint": "exact_full_v6",
+    "resume_replay": false,
+    "resume_actor_demo": false,
+    "save_replay": true,
+    "demo_bc_weight": 0.5,
+    "demo_bc_only_updates": 50,
+    "demo_bc_batch": 512,
+    "demo_bc_phases": [1],
+    "demo_bc_target_std": 0.15,
+    "demo_bc_std_weight": 0.0,
+    "demo_bc_arm_weight": 0.0,
+    "demo_bc_token_weight": 1.0,
+    "demo_bc_residual_weight": 1.0,
+    "public_latch_arm_gate": true,
+    "public_latch_frozen_lift_router": true,
+    "unlatched_arm_noise_scale": 0.0,
+    "unlatched_hand_noise_scale": 0.1,
+    "latched_arm_noise_scale": 0.0,
+    "latched_hand_noise_scale": 0.0,
+    "metrics_every": 100,
+    "validate_finite": true,
+    "kit_args": "--/app/extensions/fsWatcherEnabled=false"
+  },
+  "offline_release_gate": {
+    "all_must_pass": true,
+    "identity": {
+      "task_contract_exact_baseline": true,
+      "frozen_lift_file_exact_baseline": true,
+      "search_sha256_exact": true,
+      "actor_sha256_must_differ_from_baseline": true
+    },
+    "optimizer": {
+      "sac_actor_updates": 0,
+      "demo_bc_updates": 50,
+      "actor_action_path_adam_state_count": 18,
+      "actor_action_path_adam_step_every_state": 50,
+      "actor_std_head_adam_state_count": 0,
+      "actor_scheduler_last_epoch": 50,
+      "actor_std_head_tensors_exact_baseline": true,
+      "temperature_semantically_exact_baseline": true,
+      "demo_bc_grad_overflow": 0.0,
+      "demo_bc_scheduler_advanced": 1.0
+    },
+    "behavior": {
+      "panel": "all 598 fixed self-imitation rows; deterministic cohort is episode_cohort=0",
+      "all_demo_hand14_rmse_max": 0.02,
+      "deterministic_demo_hand14_rmse_max": 0.01,
+      "replay_panel": "all unlatched rows in Candidate38 replay_buffer.pt",
+      "relative_actor_drift_definition": "RMS(candidate_hand14-baseline_hand14)/RMS(baseline_hand14)",
+      "relative_actor_drift_min_exclusive": 0.0,
+      "relative_actor_drift_max": 0.05
+    },
+    "failure_action": "reject before online A/B; do not alter thresholds or extend training"
+  },
+  "formal_screen_if_offline_gate_passes": {
+    "collector": "scripts/flashsac/collect_online_close_ab.py",
+    "num_envs_per_run": 64,
+    "seeds": [323, 324, 325],
+    "run_order": ["323a", "323b", "324b", "324a", "325a", "325b"],
+    "output_pattern": "logs/flashsac/pick_tool/48_close_ab_c38_s{seed}_{replicate}/trial",
+    "equal_seed_horvitz_thompson": true,
+    "gates": {
+      "conditional_success_delta_min": 0.03,
+      "itt_success_delta_min": 0.01,
+      "conditional_ever_grasped_delta_min": 0.0,
+      "positive_conditional_success_seeds_min": 2,
+      "per_seed_conditional_success_delta_floor": -0.1,
+      "candidate_triggered_dropped_max": 0,
+      "candidate_triggered_unsafe_force_max": 0,
+      "conditional_unlatched_clearance_ge_5cm_delta_max": 0.02
+    }
+  },
+  "decision_rule": "train once; run the fixed A/B screen only if every offline release gate passes; otherwise return to exact V6 and test the next isolated mechanism"
+}
