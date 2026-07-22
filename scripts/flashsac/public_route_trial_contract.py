@@ -23,7 +23,12 @@ import torch.nn.functional as F
 OBSERVATION_DIM = 115
 ACTION_DIM = 21
 FEATURE_DIM = 165
-MAX_EPISODE_STEP = 999
+CONFIGURED_MAX_EPISODE_LENGTH = 1000
+# Isaac increments the buffer before the task checks >= max_length - 1.
+TIMEOUT_ACTION_COUNT = 999
+LAST_PREACTION_STEP = 998
+# Keep the preregistered feature scaling independent of the reachable maximum.
+EPISODE_STEP_DENOMINATOR = 999
 
 READINESS_MIN_SCORE = 0.10
 READINESS_HOLD_STEPS = 4
@@ -31,11 +36,11 @@ SUCCESS_HOLD_STEPS = 15
 STRATUM_G_THRESHOLD = 0.35
 STRATUM_CLOSE_THRESHOLD = 0.20
 
-TRIAL_KIND = "pick_tool_public_randomized_route_trial_v1"
-FORMAT_VERSION = 1
+TRIAL_KIND = "pick_tool_public_randomized_route_trial_v2"
+FORMAT_VERSION = 2
 FEATURE_CONTRACT = "pick_tool_public_route_gate_feature165_v1"
 ASSIGNMENT_VERSION = "sha256_rank_balanced_v1"
-OUTCOME_CONTRACT = "pick_tool_reset_before_factual_full_task_outcome_v1"
+OUTCOME_CONTRACT = "pick_tool_reset_before_factual_full_task_outcome_v2"
 PROPENSITY_ROUTE = 0.5
 
 # Fixed, externally auditable feature layout.  Observation 86 is omitted by
@@ -74,7 +79,10 @@ _METADATA_FIELDS = _METADATA_INPUT_FIELDS | {
     "observation_contract",
     "observation_dim",
     "action_dim",
-    "max_episode_step",
+    "configured_max_episode_length",
+    "timeout_action_count",
+    "last_preaction_step",
+    "episode_step_denominator",
     "outcome_contract",
     "factual_outcomes_only",
 }
@@ -230,7 +238,8 @@ def build_gate_feature(
             public_observation,
             ready_onehot,
             fork_used_before[:, None].to(dtype=dtype),
-            episode_step[:, None].to(dtype=dtype) / float(MAX_EPISODE_STEP),
+            episode_step[:, None].to(dtype=dtype)
+            / float(EPISODE_STEP_DENOMINATOR),
             public_safety,
             search_action,
             route_action,
@@ -351,7 +360,10 @@ def _normalize_metadata(metadata: Mapping[str, Any], *, input_form: bool) -> dic
         "observation_contract": "pick_tool_markov115_v1_minus_obs86",
         "observation_dim": OBSERVATION_DIM,
         "action_dim": ACTION_DIM,
-        "max_episode_step": MAX_EPISODE_STEP,
+        "configured_max_episode_length": CONFIGURED_MAX_EPISODE_LENGTH,
+        "timeout_action_count": TIMEOUT_ACTION_COUNT,
+        "last_preaction_step": LAST_PREACTION_STEP,
+        "episode_step_denominator": EPISODE_STEP_DENOMINATOR,
         "outcome_contract": OUTCOME_CONTRACT,
         "factual_outcomes_only": True,
     }
@@ -444,12 +456,14 @@ def _validate_semantics(payload: Mapping[str, Any]) -> None:
 
     steps = tensors["candidate_step"]
     lengths = tensors["outcome_episode_length"]
-    if bool(((steps < READINESS_HOLD_STEPS - 1) | (steps > MAX_EPISODE_STEP)).any()):
-        raise ValueError("candidate_step is earlier than the four-frame gate or above 999")
-    if bool(((lengths <= steps) | (lengths > MAX_EPISODE_STEP + 1)).any()):
+    if bool(
+        ((steps < READINESS_HOLD_STEPS - 1) | (steps > LAST_PREACTION_STEP)).any()
+    ):
+        raise ValueError("candidate_step is earlier than the four-frame gate or above 998")
+    if bool(((lengths <= steps) | (lengths > TIMEOUT_ACTION_COUNT)).any()):
         raise ValueError("outcome episode length is inconsistent with candidate_step")
-    if bool((timeout & (lengths != MAX_EPISODE_STEP + 1)).any()):
-        raise ValueError("full-task timeout must occur at the native 1000-action horizon")
+    if bool((timeout & (lengths != TIMEOUT_ACTION_COUNT)).any()):
+        raise ValueError("full-task timeout must occur after 999 executed actions")
     if bool((success & ((lengths - steps) < SUCCESS_HOLD_STEPS)).any()):
         raise ValueError("unlatched trigger leaves too few actions for strict success hold")
     if bool(((tensors["stratum"] < 0) | (tensors["stratum"] > 3)).any()):
@@ -461,7 +475,7 @@ def _validate_semantics(payload: Mapping[str, Any]) -> None:
         raise ValueError("trial rows must be the four-frame readiness trigger")
     if not bool((feature[:, 119] == 0.0).all()):
         raise ValueError("trial trigger must occur before the sticky fork is used")
-    expected_step = steps.float() / float(MAX_EPISODE_STEP)
+    expected_step = steps.float() / float(EPISODE_STEP_DENOMINATOR)
     if not torch.allclose(feature[:, 120], expected_step, rtol=0.0, atol=1.0e-7):
         raise ValueError("feature episode step disagrees with candidate_step")
     hard_count = feature[:, 121] * 10.0

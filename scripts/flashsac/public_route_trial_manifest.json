@@ -14,7 +14,7 @@
     ],
     "replicate_b_semantics": "exact_boolean_complement_of_replicate_a",
     "run_order": "a_then_b_for_even_seed__b_then_a_for_odd_seed",
-    "salt": "pick-tool-public-route-trial-v1-20260722-883bab4"
+    "salt": "pick-tool-public-route-trial-v2-20260722-87a3228"
   },
   "checkpoints": {
     "route_v6": {
@@ -175,7 +175,7 @@
     "fork_commit": "5ecf331fa11cd457dd39018b3d68af571b257666",
     "use_compile": false
   },
-  "format_version": 1,
+  "format_version": 2,
   "gate": {
     "close_quality_stratum_threshold": 0.2,
     "consecutive_eligible_steps": 4,
@@ -190,23 +190,23 @@
     ],
     "frozen_action_indirect_dependency": "SEARCH and V6 actions consume obs115, so indirect dependence on obs86 is allowed and explicitly not called clearance-independent"
   },
-  "kind": "pick_tool_public_route_trial_manifest_v1",
+  "kind": "pick_tool_public_route_trial_manifest_v2",
   "outputs": {
     "artifact_template": "{cohort}_s{seed}_{replicate}.pt",
     "failure_report_template": "{cohort}_s{seed}_{replicate}.failed_attempt_{attempt:03d}.json",
     "global_run_order": "pilot_then_train_then_development; within_cohort_manifest_seed_order; within_seed_even_a_then_b__odd_b_then_a; every_predecessor_requires_immutable_complete_receipt",
     "report_template": "{cohort}_s{seed}_{replicate}.json",
-    "repository_relative_root": "logs/flashsac/pick_tool/28_public_route_trial_v1_20260722",
+    "repository_relative_root": "logs/flashsac/pick_tool/29_public_route_trial_v2_20260722",
     "run_order_enforced": true
   },
   "preregistration": {
     "branch": "flashsac-pick-tool-curriculum",
-    "implementation_commit": "8840639cd1a53fcfff1e5821c6731ae135d50d65",
-    "implementation_base_commit": "883bab473bb72522cb61dfdc4efd5a4f5e648985",
+    "implementation_commit": "SET_AFTER_DRAFT_IMPLEMENTATION_COMMIT",
+    "implementation_base_commit": "87a3228c237642e7c67cc0893d49bfe364f5b9a5",
     "manifest_sha256_receipt": "recorded by every immutable artifact because a file cannot contain its own SHA256",
     "partial_or_failed_run_rule": "retain every no-clobber numbered failure report; an exception before pair publication leaves canonical outputs free for retry; a crash-created partial canonical pair fails closed for manual audit and a version bump",
     "seal_rule": "pilot may start only from the annotated seal tag whose sole parent is implementation_commit; current execution bytes must equal that tag for every bound source",
-    "seal_tag": "pick-tool-public-route-trial-v1-20260722",
+    "seal_tag": "pick-tool-public-route-trial-v2-20260722",
     "source_binding": "each artifact hashes collector, feature contract, manifest, task, adapter, bridge, FlashSAC tree, robot/tool/retarget assets and checkpoints"
   },
   "runtime_assets": {
@@ -222,7 +222,7 @@
       "source/xhand_inhand/xhand_inhand/assets/xarm7_xhand/xarm7_xhand.usd": "c361d7879735cf31107f0089a68bed014b1401eda4d340a14a8ae4630a9d756c"
     }
   },
-  "status": "preregistered",
+  "status": "draft_until_seal_commit",
   "task": {
     "action_dim": 21,
     "close_option_mode": false,
@@ -236,6 +236,7 @@
     "grasp_confirm_steps": 4,
     "grasp_release_steps": 6,
     "max_episode_steps": 1000,
+    "timeout_action_count": 999,
     "observation_contract": "pick_tool_markov115_v1",
     "observation_dim": 115,
     "overforce_limit_n": 60.0,

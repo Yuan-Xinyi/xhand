@@ -27,12 +27,16 @@ from typing import Any, Mapping, Sequence
 import torch
 
 
-MANIFEST_KIND = "pick_tool_public_route_trial_manifest_v1"
+MANIFEST_KIND = "pick_tool_public_route_trial_manifest_v2"
 DEFAULT_MANIFEST = Path(__file__).with_name("public_route_trial_manifest.json")
-COLLECTOR_REPORT_KIND = "pick_tool_public_route_trial_collection_report_v1"
+COLLECTOR_REPORT_KIND = "pick_tool_public_route_trial_collection_report_v2"
 OBSERVATION_DIM = 115
 ACTION_DIM = 21
-NATIVE_MAX_STEPS = 1000
+CONFIGURED_MAX_EPISODE_LENGTH = 1000
+# DirectRLEnv increments episode_length_buf before _get_dones(), while this
+# task truncates at max_episode_length - 1.  The frozen MDP therefore executes
+# actions with zero-based pre-action indices 0..998: 999 actions in total.
+NATIVE_TIMEOUT_ACTION_COUNT = 999
 
 
 def sha256_file(path: Path) -> str:
@@ -142,7 +146,7 @@ def load_collection_spec(
         raise ValueError("trial manifest top-level schema is not exact")
     if (
         manifest["kind"] != MANIFEST_KIND
-        or manifest["format_version"] != 1
+        or manifest["format_version"] != 2
         or manifest["status"] != "preregistered"
     ):
         raise ValueError("unsupported or non-preregistered trial manifest")
@@ -244,7 +248,8 @@ def load_collection_spec(
         "hard_force_terminate_steps": 10,
         "grasp_confirm_steps": 4,
         "grasp_release_steps": 6,
-        "max_episode_steps": NATIVE_MAX_STEPS,
+        "max_episode_steps": CONFIGURED_MAX_EPISODE_LENGTH,
+        "timeout_action_count": NATIVE_TIMEOUT_ACTION_COUNT,
         "observation_contract": "pick_tool_markov115_v1",
         "observation_dim": OBSERVATION_DIM,
         "overforce_limit_n": 60.0,
@@ -280,7 +285,7 @@ def load_collection_spec(
         "failure_report_template": "{cohort}_s{seed}_{replicate}.failed_attempt_{attempt:03d}.json",
         "global_run_order": "pilot_then_train_then_development; within_cohort_manifest_seed_order; within_seed_even_a_then_b__odd_b_then_a; every_predecessor_requires_immutable_complete_receipt",
         "report_template": "{cohort}_s{seed}_{replicate}.json",
-        "repository_relative_root": "logs/flashsac/pick_tool/28_public_route_trial_v1_20260722",
+        "repository_relative_root": "logs/flashsac/pick_tool/29_public_route_trial_v2_20260722",
         "run_order_enforced": True,
     }
     if outputs != expected_outputs:
@@ -307,7 +312,7 @@ def load_collection_spec(
         for value in (implementation_commit, base_commit)
     ):
         raise ValueError("trial implementation commits must be lowercase full Git SHA-1 values")
-    if preregistration.get("seal_tag") != "pick-tool-public-route-trial-v1-20260722":
+    if preregistration.get("seal_tag") != "pick-tool-public-route-trial-v2-20260722":
         raise ValueError("trial seal tag is invalid")
     if preregistration.get("branch") != "flashsac-pick-tool-curriculum":
         raise ValueError("trial branch is invalid")
@@ -788,7 +793,10 @@ def _validate_task_runtime(env: Any, spec: CollectionSpec) -> None:
     checks = {
         "observation_space": (int(cfg.observation_space), OBSERVATION_DIM),
         "action_space": (int(cfg.action_space), ACTION_DIM),
-        "max_episode_steps": (int(env.max_episode_steps), NATIVE_MAX_STEPS),
+        "max_episode_steps": (
+            int(env.max_episode_steps),
+            CONFIGURED_MAX_EPISODE_LENGTH,
+        ),
         "hard_force_terminate_steps": (int(cfg.tactile_hard_terminate_steps), 10),
         "grasp_confirm_steps": (int(cfg.grasp_confirm_steps), 4),
         "grasp_release_steps": (int(cfg.grasp_release_steps), 6),
@@ -1077,7 +1085,7 @@ def run_collection(spec: CollectionSpec, *, device_string: str) -> tuple[dict[st
         vector_steps = 0
         cfg = env.unwrapped.cfg
 
-        while not tracker.complete and vector_steps < NATIVE_MAX_STEPS:
+        while not tracker.complete and vector_steps < NATIVE_TIMEOUT_ACTION_COUNT:
             active_before = tracker.active.clone()
             readiness = update_public_route_readiness(
                 observation,
@@ -1254,8 +1262,8 @@ def run_collection(spec: CollectionSpec, *, device_string: str) -> tuple[dict[st
             raise RuntimeError("trial execution source changed during collection")
 
         provenance = {
-            "kind": "pick_tool_public_route_randomized_factual_trial_v1",
-            "format_version": 1,
+            "kind": "pick_tool_public_route_randomized_factual_trial_v2",
+            "format_version": 2,
             "cohort": spec.cohort,
             "seed": spec.seed,
             "replicate": spec.replicate,

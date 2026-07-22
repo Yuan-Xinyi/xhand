@@ -12,8 +12,12 @@ from typing import Any, Callable
 import torch
 
 from public_route_trial_contract import (
+    CONFIGURED_MAX_EPISODE_LENGTH,
+    EPISODE_STEP_DENOMINATOR,
     FEATURE_DIM,
+    LAST_PREACTION_STEP,
     ROW_FIELDS,
+    TIMEOUT_ACTION_COUNT,
     assignment_for,
     assignment_route_mask,
     build_gate_feature,
@@ -26,7 +30,7 @@ from public_route_trial_contract import (
 )
 
 
-SALT = "pick-tool-public-route-trial-v1-20260722-883bab4"
+SALT = "pick-tool-public-route-trial-v2-20260722-87a3228"
 
 
 def _raises(kind: type[BaseException], fn: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
@@ -83,7 +87,7 @@ def _row(slot: int | None = None) -> dict[str, Any]:
         "episode_index": slot,
         "candidate_step": 10,
         "stratum": stratum,
-        "outcome_episode_length": 1000,
+        "outcome_episode_length": 999,
         "readiness_score": score,
         "outcome_max_true_clearance_m": 0.01,
         "factual_treatment_route": bool(assignment[slot]),
@@ -143,7 +147,7 @@ def test_feature_layout_and_direct_obs86_exclusion() -> None:
 
 def test_assignment_matches_manifest_bytes_balances_and_complements() -> None:
     assigned = assignment_for("pilot", 266, 8, SALT, "a")
-    assert assigned.tolist() == [False, False, True, False, True, False, True, True]
+    assert assigned.tolist() == [True, False, True, False, False, True, True, False]
     assert torch.equal(
         assigned,
         assignment_route_mask(
@@ -248,9 +252,9 @@ def test_factual_artifact_is_strict_and_fail_closed() -> None:
     _raises(ValueError, validate_trial_artifact, missing_unlatched)
     impossible_fast_success = copy.deepcopy(artifact)
     fast = impossible_fast_success["tensors"]
-    fast["candidate_step"][0] = 999
-    fast["feature"][0, 120] = 1.0
-    fast["outcome_episode_length"][0] = 1000
+    fast["candidate_step"][0] = 998
+    fast["feature"][0, 120] = 998.0 / 999.0
+    fast["outcome_episode_length"][0] = 999
     fast["outcome_max_true_clearance_m"][0] = 0.20
     fast["outcome_success"][0] = True
     fast["outcome_time_out"][0] = False
@@ -264,16 +268,50 @@ def test_factual_artifact_is_strict_and_fail_closed() -> None:
     _raises(ValueError, validate_trial_artifact, impossible_fast_timeout)
     impossible_fast_unsafe = copy.deepcopy(artifact)
     unsafe = impossible_fast_unsafe["tensors"]
-    unsafe["candidate_step"][0] = 999
-    unsafe["feature"][0, 120] = 1.0
+    unsafe["candidate_step"][0] = 998
+    unsafe["feature"][0, 120] = 998.0 / 999.0
     unsafe["feature"][0, 121:123] = 0.0
-    unsafe["outcome_episode_length"][0] = 1000
+    unsafe["outcome_episode_length"][0] = 999
     unsafe["outcome_unsafe_force"][0] = True
     unsafe["outcome_failure"][0] = True
     unsafe["outcome_time_out"][0] = False
     unsafe["outcome_terminated"][0] = True
     unsafe["outcome_truncated"][0] = False
     _raises(ValueError, validate_trial_artifact, impossible_fast_unsafe)
+
+
+def test_native_timeout_action_count_and_preaction_boundaries() -> None:
+    assignment = assignment_for("pilot", 266, 8, SALT, "a")
+    artifact = build_trial_artifact([_row()], _metadata(), assignment)
+
+    boundary = copy.deepcopy(artifact)
+    boundary["tensors"]["candidate_step"][0] = LAST_PREACTION_STEP
+    boundary["tensors"]["feature"][0, 120] = (
+        float(LAST_PREACTION_STEP) / float(EPISODE_STEP_DENOMINATOR)
+    )
+    validate_trial_artifact(boundary)
+
+    for invalid_length in (TIMEOUT_ACTION_COUNT - 1, TIMEOUT_ACTION_COUNT + 1):
+        invalid = copy.deepcopy(artifact)
+        invalid["tensors"]["outcome_episode_length"][0] = invalid_length
+        _raises(ValueError, validate_trial_artifact, invalid)
+
+    post_timeout_candidate = copy.deepcopy(boundary)
+    post_timeout_candidate["tensors"]["candidate_step"][0] = (
+        LAST_PREACTION_STEP + 1
+    )
+    post_timeout_candidate["tensors"]["feature"][0, 120] = 1.0
+    _raises(ValueError, validate_trial_artifact, post_timeout_candidate)
+
+    episode_length_buf = 0
+    preaction_steps: list[int] = []
+    while True:
+        preaction_steps.append(len(preaction_steps))
+        episode_length_buf += 1
+        if episode_length_buf >= CONFIGURED_MAX_EPISODE_LENGTH - 1:
+            break
+    assert len(preaction_steps) == TIMEOUT_ACTION_COUNT
+    assert preaction_steps[-1] == LAST_PREACTION_STEP
 
 
 def test_weights_only_safe_atomic_pair_and_no_clobber() -> None:
@@ -310,5 +348,6 @@ if __name__ == "__main__":
     test_feature_layout_and_direct_obs86_exclusion()
     test_assignment_matches_manifest_bytes_balances_and_complements()
     test_factual_artifact_is_strict_and_fail_closed()
+    test_native_timeout_action_count_and_preaction_boundaries()
     test_weights_only_safe_atomic_pair_and_no_clobber()
     print("public route trial contract tests passed")
