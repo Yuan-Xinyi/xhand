@@ -1,0 +1,64 @@
+{
+  "kind": "pick_tool_candidate38_screen_result_v1",
+  "status": "complete",
+  "decision": "reject_candidate38",
+  "created_local_date": "2026-07-22",
+  "branch": "flashsac-pick-tool-curriculum",
+  "collection_git_commit": "4b28c39f2f007a00b0547328aed384fc6c804687",
+  "manifest": "scripts/flashsac/candidate38_screen_manifest.json",
+  "manifest_sha256": "74b12b4f43055cafbe4639f23e7d561942e89838bc9a79ce8df765642d3d062e",
+  "analysis_report": "logs/flashsac/pick_tool/48_close_ab_c38_screen.json",
+  "analysis_report_sha256": "ae2a52672afaa78fa14f287063a22ee7643635d7249dd832d56e2cf8b7c297d6",
+  "artifacts": {
+    "323a": "bab908f503159d51c6950d209df3c24beae1d64ef0294a16ad364aa7dfab1819",
+    "323b": "0c1dd8e3ddd7a6382094ef92771fe6dcdea2972d51de9ec255adee9eadbbf6a0",
+    "324b": "48b464ee5bd46bf1aa14c38dd202a24e30aa9d73ce81117c2ce46f6942afce16",
+    "324a": "b96d021bcc365433610c871b3bf51d49badb85c2001f43b3e2a063ba9e1d1326",
+    "325a": "767f3028a8087e2d68a64085dc2f939ab6e9857b2eaee6798fe3d735edb6e4d5",
+    "325b": "87195a089deddfa2c69f0e2f3c820708cfdc8fb5efd1bd7037a30fc454f883ca"
+  },
+  "preregistered_estimates": {
+    "conditional_success_delta": -0.01720853858784895,
+    "itt_success_delta": -0.005208333333333333,
+    "conditional_ever_grasped_delta": -0.047750410509031206,
+    "conditional_unlatched_clearance_ge_5cm_delta": -0.011494252873563223,
+    "positive_conditional_success_seeds": 1,
+    "minimum_seed_conditional_success_delta": -0.05714285714285716,
+    "candidate_triggered_dropped": 0,
+    "candidate_triggered_unsafe_force": 0
+  },
+  "raw_triggered_funnel": {
+    "baseline": {
+      "triggered": 72,
+      "ever_grasped": 44,
+      "ever_clearance_ge_20cm": 34,
+      "success": 30
+    },
+    "candidate38": {
+      "triggered": 71,
+      "ever_grasped": 41,
+      "ever_clearance_ge_20cm": 33,
+      "success": 29
+    },
+    "candidate_minus_baseline_rates": {
+      "grasp_given_trigger_pp": -3.364632237871671,
+      "success_given_trigger_pp": -0.821596244131454,
+      "success_given_grasp_pp": 2.5498891352549884,
+      "clearance20_given_grasp_pp": 3.2150776053215075
+    }
+  },
+  "common_triggered_slot_sensitivity": {
+    "scope": "68 env slots that triggered in both complementary replicates; diagnostic only, not the preregistered estimator",
+    "baseline_ever_grasped": 43,
+    "candidate38_ever_grasped": 41,
+    "baseline_success": 29,
+    "candidate38_success": 29
+  },
+  "interpretation": [
+    "Candidate38 fails the preregistered success, grasp-retention, positive-seed, and ITT gates.",
+    "There is no treatment-attributable drop or unsafe-force event and no increase in unlatched lift.",
+    "The loss is before stable grasp; conditional transport after grasp is not worse, so the common frozen LIFT actor remains valid.",
+    "Seeds 323 through 325 are now development-visible and must not be reused for a new formal screen.",
+    "Do not continue global success-trajectory behavior cloning; test temporally coherent pre-latch CLOSE exploration around exact V6 instead."
+  ]
+}
