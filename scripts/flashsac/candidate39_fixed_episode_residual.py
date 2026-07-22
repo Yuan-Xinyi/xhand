@@ -40,6 +40,13 @@ FIXED_DIRECTION_MANIFEST = (
     "scripts/flashsac/candidate39_fixed_direction_manifest.json"
 )
 FIXED_DIRECTION_PATH = "logs/flashsac/pick_tool/50_c39_residual_fixed_z.pt"
+V6_CHECKPOINT_PATH = (
+    "logs/flashsac/pick_tool/16_v6_router_zero_actor_s254/checkpoint_final"
+)
+SEARCH_CHECKPOINT_PATH = (
+    "logs/rl_games/pick_tool_token/0_bootstrap_handoff_20260720/nn/"
+    "pick_tool_stage7_dagger_full_iter3_bc.pth"
+)
 KIT_ARGS = "--/app/extensions/fsWatcherEnabled=false"
 REQUIRED_BRANCH = "flashsac-pick-tool-curriculum"
 SEALED_PLAN_STATUS = "sealed_before_smoke_and_collection"
@@ -604,12 +611,14 @@ def validate_sealed_validation_plan(
     ):
         raise ValueError("sealed plan fixed-direction receipt changed")
     registered_policies = {
+        "v6_checkpoint": V6_CHECKPOINT_PATH,
         "v6_actor_sha256": V6_ACTOR_SHA256,
         "v6_task_contract_sha256": V6_TASK_CONTRACT_SHA256,
         "v6_bridge_state_sha256": V6_BRIDGE_STATE_SHA256,
         "frozen_lift_actor_sha256": FROZEN_LIFT_ACTOR_SHA256,
         "frozen_lift_semantic_sha256": FROZEN_LIFT_SEMANTIC_SHA256,
         "frozen_lift_source_actor_sha256": FROZEN_LIFT_SOURCE_ACTOR_SHA256,
+        "search_checkpoint": SEARCH_CHECKPOINT_PATH,
         "search_checkpoint_sha256": SEARCH_CHECKPOINT_SHA256,
         "flashsac_fork_commit": FLASHSAC_FORK_COMMIT,
     }
@@ -707,9 +716,12 @@ def _metadata(value: Any) -> dict[str, Any]:
     )
     if result["assignment_mask_sha256"] != assignment_mask_sha256(expected_mask):
         raise ValueError("metadata assignment-mask receipt differs from run identity")
-    for name in ("v6_checkpoint", "search_checkpoint"):
-        if not isinstance(result[name], str) or not result[name]:
-            raise ValueError(f"metadata.{name} must be non-empty")
+    for name, expected in (
+        ("v6_checkpoint", V6_CHECKPOINT_PATH),
+        ("search_checkpoint", SEARCH_CHECKPOINT_PATH),
+    ):
+        if result[name] != expected:
+            raise ValueError(f"metadata.{name} differs from the registered path")
     for name in (
         "assignment_mask_sha256",
         "validation_plan_sha256",

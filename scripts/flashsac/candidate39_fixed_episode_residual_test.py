@@ -40,8 +40,8 @@ def _metadata(replicate: str = "a") -> dict:
                 seed=SEED, num_envs=N, replicate=replicate
             )
         ),
-        "v6_checkpoint": "logs/v6",
-        "search_checkpoint": "logs/search.pth",
+        "v6_checkpoint": contract.V6_CHECKPOINT_PATH,
+        "search_checkpoint": contract.SEARCH_CHECKPOINT_PATH,
         "validation_plan": contract.VALIDATION_PLAN,
         "validation_plan_sha256": contract._validation_plan_digest(),
         "fixed_direction_manifest": contract.FIXED_DIRECTION_MANIFEST,
@@ -248,6 +248,14 @@ def test_corruption_fails_closed() -> None:
     bad = copy.deepcopy(base); bad["metadata"]["validation_plan_sha256"] = "d" * 64; mutations.append(bad)
     bad = copy.deepcopy(base); bad["metadata"]["v6_actor_sha256"] = "0" * 64; mutations.append(bad)
     bad = copy.deepcopy(base); bad["metadata"]["search_checkpoint_sha256"] = "0" * 64; mutations.append(bad)
+    bad = copy.deepcopy(base)
+    bad["metadata"]["v6_checkpoint"] = str(Path("/") / contract.V6_CHECKPOINT_PATH)
+    mutations.append(bad)
+    bad = copy.deepcopy(base)
+    bad["metadata"]["search_checkpoint"] = str(
+        Path("/") / contract.SEARCH_CHECKPOINT_PATH
+    )
+    mutations.append(bad)
     bad = copy.deepcopy(base); bad["metadata"]["source_manifest_sha256"] = "c" * 64; mutations.append(bad)
     bad = copy.deepcopy(base); bad["metadata"]["git"]["branch"] = "main"; mutations.append(bad)
     bad = copy.deepcopy(base); bad["metadata"]["git"]["flashsac_commit"] = "c" * 40; mutations.append(bad)

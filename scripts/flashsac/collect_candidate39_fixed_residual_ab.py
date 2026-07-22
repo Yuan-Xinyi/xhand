@@ -187,7 +187,15 @@ def build_spec(args: argparse.Namespace) -> CollectionSpec:
         raise ValueError(f"fixed validation requires exact --kit_args={KIT_ARGS!r}")
 
     v6 = _checkpoint_directory(args.v6_checkpoint, label="exact V6 checkpoint")
-    search = _regular_file(args.search_checkpoint, label="SEARCH checkpoint")
+    expected_v6 = (root / artifact_contract.V6_CHECKPOINT_PATH).resolve(strict=True)
+    if v6 != expected_v6:
+        raise ValueError(f"V6 checkpoint must be exact registered path {expected_v6}")
+    search = _exact_registered_file(
+        root,
+        args.search_checkpoint,
+        artifact_contract.SEARCH_CHECKPOINT_PATH,
+        "SEARCH checkpoint",
+    )
     fixed_direction = _exact_registered_file(
         root,
         args.fixed_direction,
@@ -872,8 +880,10 @@ def run_collection(
             "assignment_mask_sha256": artifact_contract.assignment_mask_sha256(
                 spec.treatment
             ),
-            "v6_checkpoint": str(spec.v6_checkpoint),
-            "search_checkpoint": str(spec.search_checkpoint),
+            # Artifacts bind the canonical plan strings.  The resolved absolute
+            # paths remain in ``spec`` for loading and immutable byte checks.
+            "v6_checkpoint": artifact_contract.V6_CHECKPOINT_PATH,
+            "search_checkpoint": artifact_contract.SEARCH_CHECKPOINT_PATH,
             "validation_plan": artifact_contract.VALIDATION_PLAN,
             "validation_plan_sha256": spec.immutable_sha256["validation_plan"],
             "fixed_direction_manifest": artifact_contract.FIXED_DIRECTION_MANIFEST,
