@@ -1,10 +1,16 @@
 {
   "kind": "pick_tool_candidate40_verified_arm_handoff_development_plan_v1",
-  "status": "preregistered_before_implementation_or_simulator_evidence",
+  "status": "sealed_before_smoke_and_collection",
   "created_local_date": "2026-07-22",
   "branch": "flashsac-pick-tool-curriculum",
   "preregistration_parent_commit": "7d223ae8aff95ac466c4840d63110e2761178849",
-  "purpose": "Test one isolated post-latch mechanism: whether holding only the seven arm commands at exact zero until an actor-visible plus raw-tactile 15-frame stable-grasp verification reduces Candidate39's downstream unlatched-lift failures without suppressing true 20 cm transport. The frozen LIFT hand policy, Candidate39 pre-latch fixed residual, SEARCH policy, reward, task physics, and tactile shield remain unchanged.",
+  "preregistration_receipt": {
+    "commit": "4ba0578f356a602c6902c0c29e25ddfba4c49e93",
+    "tag": "pick-tool-candidate40-verified-arm-plan-v1-20260722",
+    "sha256": "cfa894a9744810689b5e9d337854d5a1f1426059093280c248983f70be9da4ad",
+    "simulator_evidence_at_preregistration": false
+  },
+  "purpose": "Test one isolated post-latch mechanism: whether holding only the seven arm commands at exact zero until an actor-visible plus public force-counter-sidecar 15-frame stable-grasp verification reduces Candidate39's downstream unlatched-lift failures without suppressing true 20 cm transport. The frozen LIFT hand policy, Candidate39 pre-latch fixed residual, SEARCH policy, reward, task physics, and tactile shield remain unchanged.",
   "development_only": {
     "is_formal_acceptance": false,
     "allowed_claim_if_all_gates_pass": "The verified-arm handoff is eligible for a separately preregistered formal A/B screen; Candidate40 is not yet accepted or deployable.",
@@ -288,8 +294,64 @@
       "analysis tests exercise every gate boundary without seed-334/335/336 simulator outcomes"
     ]
   },
+  "implementation_clarifications_before_simulator_evidence": {
+    "trace_scope": "Record every option-active pre-eligibility action plus the unique first-latch witness, then every first-eligible-through-terminal action. The trigger action observation may therefore reside in either table and must be unique.",
+    "trigger_contract": "The q0.30/h4 trigger cannot occur before episode action 3, and trigger_score is recomputed as min(thumb proximity, second-largest non-thumb proximity) from the trigger action's pre-action observation.",
+    "stable_transport_indexing": "The restricted mean uses eligible ages 0..127. The stable-held-5cm-by-action96 event inspects ages 0..95 and is true when any 15-action rolling minimum g_h is at least 0.25.",
+    "authoritative_reset": "Every supervisor call requires the prior transition's authoritative reset mask; all activation, verification, enable, and relock memory is cleared before any action in a reset slot.",
+    "smoke_coverage": "The smoke must contain at least one treatment-eligible trace and pass every registered algebra, safety, and validator check. Natural verification completion, arm enablement, relock, or re-enable occurrence is not an additional outcome-dependent smoke gate; those semantics are covered structurally and by simulation-free tests.",
+    "source_authority": "Before AppLauncher, the complete 104-entry runtime source manifest is checked against the implementation commit, the fixed FlashSAC submodule commit, strict Git-LFS oid/size receipts, generated-USD expected hashes, and the separately sealed plan. All eight runtime assets are checked before, during, and after collection."
+  },
   "implementation_seal": {
-    "status": "pending_no_simulator_evidence"
+    "status": "complete_without_simulator_evidence",
+    "implementation_commit": "a5fb54a4d26ba1c7f2aeda6e39246a387380eae0",
+    "source_sha256": {
+      "scripts/flashsac/analyze_candidate40_verified_arm_validation.py": "2a5e8aa0414c27a22d972297fd58d7b6c3a45569b2bb03ca7ca5327eede126b3",
+      "scripts/flashsac/analyze_candidate40_verified_arm_validation_test.py": "8831d94913ec9821342454cf82461a9b18e6975880fd8c5554092776cd47b102",
+      "scripts/flashsac/candidate40_verified_arm_episode.py": "55cf8517077bccfc41c8270982db9657217ee30ac9373b98ca37bda1a060ee31",
+      "scripts/flashsac/candidate40_verified_arm_episode_test.py": "4f01d508a17896c2e3f5be6e769aaa7e192926ec8eae08efa959d0ac23117af5",
+      "scripts/flashsac/candidate40_verified_arm_handoff.py": "110e19daa914d16ed854f1b99d640900f4ac657069e5078d8ddfd0392f877046",
+      "scripts/flashsac/candidate40_verified_arm_handoff_test.py": "cbfae61f6cc328d2241e5393433d10ea2b4118949b766942bc624a1898024d2d",
+      "scripts/flashsac/collect_candidate39_episode_residual_ab.py": "73b4310e1eff1dab404f07ccb826f0e33cd1fa02f6d589911437f80e959f817a",
+      "scripts/flashsac/collect_candidate40_verified_arm_ab.py": "7345127e024c9f676c61b6105b2fb1c3c60ba32c316216059f23dc61dc1d562a",
+      "scripts/flashsac/collect_candidate40_verified_arm_ab_test.py": "b884fea6989d559b2c6222ca5dc0e82e64310b1b95f332b9584a0fb5167e7137"
+    },
+    "simulation_free_tests": {
+      "completed_before_any_candidate40_simulator_evidence": true,
+      "candidate40_focused_pytest": {
+        "passed": 42,
+        "failed": 0
+      },
+      "candidate39_to_candidate40_route_and_evidence_regression": {
+        "passed": 90,
+        "failed": 0,
+        "deselected": 1,
+        "deselection_reason": "The legacy Candidate39 test expects its canonical output path to be absent; that output is already immutably sealed and was not removed or overwritten."
+      },
+      "adapter_bridge_evaluator_search_and_task_contract_regression": {
+        "passed": 99,
+        "failed": 0,
+        "warnings": 2,
+        "warning_scope": "Expected AMP scaler portability warnings only."
+      },
+      "python_compile": {
+        "files": 8,
+        "passed": true
+      },
+      "complete_runtime_source_authority": {
+        "entries": 104,
+        "passed": true
+      },
+      "runtime_asset_authority": {
+        "entries": 8,
+        "passed": true
+      },
+      "independent_static_audit": {
+        "passed": true,
+        "remaining_blockers": 0,
+        "simulator_started": false
+      }
+    }
   },
   "decision_rule": {
     "if_all_gates_pass": "Seal the four artifacts and development report, then write and commit a separate formal-acceptance plan before touching seeds 337-339. Development pass alone does not accept Candidate40.",
