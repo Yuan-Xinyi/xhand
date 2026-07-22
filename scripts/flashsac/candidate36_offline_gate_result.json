@@ -1,0 +1,75 @@
+{
+  "kind": "pick_tool_candidate36_offline_gate_result_v1",
+  "status": "evaluated_after_formal_training",
+  "decision": "reject_before_online_ab",
+  "evaluated_local_date": "2026-07-22",
+  "branch": "flashsac-pick-tool-curriculum",
+  "training_source_commit": "04543f84f6f191a8cf678abf32916365f213e2bc",
+  "plan": "scripts/flashsac/candidate36_bc_only_plan.json",
+  "plan_sha256": "b9463117077fc3351d1f7315cb2f78c2e32ee24fb7c5783d49edadef3b51f5c5",
+  "candidate": {
+    "checkpoint": "logs/flashsac/pick_tool/43_v6_success_si_bc_only_s310/checkpoint_final",
+    "metrics_sha256": "81ae311352d556cf2c2d7be1379341c9fa65e2413fa6c368c5558f4f77cfdaa2",
+    "actor_sha256": "9604fb348e155f094ce1cea76e00b2ffe8c4f616e093068c62e1ffdf604b6340",
+    "task_contract_sha256": "8a2a135fa1cd5bb01965fc7dc6d6a73978dffc1bf55941ae392146de1d17f61d",
+    "torch_bridge_state_sha256": "331cb80f39d0082fa44f9738f4409bfe9204808528ec1b75a111655ec649f080",
+    "frozen_lift_actor_sha256": "117f1b0ae3641bd24b6b9f3d585576a79b5aff968139c0dde86e6346f60ebaa0",
+    "temperature_sha256": "7decaa945a7ce7e21f7b97824895b2deabc3dfdb4965ecb3a8a66c4f770e2189",
+    "replay_buffer_sha256": "cb0ddc119c61760ce61512dd29b42a4fe8784bbd7d60629a66b10b2aafc883d7"
+  },
+  "identity_and_optimizer_gates": {
+    "all_pass": true,
+    "task_contract_exact_baseline": true,
+    "frozen_lift_file_exact_baseline": true,
+    "search_sha256_exact": true,
+    "actor_sha256_differs_from_baseline": true,
+    "sac_actor_updates": 0,
+    "demo_bc_updates": 50,
+    "actor_adam_state_count": 20,
+    "actor_adam_states_at_step_50": 20,
+    "actor_scheduler_last_epoch": 50,
+    "temperature_semantically_exact_baseline": true,
+    "demo_bc_grad_overflow": 0.0,
+    "demo_bc_scheduler_advanced": 1.0
+  },
+  "behavior_gate": {
+    "all_pass": false,
+    "deployment_action": "tanh(actor.get_mean_and_std(observation, training=False).mean)",
+    "action_slice": [7, 21],
+    "demo_rows": 598,
+    "deterministic_demo_rows": 363,
+    "exploratory_demo_rows": 235,
+    "all_demo_hand14_rmse": {
+      "value": 0.017133722081780434,
+      "maximum": 0.02,
+      "pass": true
+    },
+    "deterministic_demo_hand14_rmse": {
+      "value": 0.01193431206047535,
+      "maximum": 0.01,
+      "excess": 0.0019343120604753497,
+      "pass": false
+    },
+    "exploratory_demo_hand14_rmse_diagnostic": 0.0229569673538208,
+    "candidate_replay_rows": 68805,
+    "candidate_replay_unlatched_rows": 61595,
+    "candidate_replay_latched_rows": 7210,
+    "baseline_hand14_rms_on_unlatched_replay": 0.43139463663101196,
+    "candidate_minus_baseline_hand14_rms_on_unlatched_replay": 0.012598219327628613,
+    "relative_actor_drift": {
+      "value": 0.029203467071056366,
+      "minimum_exclusive": 0.0,
+      "maximum": 0.05,
+      "pass": true
+    }
+  },
+  "cross_checks": {
+    "baseline_all_demo_hand14_rmse": 0.012870067730545998,
+    "baseline_deterministic_demo_hand14_rmse": 0.00024710458773188293,
+    "baseline_exploratory_demo_hand14_rmse": 0.02052810788154602,
+    "candidate35_all_demo_hand14_rmse": 0.05749940499663353
+  },
+  "failure_location": "deterministic_close_policy_retention",
+  "interpretation": "Removing SAC actor updates eliminated the large Candidate35 drift, but the BC standard-deviation prior still updates the shared actor trunk and moves the deterministic V6 CLOSE policy beyond its sealed retention limit.",
+  "next_isolated_mechanism": "repeat the exact Candidate36 protocol with demo_bc_std_weight=0 so BC updates only the demonstrated action mean"
+}
