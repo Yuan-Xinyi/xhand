@@ -229,6 +229,7 @@ def _validate_action_inputs(
     pre_tanh_scale: torch.Tensor,
     raw_z_abs_cap: float | None,
     pre_tanh_abs_cap: torch.Tensor | None,
+    pre_tanh_l2_cap: float | None,
     atanh_epsilon: float,
 ) -> None:
     if (
@@ -305,6 +306,13 @@ def _validate_action_inputs(
         or float(raw_z_abs_cap) < 0.0
     ):
         raise ValueError("raw_z_abs_cap must be None or finite and non-negative")
+    if pre_tanh_l2_cap is not None and (
+        not isinstance(pre_tanh_l2_cap, (int, float))
+        or isinstance(pre_tanh_l2_cap, bool)
+        or not math.isfinite(float(pre_tanh_l2_cap))
+        or float(pre_tanh_l2_cap) < 0.0
+    ):
+        raise ValueError("pre_tanh_l2_cap must be None or finite and non-negative")
     if (
         not isinstance(atanh_epsilon, (int, float))
         or isinstance(atanh_epsilon, bool)
@@ -324,6 +332,7 @@ def apply_option_residual(
     pre_tanh_scale: torch.Tensor,
     raw_z_abs_cap: float | None = None,
     pre_tanh_abs_cap: torch.Tensor | None = None,
+    pre_tanh_l2_cap: float | None = None,
     atanh_epsilon: float = DEFAULT_ATANH_EPSILON,
 ) -> OptionResidualResult:
     """Apply a coherent hand-only residual in baseline pre-tanh space.
@@ -347,6 +356,7 @@ def apply_option_residual(
         pre_tanh_scale=pre_tanh_scale,
         raw_z_abs_cap=raw_z_abs_cap,
         pre_tanh_abs_cap=pre_tanh_abs_cap,
+        pre_tanh_l2_cap=pre_tanh_l2_cap,
         atanh_epsilon=atanh_epsilon,
     )
     effective_z = torch.where(
@@ -380,6 +390,15 @@ def apply_option_residual(
         residual = torch.maximum(
             torch.minimum(residual, expanded_cap), -expanded_cap
         )
+    if pre_tanh_l2_cap is not None:
+        l2_cap = float(pre_tanh_l2_cap)
+        residual_norm = torch.linalg.vector_norm(residual, dim=-1, keepdim=True)
+        l2_scale = torch.where(
+            residual_norm > l2_cap,
+            l2_cap / residual_norm.clamp_min(torch.finfo(residual.dtype).tiny),
+            torch.ones_like(residual_norm),
+        )
+        residual = residual * l2_scale
     residual = torch.where(
         eligible.unsqueeze(-1), residual, torch.zeros_like(residual)
     )

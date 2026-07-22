@@ -250,6 +250,48 @@ def test_batched_state_dependent_scale_and_symmetric_clip_audit() -> None:
     assert bool((vector_capped.pre_tanh_residual.abs() <= vector_cap).all())
 
 
+def test_global_l2_budget_is_symmetric_and_fail_closed() -> None:
+    baseline, option_active, public_latch, treatment, raw_z = _action_fixture()
+    l2_cap = 0.075
+    result = apply_option_residual(
+        baseline_action=baseline,
+        option_active=option_active,
+        public_latch=public_latch,
+        treatment=treatment,
+        raw_z=raw_z,
+        pre_tanh_scale=grouped_pre_tanh_scale(
+            token_scale=0.4, distal_scale=0.2
+        ),
+        raw_z_abs_cap=2.0,
+        pre_tanh_abs_cap=grouped_pre_tanh_scale(
+            token_scale=0.1, distal_scale=0.05
+        ),
+        pre_tanh_l2_cap=l2_cap,
+    )
+    norms = torch.linalg.vector_norm(result.pre_tanh_residual, dim=-1)
+    assert bool((norms <= l2_cap + 1.0e-7).all())
+    assert torch.count_nonzero(result.pre_tanh_residual[~result.eligible]) == 0
+
+    mirrored = apply_option_residual(
+        baseline_action=baseline,
+        option_active=option_active,
+        public_latch=public_latch,
+        treatment=treatment,
+        raw_z=-raw_z,
+        pre_tanh_scale=grouped_pre_tanh_scale(
+            token_scale=0.4, distal_scale=0.2
+        ),
+        raw_z_abs_cap=2.0,
+        pre_tanh_abs_cap=grouped_pre_tanh_scale(
+            token_scale=0.1, distal_scale=0.05
+        ),
+        pre_tanh_l2_cap=l2_cap,
+    )
+    assert torch.equal(
+        mirrored.pre_tanh_residual, -result.pre_tanh_residual
+    )
+
+
 def test_scale_and_cap_shape_dtype_device_validation() -> None:
     baseline, option_active, public_latch, treatment, raw_z = _action_fixture()
     scale = grouped_pre_tanh_scale(token_scale=0.1, distal_scale=0.1)
@@ -301,6 +343,13 @@ def test_scale_and_cap_shape_dtype_device_validation() -> None:
         **kwargs,
         raw_z_abs_cap=float("inf"),
     )
+    _expect(ValueError, apply_option_residual, **kwargs, pre_tanh_l2_cap=-0.1)
+    _expect(
+        ValueError,
+        apply_option_residual,
+        **kwargs,
+        pre_tanh_l2_cap=float("nan"),
+    )
 
 
 def test_fail_closed_validation() -> None:
@@ -349,6 +398,7 @@ if __name__ == "__main__":
     test_arm_latch_control_and_option_invariants()
     test_saturated_actions_are_finite_bounded_and_auditable()
     test_batched_state_dependent_scale_and_symmetric_clip_audit()
+    test_global_l2_budget_is_symmetric_and_fail_closed()
     test_scale_and_cap_shape_dtype_device_validation()
     test_fail_closed_validation()
     print("option_residual_screen_test: PASS")
