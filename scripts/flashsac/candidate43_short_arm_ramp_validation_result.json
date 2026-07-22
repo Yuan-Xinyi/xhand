@@ -1,0 +1,104 @@
+{
+  "kind": "pick_tool_candidate43_short_public_arm_ramp_development_validation_result_v1",
+  "status": "sealed_rejected_at_non_evidence_smoke",
+  "sealed_local_date": "2026-07-23",
+  "branch": "flashsac-pick-tool-curriculum",
+  "collection_commit": "3677a19409bb03dbf2b095563174aae9efa3ceda",
+  "implementation_commit": "9fdf5f30aeded59baa9fb7c2baff812df008fe6e",
+  "validation_plan": {
+    "path": "scripts/flashsac/candidate43_short_arm_ramp_development_plan.json",
+    "sha256": "e1edf5ed55969836bf4cfbedfb6ec2b6c8a5b72dcfe2a5cd53b741014faa0f57",
+    "pristine_preregistration_sha256": "ab2533a6a96d133b1330c1fc7803d781fb515ff392ed68ac99f1a841beea26e8",
+    "preregistration_commit": "87566ab4cd4af9137387c36c43135d13eb48c323",
+    "preregistration_tag": "pick-tool-candidate43-short-arm-ramp-plan-v1-20260723",
+    "collection_seal_tag": "pick-tool-candidate43-short-arm-ramp-validation-v1-20260723",
+    "collection_seal_tag_object_oid": "fb97e5fc1d96d1703c466581dcae2f17b0c33e0e"
+  },
+  "registered_intervention": {
+    "description": "Keep Candidate39 route, hand14, eligibility, public stability and same-action hard relock unchanged; on treatment rows only, use the D8 float32 live-stable arm7 authority ramp so the ninth consecutive stable action is full authority.",
+    "only_scientific_change_from_candidate42": "stable-count clamp 15 to 8 and float32 denominator 15.0 to 8.0",
+    "network_updates": 0
+  },
+  "implementation_validation": {
+    "simulation_free_tests_passed": 110,
+    "simulation_free_tests_failed": 0,
+    "independent_audit_blockers": 0,
+    "runtime_source_files": 143,
+    "runtime_assets": 8,
+    "simulator_invocations_before_collection_seal": 0
+  },
+  "non_evidence_smoke": {
+    "run": "352b",
+    "seed": 352,
+    "replicate": "b",
+    "num_envs": 8,
+    "output_stem": "logs/flashsac/pick_tool/55_c43_short_arm_ramp_smoke_s352_b/trial",
+    "run_id": "3ea3ad0495b034f15859e04675734294a919f082bd9dc4f289972a949bd7a8dc",
+    "attempt_id": "e766508b00261bd7a2aa4fd5e0d3bca5b40ec08db3b074c3d9817ef8b16f82cc",
+    "attempt_number": 1,
+    "transaction_contract": "candidate42_parent_child_fsync_no_clobber_commit_v1",
+    "transaction_status": "committed",
+    "first_step_boundary_armed": true,
+    "canonical_commit_is_samefile_as_attempt_60": true,
+    "artifact_path": "logs/flashsac/pick_tool/55_c43_short_arm_ramp_smoke_s352_b/trial.pt",
+    "artifact_sha256": "11b29a8190bf0469a2b94129f23acae5ec85cd9ad0451caa94acb75025650e5a",
+    "report_path": "logs/flashsac/pick_tool/55_c43_short_arm_ramp_smoke_s352_b/trial.json",
+    "report_sha256": "53b8ce5e2c1be3ec812b7adb2e3b093a7b34dc3db790c073c3b2df6aff867c5a",
+    "commit_path": "logs/flashsac/pick_tool/55_c43_short_arm_ramp_smoke_s352_b/trial.commit.json",
+    "commit_sha256": "fb5759cf9a738a99af3ff6b758fc6323e674850284494e881c18b6c141b8b2fb",
+    "registered_mechanism_coverage": {
+      "treatment_slots": 4,
+      "eligible_slots_total": 1,
+      "treatment_eligible_slots": 0,
+      "treatment_partial_authority_rows": 0,
+      "treatment_full_authority_rows": 0,
+      "required_treatment_overlay_present": false,
+      "required_partial_authority_present": false,
+      "required_full_authority_present": false
+    },
+    "registered_smoke_semantic_prerequisite_passed": false,
+    "semantic_failure": "The canonical smoke contained no treatment-and-eligible episode, so it exercised neither partial nor full D8 authority.",
+    "performance_outcomes_or_treatment_effects_inspected": false,
+    "plan_or_gate_changed_from_smoke": false
+  },
+  "rule_application": {
+    "failure_is_pre_boundary": false,
+    "identical_run_id_retry_permitted": false,
+    "different_replicate_or_seed_retry_permitted": false,
+    "development_collection_permitted": false,
+    "reason": "The registered semantic smoke prerequisite failed after the durable first-step boundary. Candidate43 must be rejected; loosening the prerequisite or rerunning is post-evidence protocol drift."
+  },
+  "development_evidence": {
+    "registered_run_order": [
+      "353a",
+      "353b",
+      "354b",
+      "354a"
+    ],
+    "simulator_runs_started": 0,
+    "canonical_outputs_present": 0,
+    "acceptance_gates_evaluated": false,
+    "combined_report_created": false
+  },
+  "formal_screen": {
+    "seeds": [
+      355,
+      356,
+      357
+    ],
+    "touched": false,
+    "permitted_under_this_candidate": false,
+    "advance_to_formal_screen": false
+  },
+  "candidate42_formal_seed_hygiene": {
+    "seeds": [
+      349,
+      350,
+      351
+    ],
+    "touched": false
+  },
+  "decision": "reject_candidate43_before_development",
+  "allowed_conclusion": "Candidate43's implementation and canonical transaction path passed, but the registered 8-environment smoke did not naturally expose any treatment-eligible D8 action. Candidate43 therefore provides no development estimate of D8 performance and is rejected without touching development or formal seeds.",
+  "next_candidate_constraint": "Any retry of D8 must be a new preregistered candidate on fresh seeds. Its smoke contract must explicitly separate deterministic algebra coverage from stochastic natural eligibility support; no Candidate43 artifact may enter its estimator."
+}
