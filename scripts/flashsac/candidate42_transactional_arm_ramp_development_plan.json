@@ -5,9 +5,9 @@
   "branch": "flashsac-pick-tool-curriculum",
   "preregistration_parent_commit": "351de88bda3aba3e8633ec7330e8edd4acd02ca6",
   "preregistration_receipt": {
-    "commit": null,
+    "commit": "6e46f567f7730a1ef296fd794ebaf10ea85dde13",
     "tag": "pick-tool-candidate42-transactional-arm-ramp-plan-v1-20260722",
-    "sha256": null,
+    "sha256": "7b9e98d06aae1c992fb4ae7fe9c283f9b746228ab7d012f8cafcd8b3c20d3727",
     "simulator_evidence_at_preregistration": false
   },
   "purpose": "Retest Candidate41's unchanged public linear arm-authority ramp under a new campaign whose only mechanism change is the evidence transaction boundary. A non-Isaac parent must survive Isaac Sim's process-terminating fast shutdown, classify the first-step boundary from durable markers, independently validate staged evidence after child exit, and become the sole canonical publisher.",
@@ -399,6 +399,58 @@
       "all unchanged estimator and 32 gate boundaries execute without simulator outcomes",
       "complete runtime-source/runtime-asset authority and exact five-position order with registered pre-boundary retries pass"
     ]
+  },
+  "implementation_seal": {
+    "status": "complete_without_simulator_evidence",
+    "implementation_commit": "98d065a2a22a106846fcae6db4ccb9edb8964909",
+    "source_sha256": {
+      "scripts/flashsac/candidate42_public_arm_ramp.py": "71cdc68fc852154ad086511f6e4b02381364d10bb79ba0f62d7b3f91687dd02e",
+      "scripts/flashsac/candidate42_public_arm_ramp_test.py": "f8777f976638b7423759e61f114a33a2367df68493949f811395ee42640f1b6f",
+      "scripts/flashsac/candidate42_public_arm_ramp_episode.py": "9ca3f5243518cfa13ac4e7b8d8b9de1972576737b5dce28e3cb8f3f7f30b096b",
+      "scripts/flashsac/candidate42_public_arm_ramp_episode_test.py": "1344fd01ca526a32ab152a65bc92f6616510b1dbd8bf9c7080446ec723dd9ed1",
+      "scripts/flashsac/candidate42_attempt_transaction.py": "2d70e3582eb4e1789bec564ffdc8aba54ca5097abd89d5420514b1c67efdf60a",
+      "scripts/flashsac/candidate42_attempt_transaction_test.py": "c4bff9c4cdac7daefbb6ba4fbf04d1ab5d75e5c6e3f4a89212e069fc5087df7a",
+      "scripts/flashsac/candidate42_public_arm_ramp_collection.py": "61ce242b171629935746b46356648ba655d5ea8dd07888ea69d525f2afd7f631",
+      "scripts/flashsac/candidate42_public_arm_ramp_collection_test.py": "8f431b6f9adae081b14684e03d8e9364d0879fb009ca4fe00f9d42a6404365c9",
+      "scripts/flashsac/collect_candidate42_public_arm_ramp_child.py": "ce1c0d826b8fcc425f12515bbc11a3fca792952eeed5057113b822cb3cfcdf91",
+      "scripts/flashsac/collect_candidate42_public_arm_ramp_child_test.py": "e652145eb7bc541ef998094e2650d73f29a2da8d9377a502af5ecb9dd8b4a935",
+      "scripts/flashsac/collect_candidate42_public_arm_ramp_ab.py": "42a5181b5d72edd6686de91900534b7f37a73678bffd9757fc43243f85bbe13b",
+      "scripts/flashsac/collect_candidate42_public_arm_ramp_ab_test.py": "efcffd477b984102434d320234330ca2323fd67d9af53aeb79794a398262fd75",
+      "scripts/flashsac/analyze_candidate42_public_arm_ramp_validation.py": "db69901d7f97b8be95fa18dc932afdb284e0fc35e1fecdf5653cb3261aa499b8",
+      "scripts/flashsac/analyze_candidate42_public_arm_ramp_validation_test.py": "3d5038ea23f14862baf36178f02fa1a16ba8b5e6b1b869495cdf54628b26ce75"
+    },
+    "simulator_evidence_before_source_seal": false,
+    "simulation_free_tests": {
+      "status": "passed",
+      "passed": 86,
+      "failed": 0,
+      "required_contracts_covered": [
+        "balanced deterministic complementary assignment on seeds 346, 347 and 348",
+        "C42 supervisor function identity and randomized tensor outputs are bit-exact to C41",
+        "authority sequence is exactly 0,1/15,...,14/15,1 and current instability hard-relocks on the same action",
+        "normalized C42 collection kernel AST equals C41 except the registered durable-boundary helper",
+        "fake env proves the fsynced first-step marker precedes env.step",
+        "fake child fast os._exit(0) after 40_close_requested success survives and parent commits exact bytes",
+        "a receipt-valid caught or abrupt pre-boundary failure may retry only after child exit or inherited-lock release is proven; after boundary arming, crash, SIGKILL, nonzero exit, or child_failed plus exit zero rejects",
+        "hash, size, run id, attempt id, schema, symlink, non-regular, terminal-conflict and canonical-collision corruption reject",
+        "post-exit source, checkpoint, runtime-asset, Git, tag or submodule drift rejects",
+        "partial canonical publication resumes idempotently only from the same verified staged transaction without simulator rerun",
+        "parent import graph excludes Isaac/Omni/PXR/AppLauncher; child excludes the parent publisher and canonical constants, every child write uses a stage-only capability constrained under the sealed attempt directory, and injected canonical or symlink paths reject",
+        "artifact validators reject altered plans, assignments, clocks, scales, actions, telemetry, traces and complementary evidence",
+        "all unchanged estimator and 32 gate boundaries execute without simulator outcomes",
+        "complete runtime-source/runtime-asset authority and exact five-position order with registered pre-boundary retries pass"
+      ]
+    },
+    "static_audit": {
+      "status": "passed",
+      "blockers": 0,
+      "simulator_invocations": 0,
+      "runtime_assets": 8,
+      "runtime_source_files": 147
+    }
+  },
+  "collection_seal": {
+    "tag": "pick-tool-candidate42-transactional-arm-ramp-validation-v1-20260722"
   },
   "decision_rule": {
     "if_all_gates_pass": "Seal all development transaction evidence and write a separate formal-acceptance plan before touching seeds 349-351.",
