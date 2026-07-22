@@ -1733,6 +1733,14 @@ def test_demo_rehearsal_optimizes_deployment_path_without_bn_drift() -> None:
         target_action = torch.tanh(target_mean)
     buffers_before = _actor_batch_norm_buffers(agent)
     parameters_before = _actor_parameters(agent)
+    named_parameters = {
+        name.removeprefix("_orig_mod."): parameter
+        for name, parameter in agent._actor.network.named_parameters()  # noqa: SLF001
+    }
+    std_head_names = {"predictor.std_bias", "predictor.std_w.w.weight"}
+    std_head_before = {
+        name: named_parameters[name].detach().clone() for name in std_head_names
+    }
 
     def deployment_loss() -> torch.Tensor:
         mean, _ = agent._actor.apply(  # noqa: SLF001
@@ -1764,6 +1772,20 @@ def test_demo_rehearsal_optimizes_deployment_path_without_bn_drift() -> None:
     assert any(
         not torch.equal(parameters_after[name], value)
         for name, value in parameters_before.items()
+    )
+    optimizer = agent._actor.optimizer  # noqa: SLF001
+    assert optimizer is not None
+    for name in std_head_names:
+        torch.testing.assert_close(
+            named_parameters[name], std_head_before[name], rtol=0.0, atol=0.0
+        )
+        assert named_parameters[name] not in optimizer.state, (
+            f"zero-weight std prior created Adam state for {name}"
+        )
+    assert all(
+        parameter in optimizer.state
+        for name, parameter in named_parameters.items()
+        if name not in std_head_names
     )
 
 
@@ -1820,10 +1842,22 @@ def test_compiled_cuda_demo_rehearsal_preserves_diagnostic_output() -> None:
     metrics = agent.demo_bc_rehearsal(
         {"observation": observation, "action": action},
         weight=1.0,
+        std_weight=0.0,
     )
     assert all(torch.isfinite(torch.tensor(value)) for value in metrics.values())
     assert metrics["demo_bc/arm_action_rmse"] >= 0.0
     assert metrics["demo_bc/grad_overflow"] in (0.0, 1.0)
+    optimizer = agent._actor.optimizer  # noqa: SLF001
+    assert optimizer is not None
+    for name, parameter in agent._actor.network.named_parameters():  # noqa: SLF001
+        if name.removeprefix("_orig_mod.") in {
+            "predictor.std_bias",
+            "predictor.std_w.w.weight",
+        }:
+            assert parameter not in optimizer.state, (
+                "compiled zero-weight std prior created Adam state for "
+                f"{name.removeprefix('_orig_mod.')}"
+            )
 
     scaler_state = agent._grad_scaler.state_dict()  # noqa: SLF001
     scaler_state["scale"] = 1.0e30

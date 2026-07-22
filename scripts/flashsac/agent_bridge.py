@@ -52,6 +52,7 @@ _ACTOR_ACTION_OUTPUT_KEYS = (
     "predictor.std_w.w.weight",
     "predictor.std_bias",
 )
+_ACTOR_STD_OUTPUT_KEYS = frozenset(_ACTOR_ACTION_OUTPUT_KEYS[2:])
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _UPSTREAM_ROOT = _PROJECT_ROOT / "third_party" / "FlashSAC"
@@ -1949,7 +1950,10 @@ class FlashSACTorchBridge(FlashSACAgent):
                 reduction="none",
                 beta=1.0,
             )
-            predicted_log_std = predicted_std.float().clamp_min(1.0e-8).log()
+            diagnostic_std = (
+                predicted_std.detach() if std_weight == 0.0 else predicted_std
+            )
+            predicted_log_std = diagnostic_std.float().clamp_min(1.0e-8).log()
             std_loss_elementwise = (
                 predicted_log_std - math.log(target_std)
             ).square()
@@ -1982,12 +1986,41 @@ class FlashSACTorchBridge(FlashSACAgent):
                 ).sum() / active_actions.sum().to(
                     dtype=std_loss_elementwise.dtype
                 )
-            loss = weight * (action_loss + std_weight * std_loss)
+            # Multiplying ``std_loss`` by an exact zero still leaves the std
+            # head in the autograd graph. Adam then allocates moments and
+            # advances their step counters even though the resulting gradient
+            # is zero. Apart from bloating an action-only checkpoint, that
+            # changes the bias correction of a later resumed std update. Keep
+            # the diagnostic std loss above, but remove its branch from the
+            # optimizer graph when the caller explicitly disables the prior.
+            if std_weight == 0.0:
+                loss = weight * action_loss
+            else:
+                loss = weight * (action_loss + std_weight * std_loss)
+
+        def clear_disabled_std_head_gradients() -> None:
+            if std_weight != 0.0:
+                return
+            found: set[str] = set()
+            for name, parameter in self._actor.network.named_parameters():
+                canonical_name = name.removeprefix(_COMPILED_STATE_PREFIX)
+                if canonical_name in _ACTOR_STD_OUTPUT_KEYS:
+                    # A compiled multi-output actor can materialize explicit
+                    # zero gradients for an unused output. Restore the stronger
+                    # action-only contract before Adam observes the parameters.
+                    parameter.grad = None
+                    found.add(canonical_name)
+            if found != _ACTOR_STD_OUTPUT_KEYS:
+                raise RuntimeError(
+                    "FlashSAC actor std-head parameters changed: "
+                    f"expected={sorted(_ACTOR_STD_OUTPUT_KEYS)}, found={sorted(found)}"
+                )
 
         if self._cfg.use_amp:
             scale_before = float(self._grad_scaler.get_scale())
             self._grad_scaler.scale(loss).backward()
             self._grad_scaler.unscale_(optimizer)
+            clear_disabled_std_head_gradients()
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self._actor.network.parameters(), gradient_clip
             )
@@ -1999,6 +2032,7 @@ class FlashSACTorchBridge(FlashSACAgent):
             )
         else:
             loss.backward()
+            clear_disabled_std_head_gradients()
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self._actor.network.parameters(), gradient_clip
             )

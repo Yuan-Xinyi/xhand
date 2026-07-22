@@ -1,0 +1,81 @@
+{
+  "kind": "pick_tool_candidate37_offline_gate_result_v1",
+  "status": "evaluated_after_formal_training",
+  "decision": "reject_before_online_ab",
+  "evaluated_local_date": "2026-07-22",
+  "branch": "flashsac-pick-tool-curriculum",
+  "training_source_commit": "ff816cfea6012e5d551244a64f251e4211dd9434",
+  "plan": "scripts/flashsac/candidate37_action_only_plan.json",
+  "plan_sha256": "df3623235e884ef53874e1d6eb8736e7b850aabd9099e0c1becdb67f1adb233a",
+  "candidate": {
+    "checkpoint": "logs/flashsac/pick_tool/45_v6_success_si_action_only_s310/checkpoint_final",
+    "metrics_sha256": "399e8548ad12d2fec3fed76d46f96507ebf71c8c39b4965ff9b8d63f70753037",
+    "actor_sha256": "87c4bf9cd5379ec16276d9da855112b445068fcc852940a864e72ede48a6e702",
+    "task_contract_sha256": "8a2a135fa1cd5bb01965fc7dc6d6a73978dffc1bf55941ae392146de1d17f61d",
+    "torch_bridge_state_sha256": "866c11af2c8e4e89dc8edeb48b4e422db7548f6ebed1b255cf7c0bf726455d95",
+    "frozen_lift_actor_sha256": "117f1b0ae3641bd24b6b9f3d585576a79b5aff968139c0dde86e6346f60ebaa0",
+    "temperature_sha256": "7decaa945a7ce7e21f7b97824895b2deabc3dfdb4965ecb3a8a66c4f770e2189",
+    "replay_buffer_sha256": "226b7adf76c7302f82f53f4b3721d11fca33259c45894e32c9d5a346201723cc"
+  },
+  "identity_gates": {
+    "all_pass": true,
+    "task_contract_exact_baseline": true,
+    "frozen_lift_file_exact_baseline": true,
+    "search_sha256_exact": true,
+    "actor_sha256_differs_from_baseline": true
+  },
+  "optimizer_gate": {
+    "all_pass": false,
+    "sac_actor_updates": 0,
+    "demo_bc_updates": 50,
+    "actor_action_path_adam_state_count": 18,
+    "actor_action_path_adam_states_at_step_50": 18,
+    "actor_std_head_adam_state_count": {
+      "value": 2,
+      "required": 0,
+      "pass": false
+    },
+    "actor_std_head_adam_steps": {
+      "predictor.std_bias": 50,
+      "predictor.std_w.w.weight": 50
+    },
+    "actor_std_head_exp_avg_nonzero_elements": 0,
+    "actor_std_head_exp_avg_sq_nonzero_elements": 0,
+    "actor_scheduler_last_epoch": 50,
+    "actor_std_head_tensors_exact_baseline": true,
+    "temperature_semantically_exact_baseline": true,
+    "demo_bc_grad_overflow": 0.0,
+    "demo_bc_scheduler_advanced": 1.0
+  },
+  "behavior_gate": {
+    "all_pass": true,
+    "demo_rows": 598,
+    "deterministic_demo_rows": 363,
+    "exploratory_demo_rows": 235,
+    "all_demo_hand14_rmse": {
+      "value": 0.01199324894696474,
+      "maximum": 0.02,
+      "pass": true
+    },
+    "deterministic_demo_hand14_rmse": {
+      "value": 0.00285745388828218,
+      "maximum": 0.01,
+      "pass": true
+    },
+    "exploratory_demo_hand14_rmse_diagnostic": 0.01879918947815895,
+    "candidate_replay_rows": 67577,
+    "candidate_replay_unlatched_rows": 60095,
+    "candidate_replay_latched_rows": 7482,
+    "baseline_hand14_rms_on_unlatched_replay": 0.43287861347198486,
+    "candidate_minus_baseline_hand14_rms_on_unlatched_replay": 0.0053560747765004635,
+    "relative_actor_drift": {
+      "value": 0.012373155914247036,
+      "minimum_exclusive": 0.0,
+      "maximum": 0.05,
+      "pass": true
+    }
+  },
+  "failure_location": "zero_weight_std_optimizer_bookkeeping",
+  "interpretation": "The action-only behavior hypothesis passed, but loss construction retained the zero-weight std branch in autograd. Compiled and eager Adam therefore allocated zero-valued moments and advanced both std-head step counters, violating the sealed resumability contract.",
+  "next_isolated_mechanism": "exclude the std branch from the loss graph at exact zero and clear compiler-materialized zero std-head gradients before Adam"
+}
