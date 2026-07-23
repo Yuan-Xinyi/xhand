@@ -31,6 +31,29 @@ ACTION_BLOCKS = {
 ACTOR_PREFIXES = ("a2c_network.actor_mlp.", "a2c_network.mu.")
 MU_KEYS = {"a2c_network.mu.weight", "a2c_network.mu.bias"}
 
+# Training state whose shape/coupling is stale after BC surgery.  A BC output is a
+# weights checkpoint, never a resumable one, so these are dropped from the output payload
+# while every other provenance field (option/separate/migrate metadata) is preserved.
+INCOMPATIBLE_TRAINING_KEYS = frozenset(
+    {
+        "assymetric_vf_nets",
+        "current_lengths",
+        "current_rewards",
+        "current_shaped_rewards",
+        "dones",
+        "env_state",
+        "epoch",
+        "frame",
+        "intr_reward_model",
+        "last_mean_rewards",
+        "obs",
+        "optimizer",
+        "rnn_states",
+        "scaler",
+        "trackers",
+    }
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -449,10 +472,29 @@ def main() -> None:
             f"BC is defined for a migrated 115-or-120/21 policy, got "
             f"{actor.observation_dim}/{actor.action_dim}"
         )
-    if args.mu_head_only and not any(
+    has_separate_critic = any(
         key.startswith("a2c_network.critic_mlp.") for key in initial_model
-    ):
+    )
+    if args.mu_head_only and not has_separate_critic:
         raise RuntimeError("--mu-head-only requires a separate actor/critic checkpoint")
+    # Full-actor BC trains the actor trunk.  On a shared-trunk checkpoint that trunk is
+    # also the value trunk, so the value function silently changes even though every
+    # tensor-level "value" check passes.  The pipeline is only safe because the migrate
+    # step zeroes the value head (0 output regardless of trunk).  Refuse full-actor BC on
+    # a shared trunk whose value head is still live, rather than emit a checkpoint whose
+    # "value bit-identical" guarantee is false.
+    if not args.mu_head_only and not has_separate_critic:
+        value_weight = initial_model.get("a2c_network.value.weight")
+        value_bias = initial_model.get("a2c_network.value.bias")
+        value_live = (
+            value_weight is not None and bool(torch.count_nonzero(value_weight))
+        ) or (value_bias is not None and bool(torch.count_nonzero(value_bias)))
+        if value_live:
+            raise RuntimeError(
+                "full-actor BC on a shared trunk with a live value head would change the "
+                "value function while all tensor-level checks pass; separate the critic "
+                "first, use --mu-head-only, or zero the value head (as migrate does)"
+            )
 
     raw_dataset = load_torch(dataset_path)
     data = validate_dataset(raw_dataset, actor.observation_dim, actor.action_dim)
@@ -702,6 +744,15 @@ def main() -> None:
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_payload = {"model": output_model, "bc_meta": merged_meta}
+    # Preserve upstream provenance (option_checkpoint_meta, migrate/separate metadata, ...)
+    # so BC does not silently break the audit chain; drop only the shape-stale training
+    # state and the keys we (re)generate below.
+    for key, value in payload.items():
+        if key in {"model", "bc_meta", "separate_actor_critic_meta"}:
+            continue
+        if key in INCOMPATIBLE_TRAINING_KEYS:
+            continue
+        output_payload[key] = copy.deepcopy(value)
     separate_meta = payload.get("separate_actor_critic_meta")
     if isinstance(separate_meta, dict):
         output_payload["separate_actor_critic_meta"] = copy.deepcopy(separate_meta)

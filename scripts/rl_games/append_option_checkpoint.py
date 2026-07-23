@@ -28,6 +28,28 @@ NEW_OBSERVATIONS = OLD_OBSERVATIONS + OPTION_OBSERVATIONS
 ACTIONS = 21
 RMS_EPSILON = 1.0e-5
 
+# The first actor layer changes shape (115 -> 120 input), so any optimizer moment or
+# rollout counter carried from the source is stale and would either crash at the first
+# optimizer.step() or silently skew schedules if train.py classifies the payload as a
+# resumable checkpoint.  Strip the same keys separate_actor_critic_checkpoint.py strips.
+INCOMPATIBLE_TRAINING_KEYS = {
+    "assymetric_vf_nets",
+    "current_lengths",
+    "current_rewards",
+    "current_shaped_rewards",
+    "dones",
+    "env_state",
+    "epoch",
+    "frame",
+    "intr_reward_model",
+    "last_mean_rewards",
+    "obs",
+    "optimizer",
+    "rnn_states",
+    "scaler",
+    "trackers",
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -76,6 +98,18 @@ def actor_layer_indices(state: Mapping[str, Any]) -> list[int]:
 
 
 def validate_model(state: Mapping[str, Any]) -> list[int]:
+    # This tool widens only the actor first layer and the observation RMS.  A checkpoint
+    # that already carries a separate critic MLP would keep its critic at 115-input while
+    # the RMS/actor move to 120, and the self-check (actor-only) cannot notice it, so the
+    # break surfaces only at online-training load_state_dict.  Refuse it up front.
+    critic_keys = sorted(key for key in state if key.startswith("a2c_network.critic_mlp."))
+    if critic_keys:
+        raise ValueError(
+            "checkpoint has a separate critic MLP (e.g. "
+            f"{critic_keys[0]!r}); append the option observations before separating the "
+            "critic, or widen the critic first layer symmetrically"
+        )
+
     mean = require_tensor(state, "running_mean_std.running_mean")
     var = require_tensor(state, "running_mean_std.running_var")
     if mean.shape != (OLD_OBSERVATIONS,) or var.shape != (OLD_OBSERVATIONS,):
@@ -251,6 +285,8 @@ def main() -> None:
     layer_indices = validate_model(old_state)
     new_state = expand_model(old_state, layer_indices)
     check = self_check(old_state, new_state, layer_indices, args.self_check_samples, args.seed)
+
+    stripped_keys = sorted(key for key in payload if key in INCOMPATIBLE_TRAINING_KEYS)
     metadata = {
         "format": "pick_tool_option_observations_v1",
         "source_path": str(args.input.resolve()),
@@ -262,13 +298,23 @@ def main() -> None:
         "option_rms_mean": 0.0,
         "option_rms_variance": 1.0,
         "option_actor_columns": "zero",
+        "checkpoint_load_mode": "weights",
+        "stripped_training_state_keys": stripped_keys,
         "self_check": check,
     }
 
-    output_checkpoint = copy.deepcopy(checkpoint)
-    output_payload = copy.deepcopy(payload)
+    # Preserve every non-model payload field except the shape-stale training state; the
+    # widened first layer is incompatible with any carried optimizer/rollout counters.
+    output_payload = {
+        key: copy.deepcopy(value)
+        for key, value in payload.items()
+        if key != "model" and key not in INCOMPATIBLE_TRAINING_KEYS
+    }
     output_payload["model"] = new_state
     output_payload["option_checkpoint_meta"] = metadata
+    output_checkpoint = {
+        key: copy.deepcopy(value) for key, value in checkpoint.items() if key != root_key
+    }
     output_checkpoint[root_key] = output_payload
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
