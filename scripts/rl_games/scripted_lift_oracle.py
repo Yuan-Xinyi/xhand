@@ -88,6 +88,24 @@ def main() -> None:
     env_cfg.terminate_on_drop = False
     # Prevent the built-in success termination/reset; this script validates its own stable hold.
     env_cfg.success_hold_steps = 100000
+    # Disable the sustained-force safety cutoffs too.  Otherwise a force spike auto-resets a
+    # single env to a fresh random episode mid-run while ``commanded`` keeps yanking it, silently
+    # corrupting the close/micro/success counts (which are read from the snapshot-locked state).
+    env_cfg.tactile_terminate_steps = 1_000_000_000
+    env_cfg.tactile_hard_terminate_steps = 1_000_000_000
+    # The oracle bypasses the action space (it monkey-patches ``_pre_physics_step`` to command
+    # joint targets directly), so its per-step arm target increment must not exceed what a max
+    # policy action can realize: act_moving_average * action_scale.  Otherwise the feasibility
+    # verdict is proven under a stronger controller than any learned policy has.
+    realizable_arm_step = float(env_cfg.act_moving_average * env_cfg.action_scale)
+    effective_max_joint_step = min(args_cli.max_joint_step, realizable_arm_step)
+    if args_cli.max_joint_step > realizable_arm_step + 1.0e-12:
+        print(
+            f"[safety] capping --max_joint_step {args_cli.max_joint_step:.4f} -> "
+            f"{realizable_arm_step:.4f} rad/step (act_moving_average*action_scale) so the lift "
+            f"stays reproducible through the policy action space",
+            flush=True,
+        )
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode=None)
     u = env.unwrapped
     dev = u.device
@@ -153,6 +171,11 @@ def main() -> None:
         u._success_paid.zero_()
         u._success_steps.zero_()
         u._is_success.zero_()
+        # Force-safety and potential-shaping counters are also episode state; leaving them stale
+        # would let a pre-snapshot force spike or potential baseline leak into the fresh run.
+        u._hard_force_steps.zero_()
+        u._overforce_steps.zero_()
+        u._potential_initialized.zero_()
         u.actions.zero_()
         u.prev_actions.zero_()
         u._compute_intermediate_values()
@@ -164,7 +187,17 @@ def main() -> None:
 
     @torch.inference_mode()
     def step_and_measure() -> dict[str, torch.Tensor]:
-        env.step(zero_action)
+        _, _, terminated, truncated, _ = env.step(zero_action)
+        # With drop, success and both force cutoffs disabled, no env should reset mid-run.  Any
+        # done here means an unexpected auto-reset (e.g. the horizon was exceeded) that would
+        # desynchronize this env from the snapshot; fail loudly rather than measure garbage.
+        done = terminated | truncated
+        if bool(done.any()):
+            raise RuntimeError(
+                f"{int(done.sum())} env(s) auto-reset mid-run "
+                f"(terminated={int(terminated.sum())}, truncated={int(truncated.sum())}); "
+                f"the oracle measurement is only valid while every env stays on its snapshot"
+            )
         signals = u._compute_grasp_signals()
         force = u._finger_object_force_magnitudes()
         clearance = u._object_true_min_z() - u._table_surface_z
@@ -252,8 +285,7 @@ def main() -> None:
         jt = jacobian.transpose(1, 2)
         system = jacobian @ jt + (args_cli.damping**2) * eye6
         delta_q = (jt @ torch.linalg.solve(system, delta.unsqueeze(-1))).squeeze(-1)
-        delta_q = delta_q.clamp(-args_cli.max_joint_step, args_cli.max_joint_step)
-        current_arm = u.robot.data.joint_pos[:, u._arm_ids_t]
+        delta_q = delta_q.clamp(-effective_max_joint_step, effective_max_joint_step)
         current_target = commanded[:, u._arm_ids_t]
         next_arm = torch.maximum(
             # Integrate in target space.  Using ``current_arm + delta_q`` caps the actuator's
@@ -383,6 +415,9 @@ def main() -> None:
         "source_feasibility_json": str(artifact_path.resolve()),
         "mode": args_cli.mode,
         "num_envs": num_envs,
+        "requested_max_joint_step": args_cli.max_joint_step,
+        "realizable_arm_step_rad": realizable_arm_step,
+        "effective_max_joint_step": effective_max_joint_step,
         "close_pass_count": int(close_pass.sum()),
         "micro_pass_count": int(micro_pass.sum()),
         "success_count": int(success.sum()),
