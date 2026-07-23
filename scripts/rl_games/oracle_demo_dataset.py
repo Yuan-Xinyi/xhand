@@ -201,6 +201,16 @@ def _checkpoint_model(path: Path) -> dict[str, torch.Tensor]:
 
 @torch.inference_mode()
 def main() -> None:
+    print(
+        "[deprecation] oracle_demo_dataset produces two label-quality artifacts that "
+        "option_oracle_dataset.py fixes: (1) the CLOSE-phase arm label is identically zero, "
+        "so under --teacher_probability<1 it teaches 'do not correct' on drifted states; "
+        "(2) the lift target height is scheduled by the teacher's loop counter, which is not in "
+        "the 115-D observation, making those arm labels non-Markovian. Prefer "
+        "option_oracle_dataset.py for state-driven, Markovian labels; use this collector only "
+        "for the approach+teleport pregrasp sourcing it uniquely provides.",
+        flush=True,
+    )
     torch.manual_seed(args_cli.seed)
     artifact_path = Path(args_cli.feasibility_json)
     artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
@@ -607,6 +617,13 @@ def main() -> None:
     oracle_action: list[torch.Tensor] = []
     oracle_phase: list[int] = []
     force_peak = torch.zeros((n, len(u.ee_names)), device=dev)
+    # Track the env's exact sustained-force safety contract across the whole episode so a demo
+    # that the deployment/eval env would terminate (30 N for 10 frames or 60 N for 2 frames) is
+    # rejected as a success, not merely reported via force_peak.  Force terminations are disabled
+    # during collection, so this must be reconstructed here.
+    hard_force_steps = torch.zeros(n, dtype=torch.long, device=dev)
+    overforce_steps = torch.zeros(n, dtype=torch.long, device=dev)
+    force_unsafe = torch.zeros(n, dtype=torch.bool, device=dev)
     executed_teacher_rows = approach_teacher_rows
     executed_total_rows = approach_total_rows
 
@@ -663,6 +680,25 @@ def main() -> None:
         signals = u._compute_grasp_signals()
         force = signals["force_magnitude"]
         force_peak.copy_(torch.maximum(force_peak, force))
+        force_max = force.max(dim=-1).values
+        hard_force_steps.copy_(
+            torch.where(
+                force_max > cfg.tactile_hard_force_limit,
+                hard_force_steps + 1,
+                torch.zeros_like(hard_force_steps),
+            )
+        )
+        overforce_steps.copy_(
+            torch.where(
+                force_max > cfg.tactile_terminate_force_limit,
+                overforce_steps + 1,
+                torch.zeros_like(overforce_steps),
+            )
+        )
+        force_unsafe.logical_or_(
+            (hard_force_steps >= cfg.tactile_hard_terminate_steps)
+            | (overforce_steps >= cfg.tactile_terminate_steps)
+        )
         return {
             "signals": signals,
             "force": force,
@@ -751,9 +787,16 @@ def main() -> None:
         stable_count = torch.where(stable, stable_count + 1, torch.zeros_like(stable_count))
 
     # A marginal close may cross the strict Schmitt threshold during the deliberately slow
-    # micro-lift.  Judge demonstrations by the task's final fifteen-step criterion, while
-    # retaining close/micro pass counts as separate diagnostics.
-    success = stable_count >= 15
+    # micro-lift.  Judge demonstrations by the task's final fifteen-step criterion, and also
+    # reject any episode that violated the env's sustained-force safety at any point (the
+    # deployment/eval env would have terminated it).
+    success = (stable_count >= 15) & ~force_unsafe
+    if int(force_unsafe.sum()):
+        print(
+            f"[safety] {int(force_unsafe.sum())}/{n} episodes hit the env's sustained-force cutoff "
+            f"and are excluded from successes",
+            flush=True,
+        )
     success_ids = success.nonzero(as_tuple=False).squeeze(-1)
     selected_ids = (
         torch.arange(n, device=dev, dtype=torch.long)
@@ -798,13 +841,20 @@ def main() -> None:
     episode_phase = []
     episode_id = []
     episode_step = []
+    # Per-episode approach length marks the teleport splice: rows [0:approach_length] come from
+    # the policy/IK approach, then the state is re-teleported (velocities zeroed, object rewound)
+    # before the close rows.  That single boundary is not a physical transition; sequence/history
+    # consumers must not cross it.  0 means no approach segment (already-in-hand pregrasp).
+    episode_approach_length = []
     offsets = [0]
     for episode, env_id in enumerate(selected_ids.tolist()):
         obs_parts = []
         action_parts = []
         phase_parts = []
+        approach_length = 0
         if approach_obs_t is not None:
             end = int(best_step[env_id]) + 1
+            approach_length = end
             obs_parts.append(approach_obs_t[:end, env_id])
             action_parts.append(approach_action_t[:end, env_id])
             phase_parts.append(torch.full((end,), PHASE_APPROACH, dtype=torch.uint8, device=dev))
@@ -820,6 +870,7 @@ def main() -> None:
         episode_phase.append(ep_phase)
         episode_id.append(torch.full((length,), episode, dtype=torch.int32, device=dev))
         episode_step.append(torch.arange(length, dtype=torch.int16, device=dev))
+        episode_approach_length.append(approach_length)
         offsets.append(offsets[-1] + length)
 
     checkpoint_path = Path(args_cli.checkpoint) if args_cli.checkpoint else None
@@ -830,6 +881,12 @@ def main() -> None:
         "episode_id": torch.cat(episode_id).cpu(),
         "step": torch.cat(episode_step).cpu(),
         "episode_offsets": torch.tensor(offsets, dtype=torch.int64),
+        # Per-episode outcome, aligned with episode_id order.  With --retain_all_episodes the
+        # failed episodes are otherwise indistinguishable inside the .pt.
+        "episode_success": success[selected_ids].cpu(),
+        "episode_force_unsafe": force_unsafe[selected_ids].cpu(),
+        "episode_stable_count": stable_count[selected_ids].cpu(),
+        "episode_approach_length": torch.tensor(episode_approach_length, dtype=torch.int64),
         "boundaries": {
             "close_start": {key: value[selected_ids].cpu() for key, value in close_start.items()},
             "lift_start": {key: value[selected_ids].cpu() for key, value in lift_start.items()},
@@ -866,6 +923,14 @@ def main() -> None:
             },
         },
     }
+    if not torch.isfinite(dataset["obs"]).all() or not torch.isfinite(dataset["action"]).all():
+        env.close()
+        raise RuntimeError("refusing to save: dataset contains non-finite observations or actions")
+    for name, boundary in dataset["boundaries"].items():
+        for key, value in boundary.items():
+            if torch.is_floating_point(value) and not torch.isfinite(value).all():
+                env.close()
+                raise RuntimeError(f"refusing to save: boundary {name}.{key} contains non-finite values")
     output_path = Path(args_cli.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(dataset, output_path)

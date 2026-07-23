@@ -439,15 +439,9 @@ def main() -> None:
         servo_lower + args_cli.grip_servo_range,
         hand_upper.index_select(1, u._distal_hand_ids),
     )
-    fingertip_to_distal = {
-        "thumb_rota_link2": "thumb_joint2",
-        "index_rota_link2": "index_joint2",
-        "mid_link2": "middle_joint1",
-        "ring_link2": "ring_joint1",
-        "pinky_link2": "pinky_joint1",
-    }
-    distal_names = list(cfg.distal_residual_joint_names)
-    force_to_distal = [distal_names.index(fingertip_to_distal[name]) for name in u.ee_names]
+    # Reuse the env's fingertip->distal routing rather than re-deriving it, so the servo cannot
+    # drift from the shield the deployment env applies.
+    force_to_distal = u._force_to_distal_index.tolist()
 
     def servo_hand_action(force: torch.Tensor) -> torch.Tensor:
         previous = u.actions[:, u._n_arm :]
@@ -520,6 +514,7 @@ def main() -> None:
     post_base_lost_steps = torch.zeros(n, dtype=torch.long, device=dev)
     base_only_stable_steps = torch.zeros(n, dtype=torch.long, device=dev)
     overforce_steps = torch.zeros(n, dtype=torch.long, device=dev)
+    hard_force_steps = torch.zeros(n, dtype=torch.long, device=dev)
     close_start_xy = torch.zeros((n, 2), device=dev)
     verify_anchor_pos = torch.zeros((n, 3), device=dev)
     verify_anchor_quat = torch.zeros((n, 4), device=dev)
@@ -875,11 +870,23 @@ def main() -> None:
             force_peak_per_finger,
             torch.where(close_mask.unsqueeze(-1), force, force_peak_per_finger),
         )
+        # Mirror the env's full sustained-force safety contract (both cutoffs, cfg-driven), not
+        # just the 60 N rule with a hard-coded count.  The tactile terminations are disabled during
+        # collection, so a demo that violates either rule must be rejected here or it would be a
+        # trajectory the deployment/eval env terminates but the dataset admits.
         overforce = force_max > cfg.tactile_terminate_force_limit
         overforce_steps = torch.where(
             active & overforce, overforce_steps + 1, torch.zeros_like(overforce_steps)
         )
-        unsafe = (overforce_steps >= 2) | terminal_failure_now
+        hard_force = force_max > cfg.tactile_hard_force_limit
+        hard_force_steps = torch.where(
+            active & hard_force, hard_force_steps + 1, torch.zeros_like(hard_force_steps)
+        )
+        unsafe = (
+            (overforce_steps >= cfg.tactile_terminate_steps)
+            | (hard_force_steps >= cfg.tactile_hard_terminate_steps)
+            | terminal_failure_now
+        )
         dropped = clearance < -0.03
         environment_failure |= terminal_failure_now
         search_environment_failure = searching & terminal_failure_now
