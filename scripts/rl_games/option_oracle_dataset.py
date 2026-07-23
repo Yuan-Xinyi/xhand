@@ -200,6 +200,12 @@ def _capture_boundary(u) -> dict[str, torch.Tensor]:
             (u.object.data.root_com_lin_vel_w, u.object.data.root_com_ang_vel_w), dim=-1
         ).detach().clone(),
         "last_action": u.actions.detach().clone(),
+        # The grasp latch is Markov-critical: restoring a latched lift boundary without
+        # is_grasped=True makes the env's grasp shield block upward arm motion.  The env's
+        # curriculum reset requires these three per-episode vectors, so save them too.
+        "contact_steps": u._contact_steps.detach().clone(),
+        "lost_contact_steps": u._lost_contact_steps.detach().clone(),
+        "is_grasped": u._is_grasped.detach().clone(),
     }
 
 
@@ -215,6 +221,12 @@ def _write_boundary(u, state: dict[str, torch.Tensor]) -> None:
     u.object.write_root_velocity_to_sim(state["object_velocity"], env_ids=all_ids)
     u.actions.copy_(state["last_action"])
     u.prev_actions.copy_(state["last_action"])
+    # Restore the latch counters/flag when present so an internal snapshot round-trip matches
+    # what the env's curriculum reset would load.
+    if "contact_steps" in state:
+        u._contact_steps.copy_(state["contact_steps"].to(dtype=u._contact_steps.dtype))
+        u._lost_contact_steps.copy_(state["lost_contact_steps"].to(dtype=u._lost_contact_steps.dtype))
+        u._is_grasped.copy_(state["is_grasped"].to(dtype=u._is_grasped.dtype))
     u.scene.write_data_to_sim()
     u.sim.forward()
     u.scene.update(dt=u.physics_dt)
