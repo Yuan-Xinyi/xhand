@@ -148,8 +148,13 @@ OPTION_APPROACH_HOLD_STEPS = 8
 OPTION_GRASP_HOLD_STEPS = 4
 
 
-def _summary(value: torch.Tensor) -> dict[str, float]:
+def _summary(value: torch.Tensor) -> dict[str, float] | None:
     flat = value.detach().float().flatten()
+    # Drop non-finite entries (e.g. the -inf sentinel for envs that never unlatched) so the
+    # serialized summary is standard JSON rather than NaN/Infinity tokens.
+    flat = flat[torch.isfinite(flat)]
+    if flat.numel() == 0:
+        return None
     q = torch.quantile(flat, torch.tensor((0.0, 0.1, 0.5, 0.9, 1.0), device=flat.device))
     return dict(zip(("min", "p10", "median", "p90", "max"), (float(x) for x in q), strict=True))
 
@@ -475,6 +480,11 @@ def main() -> None:
     stable_count = torch.zeros(n, dtype=torch.long, device=dev)
     success = torch.zeros(n, dtype=torch.bool, device=dev)
     success_step = torch.full((n,), -1, dtype=torch.long, device=dev)
+    # Single-attempt contract: an env is "consumed" the moment it first auto-resets
+    # (force cutoff or time limit) or first latches a strict success.  After that, none of
+    # the per-env accumulators below update, so a fresh post-reset attempt can never add a
+    # second success and reset-state physics never pollute the "ever" funnel statistics.
+    consumed = torch.zeros(n, dtype=torch.bool, device=dev)
     max_clearance = torch.full((n,), -float("inf"), device=dev)
     max_unlatched_clearance = torch.full((n,), -float("inf"), device=dev)
     # COM displacement is invariant to rotation about an off-center asset root.
@@ -673,10 +683,14 @@ def main() -> None:
         action_abs_sum[:, 2] += action[:, 16:].abs().mean(dim=-1)
         obs, _, terminated, truncated, _ = env.step(action)
         done = terminated | truncated
+        # Single-attempt masks.  `attempt_alive` = still on the first attempt (not yet
+        # consumed).  `attempt_active` additionally excludes the current done step, whose
+        # post-step observation is already the auto-reset state and must not be measured.
+        attempt_alive = ~consumed
+        attempt_active = attempt_alive & ~done
         # Evaluation disables drop and built-in success termination, so every termination here is
-        # the sustained-force safety cutoff.  Keep per-env event counts because auto-reset permits
-        # a fresh attempt during a long diagnostic rollout.
-        unsafe_force_terminations += terminated.long()
+        # the sustained-force safety cutoff.  Only count it against the env's first attempt.
+        unsafe_force_terminations += (terminated & attempt_alive).long()
         if close_controller is not None:
             close_controller.reset(done)
         if distal_close_gate is not None:
@@ -795,19 +809,34 @@ def main() -> None:
             (clearance >= cfg.lift_success_height)
             & u._is_grasped
             & (signals["grasp_quality"] >= cfg.grasp_quality_high)
+            # Match the collector's load-bearing contract: a strict success also needs the
+            # rigid-body-compensated hold quality, not just the instantaneous grasp quality.
+            & (signals["hold_quality"] >= cfg.close_option_min_hold_quality)
             & (force_max <= cfg.grasp_bonus_max_force)
             & slow
         )
         if args_cli.option_fsm:
             strict &= option_state == LIFT_HOLD
-        stable_count = torch.where(strict, stable_count + 1, torch.zeros_like(stable_count))
-        newly_successful = (~success) & (stable_count >= args_cli.stable_steps)
+        # Freeze the stable-hold counter and success latch once an env is consumed so a
+        # post-reset retry cannot register a second success.
+        stable_count = torch.where(
+            attempt_active,
+            torch.where(strict, stable_count + 1, torch.zeros_like(stable_count)),
+            stable_count,
+        )
+        newly_successful = attempt_active & (~success) & (stable_count >= args_cli.stable_steps)
         success_step[newly_successful] = step
         success |= newly_successful
-        max_clearance = torch.maximum(max_clearance, clearance)
-        max_unlatched_clearance = torch.maximum(
+        max_clearance = torch.where(
+            attempt_active, torch.maximum(max_clearance, clearance), max_clearance
+        )
+        max_unlatched_clearance = torch.where(
+            attempt_active,
+            torch.maximum(
+                max_unlatched_clearance,
+                torch.where(u._is_grasped, torch.full_like(clearance, -float("inf")), clearance),
+            ),
             max_unlatched_clearance,
-            torch.where(u._is_grasped, torch.full_like(clearance, -float("inf")), clearance),
         )
         current_object_xy = _object_com_position_w(u)[:, :2]
         horizontal_drift = (current_object_xy - initial_object_xy).norm(dim=-1)
@@ -866,15 +895,25 @@ def main() -> None:
                 horizontal_drift,
             ),
         )
-        max_grasp_quality = torch.maximum(max_grasp_quality, signals["grasp_quality"])
-        force_peak = torch.maximum(force_peak, force)
-        force_peak_env = torch.maximum(force_peak_env, force_max)
-        force_above_30_steps += (force_max > 30.0).long()
-        force_above_60_steps += (force_max > 60.0).long()
-        force_impulse += force_max * (cfg.sim.dt * cfg.decimation)
-        latch_steps += u._is_grasped.long()
-        ever_touch |= force_max >= cfg.contact_force_thr
-        ever_latch |= u._is_grasped
+        # Every funnel/force accumulator below is frozen once the env is consumed, so the
+        # reported "ever" quantities describe exactly one attempt per env.
+        max_grasp_quality = torch.where(
+            attempt_active, torch.maximum(max_grasp_quality, signals["grasp_quality"]), max_grasp_quality
+        )
+        force_peak = torch.where(
+            attempt_active.unsqueeze(-1), torch.maximum(force_peak, force), force_peak
+        )
+        force_peak_env = torch.where(
+            attempt_active, torch.maximum(force_peak_env, force_max), force_peak_env
+        )
+        force_above_30_steps += (attempt_active & (force_max > 30.0)).long()
+        force_above_60_steps += (attempt_active & (force_max > 60.0)).long()
+        force_impulse += torch.where(
+            attempt_active, force_max * (cfg.sim.dt * cfg.decimation), torch.zeros_like(force_impulse)
+        )
+        latch_steps += (attempt_active & u._is_grasped).long()
+        ever_touch |= attempt_active & (force_max >= cfg.contact_force_thr)
+        ever_latch |= attempt_active & u._is_grasped
         safe_latch = (
             u._is_grasped
             & (signals["grasp_quality"] >= cfg.grasp_quality_high)
@@ -882,14 +921,24 @@ def main() -> None:
             & (force_max <= cfg.grasp_bonus_max_force)
         )
         stable_grasp_steps = torch.where(
-            safe_latch, stable_grasp_steps + 1, torch.zeros_like(stable_grasp_steps)
+            attempt_active,
+            torch.where(safe_latch, stable_grasp_steps + 1, torch.zeros_like(stable_grasp_steps)),
+            stable_grasp_steps,
         )
         max_stable_grasp_steps = torch.maximum(max_stable_grasp_steps, stable_grasp_steps)
-        ever_stable_grasp |= stable_grasp_steps >= cfg.close_option_confirm_steps
-        ever_latched_5cm |= u._is_grasped & (clearance >= 0.05)
-        ever_20cm |= clearance >= cfg.lift_success_height
+        ever_stable_grasp |= attempt_active & (stable_grasp_steps >= cfg.close_option_confirm_steps)
+        ever_latched_5cm |= attempt_active & u._is_grasped & (clearance >= 0.05)
+        ever_20cm |= attempt_active & (clearance >= cfg.lift_success_height)
 
-    fling = (~success) & (max_unlatched_clearance >= 0.05)
+        # Consume the env on its first success or first auto-reset; everything above is
+        # frozen from the next step onward.
+        consumed |= newly_successful | done
+
+    # Headline strict success is single-attempt AND fling-free: an env that ever threw the
+    # tool >=5 cm while unlatched (even if it re-caught and held) is a failure, matching the
+    # dataset collector, which rejects any episode with an unlatched >=5 cm excursion.
+    clean_success = success & (max_unlatched_clearance < 0.05) & (unsafe_force_terminations == 0)
+    fling = (~clean_success) & (max_unlatched_clearance >= 0.05)
     metrics = {
         "checkpoint": str(checkpoint_path.resolve()),
         "mode": args_cli.mode,
@@ -898,8 +947,10 @@ def main() -> None:
         "steps": args_cli.steps,
         "stable_steps": args_cli.stable_steps,
         "zero_arm_actions": args_cli.zero_arm_actions,
-        "success_count": int(success.sum()),
-        "success_rate": float(success.float().mean()),
+        "success_count": int(clean_success.sum()),
+        "success_rate": float(clean_success.float().mean()),
+        # Raw latched-20cm holds before the fling/unsafe exclusions, for diagnosis only.
+        "latched_success_count": int(success.sum()),
         "success_step": success_step.cpu().tolist(),
         "max_true_clearance": _summary(max_clearance),
         "max_unlatched_clearance": _summary(max_unlatched_clearance),
@@ -925,12 +976,13 @@ def main() -> None:
             "stable_grasp_latch": int(ever_stable_grasp.sum()),
             "latched_lift_ge_5cm": int(ever_latched_5cm.sum()),
             "true_clearance_ge_20cm": int(ever_20cm.sum()),
-            "strict_success": int(success.sum()),
+            "latched_20cm_success": int(success.sum()),
+            "strict_success": int(clean_success.sum()),
         },
         "force_safety": {
             "peak_all": _summary(force_peak_env),
-            "peak_success": _masked_summary(force_peak_env, success),
-            "peak_failure": _masked_summary(force_peak_env, ~success),
+            "peak_success": _masked_summary(force_peak_env, clean_success),
+            "peak_failure": _masked_summary(force_peak_env, ~clean_success),
             "steps_above_30N": _summary(force_above_30_steps.float()),
             "steps_above_60N": _summary(force_above_60_steps.float()),
             "force_time_integral_Ns": _summary(force_impulse),
@@ -1083,11 +1135,12 @@ def main() -> None:
         }
     output = Path(args_cli.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    # Fail loudly on a NaN/Inf leak instead of emitting non-standard JSON a parser accepts silently.
+    output.write_text(json.dumps(metrics, indent=2, allow_nan=False), encoding="utf-8")
     print(
-        f"{args_cli.mode} closed-loop: success={int(success.sum())}/{n}; "
-        f"fling={int(fling.sum())}/{n}; clearance={metrics['max_true_clearance']}; "
-        f"latch={metrics['latch_occupancy']}",
+        f"{args_cli.mode} closed-loop: strict_success={int(clean_success.sum())}/{n} "
+        f"(latched={int(success.sum())}); fling={int(fling.sum())}/{n}; "
+        f"clearance={metrics['max_true_clearance']}; latch={metrics['latch_occupancy']}",
         flush=True,
     )
     if reach_actor is not None:
