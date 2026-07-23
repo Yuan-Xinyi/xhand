@@ -59,6 +59,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True, type=Path, help="120-observation checkpoint")
     parser.add_argument("--self-check-samples", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--expect-source-sha256",
+        type=str,
+        default=None,
+        help="abort unless the input checkpoint's SHA-256 matches, binding this stage to a "
+        "specific upstream checkpoint.",
+    )
     args = parser.parse_args()
     if args.self_check_samples < 1:
         parser.error("--self-check-samples must be positive")
@@ -267,6 +274,13 @@ def main() -> None:
     args = parse_args()
     if not args.input.is_file():
         raise FileNotFoundError(args.input)
+    if args.expect_source_sha256 is not None:
+        actual_sha = sha256(args.input)
+        if actual_sha != args.expect_source_sha256:
+            raise RuntimeError(
+                f"input SHA-256 {actual_sha} does not match --expect-source-sha256 "
+                f"{args.expect_source_sha256}"
+            )
 
     checkpoint = load_torch(args.input)
     if not isinstance(checkpoint, Mapping):

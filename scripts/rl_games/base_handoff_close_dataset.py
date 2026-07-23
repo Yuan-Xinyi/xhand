@@ -12,7 +12,6 @@ subsequently satisfy the selected load-bearing success contract.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 from pathlib import Path
@@ -223,6 +222,11 @@ simulation_app = app_launcher.app
 
 import gymnasium as gym
 import torch
+
+# Sibling module (scripts/rl_games is sys.path[0] for direct-script execution): single source of
+# truth for the pregrasp score, boundary schema and force constants shared with the evaluator.
+from pick_tool_shared import capture_boundary, limit_norm, pregrasp_score, sha256
+
 from isaaclab.utils.math import compute_pose_error, quat_apply
 from isaaclab_tasks.utils import parse_env_cfg
 
@@ -245,12 +249,11 @@ PHASE_CLOSE = 1
 PHASE_LIFT = 3
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+# Bound to the shared implementations so collector and evaluator cannot drift apart.
+_sha256 = sha256
+_limit_norm = limit_norm
+_pregrasp_score = pregrasp_score
+_capture_boundary = capture_boundary
 
 
 def _checkpoint_model(path: Path) -> dict[str, torch.Tensor]:
@@ -266,55 +269,11 @@ def _checkpoint_model(path: Path) -> dict[str, torch.Tensor]:
     return clone_state(payload["model"])
 
 
-def _capture_boundary(u) -> dict[str, torch.Tensor]:
-    return {
-        "joint_pos": u.robot.data.joint_pos.detach().clone(),
-        "joint_vel": u.robot.data.joint_vel.detach().clone(),
-        "dof_targets": u.dof_targets.detach().clone(),
-        "object_local_pos": (u.object.data.root_pos_w - u.scene.env_origins).detach().clone(),
-        "object_quat": u.object.data.root_quat_w.detach().clone(),
-        "object_velocity": torch.cat(
-            (u.object.data.root_com_lin_vel_w, u.object.data.root_com_ang_vel_w), dim=-1
-        ).detach().clone(),
-        "last_action": u.actions.detach().clone(),
-        "contact_steps": u._contact_steps.detach().clone(),
-        "lost_contact_steps": u._lost_contact_steps.detach().clone(),
-        "is_grasped": u._is_grasped.detach().clone(),
-    }
-
-
-def _pregrasp_score(u) -> torch.Tensor:
-    distances = u._curr_fingertip_distances
-    other_distances = distances[:, u._other_ee_idx]
-    nearest_distances, nearest_indices = torch.topk(
-        other_distances, k=2, dim=1, largest=False
-    )
-    grasp_distance = (
-        distances[:, u._thumb_ee_idx] + nearest_distances.sum(dim=-1)
-    ) / 3.0
-    other_alignment = u._finger_align[:, u._other_ee_idx]
-    alignment = (
-        u._finger_align[:, u._thumb_ee_idx]
-        + torch.gather(other_alignment, 1, nearest_indices).sum(dim=-1)
-    ) / 3.0
-    to_handle = u.handle_center_w - u.palm_center_w
-    to_handle = to_handle / to_handle.norm(dim=-1, keepdim=True).clamp_min(1.0e-6)
-    palm_facing = 0.5 * (1.0 + (u.palm_normal_w * to_handle).sum(dim=-1))
-    clearance = u._object_true_min_z() - u._table_surface_z
-    score = torch.exp(-grasp_distance / 0.025) * alignment * palm_facing
-    return torch.where(clearance.abs() <= 0.005, score, torch.zeros_like(score))
-
-
 def _object_com_position_w(u) -> torch.Tensor:
     return u.object.data.root_link_pos_w + quat_apply(
         u.object.data.root_link_quat_w,
         u.object.data.body_com_pos_b[:, 0],
     )
-
-
-def _limit_norm(value: torch.Tensor, limit: float) -> torch.Tensor:
-    norm = value.norm(dim=-1, keepdim=True).clamp_min(1.0e-9)
-    return value * torch.clamp(limit / norm, max=1.0)
 
 
 def _summary(value: torch.Tensor) -> dict[str, float] | None:

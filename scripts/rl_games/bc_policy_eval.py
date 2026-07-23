@@ -120,6 +120,11 @@ simulation_app = app_launcher.app
 
 import gymnasium as gym
 import torch
+
+# Sibling module (scripts/rl_games is sys.path[0] for direct-script execution): single source of
+# truth for the pregrasp score shared with the dataset collector.
+from pick_tool_shared import pregrasp_score
+
 from isaaclab_tasks.utils import parse_env_cfg
 from isaaclab.utils.math import (
     combine_frame_transforms,
@@ -281,27 +286,8 @@ def _calibrate_palm_in_object(u, artifact: dict) -> tuple[torch.Tensor, torch.Te
     return palm_in_object_pos, palm_in_object_quat
 
 
-def _pregrasp_score(u) -> torch.Tensor:
-    """Geometry-only readiness score used by the reach-to-grasp option transition."""
-
-    distances = u._curr_fingertip_distances
-    other_distances = distances[:, u._other_ee_idx]
-    nearest_distances, nearest_indices = torch.topk(other_distances, k=2, dim=1, largest=False)
-    grasp_distance = (
-        distances[:, u._thumb_ee_idx] + nearest_distances.sum(dim=-1)
-    ) / 3.0
-
-    other_alignment = u._finger_align[:, u._other_ee_idx]
-    alignment = (
-        u._finger_align[:, u._thumb_ee_idx]
-        + torch.gather(other_alignment, 1, nearest_indices).sum(dim=-1)
-    ) / 3.0
-    to_handle = u.handle_center_w - u.palm_center_w
-    to_handle = to_handle / to_handle.norm(dim=-1, keepdim=True).clamp_min(1.0e-6)
-    palm_facing = 0.5 * (1.0 + (u.palm_normal_w * to_handle).sum(dim=-1))
-    clearance = u._object_true_min_z() - u._table_surface_z
-    score = torch.exp(-grasp_distance / 0.025) * alignment * palm_facing
-    return torch.where(clearance.abs() <= 0.005, score, torch.zeros_like(score))
+# Bound to the shared implementation so evaluator and collector measure the identical event.
+_pregrasp_score = pregrasp_score
 
 
 def _option_pose_state(

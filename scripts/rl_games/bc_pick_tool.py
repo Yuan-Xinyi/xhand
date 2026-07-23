@@ -88,6 +88,20 @@ def parse_args() -> argparse.Namespace:
         help="freeze actor trunk, sigma, critic/value and RMS; optimize only the separate actor mu head",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=None,
+        help="seed for the episode train/val split; defaults to --seed. Set explicitly to hold "
+        "the validation set fixed across a --seed sweep so best-objective values are comparable.",
+    )
+    parser.add_argument(
+        "--expect-source-sha256",
+        type=str,
+        default=None,
+        help="if given, abort unless the input checkpoint's SHA-256 matches, binding this BC run "
+        "to a specific upstream checkpoint (the provenance the pipeline otherwise only records).",
+    )
     parser.add_argument("--log-every", type=int, default=10)
     args = parser.parse_args()
 
@@ -448,6 +462,13 @@ def main() -> None:
 
     checkpoint_path = Path(args.checkpoint)
     dataset_path = Path(args.dataset)
+    if args.expect_source_sha256 is not None:
+        actual_sha = sha256(checkpoint_path)
+        if actual_sha != args.expect_source_sha256:
+            raise RuntimeError(
+                f"checkpoint SHA-256 {actual_sha} does not match --expect-source-sha256 "
+                f"{args.expect_source_sha256}; refusing to BC-train against an unexpected checkpoint"
+            )
     raw_checkpoint = load_torch(checkpoint_path)
     if not isinstance(raw_checkpoint, dict):
         raise TypeError("checkpoint root must be a dictionary")
@@ -503,8 +524,10 @@ def main() -> None:
         if not bool(selected_phase.any()):
             raise RuntimeError(f"dataset contains no rows for --only-phase {args.only_phase}")
         data = {key: value[selected_phase] for key, value in data.items()}
+    # Decouple the split from training randomness so a --seed sweep can keep one fixed val set.
+    split_seed = args.seed if args.split_seed is None else args.split_seed
     train_indices, val_indices, train_episodes, val_episodes = episode_split(
-        data["episode_id"], args.val_fraction, args.seed
+        data["episode_id"], args.val_fraction, split_seed
     )
     train_phase_values = data["phase"][train_indices].unique(sorted=True).tolist()
     val_phase_values = data["phase"][val_indices].unique(sorted=True).tolist()
@@ -714,6 +737,7 @@ def main() -> None:
         "only_phase": args.only_phase,
         "mu_head_only": args.mu_head_only,
         "seed": args.seed,
+        "split_seed": split_seed,
         "device": str(device),
         "transitions": int(data["obs"].shape[0]),
         "train_episode_ids": train_episodes,

@@ -216,9 +216,18 @@ def _boundary_key_set(data: dict[str, Any]) -> set[tuple[str, str]]:
 def main() -> None:
     args = parse_args()
     sources: list[tuple[Path, dict[str, Any]]] = []
+    seen_sha: dict[str, Path] = {}
     for path in args.inputs:
         if not path.is_file():
             raise FileNotFoundError(path)
+        # Passing the same shard twice renumbers identical trajectories as distinct episodes; the
+        # downstream episode-disjoint BC split could then leak a copy across train/val.  Reject it.
+        digest = sha256(path)
+        if digest in seen_sha:
+            raise ValueError(
+                f"duplicate input dataset (identical content): {seen_sha[digest]} == {path}"
+            )
+        seen_sha[digest] = path
         sources.append((path, validate_dataset(path, load_torch(path))))
 
     obs_parts: list[torch.Tensor] = []

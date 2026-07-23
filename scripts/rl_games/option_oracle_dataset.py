@@ -10,7 +10,6 @@ limits below only terminate failed attempts and never advance the controller.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 
@@ -123,10 +122,17 @@ from isaaclab_tasks.utils import parse_env_cfg
 
 import xhand_inhand.tasks  # noqa: F401
 from bc_pick_tool import MigratedActor, clone_state, load_torch
+
+# Single source of truth for the boundary schema shared with the env's curriculum loader.
+from pick_tool_shared import capture_boundary, limit_norm, sha256
 from xhand_inhand.tasks.direct.pick_tool_token.hybrid_action import (
     apply_asymmetric_joint_residual,
     invert_asymmetric_joint_residual,
 )
+
+_sha256 = sha256
+_limit_norm = limit_norm
+_capture_boundary = capture_boundary
 
 
 OPTION_NAMES = ("HOVER", "DESCEND", "CLOSE", "MICRO", "LIFT_HOLD")
@@ -157,19 +163,6 @@ FAILURE_NAMES = (
 )
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _limit_norm(value: torch.Tensor, limit: float) -> torch.Tensor:
-    norm = value.norm(dim=-1, keepdim=True).clamp_min(1.0e-9)
-    return value * torch.clamp(limit / norm, max=1.0)
-
-
 def _quantiles(value: torch.Tensor) -> dict[str, float]:
     flat = value.detach().float().flatten()
     q = torch.quantile(flat, torch.tensor((0.0, 0.1, 0.5, 0.9, 1.0), device=flat.device))
@@ -187,26 +180,6 @@ def _checkpoint_model(path: Path) -> dict[str, torch.Tensor]:
     if not isinstance(payload, dict) or not isinstance(payload.get("model"), dict):
         raise KeyError("rollout checkpoint must contain {'model': state_dict}, optionally below key 0")
     return clone_state(payload["model"])
-
-
-def _capture_boundary(u) -> dict[str, torch.Tensor]:
-    return {
-        "joint_pos": u.robot.data.joint_pos.detach().clone(),
-        "joint_vel": u.robot.data.joint_vel.detach().clone(),
-        "dof_targets": u.dof_targets.detach().clone(),
-        "object_local_pos": (u.object.data.root_pos_w - u.scene.env_origins).detach().clone(),
-        "object_quat": u.object.data.root_quat_w.detach().clone(),
-        "object_velocity": torch.cat(
-            (u.object.data.root_com_lin_vel_w, u.object.data.root_com_ang_vel_w), dim=-1
-        ).detach().clone(),
-        "last_action": u.actions.detach().clone(),
-        # The grasp latch is Markov-critical: restoring a latched lift boundary without
-        # is_grasped=True makes the env's grasp shield block upward arm motion.  The env's
-        # curriculum reset requires these three per-episode vectors, so save them too.
-        "contact_steps": u._contact_steps.detach().clone(),
-        "lost_contact_steps": u._lost_contact_steps.detach().clone(),
-        "is_grasped": u._is_grasped.detach().clone(),
-    }
 
 
 def _write_boundary(u, state: dict[str, torch.Tensor]) -> None:

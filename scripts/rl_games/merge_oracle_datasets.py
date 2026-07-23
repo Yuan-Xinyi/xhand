@@ -220,12 +220,27 @@ def merge_datasets(paths: list[Path]) -> dict[str, Any]:
     if not paths:
         raise ValueError("at least one input dataset is required")
     datasets = []
+    shas = []
     for path in paths:
         if not path.is_file():
             raise FileNotFoundError(path)
         data = load(path)
         validate(path, data)
         datasets.append(data)
+        shas.append(sha256(path))
+
+    # Merging identical (or overlapping) inputs renumbers the same trajectories as distinct
+    # episodes; the episode-disjoint BC split could then place a copy in train and its twin in
+    # val, silently inflating the "episode-isolated" validation objective.  Reject exact dupes.
+    if len(set(shas)) != len(shas):
+        seen: dict[str, Path] = {}
+        duplicates = []
+        for path, sha in zip(paths, shas, strict=True):
+            if sha in seen:
+                duplicates.append(f"{seen[sha]} == {path}")
+            else:
+                seen[sha] = path
+        raise ValueError(f"duplicate input datasets (identical content): {duplicates}")
 
     obs_dims = [int(data["obs"].shape[1]) for data in datasets]
     if any(obs_dim != obs_dims[0] for obs_dim in obs_dims[1:]):
@@ -234,6 +249,16 @@ def merge_datasets(paths: list[Path]) -> dict[str, Any]:
     phase_names = phase_schemas[0][1]
     if any(names != phase_names for _, names in phase_schemas[1:]):
         raise ValueError(f"input phase/option names must agree, got {[names for _, names in phase_schemas]}")
+    # Dimensions and phase names agreeing is not enough: two datasets can share a 115-D shape but
+    # lay out those columns differently.  Require the declared layout strings to agree when present.
+    for layout_key in ("observation_layout", "action_layout"):
+        layouts = {
+            data.get("meta", {}).get(layout_key)
+            for data in datasets
+            if isinstance(data.get("meta"), dict) and data["meta"].get(layout_key) is not None
+        }
+        if len(layouts) > 1:
+            raise ValueError(f"input {layout_key} strings disagree: {sorted(layouts)}")
     # Preserve the legacy compact representation when it is sufficient, but do
     # not silently wrap a future schema with more than 256 phase ids.
     phase_dtype = torch.uint8 if len(phase_names) <= 256 else torch.int64
@@ -363,10 +388,18 @@ def self_test() -> None:
         assert merged120["meta"]["option_names"] == ["HOVER", "DESCEND", "CLOSE"]
 
         path115 = tmp_path / "legacy.pt"
+        path115b = tmp_path / "legacy_b.pt"
         torch.save(_synthetic_dataset(115, 1, 0, option_names=False), path115)
-        merged115 = merge_datasets([path115, path115])
+        torch.save(_synthetic_dataset(115, 1, 7, option_names=False), path115b)
+        merged115 = merge_datasets([path115, path115b])
         assert merged115["obs"].shape == (4, 115)
         assert merged115["meta"]["phase_names"] == ["approach", "close", "lift"]
+        try:
+            merge_datasets([path115, path115])
+        except ValueError as error:
+            assert "duplicate input datasets" in str(error)
+        else:
+            raise AssertionError("exact-duplicate inputs were not rejected")
         try:
             merge_datasets([path115, paths120[0]])
         except ValueError as error:
