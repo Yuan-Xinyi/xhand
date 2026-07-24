@@ -55,8 +55,14 @@ parser.add_argument("--grip_servo_range", type=float, default=0.60)
 parser.add_argument("--no_grip_servo", action="store_true", help="freeze the hand entirely (ablation)")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--output", type=str, default="/tmp/pick_tool_ppo_grasp_ik_lift.json")
+parser.add_argument("--video", action="store_true", help="record an rgb_array video of the run")
+parser.add_argument("--video_folder", type=str, default="/tmp/pick_tool_ik_lift_video")
+parser.add_argument("--video_length", type=int, default=0, help="0 = record the whole run")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
+
+if args_cli.video:
+    args_cli.enable_cameras = True
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -110,7 +116,22 @@ def main() -> None:
     realizable_arm_step = float(cfg.act_moving_average * cfg.action_scale)
     max_joint_step = min(args_cli.max_joint_step, realizable_arm_step)
 
-    env = gym.make(args_cli.task, cfg=cfg, render_mode=None)
+    total_steps = args_cli.grasp_deadline + args_cli.lift_ramp + args_cli.hold_steps
+    env = gym.make(args_cli.task, cfg=cfg, render_mode="rgb_array" if args_cli.video else None)
+    if args_cli.video:
+        import os
+
+        video_length = args_cli.video_length if args_cli.video_length > 0 else total_steps
+        os.makedirs(args_cli.video_folder, exist_ok=True)
+        env = gym.wrappers.RecordVideo(
+            env,
+            video_folder=args_cli.video_folder,
+            step_trigger=lambda step: step == 0,
+            video_length=video_length,
+            name_prefix="ppo_grasp_ik_lift",
+            disable_logger=True,
+        )
+        print(f"[video] recording {video_length} steps to {args_cli.video_folder}", flush=True)
     u = env.unwrapped
     dev = u.device
     actor = MigratedActor(_checkpoint_model(Path(args_cli.checkpoint))).to(dev).eval()
@@ -163,7 +184,6 @@ def main() -> None:
     max_clearance = torch.full((n,), -float("inf"), device=dev)
     force_peak = torch.zeros(n, device=dev)
 
-    total_steps = args_cli.grasp_deadline + args_cli.lift_ramp + args_cli.hold_steps
     for step in range(total_steps):
         u._compute_intermediate_values()
         signals = u._compute_grasp_signals()
