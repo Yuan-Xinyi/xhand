@@ -316,6 +316,14 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         "spawn at a pregrasp boundary, so this requires --curriculum_dataset with "
         "--curriculum_probability 1.0 (e.g. boundary close_start).",
     )
+    parser.add_argument(
+        "--nudge_option",
+        action="store_true",
+        help="Train ONLY the non-prehensile pre-grasp reorientation (nudge) phase: from a "
+        "normal randomized reset, push the tool on the table back into the graspable pose "
+        "family.  Episodes terminate on the env's nudge success/failure contract.  No "
+        "curriculum spawn is needed.",
+    )
     parser.add_argument("--output_dir", type=Path, default=Path("logs/flashsac/pick_tool"))
     parser.add_argument("--metrics_every", type=int, default=100)
     parser.add_argument("--smoke", action="store_true", help="Use a tiny 8-env, 8-step integration run.")
@@ -380,6 +388,8 @@ def _validate_args(args: argparse.Namespace) -> None:
                 "--close_option requires --curriculum_dataset and --curriculum_probability 1.0 "
                 "(every episode must spawn at a pregrasp boundary)"
             )
+    if args.nudge_option and args.close_option:
+        raise ValueError("--nudge_option and --close_option are mutually exclusive")
     if args.resume_replay and args.checkpoint is None:
         raise ValueError("--resume_replay requires --checkpoint")
     if args.demo is not None:
@@ -579,6 +589,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "curriculum_joint_noise": args.curriculum_joint_noise,
         }
     curriculum_metrics["close_option"] = bool(args.close_option)
+    curriculum_metrics["nudge_option"] = bool(args.nudge_option)
 
     cfg_overrides = {}
     if args.episode_length_s is not None:
@@ -600,6 +611,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         cfg_overrides["close_option_mode"] = True
         if args.episode_length_s is None:
             cfg_overrides["episode_length_s"] = 3.0
+    if args.nudge_option:
+        # Nudge-phase-only training: normal randomized resets; the env pays potential-based
+        # reach/pose shaping plus the nudge success/failure/timeout contract.  Pushing needs
+        # more time than closing, so default to a 6s horizon.
+        cfg_overrides["nudge_option_mode"] = True
+        if args.episode_length_s is None:
+            cfg_overrides["episode_length_s"] = 6.0
     env = make_pick_tool_env(
         num_envs=args.num_envs,
         device=device,
@@ -943,6 +961,13 @@ def main() -> None:
     try:
         metrics = run(args)
         print(json.dumps(metrics, indent=2, sort_keys=True, allow_nan=False))
+    except BaseException:
+        # SimulationApp.close() in the finally block hard-exits the process with code 0,
+        # swallowing any pending traceback.  Print it before the app can eat it.
+        import traceback
+
+        traceback.print_exc()
+        raise
     finally:
         launcher.app.close()
 

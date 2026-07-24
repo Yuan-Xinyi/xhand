@@ -25,7 +25,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.sensors import ContactSensor, ContactSensorCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.utils.math import quat_apply, quat_conjugate, sample_uniform
+from isaaclab.utils.math import quat_apply, quat_conjugate, sample_uniform, wrap_to_pi
 
 from ..pick_cube_token.pick_cube_token_env import PickCubeTokenEnv
 from .grasp_signals import (
@@ -225,6 +225,28 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._close_option_unlatched_lift_total = torch.zeros((), dtype=torch.long, device=dev)
         self._close_option_horizontal_escape_total = torch.zeros((), dtype=torch.long, device=dev)
         self._close_option_lost_window_total = torch.zeros((), dtype=torch.long, device=dev)
+        if cfg.nudge_option_mode and cfg.close_option_mode:
+            raise ValueError("nudge_option_mode and close_option_mode are mutually exclusive")
+        # ---- nudge-option state (non-prehensile pre-grasp reorientation) ----
+        # Rest-frame axes let heading (yaw about world z vs the rest orientation) and tipping be
+        # measured for an arbitrary rest quaternion: both are read off the rest x/z axes rotated by
+        # the current orientation.
+        default_quat = self.object.data.default_root_state[:, 3:7]
+        world_x = torch.tensor([1.0, 0.0, 0.0], device=dev).expand(N, 3)
+        world_z = torch.tensor([0.0, 0.0, 1.0], device=dev).expand(N, 3)
+        self._nudge_rest_x_local = quat_apply(quat_conjugate(default_quat), world_x).clone()
+        self._nudge_rest_up_local = quat_apply(quat_conjugate(default_quat), world_z).clone()
+        self._nudge_target_xy = torch.zeros((N, 2), device=dev)
+        self._nudge_success = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._nudge_failure = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._nudge_timeout = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._nudge_hold_steps = torch.zeros(N, dtype=torch.long, device=dev)
+        self._prev_nudge_potential = torch.zeros(N, device=dev)
+        self._prev_nudge_proximity = torch.zeros(N, device=dev)
+        self._nudge_episode_total = torch.zeros((), dtype=torch.long, device=dev)
+        self._nudge_success_total = torch.zeros((), dtype=torch.long, device=dev)
+        self._nudge_failure_total = torch.zeros((), dtype=torch.long, device=dev)
+        self._nudge_timeout_total = torch.zeros((), dtype=torch.long, device=dev)
         self._lift_bonus_given = torch.zeros(N, dtype=torch.bool, device=dev)    # mvp20: one-shot lift-off bonus latch (per episode)
         self._prev_close_quality = torch.zeros(N, device=dev)
         self._prev_wrap_quality = torch.zeros(N, device=dev)
@@ -1278,6 +1300,52 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             log["distal_delta_abs_mean"] = self._last_distal_delta.abs().mean()
             log["distal_delta_abs_max"] = self._last_distal_delta.abs().max()
 
+        if cfg.nudge_option_mode:
+            # Non-prehensile reorientation: no grasp/close/lift terms at all.  Two potential-based
+            # shaping channels (gamma-correct, farm-proof like the close/wrap potentials above):
+            # fingertip proximity draws the hand to the tool, and the pose potential pays only for
+            # actually moving the tool toward the target spot/heading while it stays flat.
+            errors = self._nudge_pose_errors()
+            upright = (errors["tip_cos"] >= cfg.nudge_tip_cos_min).float()
+            nudge_potential = (
+                torch.exp(-errors["pos_error"] / cfg.nudge_pos_sigma)
+                * torch.exp(-errors["heading_error"] / cfg.nudge_yaw_sigma)
+                * upright
+            )
+            nudge_delta = cfg.shaping_discount * nudge_potential - self._prev_nudge_potential
+            r_nudge_progress = cfg.nudge_progress_scale * nudge_delta * potential_ready
+            proximity = signals["proximity_quality"]
+            proximity_delta = cfg.shaping_discount * proximity - self._prev_nudge_proximity
+            r_nudge_reach = cfg.nudge_reach_scale * proximity_delta * potential_ready
+            self._prev_nudge_potential.copy_(nudge_potential)
+            self._prev_nudge_proximity.copy_(proximity)
+            r_nudge_success = cfg.nudge_success_bonus * self._nudge_success.float()
+            r_nudge_failure = -cfg.nudge_failure_penalty * self._nudge_failure.float()
+            r_nudge_timeout = -cfg.nudge_timeout_penalty * self._nudge_timeout.float()
+            log["nudge_pos_error_mean"] = errors["pos_error"].mean()
+            log["nudge_heading_error_mean"] = errors["heading_error"].mean()
+            log["nudge_tip_cos_mean"] = errors["tip_cos"].mean()
+            log["nudge_potential_mean"] = nudge_potential.mean()
+            log["r_nudge_progress_mean"] = r_nudge_progress.mean()
+            log["r_nudge_reach_mean"] = r_nudge_reach.mean()
+            log["nudge_success_frac"] = self._nudge_success.float().mean()
+            log["nudge_failure_frac"] = self._nudge_failure.float().mean()
+            log["nudge_timeout_frac"] = self._nudge_timeout.float().mean()
+            nudge_completed = self._nudge_episode_total.clamp_min(1).float()
+            log["nudge_episode_total"] = self._nudge_episode_total.float()
+            log["nudge_success_rate_total"] = self._nudge_success_total.float() / nudge_completed
+            log["nudge_failure_rate_total"] = self._nudge_failure_total.float() / nudge_completed
+            log["nudge_timeout_rate_total"] = self._nudge_timeout_total.float() / nudge_completed
+            return (
+                r_nudge_reach
+                + r_nudge_progress
+                + r_nudge_success
+                + r_nudge_failure
+                + r_nudge_timeout
+                + r_force_penalty
+                + r_residual_penalty
+            )
+
         if cfg.close_option_mode:
             # The option is only a bridge from pregrasp to a stable latch.  In particular, neither
             # true-clearance progress nor the full-task 20cm success can pay during this phase.
@@ -1300,6 +1368,20 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             + r_force_penalty
             + r_residual_penalty
         )
+
+    # ------------------------------------------------------------------ nudge pose errors
+    def _nudge_pose_errors(self) -> dict[str, torch.Tensor]:
+        """COM-xy error, wrapped heading error and rest-up alignment of the tool on the table."""
+
+        quat = self.object.data.root_quat_w
+        com_xy = self._object_com_position_w()[:, :2]
+        target_xy = self._nudge_target_xy + self.scene.env_origins[:, :2]
+        pos_error = (com_xy - target_xy).norm(dim=-1)
+        x_now = quat_apply(quat, self._nudge_rest_x_local)
+        heading = torch.atan2(x_now[:, 1], x_now[:, 0])
+        heading_error = wrap_to_pi(heading - self.cfg.nudge_target_yaw).abs()
+        tip_cos = quat_apply(quat, self._nudge_rest_up_local)[:, 2]
+        return {"pos_error": pos_error, "heading_error": heading_error, "tip_cos": tip_cos}
 
     # ------------------------------------------------------------------ termination
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1357,6 +1439,55 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             "object_ang_speed": obj_ang.clone(),
             "success_steps": self._success_steps.clone(),
         }
+
+        if cfg.nudge_option_mode:
+            errors = self._nudge_pose_errors()
+            upright = errors["tip_cos"] >= cfg.nudge_tip_cos_min
+            on_table = clearance.abs() <= cfg.nudge_on_table_tolerance
+            settled = obj_lin <= cfg.nudge_max_obj_speed
+            in_target = (
+                (errors["pos_error"] <= cfg.nudge_pos_tolerance)
+                & (errors["heading_error"] <= cfg.nudge_yaw_tolerance)
+                & upright
+                & on_table
+                & settled
+            )
+            self._nudge_hold_steps.copy_(
+                torch.where(in_target, self._nudge_hold_steps + 1, torch.zeros_like(self._nudge_hold_steps))
+            )
+            escaped = errors["pos_error"] > cfg.nudge_workspace_radius
+            success = self._nudge_hold_steps >= cfg.nudge_confirm_steps
+            failure = (~upright) | escaped | dropped | unsafe_force
+            success = success & ~failure
+            self._nudge_success.copy_(success)
+            self._nudge_failure.copy_(failure)
+            terminated = success | failure
+            time_out = time_out & ~terminated
+            self._nudge_timeout.copy_(time_out)
+            self._nudge_episode_total.add_((terminated | time_out).sum())
+            self._nudge_success_total.add_(success.sum())
+            self._nudge_failure_total.add_(failure.sum())
+            self._nudge_timeout_total.add_(time_out.sum())
+            # Terminal truth pre-auto-reset, mirroring the close-option contract for off-policy
+            # collectors (diagnostics only; no reward/reset side effects).
+            self.extras["pick_tool_terminal"] = {
+                "success": success.clone(),
+                "failure": failure.clone(),
+                "time_out": time_out.clone(),
+                "dropped": dropped.clone(),
+                "unsafe_force": unsafe_force.clone(),
+                # In nudge mode this flags a fling-style push: the tool left the table by 5cm
+                # while nothing held it.  Keeps the trainer's terminal-event schema uniform.
+                "unlatched_clearance_ge_5cm": (
+                    (clearance >= 0.05) & (~self._is_grasped)
+                ).clone(),
+                "nudge_tipped": (~upright).clone(),
+                "nudge_escaped": escaped.clone(),
+                "nudge_pos_error": errors["pos_error"].clone(),
+                "nudge_heading_error": errors["heading_error"].clone(),
+                **terminal_state,
+            }
+            return terminated, time_out
 
         if cfg.close_option_mode:
             horizontal_drift = (
@@ -1458,6 +1589,18 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._close_option_lost_window[env_ids] = False
         self._close_option_stable_steps[env_ids] = 0
         self._close_option_lost_window_steps[env_ids] = 0
+        self._nudge_success[env_ids] = False
+        self._nudge_failure[env_ids] = False
+        self._nudge_timeout[env_ids] = False
+        self._nudge_hold_steps[env_ids] = 0
+        self._prev_nudge_potential[env_ids] = 0.0
+        self._prev_nudge_proximity[env_ids] = 0.0
+        if self.cfg.nudge_target_xy is None:
+            self._nudge_target_xy[env_ids] = self.object.data.default_root_state[env_ids, :2]
+        else:
+            self._nudge_target_xy[env_ids] = torch.tensor(
+                self.cfg.nudge_target_xy, device=self.device
+            )
         self._hard_force_steps[env_ids] = 0
         self._overforce_steps[env_ids] = 0
         self._lift_bonus_given[env_ids] = False

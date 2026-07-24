@@ -56,6 +56,14 @@ STRICT_METRIC_KEYS = (
     "hold_quality_mean",
     "object_contact_force_max",
     "tactile_terminate_fraction",
+    # Nudge-option diagnostics.  Outside nudge mode the env never logs these keys and the
+    # selector below simply skips them.
+    "nudge_success_rate_total",
+    "nudge_failure_rate_total",
+    "nudge_timeout_rate_total",
+    "nudge_pos_error_mean",
+    "nudge_heading_error_mean",
+    "nudge_tip_cos_mean",
 )
 
 _ADAPTER_INFO_KEYS = frozenset(

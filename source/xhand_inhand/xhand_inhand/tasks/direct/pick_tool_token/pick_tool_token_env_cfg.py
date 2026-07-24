@@ -52,6 +52,30 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     close_option_failure_penalty = 100.0
     close_option_timeout_penalty = 20.0
 
+    # ---- nudge-option mode: non-prehensile pre-grasp reorientation ----
+    # Short-horizon task: push/nudge the tool ON the table into the graspable pose family
+    # (the close_start distribution the close option was trained from), without grasping it.
+    # Success = object COM near the target spot, heading near the target yaw (measured in the
+    # rest frame), still flat on the table and settled, held nudge_confirm_steps frames.
+    # Mutually exclusive with close_option_mode; the default end-to-end task is unchanged.
+    nudge_option_mode = False
+    nudge_target_xy = None            # env-local target COM xy; None -> the default spawn xy
+    nudge_target_yaw = 0.0            # target heading vs the rest orientation (rad)
+    nudge_pos_tolerance = 0.06        # COM xy distance for success (m)
+    nudge_yaw_tolerance = 0.20        # |wrapped heading error| for success (rad)
+    nudge_confirm_steps = 15          # consecutive settled in-tolerance frames
+    nudge_max_obj_speed = 0.10        # settled COM linear speed for success (m/s)
+    nudge_workspace_radius = 0.22     # COM xy escape distance from the target -> failure (m)
+    nudge_tip_cos_min = 0.90          # rest-up axis dot world-z below this = tipped -> failure
+    nudge_on_table_tolerance = 0.01   # |true clearance| above this = airborne/embedded guard (m)
+    nudge_success_bonus = 100.0
+    nudge_failure_penalty = 100.0
+    nudge_timeout_penalty = 20.0
+    nudge_progress_scale = 20.0       # potential-based shaping on the pose error
+    nudge_reach_scale = 5.0           # potential-based shaping on fingertip proximity
+    nudge_pos_sigma = 0.08            # xy error scale inside the pose potential (m)
+    nudge_yaw_sigma = 0.50            # heading error scale inside the pose potential (rad)
+
     # Action = 7 arm relative deltas + 9 CrossDex tokens + 5 absolute distal residuals.  A residual
     # of -1/0/+1 reaches the runtime lower/token/upper target respectively, before the existing EMA.
     enable_distal_residual = True
