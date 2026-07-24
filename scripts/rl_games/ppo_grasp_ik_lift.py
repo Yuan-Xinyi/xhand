@@ -70,8 +70,8 @@ parser.add_argument("--max_clips", type=int, default=5, help="stop after this ma
 parser.add_argument("--fps", type=int, default=50)
 # Render camera (world frame).  The tool sits at ~(0.5, 0, 0.05) and lifts to ~0.25; the default
 # viewer sits far away, so frame the tabletop grasp zone up close for recording.
-parser.add_argument("--cam_eye", type=float, nargs=3, default=[1.4, 0.7, 0.62])
-parser.add_argument("--cam_lookat", type=float, nargs=3, default=[0.5, 0.0, 0.22])
+parser.add_argument("--cam_eye", type=float, nargs=3, default=[1.9, 0.95, 0.9])
+parser.add_argument("--cam_lookat", type=float, nargs=3, default=[0.5, 0.0, 0.32])
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
