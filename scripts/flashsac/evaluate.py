@@ -618,10 +618,22 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
     parser.add_argument("--max_vector_steps", type=int, default=None)
     parser.add_argument("--nudge_option", action="store_true", help="evaluate the nudge contract")
     parser.add_argument("--nudge_yaw_range", type=float, default=None)
+    # Success-clip recording (requires --num_envs 1): every successful episode is written as
+    # an mp4 until --max_clips are saved; evaluation statistics are unaffected.
+    parser.add_argument("--video", action="store_true")
+    parser.add_argument("--video_folder", type=Path, default=Path("/tmp/flashsac_eval_video"))
+    parser.add_argument("--max_clips", type=int, default=3)
+    parser.add_argument("--fps", type=int, default=40)
+    parser.add_argument("--cam_eye", type=float, nargs=3, default=[1.9, 0.95, 0.9])
+    parser.add_argument("--cam_lookat", type=float, nargs=3, default=[0.5, 0.0, 0.32])
     parser.add_argument("--validate_finite", action="store_true")
     parser.add_argument("--output", type=Path, default=Path("/tmp/pick_tool_flashsac_eval.json"))
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args()
+    if args.video:
+        if args.num_envs != 1:
+            parser.error("--video requires --num_envs 1 (one clean single-env framing)")
+        args.enable_cameras = True
     launcher = AppLauncher(args)
     return args, launcher
 
@@ -687,6 +699,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     cfg_overrides: dict[str, Any] = {}
+    if args.video:
+        cfg_overrides["viewer.eye"] = tuple(args.cam_eye)
+        cfg_overrides["viewer.lookat"] = tuple(args.cam_lookat)
+        cfg_overrides["viewer.origin_type"] = "world"
     if args.nudge_option:
         # Nudge-phase evaluation: pick_tool_terminal success/failure carry the nudge contract.
         cfg_overrides["nudge_option_mode"] = True
@@ -709,6 +725,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         num_envs=args.num_envs,
         device=device_string,
         seed=args.seed,
+        render_mode="rgb_array" if args.video else None,
         cfg_overrides=cfg_overrides,
         validate_finite=args.validate_finite,
     )
@@ -782,6 +799,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     max_vector_steps = args.max_vector_steps or default_max_steps
     vector_steps = 0
 
+    frames: list[Any] = []
+    saved_clips: list[str] = []
+    if args.video:
+        import os
+
+        os.makedirs(args.video_folder, exist_ok=True)
+        # Renderer warmup: the first frames after startup are black / exposure transients.
+        for _ in range(8):
+            env.unwrapped.render()
+
     try:
         while not tracker.complete and vector_steps < max_vector_steps:
             vector_steps += 1
@@ -812,6 +839,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 transition_truth=transition_truth,
                 post_reset_truth=post_reset_truth,
             )
+            if args.video:
+                frames.append(env.unwrapped.render())
+                done_now = bool((terminated | truncated)[0])
+                if done_now:
+                    if bool(events["success"][0]) and len(saved_clips) < args.max_clips:
+                        import imageio.v2 as imageio
+                        import numpy as np
+
+                        clip_path = str(
+                            args.video_folder / f"nudge_success_{len(saved_clips) + 1}.mp4"
+                        )
+                        imageio.mimwrite(
+                            clip_path,
+                            [np.asarray(f) for f in frames],
+                            fps=args.fps,
+                            macro_block_size=None,
+                        )
+                        saved_clips.append(clip_path)
+                        print(f"[video] saved success clip: {clip_path}", flush=True)
+                    frames = []
             observation = next_observation
 
         if not tracker.complete:
