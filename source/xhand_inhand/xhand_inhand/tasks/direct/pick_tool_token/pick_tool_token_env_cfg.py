@@ -72,14 +72,17 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     nudge_failure_penalty = 100.0
     nudge_timeout_penalty = 10.0
     nudge_progress_scale = 30.0       # potential-based shaping on the pose error
-    nudge_reach_scale = 20.0          # potential-based shaping on the reach potential
-    # The reach potential is 0.5*coarse + 0.5*gated: an ungated coarse distance kernel that
-    # keeps a usable far-field gradient (the full gate stack multiplies to ~0 under random
-    # exploration poses, which starved off-policy training of any approach signal -- measured
-    # object_contact_force_max == 0 after 18k pilot steps), plus the battle-tested gated
-    # proximity (dual kernels x region x alignment x opposition x palm facing) that shapes the
-    # final approach posture.  The gates are kept, not removed.
+    # Reach is OCCUPANCY-style, not potential-based.  Two pilots measured zero object contact:
+    # a gamma-correct potential telescopes to PHI(end)-PHI(start) (~8 return for a full
+    # approach), 30x weaker than the occupancy reward the original PPO reach learned from, and
+    # FlashSAC's return normalization (scaled by the +-100 terminals) buries it entirely.
+    # Occupancy pays every step near the tool: 0.5*coarse + 0.5*gated, capped so a full-episode
+    # hover earns ~30 < the +100 success bonus (hovering is never preferable to finishing).
+    # The gated layer keeps the battle-tested stack (dual kernels x region x alignment x
+    # opposition x palm facing); the ungated coarse layer supplies the far-field gradient.
+    nudge_reach_scale = 0.1           # occupancy reward per step at reach potential 1.0
     nudge_reach_coarse_sigma = 0.12   # mean-fingertip-distance scale of the coarse layer (m)
+    nudge_touch_bonus = 10.0          # one-shot bonus at first object contact of the episode
     nudge_pos_sigma = 0.08            # xy error scale inside the pose potential (m)
     # Heading enters the pose potential linearly (1 - err/pi): with full-yaw resets an
     # exponential is numerically flat at large errors and provides no gradient.

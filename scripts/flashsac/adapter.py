@@ -64,6 +64,10 @@ STRICT_METRIC_KEYS = (
     "nudge_pos_error_mean",
     "nudge_heading_error_mean",
     "nudge_tip_cos_mean",
+    "nudge_touched_frac",
+    "nudge_reach_potential_mean",
+    "r_nudge_reach_mean",
+    "r_nudge_progress_mean",
 )
 
 _ADAPTER_INFO_KEYS = frozenset(

@@ -241,6 +241,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._nudge_failure = torch.zeros(N, dtype=torch.bool, device=dev)
         self._nudge_timeout = torch.zeros(N, dtype=torch.bool, device=dev)
         self._nudge_hold_steps = torch.zeros(N, dtype=torch.long, device=dev)
+        self._nudge_touched = torch.zeros(N, dtype=torch.bool, device=dev)
         self._prev_nudge_potential = torch.zeros(N, device=dev)
         self._prev_nudge_proximity = torch.zeros(N, device=dev)
         self._nudge_episode_total = torch.zeros((), dtype=torch.long, device=dev)
@@ -1316,19 +1317,23 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             )
             nudge_delta = cfg.shaping_discount * nudge_potential - self._prev_nudge_potential
             r_nudge_progress = cfg.nudge_progress_scale * nudge_delta * potential_ready
-            # Reach potential = ungated coarse guidance + the full battle-tested gate stack.
-            # The gated term (dual kernels x region x alignment x opposition x palm facing)
-            # shapes the final approach posture and is kept deliberately; the coarse term exists
-            # because that gate product is ~0 under random exploration poses and off-policy
-            # training measured zero object contact after 18k pilot steps -- the far field needs
-            # an ungated, monotone gradient to pull the hand down to the tool at all.
+            # OCCUPANCY reach (see cfg comment): pays every step near the tool.  Potential-form
+            # reach telescopes to a ~8-return approach incentive that FlashSAC's normalization
+            # buries -- two pilots measured zero contact.  The gated layer keeps the full
+            # battle-tested stack; the ungated coarse layer supplies the far-field gradient.
             coarse = torch.exp(
                 -self._curr_fingertip_distances.mean(dim=-1) / cfg.nudge_reach_coarse_sigma
             )
             gated = signals["proximity_quality"] * signals["palm_score"]
             proximity = 0.5 * coarse + 0.5 * gated
-            proximity_delta = cfg.shaping_discount * proximity - self._prev_nudge_proximity
-            r_nudge_reach = cfg.nudge_reach_scale * proximity_delta * potential_ready
+            r_nudge_reach = cfg.nudge_reach_scale * proximity
+            self._prev_nudge_proximity.copy_(proximity)  # kept as a logged diagnostic
+            # One-shot first-contact bonus: a farming-proof exploration milestone between
+            # "descended" and "pushed to target".
+            touched_now = signals["force_magnitude"].max(dim=-1).values >= cfg.contact_force_thr
+            first_touch = touched_now & (~self._nudge_touched)
+            self._nudge_touched |= touched_now
+            r_nudge_touch = cfg.nudge_touch_bonus * first_touch.float()
             self._prev_nudge_potential.copy_(nudge_potential)
             self._prev_nudge_proximity.copy_(proximity)
             r_nudge_success = cfg.nudge_success_bonus * self._nudge_success.float()
@@ -1340,6 +1345,8 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             log["nudge_potential_mean"] = nudge_potential.mean()
             log["r_nudge_progress_mean"] = r_nudge_progress.mean()
             log["r_nudge_reach_mean"] = r_nudge_reach.mean()
+            log["nudge_reach_potential_mean"] = proximity.mean()
+            log["nudge_touched_frac"] = self._nudge_touched.float().mean()
             log["nudge_success_frac"] = self._nudge_success.float().mean()
             log["nudge_failure_frac"] = self._nudge_failure.float().mean()
             log["nudge_timeout_frac"] = self._nudge_timeout.float().mean()
@@ -1350,6 +1357,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             log["nudge_timeout_rate_total"] = self._nudge_timeout_total.float() / nudge_completed
             return (
                 r_nudge_reach
+                + r_nudge_touch
                 + r_nudge_progress
                 + r_nudge_success
                 + r_nudge_failure
@@ -1605,6 +1613,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._nudge_failure[env_ids] = False
         self._nudge_timeout[env_ids] = False
         self._nudge_hold_steps[env_ids] = 0
+        self._nudge_touched[env_ids] = False
         self._prev_nudge_potential[env_ids] = 0.0
         self._prev_nudge_proximity[env_ids] = 0.0
         if self.cfg.nudge_target_xy is None:
