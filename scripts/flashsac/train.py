@@ -308,6 +308,14 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
     parser.add_argument("--curriculum_boundary", default="close_start")
     parser.add_argument("--curriculum_probability", type=float, default=0.0)
     parser.add_argument("--curriculum_joint_noise", type=float, default=0.0)
+    parser.add_argument(
+        "--close_option",
+        action="store_true",
+        help="Train ONLY the stable-latch (close) phase: episodes terminate on the env's "
+        "close-option success/failure contract and pay its bonus/penalties.  The hand must "
+        "spawn at a pregrasp boundary, so this requires --curriculum_dataset with "
+        "--curriculum_probability 1.0 (e.g. boundary close_start).",
+    )
     parser.add_argument("--output_dir", type=Path, default=Path("logs/flashsac/pick_tool"))
     parser.add_argument("--metrics_every", type=int, default=100)
     parser.add_argument("--smoke", action="store_true", help="Use a tiny 8-env, 8-step integration run.")
@@ -363,6 +371,15 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--curriculum_probability > 0 requires --curriculum_dataset")
     if args.curriculum_dataset is not None and not args.curriculum_dataset.is_file():
         raise FileNotFoundError(args.curriculum_dataset)
+    if args.close_option:
+        # The close-option contract judges failure by pregrasp-window quantities (proximity,
+        # horizontal drift from the spawn pose); from a normal far-away reset those conditions
+        # fire immediately and every episode is an instant failure.  Demand the pregrasp spawn.
+        if args.curriculum_dataset is None or args.curriculum_probability < 1.0:
+            raise ValueError(
+                "--close_option requires --curriculum_dataset and --curriculum_probability 1.0 "
+                "(every episode must spawn at a pregrasp boundary)"
+            )
     if args.resume_replay and args.checkpoint is None:
         raise ValueError("--resume_replay requires --checkpoint")
     if args.demo is not None:
@@ -561,6 +578,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "curriculum_probability": args.curriculum_probability,
             "curriculum_joint_noise": args.curriculum_joint_noise,
         }
+    curriculum_metrics["close_option"] = bool(args.close_option)
 
     cfg_overrides = {}
     if args.episode_length_s is not None:
@@ -574,6 +592,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "curriculum_joint_noise": args.curriculum_joint_noise,
             }
         )
+    if args.close_option:
+        # Close-phase-only training: the env terminates each episode on its close-option
+        # success/failure contract and pays the corresponding bonus/penalties on top of the
+        # dense close/wrap shaping.  All thresholds keep their cfg defaults (the same values
+        # the PPO close-option runs used).
+        cfg_overrides["close_option_mode"] = True
+        if args.episode_length_s is None:
+            cfg_overrides["episode_length_s"] = 3.0
     env = make_pick_tool_env(
         num_envs=args.num_envs,
         device=device,
