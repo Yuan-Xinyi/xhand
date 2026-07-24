@@ -68,6 +68,10 @@ parser.add_argument("--video_length", type=int, default=0, help="0 = record the 
 parser.add_argument("--attempts", type=int, default=1, help=">1 enables single-env demo recording")
 parser.add_argument("--max_clips", type=int, default=5, help="stop after this many successful clips")
 parser.add_argument("--fps", type=int, default=50)
+# Render camera (world frame).  The tool sits at ~(0.5, 0, 0.05) and lifts to ~0.25; the default
+# viewer sits far away, so frame the tabletop grasp zone up close for recording.
+parser.add_argument("--cam_eye", type=float, nargs=3, default=[1.4, 0.7, 0.62])
+parser.add_argument("--cam_lookat", type=float, nargs=3, default=[0.5, 0.0, 0.22])
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -123,6 +127,10 @@ def main() -> None:
     n = args_cli.num_envs
     cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=n)
     cfg.seed = args_cli.seed
+    # Pull the render camera in close on the tabletop grasp/lift zone (world frame, single env).
+    cfg.viewer.eye = tuple(args_cli.cam_eye)
+    cfg.viewer.lookat = tuple(args_cli.cam_lookat)
+    cfg.viewer.origin_type = "world"
     cfg.episode_length_s = 120.0
     cfg.terminate_on_drop = False
     cfg.success_hold_steps = 100000
