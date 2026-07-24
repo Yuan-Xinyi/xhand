@@ -1316,12 +1316,17 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             )
             nudge_delta = cfg.shaping_discount * nudge_potential - self._prev_nudge_potential
             r_nudge_progress = cfg.nudge_progress_scale * nudge_delta * potential_ready
-            # Reach potential keeps the full battle-tested reach gate stack: the dual distance
-            # kernels, handle-region, fingerpad alignment and thumb opposition gates live inside
-            # proximity_quality, and palm_score restores the palm-facing gate of the original
-            # R_reach.  These gates were kept deliberately (they were earned over many reward
-            # iterations) and leave the hand in a pregrasp-like approach for the close option.
-            proximity = signals["proximity_quality"] * signals["palm_score"]
+            # Reach potential = ungated coarse guidance + the full battle-tested gate stack.
+            # The gated term (dual kernels x region x alignment x opposition x palm facing)
+            # shapes the final approach posture and is kept deliberately; the coarse term exists
+            # because that gate product is ~0 under random exploration poses and off-policy
+            # training measured zero object contact after 18k pilot steps -- the far field needs
+            # an ungated, monotone gradient to pull the hand down to the tool at all.
+            coarse = torch.exp(
+                -self._curr_fingertip_distances.mean(dim=-1) / cfg.nudge_reach_coarse_sigma
+            )
+            gated = signals["proximity_quality"] * signals["palm_score"]
+            proximity = 0.5 * coarse + 0.5 * gated
             proximity_delta = cfg.shaping_discount * proximity - self._prev_nudge_proximity
             r_nudge_reach = cfg.nudge_reach_scale * proximity_delta * potential_ready
             self._prev_nudge_potential.copy_(nudge_potential)

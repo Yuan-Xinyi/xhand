@@ -70,9 +70,16 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     nudge_on_table_tolerance = 0.01   # |true clearance| above this = airborne/embedded guard (m)
     nudge_success_bonus = 100.0
     nudge_failure_penalty = 100.0
-    nudge_timeout_penalty = 20.0
-    nudge_progress_scale = 20.0       # potential-based shaping on the pose error
-    nudge_reach_scale = 5.0           # potential-based shaping on gated fingertip proximity
+    nudge_timeout_penalty = 10.0
+    nudge_progress_scale = 30.0       # potential-based shaping on the pose error
+    nudge_reach_scale = 20.0          # potential-based shaping on the reach potential
+    # The reach potential is 0.5*coarse + 0.5*gated: an ungated coarse distance kernel that
+    # keeps a usable far-field gradient (the full gate stack multiplies to ~0 under random
+    # exploration poses, which starved off-policy training of any approach signal -- measured
+    # object_contact_force_max == 0 after 18k pilot steps), plus the battle-tested gated
+    # proximity (dual kernels x region x alignment x opposition x palm facing) that shapes the
+    # final approach posture.  The gates are kept, not removed.
+    nudge_reach_coarse_sigma = 0.12   # mean-fingertip-distance scale of the coarse layer (m)
     nudge_pos_sigma = 0.08            # xy error scale inside the pose potential (m)
     # Heading enters the pose potential linearly (1 - err/pi): with full-yaw resets an
     # exponential is numerically flat at large errors and provides no gradient.
