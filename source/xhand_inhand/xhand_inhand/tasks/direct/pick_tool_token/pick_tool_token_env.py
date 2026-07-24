@@ -1614,6 +1614,29 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._nudge_timeout[env_ids] = False
         self._nudge_hold_steps[env_ids] = 0
         self._nudge_touched[env_ids] = False
+        if self.cfg.nudge_option_mode and self.cfg.nudge_ready_arm_joints is not None:
+            # Start nudge episodes from the low-ready pose (palm ~10cm over the table center)
+            # plus the standard arm joint noise; the hand keeps the parent's open home pose.
+            ready = torch.tensor(
+                self.cfg.nudge_ready_arm_joints, device=self.device, dtype=torch.float32
+            )
+            noise = sample_uniform(
+                -self.cfg.reset_arm_joint_noise,
+                self.cfg.reset_arm_joint_noise,
+                (len(env_ids), ready.numel()),
+                self.device,
+            )
+            joint_pos = self.robot.data.joint_pos[env_ids].clone()
+            arm_pos = (ready.unsqueeze(0) + noise).clamp(
+                self.dof_lower[env_ids][:, self._arm_ids_t],
+                self.dof_upper[env_ids][:, self._arm_ids_t],
+            )
+            joint_pos[:, self._arm_ids_t] = arm_pos
+            self.robot.write_joint_state_to_sim(
+                joint_pos, torch.zeros_like(joint_pos), env_ids=env_ids
+            )
+            self.robot.set_joint_position_target(joint_pos, env_ids=env_ids)
+            self.dof_targets[env_ids] = joint_pos
         self._prev_nudge_potential[env_ids] = 0.0
         self._prev_nudge_proximity[env_ids] = 0.0
         if self.cfg.nudge_target_xy is None:

@@ -83,6 +83,12 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     nudge_reach_scale = 0.1           # occupancy reward per step at reach potential 1.0
     nudge_reach_coarse_sigma = 0.12   # mean-fingertip-distance scale of the coarse layer (m)
     nudge_touch_bonus = 10.0          # one-shot bonus at first object contact of the episode
+    # Nudge episodes start from a low-ready arm pose (palm ~10cm above the table center, found
+    # by DLS, final error 1.7mm) instead of the high home pose.  Three exploration-only runs
+    # measured zero object contact from home: the 25cm descend gap is precisely the exploration
+    # wall this project's hierarchy solves by starting each option where its predecessor
+    # delivers (reach/DLS can already position the hand low).  Set to None to keep home.
+    nudge_ready_arm_joints = (-0.1399, 0.8565, 0.2425, 0.9967, 0.3287, -0.7948, -1.3486)
     nudge_pos_sigma = 0.08            # xy error scale inside the pose potential (m)
     # Heading enters the pose potential linearly (1 - err/pi): with full-yaw resets an
     # exponential is numerically flat at large errors and provides no gradient.
