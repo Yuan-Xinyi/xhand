@@ -72,9 +72,10 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     nudge_failure_penalty = 100.0
     nudge_timeout_penalty = 20.0
     nudge_progress_scale = 20.0       # potential-based shaping on the pose error
-    nudge_reach_scale = 5.0           # potential-based shaping on fingertip proximity
+    nudge_reach_scale = 5.0           # potential-based shaping on gated fingertip proximity
     nudge_pos_sigma = 0.08            # xy error scale inside the pose potential (m)
-    nudge_yaw_sigma = 0.50            # heading error scale inside the pose potential (rad)
+    # Heading enters the pose potential linearly (1 - err/pi): with full-yaw resets an
+    # exponential is numerically flat at large errors and provides no gradient.
 
     # Action = 7 arm relative deltas + 9 CrossDex tokens + 5 absolute distal residuals.  A residual
     # of -1/0/+1 reaches the runtime lower/token/upper target respectively, before the existing EMA.

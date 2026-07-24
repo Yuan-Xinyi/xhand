@@ -324,6 +324,13 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         "family.  Episodes terminate on the env's nudge success/failure contract.  No "
         "curriculum spawn is needed.",
     )
+    parser.add_argument(
+        "--nudge_yaw_range",
+        type=float,
+        default=None,
+        help="Curriculum knob for --nudge_option: reset yaw is sampled from [-r, r] radians "
+        "instead of the full [-pi, pi].  Start e.g. at 1.57 and widen in later runs.",
+    )
     parser.add_argument("--output_dir", type=Path, default=Path("logs/flashsac/pick_tool"))
     parser.add_argument("--metrics_every", type=int, default=100)
     parser.add_argument("--smoke", action="store_true", help="Use a tiny 8-env, 8-step integration run.")
@@ -390,6 +397,11 @@ def _validate_args(args: argparse.Namespace) -> None:
             )
     if args.nudge_option and args.close_option:
         raise ValueError("--nudge_option and --close_option are mutually exclusive")
+    if args.nudge_yaw_range is not None:
+        if not args.nudge_option:
+            raise ValueError("--nudge_yaw_range only applies with --nudge_option")
+        if not math.isfinite(args.nudge_yaw_range) or not 0.0 < args.nudge_yaw_range <= math.pi:
+            raise ValueError("--nudge_yaw_range must be in (0, pi]")
     if args.resume_replay and args.checkpoint is None:
         raise ValueError("--resume_replay requires --checkpoint")
     if args.demo is not None:
@@ -590,6 +602,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         }
     curriculum_metrics["close_option"] = bool(args.close_option)
     curriculum_metrics["nudge_option"] = bool(args.nudge_option)
+    curriculum_metrics["nudge_yaw_range"] = args.nudge_yaw_range
 
     cfg_overrides = {}
     if args.episode_length_s is not None:
@@ -618,6 +631,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         cfg_overrides["nudge_option_mode"] = True
         if args.episode_length_s is None:
             cfg_overrides["episode_length_s"] = 6.0
+        if args.nudge_yaw_range is not None:
+            cfg_overrides["reset_object_yaw_range"] = (
+                -args.nudge_yaw_range,
+                args.nudge_yaw_range,
+            )
     env = make_pick_tool_env(
         num_envs=args.num_envs,
         device=device,

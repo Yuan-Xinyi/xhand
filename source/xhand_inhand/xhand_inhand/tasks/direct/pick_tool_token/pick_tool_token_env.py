@@ -1307,14 +1307,21 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             # actually moving the tool toward the target spot/heading while it stays flat.
             errors = self._nudge_pose_errors()
             upright = (errors["tip_cos"] >= cfg.nudge_tip_cos_min).float()
+            # Heading uses a LINEAR ramp, not an exponential: with full-yaw resets a 176-degree
+            # error must still see a constant-slope gradient (exp(-pi/sigma) is numerically flat).
+            # The position kernel stays exponential to sharpen near the target.
+            yaw_term = 1.0 - errors["heading_error"] / torch.pi
             nudge_potential = (
-                torch.exp(-errors["pos_error"] / cfg.nudge_pos_sigma)
-                * torch.exp(-errors["heading_error"] / cfg.nudge_yaw_sigma)
-                * upright
+                torch.exp(-errors["pos_error"] / cfg.nudge_pos_sigma) * yaw_term * upright
             )
             nudge_delta = cfg.shaping_discount * nudge_potential - self._prev_nudge_potential
             r_nudge_progress = cfg.nudge_progress_scale * nudge_delta * potential_ready
-            proximity = signals["proximity_quality"]
+            # Reach potential keeps the full battle-tested reach gate stack: the dual distance
+            # kernels, handle-region, fingerpad alignment and thumb opposition gates live inside
+            # proximity_quality, and palm_score restores the palm-facing gate of the original
+            # R_reach.  These gates were kept deliberately (they were earned over many reward
+            # iterations) and leave the hand in a pregrasp-like approach for the close option.
+            proximity = signals["proximity_quality"] * signals["palm_score"]
             proximity_delta = cfg.shaping_discount * proximity - self._prev_nudge_proximity
             r_nudge_reach = cfg.nudge_reach_scale * proximity_delta * potential_ready
             self._prev_nudge_potential.copy_(nudge_potential)
