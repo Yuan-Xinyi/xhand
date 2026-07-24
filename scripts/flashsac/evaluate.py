@@ -132,7 +132,15 @@ def validate_terminal_events(
         )
     if bool((events["success"] & events["failure"]).any()):
         raise RuntimeError("an episode cannot be both a strict success and task failure")
-    if not torch.equal(events["failure"], events["dropped"] | events["unsafe_force"]):
+    raw = _terminal_mapping(info)
+    if "nudge_tipped" in raw:
+        # Nudge contract: failure is tipped OR escaped OR dropped OR unsafe force.
+        tipped = raw["nudge_tipped"]
+        escaped = raw["nudge_escaped"]
+        expected = tipped | escaped | events["dropped"] | events["unsafe_force"]
+        if not torch.equal(events["failure"], expected):
+            raise RuntimeError("nudge failure must be exactly tipped/escaped/drop/unsafe force")
+    elif not torch.equal(events["failure"], events["dropped"] | events["unsafe_force"]):
         raise RuntimeError("task failure must be exactly drop or unsafe force")
     return events
 
@@ -189,7 +197,8 @@ def physical_truth_from_terminal_info(
     )
     truth.validate(num_envs=num_envs, device=device, name="pick_tool_terminal")
     success = raw.get("success")
-    if isinstance(success, torch.Tensor):
+    if isinstance(success, torch.Tensor) and "nudge_tipped" not in raw:
+        # Pick contract only: nudge success is a tabletop pose contract (clearance ~0, no latch).
         if bool((success & (truth.clearance < 0.20 - 1.0e-6)).any()):
             raise RuntimeError("strict success reported below 20 cm true mesh clearance")
         if bool((success & ~truth.grasped).any()):
@@ -607,6 +616,8 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
     parser.add_argument("--curriculum_probability", type=float, default=0.0)
     parser.add_argument("--curriculum_joint_noise", type=float, default=0.0)
     parser.add_argument("--max_vector_steps", type=int, default=None)
+    parser.add_argument("--nudge_option", action="store_true", help="evaluate the nudge contract")
+    parser.add_argument("--nudge_yaw_range", type=float, default=None)
     parser.add_argument("--validate_finite", action="store_true")
     parser.add_argument("--output", type=Path, default=Path("/tmp/pick_tool_flashsac_eval.json"))
     AppLauncher.add_app_launcher_args(parser)
@@ -676,6 +687,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     cfg_overrides: dict[str, Any] = {}
+    if args.nudge_option:
+        # Nudge-phase evaluation: pick_tool_terminal success/failure carry the nudge contract.
+        cfg_overrides["nudge_option_mode"] = True
+        if args.episode_length_s is None:
+            cfg_overrides["episode_length_s"] = 6.0
+        if args.nudge_yaw_range is not None:
+            cfg_overrides["reset_object_yaw_range"] = (-args.nudge_yaw_range, args.nudge_yaw_range)
     if args.episode_length_s is not None:
         cfg_overrides["episode_length_s"] = args.episode_length_s
     if args.curriculum_dataset is not None:
@@ -834,6 +852,13 @@ def main() -> None:
     try:
         metrics = run(args)
         print(json.dumps(metrics, indent=2, sort_keys=True, allow_nan=False))
+    except BaseException:
+        # SimulationApp.close() in the finally block hard-exits with code 0 and would
+        # swallow the traceback; print it first.
+        import traceback
+
+        traceback.print_exc()
+        raise
     finally:
         launcher.app.close()
 
