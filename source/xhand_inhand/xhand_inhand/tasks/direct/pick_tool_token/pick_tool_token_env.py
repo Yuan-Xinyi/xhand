@@ -1343,6 +1343,9 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             # Dense occupancy on partial closure (see cfg comment): the SAC-visible signal
             # between "touching" and "latched" that the telescoping potentials cannot provide.
             r_ng_close_occ = cfg.nudge_grasp_close_occupancy * signals["close_quality"]
+            # Grasp-like approach posture occupancy (see cfg comment): `gated` is the full
+            # battle-tested stack, reused here as a dense per-step signal.
+            r_ng_posture = cfg.nudge_grasp_posture_occupancy * gated
             r_ng_success = cfg.nudge_grasp_success_bonus * self._ng_success.float()
             r_ng_failure = -cfg.nudge_grasp_failure_penalty * self._ng_failure.float()
             r_ng_timeout = -cfg.nudge_grasp_timeout_penalty * self._ng_timeout.float()
@@ -1363,6 +1366,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 + r_ng_touch
                 + r_ng_pose
                 + r_ng_close_occ
+                + r_ng_posture
                 + r_close_progress
                 + r_wrap_progress
                 + r_grasp

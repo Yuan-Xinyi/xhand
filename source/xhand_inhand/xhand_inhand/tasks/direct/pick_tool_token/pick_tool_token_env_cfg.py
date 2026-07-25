@@ -77,6 +77,13 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # a full-episode maximum (~25) stays well under the +100 latch bonus, so parking in a
     # half-closed touch is never preferable to finishing the grasp.
     nudge_grasp_close_occupancy = 0.05
+    # Occupancy on the GATED approach posture (proximity x alignment x opposition x palm):
+    # the v6-inherited pushing fist is un-closable, and self-play spawns from those postures
+    # produced zero latches (v10, falsified).  Paying for grasp-like approach postures every
+    # step steers the approach itself toward states closure can actually start from.
+    # Full-episode maximum ~75 at posture 1.0, but sustained posture~1.0 implies a pregrasp
+    # that the +100 latch bonus strictly dominates by finishing.
+    nudge_grasp_posture_occupancy = 0.15
     nudge_target_xy = None            # env-local target COM xy; None -> the default spawn xy
     nudge_target_yaw = 0.0            # target heading vs the rest orientation (rad)
     nudge_pos_tolerance = 0.06        # COM xy distance for success (m)
