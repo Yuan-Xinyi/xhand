@@ -1340,6 +1340,9 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             first_touch = touched_now & (~self._nudge_touched)
             self._nudge_touched |= touched_now
             r_ng_touch = cfg.nudge_touch_bonus * first_touch.float()
+            # Dense occupancy on partial closure (see cfg comment): the SAC-visible signal
+            # between "touching" and "latched" that the telescoping potentials cannot provide.
+            r_ng_close_occ = cfg.nudge_grasp_close_occupancy * signals["close_quality"]
             r_ng_success = cfg.nudge_grasp_success_bonus * self._ng_success.float()
             r_ng_failure = -cfg.nudge_grasp_failure_penalty * self._ng_failure.float()
             r_ng_timeout = -cfg.nudge_grasp_timeout_penalty * self._ng_timeout.float()
@@ -1359,6 +1362,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 r_ng_reach
                 + r_ng_touch
                 + r_ng_pose
+                + r_ng_close_occ
                 + r_close_progress
                 + r_wrap_progress
                 + r_grasp

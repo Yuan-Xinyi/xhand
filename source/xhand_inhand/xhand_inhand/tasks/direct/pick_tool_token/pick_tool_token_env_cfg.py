@@ -71,6 +71,12 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     nudge_grasp_success_bonus = 100.0
     nudge_grasp_failure_penalty = 100.0
     nudge_grasp_timeout_penalty = 10.0
+    # Occupancy on close_quality: potential-difference closure shaping telescopes away under
+    # FlashSAC's return normalization (27k warm-started steps produced zero latches), exactly
+    # like the reach potentials before it.  Occupancy pays every step of partial closure;
+    # a full-episode maximum (~25) stays well under the +100 latch bonus, so parking in a
+    # half-closed touch is never preferable to finishing the grasp.
+    nudge_grasp_close_occupancy = 0.05
     nudge_target_xy = None            # env-local target COM xy; None -> the default spawn xy
     nudge_target_yaw = 0.0            # target heading vs the rest orientation (rad)
     nudge_pos_tolerance = 0.06        # COM xy distance for success (m)
