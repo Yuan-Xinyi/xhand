@@ -32,6 +32,13 @@ parser.add_argument(
     "policy's own pushing postures, which is precisely the distribution being captured.",
 )
 parser.add_argument("--capture_every", type=int, default=15, help="steps between captures per env")
+parser.add_argument(
+    "--gate",
+    choices=("engaged", "post_nudge"),
+    default="engaged",
+    help="capture moments: any near-tool engagement, or the post-nudge-success family (tool "
+    "reoriented into the pose tolerance, settled on the table, hand nearby, unlatched).",
+)
 parser.add_argument("--max_states", type=int, default=4096)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--output", type=Path, required=True)
@@ -96,9 +103,22 @@ def main() -> None:
         obs, _, terminated, truncated, _ = env.step(action)
         u._compute_intermediate_values()
         signals = u._compute_grasp_signals()
-        near = u._curr_fingertip_distances.mean(dim=-1) <= args_cli.engage_dist
-        touching = signals["force_magnitude"].max(dim=-1).values >= cfg.contact_force_thr
-        engaged = (near | touching) & (~u._is_grasped)
+        if args_cli.gate == "engaged":
+            near = u._curr_fingertip_distances.mean(dim=-1) <= args_cli.engage_dist
+            touching = signals["force_magnitude"].max(dim=-1).values >= cfg.contact_force_thr
+            engaged = (near | touching) & (~u._is_grasped)
+        else:  # post_nudge: the tool has just been reoriented into the pose family and settled
+            errors = u._nudge_pose_errors()
+            clearance = u._object_true_min_z() - u._table_surface_z
+            engaged = (
+                (errors["pos_error"] <= cfg.nudge_pos_tolerance)
+                & (errors["heading_error"] <= cfg.nudge_yaw_tolerance)
+                & (errors["tip_cos"] >= cfg.nudge_tip_cos_min)
+                & (clearance.abs() <= cfg.nudge_on_table_tolerance)
+                & (u.object.data.root_com_lin_vel_w.norm(dim=-1) <= cfg.nudge_max_obj_speed)
+                & (u._curr_fingertip_distances.mean(dim=-1) <= args_cli.engage_dist)
+                & (~u._is_grasped)
+            )
         cooldown = (cooldown - 1).clamp_min(0)
         pick = engaged & (cooldown == 0) & ~(terminated | truncated)
         if bool(pick.any()) and kept < args_cli.max_states:
