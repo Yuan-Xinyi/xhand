@@ -68,6 +68,10 @@ STRICT_METRIC_KEYS = (
     "nudge_reach_potential_mean",
     "nudge_table_hit_rate_total",
     "nudge_spawn_blend_mean",
+    "nudge_grasp_success_rate_total",
+    "nudge_grasp_failure_rate_total",
+    "nudge_grasp_timeout_rate_total",
+    "nudge_grasp_stable_steps_mean",
     "r_nudge_reach_mean",
     "r_nudge_progress_mean",
 )

@@ -622,6 +622,9 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
     parser.add_argument("--curriculum_joint_noise", type=float, default=0.0)
     parser.add_argument("--max_vector_steps", type=int, default=None)
     parser.add_argument("--nudge_option", action="store_true", help="evaluate the nudge contract")
+    parser.add_argument(
+        "--nudge_grasp_option", action="store_true", help="evaluate the merged nudge+grasp contract"
+    )
     parser.add_argument("--nudge_yaw_range", type=float, default=None)
     parser.add_argument(
         "--nudge_spawn_blend",
@@ -715,6 +718,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         cfg_overrides["viewer.eye"] = tuple(args.cam_eye)
         cfg_overrides["viewer.lookat"] = tuple(args.cam_lookat)
         cfg_overrides["viewer.origin_type"] = "world"
+    if args.nudge_grasp_option:
+        cfg_overrides["nudge_grasp_mode"] = True
+        if args.episode_length_s is None:
+            cfg_overrides["episode_length_s"] = 10.0
+        if args.nudge_yaw_range is not None:
+            cfg_overrides["reset_object_yaw_range"] = (-args.nudge_yaw_range, args.nudge_yaw_range)
+        if args.nudge_spawn_blend is not None:
+            if not 0.0 <= args.nudge_spawn_blend <= 1.0:
+                raise ValueError("--nudge_spawn_blend must be in [0, 1]")
+            cfg_overrides["nudge_spawn_blend_min"] = args.nudge_spawn_blend
+            cfg_overrides["nudge_spawn_blend_max"] = args.nudge_spawn_blend
+        else:
+            cfg_overrides["nudge_spawn_blend_min"] = 0.0
+            cfg_overrides["nudge_spawn_blend_max"] = 0.0
     if args.nudge_option:
         # Nudge-phase evaluation: pick_tool_terminal success/failure carry the nudge contract.
         cfg_overrides["nudge_option_mode"] = True

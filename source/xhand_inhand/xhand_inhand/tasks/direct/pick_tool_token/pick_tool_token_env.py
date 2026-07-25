@@ -225,8 +225,10 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._close_option_unlatched_lift_total = torch.zeros((), dtype=torch.long, device=dev)
         self._close_option_horizontal_escape_total = torch.zeros((), dtype=torch.long, device=dev)
         self._close_option_lost_window_total = torch.zeros((), dtype=torch.long, device=dev)
-        if cfg.nudge_option_mode and cfg.close_option_mode:
-            raise ValueError("nudge_option_mode and close_option_mode are mutually exclusive")
+        if sum((cfg.nudge_option_mode, cfg.close_option_mode, cfg.nudge_grasp_mode)) > 1:
+            raise ValueError(
+                "nudge_option_mode, close_option_mode and nudge_grasp_mode are mutually exclusive"
+            )
         # ---- nudge-option state (non-prehensile pre-grasp reorientation) ----
         # Rest-frame axes let heading (yaw about world z vs the rest orientation) and tipping be
         # measured for an arbitrary rest quaternion: both are read off the rest x/z axes rotated by
@@ -250,6 +252,16 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._nudge_failure_total = torch.zeros((), dtype=torch.long, device=dev)
         self._nudge_timeout_total = torch.zeros((), dtype=torch.long, device=dev)
         self._nudge_table_hit_total = torch.zeros((), dtype=torch.long, device=dev)
+        # merged nudge+grasp mode state
+        self._ng_stable_steps = torch.zeros(N, dtype=torch.long, device=dev)
+        self._ng_success = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._ng_failure = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._ng_timeout = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._ng_episode_total = torch.zeros((), dtype=torch.long, device=dev)
+        self._ng_success_total = torch.zeros((), dtype=torch.long, device=dev)
+        self._ng_failure_total = torch.zeros((), dtype=torch.long, device=dev)
+        self._ng_timeout_total = torch.zeros((), dtype=torch.long, device=dev)
+        self._ng_table_hit_total = torch.zeros((), dtype=torch.long, device=dev)
         self._lift_bonus_given = torch.zeros(N, dtype=torch.bool, device=dev)    # mvp20: one-shot lift-off bonus latch (per episode)
         self._prev_close_quality = torch.zeros(N, device=dev)
         self._prev_wrap_quality = torch.zeros(N, device=dev)
@@ -1303,6 +1315,60 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             log["distal_delta_abs_mean"] = self._last_distal_delta.abs().mean()
             log["distal_delta_abs_max"] = self._last_distal_delta.abs().max()
 
+        if cfg.nudge_grasp_mode:
+            # Merged nudge+grasp: the v6 shaping stack guides reach/reorientation, the
+            # battle-tested close/wrap potentials guide finger closure, and the strict latch
+            # contract pays the terminal bonus.  The pose potential is guidance only -- the
+            # policy may grasp at any tool pose it can manage.
+            errors = self._nudge_pose_errors()
+            upright = (errors["tip_cos"] >= cfg.nudge_tip_cos_min).float()
+            yaw_term = 1.0 - errors["heading_error"] / torch.pi
+            nudge_potential = (
+                torch.exp(-errors["pos_error"] / cfg.nudge_pos_sigma) * yaw_term * upright
+            )
+            nudge_delta = cfg.shaping_discount * nudge_potential - self._prev_nudge_potential
+            r_ng_pose = cfg.nudge_progress_scale * nudge_delta * potential_ready
+            coarse = torch.exp(
+                -self._curr_fingertip_distances.mean(dim=-1) / cfg.nudge_reach_coarse_sigma
+            )
+            gated = signals["proximity_quality"] * signals["palm_score"]
+            proximity = 0.5 * coarse + 0.5 * gated
+            r_ng_reach = cfg.nudge_reach_scale * proximity
+            self._prev_nudge_potential.copy_(nudge_potential)
+            self._prev_nudge_proximity.copy_(proximity)
+            touched_now = signals["force_magnitude"].max(dim=-1).values >= cfg.contact_force_thr
+            first_touch = touched_now & (~self._nudge_touched)
+            self._nudge_touched |= touched_now
+            r_ng_touch = cfg.nudge_touch_bonus * first_touch.float()
+            r_ng_success = cfg.nudge_grasp_success_bonus * self._ng_success.float()
+            r_ng_failure = -cfg.nudge_grasp_failure_penalty * self._ng_failure.float()
+            r_ng_timeout = -cfg.nudge_grasp_timeout_penalty * self._ng_timeout.float()
+            log["nudge_pos_error_mean"] = errors["pos_error"].mean()
+            log["nudge_heading_error_mean"] = errors["heading_error"].mean()
+            log["nudge_touched_frac"] = self._nudge_touched.float().mean()
+            log["nudge_reach_potential_mean"] = proximity.mean()
+            log["r_nudge_reach_mean"] = r_ng_reach.mean()
+            log["r_nudge_progress_mean"] = r_ng_pose.mean()
+            ng_completed = self._ng_episode_total.clamp_min(1).float()
+            log["nudge_grasp_success_rate_total"] = self._ng_success_total.float() / ng_completed
+            log["nudge_grasp_failure_rate_total"] = self._ng_failure_total.float() / ng_completed
+            log["nudge_grasp_timeout_rate_total"] = self._ng_timeout_total.float() / ng_completed
+            log["nudge_table_hit_rate_total"] = self._ng_table_hit_total.float() / ng_completed
+            log["nudge_grasp_stable_steps_mean"] = self._ng_stable_steps.float().mean()
+            return (
+                r_ng_reach
+                + r_ng_touch
+                + r_ng_pose
+                + r_close_progress
+                + r_wrap_progress
+                + r_grasp
+                + r_ng_success
+                + r_ng_failure
+                + r_ng_timeout
+                + r_force_penalty
+                + r_residual_penalty
+            )
+
         if cfg.nudge_option_mode:
             # Non-prehensile reorientation: no grasp/close/lift terms at all.  Two potential-based
             # shaping channels (gamma-correct, farm-proof like the close/wrap potentials above):
@@ -1463,6 +1529,58 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             "object_ang_speed": obj_ang.clone(),
             "success_steps": self._success_steps.clone(),
         }
+
+        if cfg.nudge_grasp_mode:
+            errors = self._nudge_pose_errors()
+            hand_points_z = torch.cat(
+                (self.ee_pos_w[:, :, 2], self.palm_center_w[:, 2:3]), dim=1
+            )
+            table_hit = (
+                hand_points_z.min(dim=-1).values
+                < self._table_surface_z + cfg.nudge_table_margin
+            )
+            escaped = errors["pos_error"] > cfg.nudge_workspace_radius
+            latched = (
+                self._is_grasped
+                & (signals["grasp_quality"] >= cfg.grasp_quality_high)
+                & (signals["hold_quality"] >= cfg.close_option_min_hold_quality)
+                & (max_force <= cfg.grasp_bonus_max_force)
+            )
+            self._ng_stable_steps.copy_(
+                torch.where(latched, self._ng_stable_steps + 1, torch.zeros_like(self._ng_stable_steps))
+            )
+            success = self._ng_stable_steps >= cfg.close_option_confirm_steps
+            failure = table_hit | escaped | dropped | unsafe_force
+            success = success & ~failure
+            self._ng_success.copy_(success)
+            self._ng_failure.copy_(failure)
+            terminated = success | failure
+            time_out = time_out & ~terminated
+            self._ng_timeout.copy_(time_out)
+            self._ng_episode_total.add_((terminated | time_out).sum())
+            self._ng_success_total.add_(success.sum())
+            self._ng_failure_total.add_(failure.sum())
+            self._ng_timeout_total.add_(time_out.sum())
+            self._ng_table_hit_total.add_(table_hit.sum())
+            self.extras["pick_tool_terminal"] = {
+                "success": success.clone(),
+                "failure": failure.clone(),
+                "time_out": time_out.clone(),
+                "dropped": dropped.clone(),
+                "unsafe_force": unsafe_force.clone(),
+                "unlatched_clearance_ge_5cm": (
+                    (clearance >= 0.05) & (~self._is_grasped)
+                ).clone(),
+                # Attitude change of a grasped tool is legitimate here; export a zero tipped
+                # flag to keep the evaluator's nudge failure-contract check applicable.
+                "nudge_tipped": torch.zeros_like(success),
+                "nudge_escaped": escaped.clone(),
+                "nudge_table_hit": table_hit.clone(),
+                "nudge_pos_error": errors["pos_error"].clone(),
+                "nudge_heading_error": errors["heading_error"].clone(),
+                **terminal_state,
+            }
+            return terminated, time_out
 
         if cfg.nudge_option_mode:
             errors = self._nudge_pose_errors()
@@ -1629,7 +1747,13 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._nudge_timeout[env_ids] = False
         self._nudge_hold_steps[env_ids] = 0
         self._nudge_touched[env_ids] = False
-        if self.cfg.nudge_option_mode and self.cfg.nudge_ready_arm_joints is not None:
+        self._ng_stable_steps[env_ids] = 0
+        self._ng_success[env_ids] = False
+        self._ng_failure[env_ids] = False
+        self._ng_timeout[env_ids] = False
+        if (
+            self.cfg.nudge_option_mode or self.cfg.nudge_grasp_mode
+        ) and self.cfg.nudge_ready_arm_joints is not None:
             # Spawn-pose curriculum: arm starts at home + blend*(ready - home) + joint noise,
             # blend ~ U[blend_min, blend_max] per episode (1 = low-ready over the table,
             # 0 = home).  The hand keeps the parent's open home pose.

@@ -59,6 +59,18 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # rest frame), still flat on the table and settled, held nudge_confirm_steps frames.
     # Mutually exclusive with close_option_mode; the default end-to-end task is unchanged.
     nudge_option_mode = False
+    # ---- merged nudge+grasp mode: one SAC policy from reorient to a held latch ----
+    # From the home spawn, the policy may reorient the tool (nudge shaping guides but does not
+    # require it) and must end holding the tool: success = the strict latch contract
+    # (is_grasped & grasp_quality>=high & hold_quality>=min & force<=limit) sustained for
+    # close_option_confirm_steps.  Failure = table-hit / escape / drop / sustained force; the
+    # tip check is deliberately absent (a grasped tool changing attitude is not a failure).
+    # Reward = the v6 nudge shaping stack + the battle-tested close/wrap progress + the
+    # one-shot first-stable-grasp bonus + the +-100 contract terms.
+    nudge_grasp_mode = False
+    nudge_grasp_success_bonus = 100.0
+    nudge_grasp_failure_penalty = 100.0
+    nudge_grasp_timeout_penalty = 10.0
     nudge_target_xy = None            # env-local target COM xy; None -> the default spawn xy
     nudge_target_yaw = 0.0            # target heading vs the rest orientation (rad)
     nudge_pos_tolerance = 0.06        # COM xy distance for success (m)

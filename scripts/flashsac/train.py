@@ -332,6 +332,13 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         "instead of the full [-pi, pi].  Start e.g. at 1.57 and widen in later runs.",
     )
     parser.add_argument(
+        "--nudge_grasp_option",
+        action="store_true",
+        help="Merged nudge+grasp phase: from the home spawn, reorient (guided, not required) "
+        "and END HOLDING the tool -- success is the strict latch contract sustained "
+        "close_option_confirm_steps.  Spawn is fixed at home unless --nudge_spawn_anneal.",
+    )
+    parser.add_argument(
         "--nudge_spawn_anneal",
         type=float,
         nargs=2,
@@ -405,16 +412,20 @@ def _validate_args(args: argparse.Namespace) -> None:
                 "--close_option requires --curriculum_dataset and --curriculum_probability 1.0 "
                 "(every episode must spawn at a pregrasp boundary)"
             )
-    if args.nudge_option and args.close_option:
-        raise ValueError("--nudge_option and --close_option are mutually exclusive")
+    if sum((args.nudge_option, args.close_option, args.nudge_grasp_option)) > 1:
+        raise ValueError(
+            "--nudge_option, --close_option and --nudge_grasp_option are mutually exclusive"
+        )
     if args.nudge_yaw_range is not None:
         if not args.nudge_option:
             raise ValueError("--nudge_yaw_range only applies with --nudge_option")
         if not math.isfinite(args.nudge_yaw_range) or not 0.0 < args.nudge_yaw_range <= math.pi:
             raise ValueError("--nudge_yaw_range must be in (0, pi]")
     if args.nudge_spawn_anneal is not None:
-        if not args.nudge_option:
-            raise ValueError("--nudge_spawn_anneal only applies with --nudge_option")
+        if not (args.nudge_option or args.nudge_grasp_option):
+            raise ValueError(
+                "--nudge_spawn_anneal only applies with --nudge_option/--nudge_grasp_option"
+            )
         start, end = args.nudge_spawn_anneal
         for name, value in (("START", start), ("END", end)):
             if not math.isfinite(value) or not 0.0 <= value <= 1.0:
@@ -619,6 +630,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         }
     curriculum_metrics["close_option"] = bool(args.close_option)
     curriculum_metrics["nudge_option"] = bool(args.nudge_option)
+    curriculum_metrics["nudge_grasp_option"] = bool(args.nudge_grasp_option)
     curriculum_metrics["nudge_yaw_range"] = args.nudge_yaw_range
     curriculum_metrics["nudge_spawn_anneal"] = (
         list(args.nudge_spawn_anneal) if args.nudge_spawn_anneal is not None else None
@@ -651,6 +663,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         cfg_overrides["nudge_option_mode"] = True
         if args.episode_length_s is None:
             cfg_overrides["episode_length_s"] = 6.0
+        if args.nudge_yaw_range is not None:
+            cfg_overrides["reset_object_yaw_range"] = (
+                -args.nudge_yaw_range,
+                args.nudge_yaw_range,
+            )
+    if args.nudge_grasp_option:
+        # Merged nudge+grasp: reorient AND hold the latch.  Longer horizon than nudge alone;
+        # spawn fixed at home (the v6 regime) unless the anneal knob is driving blend_min.
+        cfg_overrides["nudge_grasp_mode"] = True
+        if args.episode_length_s is None:
+            cfg_overrides["episode_length_s"] = 10.0
+        if args.nudge_spawn_anneal is None:
+            cfg_overrides["nudge_spawn_blend_min"] = 0.0
+            cfg_overrides["nudge_spawn_blend_max"] = 0.0
         if args.nudge_yaw_range is not None:
             cfg_overrides["reset_object_yaw_range"] = (
                 -args.nudge_yaw_range,
@@ -835,7 +861,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     try:
         for interaction_step in range(1, args.steps + 1):
-            if args.nudge_option and args.nudge_spawn_anneal is not None:
+            if (args.nudge_option or args.nudge_grasp_option) and args.nudge_spawn_anneal is not None:
                 # Demo-free spawn curriculum: anneal the LOWER edge of the spawn-blend range
                 # linearly over the run (1 = low-ready over the table, 0 = home) while the
                 # upper edge stays at 1, so easy near-object starts never disappear.  Reset
