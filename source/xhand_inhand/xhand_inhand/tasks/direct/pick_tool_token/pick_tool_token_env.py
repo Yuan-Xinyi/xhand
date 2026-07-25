@@ -248,6 +248,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._nudge_success_total = torch.zeros((), dtype=torch.long, device=dev)
         self._nudge_failure_total = torch.zeros((), dtype=torch.long, device=dev)
         self._nudge_timeout_total = torch.zeros((), dtype=torch.long, device=dev)
+        self._nudge_table_hit_total = torch.zeros((), dtype=torch.long, device=dev)
         self._lift_bonus_given = torch.zeros(N, dtype=torch.bool, device=dev)    # mvp20: one-shot lift-off bonus latch (per episode)
         self._prev_close_quality = torch.zeros(N, device=dev)
         self._prev_wrap_quality = torch.zeros(N, device=dev)
@@ -1334,18 +1335,6 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             first_touch = touched_now & (~self._nudge_touched)
             self._nudge_touched |= touched_now
             r_nudge_touch = cfg.nudge_touch_bonus * first_touch.float()
-            # Hand-table clearance penalty: finger pads + palm center must stay above the
-            # table by nudge_table_margin; scraping/pressing the table is punished per step.
-            hand_points_z = torch.cat(
-                (self.ee_pos_w[:, :, 2], self.palm_center_w[:, 2:3]), dim=1
-            )
-            table_violation = torch.clamp(
-                (self._table_surface_z + cfg.nudge_table_margin - hand_points_z)
-                / cfg.nudge_table_margin,
-                0.0,
-                2.0,
-            ).mean(dim=-1)
-            r_nudge_table = -cfg.nudge_table_penalty_scale * table_violation
             self._prev_nudge_potential.copy_(nudge_potential)
             self._prev_nudge_proximity.copy_(proximity)
             r_nudge_success = cfg.nudge_success_bonus * self._nudge_success.float()
@@ -1359,7 +1348,6 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             log["r_nudge_reach_mean"] = r_nudge_reach.mean()
             log["nudge_reach_potential_mean"] = proximity.mean()
             log["nudge_touched_frac"] = self._nudge_touched.float().mean()
-            log["nudge_table_violation_mean"] = table_violation.mean()
             log["nudge_success_frac"] = self._nudge_success.float().mean()
             log["nudge_failure_frac"] = self._nudge_failure.float().mean()
             log["nudge_timeout_frac"] = self._nudge_timeout.float().mean()
@@ -1368,11 +1356,11 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             log["nudge_success_rate_total"] = self._nudge_success_total.float() / nudge_completed
             log["nudge_failure_rate_total"] = self._nudge_failure_total.float() / nudge_completed
             log["nudge_timeout_rate_total"] = self._nudge_timeout_total.float() / nudge_completed
+            log["nudge_table_hit_rate_total"] = self._nudge_table_hit_total.float() / nudge_completed
             return (
                 r_nudge_reach
                 + r_nudge_touch
                 + r_nudge_progress
-                + r_nudge_table
                 + r_nudge_success
                 + r_nudge_failure
                 + r_nudge_timeout
@@ -1490,8 +1478,17 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 torch.where(in_target, self._nudge_hold_steps + 1, torch.zeros_like(self._nudge_hold_steps))
             )
             escaped = errors["pos_error"] > cfg.nudge_workspace_radius
+            # Hand-table collision is a hard constraint: any finger pad or the palm center
+            # below table + margin ends the episode as a failure (no reward shaping).
+            hand_points_z = torch.cat(
+                (self.ee_pos_w[:, :, 2], self.palm_center_w[:, 2:3]), dim=1
+            )
+            table_hit = (
+                hand_points_z.min(dim=-1).values
+                < self._table_surface_z + cfg.nudge_table_margin
+            )
             success = self._nudge_hold_steps >= cfg.nudge_confirm_steps
-            failure = (~upright) | escaped | dropped | unsafe_force
+            failure = (~upright) | escaped | dropped | unsafe_force | table_hit
             success = success & ~failure
             self._nudge_success.copy_(success)
             self._nudge_failure.copy_(failure)
@@ -1502,6 +1499,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             self._nudge_success_total.add_(success.sum())
             self._nudge_failure_total.add_(failure.sum())
             self._nudge_timeout_total.add_(time_out.sum())
+            self._nudge_table_hit_total.add_(table_hit.sum())
             # Terminal truth pre-auto-reset, mirroring the close-option contract for off-policy
             # collectors (diagnostics only; no reward/reset side effects).
             self.extras["pick_tool_terminal"] = {
@@ -1517,6 +1515,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 ).clone(),
                 "nudge_tipped": (~upright).clone(),
                 "nudge_escaped": escaped.clone(),
+                "nudge_table_hit": table_hit.clone(),
                 "nudge_pos_error": errors["pos_error"].clone(),
                 "nudge_heading_error": errors["heading_error"].clone(),
                 **terminal_state,

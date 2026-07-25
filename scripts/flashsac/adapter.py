@@ -66,7 +66,7 @@ STRICT_METRIC_KEYS = (
     "nudge_tip_cos_mean",
     "nudge_touched_frac",
     "nudge_reach_potential_mean",
-    "nudge_table_violation_mean",
+    "nudge_table_hit_rate_total",
     "r_nudge_reach_mean",
     "r_nudge_progress_mean",
 )

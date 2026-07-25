@@ -134,12 +134,17 @@ def validate_terminal_events(
         raise RuntimeError("an episode cannot be both a strict success and task failure")
     raw = _terminal_mapping(info)
     if "nudge_tipped" in raw:
-        # Nudge contract: failure is tipped OR escaped OR dropped OR unsafe force.
+        # Nudge contract: failure is tipped OR escaped OR table-hit OR dropped OR unsafe force.
         tipped = raw["nudge_tipped"]
         escaped = raw["nudge_escaped"]
+        table_hit = raw.get("nudge_table_hit")
         expected = tipped | escaped | events["dropped"] | events["unsafe_force"]
+        if isinstance(table_hit, torch.Tensor):
+            expected = expected | table_hit
         if not torch.equal(events["failure"], expected):
-            raise RuntimeError("nudge failure must be exactly tipped/escaped/drop/unsafe force")
+            raise RuntimeError(
+                "nudge failure must be exactly tipped/escaped/table-hit/drop/unsafe force"
+            )
     elif not torch.equal(events["failure"], events["dropped"] | events["unsafe_force"]):
         raise RuntimeError("task failure must be exactly drop or unsafe force")
     return events
