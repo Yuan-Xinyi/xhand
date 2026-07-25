@@ -1334,6 +1334,18 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             first_touch = touched_now & (~self._nudge_touched)
             self._nudge_touched |= touched_now
             r_nudge_touch = cfg.nudge_touch_bonus * first_touch.float()
+            # Hand-table clearance penalty: finger pads + palm center must stay above the
+            # table by nudge_table_margin; scraping/pressing the table is punished per step.
+            hand_points_z = torch.cat(
+                (self.ee_pos_w[:, :, 2], self.palm_center_w[:, 2:3]), dim=1
+            )
+            table_violation = torch.clamp(
+                (self._table_surface_z + cfg.nudge_table_margin - hand_points_z)
+                / cfg.nudge_table_margin,
+                0.0,
+                2.0,
+            ).mean(dim=-1)
+            r_nudge_table = -cfg.nudge_table_penalty_scale * table_violation
             self._prev_nudge_potential.copy_(nudge_potential)
             self._prev_nudge_proximity.copy_(proximity)
             r_nudge_success = cfg.nudge_success_bonus * self._nudge_success.float()
@@ -1347,6 +1359,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             log["r_nudge_reach_mean"] = r_nudge_reach.mean()
             log["nudge_reach_potential_mean"] = proximity.mean()
             log["nudge_touched_frac"] = self._nudge_touched.float().mean()
+            log["nudge_table_violation_mean"] = table_violation.mean()
             log["nudge_success_frac"] = self._nudge_success.float().mean()
             log["nudge_failure_frac"] = self._nudge_failure.float().mean()
             log["nudge_timeout_frac"] = self._nudge_timeout.float().mean()
@@ -1359,6 +1372,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 r_nudge_reach
                 + r_nudge_touch
                 + r_nudge_progress
+                + r_nudge_table
                 + r_nudge_success
                 + r_nudge_failure
                 + r_nudge_timeout

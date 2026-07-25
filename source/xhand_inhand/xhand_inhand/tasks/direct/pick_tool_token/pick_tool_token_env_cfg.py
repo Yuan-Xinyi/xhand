@@ -83,6 +83,11 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     nudge_reach_scale = 0.1           # occupancy reward per step at reach potential 1.0
     nudge_reach_coarse_sigma = 0.12   # mean-fingertip-distance scale of the coarse layer (m)
     nudge_touch_bonus = 10.0          # one-shot bonus at first object contact of the episode
+    # Hand-table clearance: penalize finger pads / palm center dipping below the table surface
+    # plus a small margin, so pushing is done at handle height instead of scraping the table.
+    # Per point: clamp((table_z + margin - z)/margin, 0, 2), meaned over the 6 points.
+    nudge_table_margin = 0.004        # start penalizing below this height above the table (m)
+    nudge_table_penalty_scale = 1.0   # reward = -scale * mean(violation), up to -2.0/step
     # Nudge episodes start from a low-ready arm pose (palm ~10cm above the table center, found
     # by DLS, final error 1.7mm) instead of the high home pose.  Three exploration-only runs
     # measured zero object contact from home: the 25cm descend gap is precisely the exploration
