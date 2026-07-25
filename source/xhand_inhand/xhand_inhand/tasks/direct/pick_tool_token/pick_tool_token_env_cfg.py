@@ -87,12 +87,16 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # center dipping below table + margin terminates the episode as a failure (same -100
     # failure contract as tipping/escaping).  No reward term.
     nudge_table_margin = 0.004        # minimum hand height above the table surface (m)
-    # Nudge episodes start from a low-ready arm pose (palm ~10cm above the table center, found
-    # by DLS, final error 1.7mm) instead of the high home pose.  Three exploration-only runs
-    # measured zero object contact from home: the 25cm descend gap is precisely the exploration
-    # wall this project's hierarchy solves by starting each option where its predecessor
-    # delivers (reach/DLS can already position the hand low).  Set to None to keep home.
-    nudge_ready_arm_joints = (-0.1399, 0.8565, 0.2425, 0.9967, 0.3287, -0.7948, -1.3486)
+    # Nudge episodes start from a low-ready arm pose instead of the high home pose (three
+    # exploration-only runs measured zero object contact from home).  The pose is DLS-solved
+    # and its finger-pad clearance is verified in the TRUE reset context -- the hand at the
+    # OPEN home posture, whose pads hang ~4.4cm lower than the curled solve-time posture that
+    # fooled the first two attempts (85.5%-100% of spawns started with pads through the
+    # table).  Result: palm 160mm over the table center, every finger pad >= 47mm above the
+    # surface, >= ~30mm under the dedicated spawn noise below (+-0.1 rad reset noise amplified
+    # to +-5cm of palm height and re-broke the clearance on its own).  None keeps home.
+    nudge_ready_arm_joints = (-0.0392, 0.4001, 0.0703, 1.1947, 0.081, 1.1331, 0.04)
+    nudge_spawn_joint_noise = 0.02    # per-joint spawn noise (rad); NOT reset_arm_joint_noise
     # Spawn-pose curriculum (demo-free bridge of the home->object exploration gap): each
     # episode spawns the arm at home + blend*(ready - home) with blend ~ U[min, max].  The
     # trainer anneals blend_min 1.0 -> 0.0 while blend_max stays 1.0, so the mixture always

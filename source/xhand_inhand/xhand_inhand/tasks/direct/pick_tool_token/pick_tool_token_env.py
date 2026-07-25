@@ -1644,8 +1644,8 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 self.device,
             )
             noise = sample_uniform(
-                -self.cfg.reset_arm_joint_noise,
-                self.cfg.reset_arm_joint_noise,
+                -self.cfg.nudge_spawn_joint_noise,
+                self.cfg.nudge_spawn_joint_noise,
                 (len(env_ids), ready.numel()),
                 self.device,
             )
