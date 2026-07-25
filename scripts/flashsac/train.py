@@ -417,8 +417,10 @@ def _validate_args(args: argparse.Namespace) -> None:
             "--nudge_option, --close_option and --nudge_grasp_option are mutually exclusive"
         )
     if args.nudge_yaw_range is not None:
-        if not args.nudge_option:
-            raise ValueError("--nudge_yaw_range only applies with --nudge_option")
+        if not (args.nudge_option or args.nudge_grasp_option):
+            raise ValueError(
+                "--nudge_yaw_range only applies with --nudge_option/--nudge_grasp_option"
+            )
         if not math.isfinite(args.nudge_yaw_range) or not 0.0 < args.nudge_yaw_range <= math.pi:
             raise ValueError("--nudge_yaw_range must be in (0, pi]")
     if args.nudge_spawn_anneal is not None:
