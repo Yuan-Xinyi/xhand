@@ -242,6 +242,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._nudge_timeout = torch.zeros(N, dtype=torch.bool, device=dev)
         self._nudge_hold_steps = torch.zeros(N, dtype=torch.long, device=dev)
         self._nudge_touched = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._nudge_spawn_blend = torch.ones(N, device=dev)
         self._prev_nudge_potential = torch.zeros(N, device=dev)
         self._prev_nudge_proximity = torch.zeros(N, device=dev)
         self._nudge_episode_total = torch.zeros((), dtype=torch.long, device=dev)
@@ -1357,6 +1358,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             log["nudge_failure_rate_total"] = self._nudge_failure_total.float() / nudge_completed
             log["nudge_timeout_rate_total"] = self._nudge_timeout_total.float() / nudge_completed
             log["nudge_table_hit_rate_total"] = self._nudge_table_hit_total.float() / nudge_completed
+            log["nudge_spawn_blend_mean"] = self._nudge_spawn_blend.mean()
             return (
                 r_nudge_reach
                 + r_nudge_touch
@@ -1628,10 +1630,18 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._nudge_hold_steps[env_ids] = 0
         self._nudge_touched[env_ids] = False
         if self.cfg.nudge_option_mode and self.cfg.nudge_ready_arm_joints is not None:
-            # Start nudge episodes from the low-ready pose (palm ~10cm over the table center)
-            # plus the standard arm joint noise; the hand keeps the parent's open home pose.
+            # Spawn-pose curriculum: arm starts at home + blend*(ready - home) + joint noise,
+            # blend ~ U[blend_min, blend_max] per episode (1 = low-ready over the table,
+            # 0 = home).  The hand keeps the parent's open home pose.
             ready = torch.tensor(
                 self.cfg.nudge_ready_arm_joints, device=self.device, dtype=torch.float32
+            )
+            home = self.robot.data.default_joint_pos[env_ids][:, self._arm_ids_t]
+            blend = sample_uniform(
+                float(self.cfg.nudge_spawn_blend_min),
+                float(self.cfg.nudge_spawn_blend_max),
+                (len(env_ids), 1),
+                self.device,
             )
             noise = sample_uniform(
                 -self.cfg.reset_arm_joint_noise,
@@ -1640,7 +1650,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 self.device,
             )
             joint_pos = self.robot.data.joint_pos[env_ids].clone()
-            arm_pos = (ready.unsqueeze(0) + noise).clamp(
+            arm_pos = (home + blend * (ready.unsqueeze(0) - home) + noise).clamp(
                 self.dof_lower[env_ids][:, self._arm_ids_t],
                 self.dof_upper[env_ids][:, self._arm_ids_t],
             )
@@ -1650,6 +1660,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             )
             self.robot.set_joint_position_target(joint_pos, env_ids=env_ids)
             self.dof_targets[env_ids] = joint_pos
+            self._nudge_spawn_blend[env_ids] = blend.squeeze(-1)
         self._prev_nudge_potential[env_ids] = 0.0
         self._prev_nudge_proximity[env_ids] = 0.0
         if self.cfg.nudge_target_xy is None:

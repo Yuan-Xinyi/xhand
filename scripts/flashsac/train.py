@@ -331,6 +331,16 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         help="Curriculum knob for --nudge_option: reset yaw is sampled from [-r, r] radians "
         "instead of the full [-pi, pi].  Start e.g. at 1.57 and widen in later runs.",
     )
+    parser.add_argument(
+        "--nudge_spawn_anneal",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("START", "END"),
+        help="Demo-free spawn curriculum: anneal nudge_spawn_blend_min linearly from START to "
+        "END over the run (blend 1 = low-ready pose, 0 = home).  blend_max stays 1.0, so the "
+        "spawn mixture always keeps easy near-object starts.  E.g. '1.0 0.0'.",
+    )
     parser.add_argument("--output_dir", type=Path, default=Path("logs/flashsac/pick_tool"))
     parser.add_argument("--metrics_every", type=int, default=100)
     parser.add_argument("--smoke", action="store_true", help="Use a tiny 8-env, 8-step integration run.")
@@ -402,6 +412,13 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--nudge_yaw_range only applies with --nudge_option")
         if not math.isfinite(args.nudge_yaw_range) or not 0.0 < args.nudge_yaw_range <= math.pi:
             raise ValueError("--nudge_yaw_range must be in (0, pi]")
+    if args.nudge_spawn_anneal is not None:
+        if not args.nudge_option:
+            raise ValueError("--nudge_spawn_anneal only applies with --nudge_option")
+        start, end = args.nudge_spawn_anneal
+        for name, value in (("START", start), ("END", end)):
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"--nudge_spawn_anneal {name} must be in [0, 1]")
     if args.resume_replay and args.checkpoint is None:
         raise ValueError("--resume_replay requires --checkpoint")
     if args.demo is not None:
@@ -603,6 +620,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     curriculum_metrics["close_option"] = bool(args.close_option)
     curriculum_metrics["nudge_option"] = bool(args.nudge_option)
     curriculum_metrics["nudge_yaw_range"] = args.nudge_yaw_range
+    curriculum_metrics["nudge_spawn_anneal"] = (
+        list(args.nudge_spawn_anneal) if args.nudge_spawn_anneal is not None else None
+    )
 
     cfg_overrides = {}
     if args.episode_length_s is not None:
@@ -815,6 +835,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     try:
         for interaction_step in range(1, args.steps + 1):
+            if args.nudge_option and args.nudge_spawn_anneal is not None:
+                # Demo-free spawn curriculum: anneal the LOWER edge of the spawn-blend range
+                # linearly over the run (1 = low-ready over the table, 0 = home) while the
+                # upper edge stays at 1, so easy near-object starts never disappear.  Reset
+                # code reads cfg live, so mutating it here affects the next resets.
+                start, end = args.nudge_spawn_anneal
+                progress = min(1.0, interaction_step / max(1, args.steps))
+                env.unwrapped.cfg.nudge_spawn_blend_min = start + (end - start) * progress
             training_ready = agent.can_start_training()
             if args.checkpoint is not None or training_ready:
                 noise_scale = None

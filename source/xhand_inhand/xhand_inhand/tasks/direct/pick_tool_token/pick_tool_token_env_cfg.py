@@ -93,6 +93,13 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # wall this project's hierarchy solves by starting each option where its predecessor
     # delivers (reach/DLS can already position the hand low).  Set to None to keep home.
     nudge_ready_arm_joints = (-0.1399, 0.8565, 0.2425, 0.9967, 0.3287, -0.7948, -1.3486)
+    # Spawn-pose curriculum (demo-free bridge of the home->object exploration gap): each
+    # episode spawns the arm at home + blend*(ready - home) with blend ~ U[min, max].  The
+    # trainer anneals blend_min 1.0 -> 0.0 while blend_max stays 1.0, so the mixture always
+    # contains easy near-object starts (success keeps flowing) while the boundary marches
+    # toward the home pose.  Defaults reproduce the fixed low-ready spawn.
+    nudge_spawn_blend_min = 1.0
+    nudge_spawn_blend_max = 1.0
     nudge_pos_sigma = 0.08            # xy error scale inside the pose potential (m)
     # Heading enters the pose potential linearly (1 - err/pi): with full-yaw resets an
     # exponential is numerically flat at large errors and provides no gradient.
