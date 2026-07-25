@@ -30,7 +30,15 @@ from isaaclab.app import AppLauncher
 parser = argparse.ArgumentParser(description="NUDGE -> RETRACT -> GRASP -> IK-LIFT chain.")
 parser.add_argument("--task", type=str, default="Pick-Tool-Token-Direct-v0")
 parser.add_argument("--nudge_checkpoint", type=Path, required=True, help="FlashSAC checkpoint dir")
-parser.add_argument("--grasp_checkpoint", type=Path, required=True, help="rl_games 115/21 .pth")
+parser.add_argument("--grasp_checkpoint", type=Path, default=None, help="rl_games 115/21 .pth")
+parser.add_argument(
+    "--grasp_flashsac_checkpoint",
+    type=Path,
+    default=None,
+    help="FlashSAC checkpoint dir for the GRASP stage (the stage-2 close policy trained from "
+    "post-nudge self-play states).  Replaces the PPO grasp actor; pair with --no_retract "
+    "--retract_steps 0 for the direct nudge->close handoff the policy was trained on.",
+)
 parser.add_argument("--num_envs", type=int, default=256)
 parser.add_argument("--yaw_range", type=float, default=1.57, help="reset yaw sampled from [-r, r]")
 # stage deadlines/gates (control steps)
@@ -81,6 +89,9 @@ parser.add_argument("--cam_eye", type=float, nargs=3, default=[1.9, 0.95, 0.9])
 parser.add_argument("--cam_lookat", type=float, nargs=3, default=[0.5, 0.0, 0.32])
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
+
+if (args_cli.grasp_checkpoint is None) == (args_cli.grasp_flashsac_checkpoint is None):
+    parser.error("provide exactly one of --grasp_checkpoint / --grasp_flashsac_checkpoint")
 
 demo_mode = args_cli.attempts > 1
 if demo_mode and args_cli.num_envs != 1:
@@ -177,9 +188,20 @@ def main() -> None:
     dev = u.device
 
     nudge_actor = load_nudge_actor(args_cli.nudge_checkpoint, dev)
-    grasp_actor = MigratedActor(_checkpoint_model(args_cli.grasp_checkpoint)).to(dev).eval()
-    if grasp_actor.observation_dim != 115 or grasp_actor.action_dim != 21:
-        raise RuntimeError("grasp checkpoint must be a 115/21 actor")
+    if args_cli.grasp_flashsac_checkpoint is not None:
+        close_actor = load_nudge_actor(args_cli.grasp_flashsac_checkpoint, dev)
+
+        def grasp_policy(policy_obs: torch.Tensor) -> torch.Tensor:
+            mean, _ = close_actor.get_mean_and_std(policy_obs, training=False)
+            return torch.tanh(mean)
+
+    else:
+        grasp_actor = MigratedActor(_checkpoint_model(args_cli.grasp_checkpoint)).to(dev).eval()
+        if grasp_actor.observation_dim != 115 or grasp_actor.action_dim != 21:
+            raise RuntimeError("grasp checkpoint must be a 115/21 actor")
+
+        def grasp_policy(policy_obs: torch.Tensor) -> torch.Tensor:
+            return grasp_actor(policy_obs).clamp(-1.0, 1.0)
 
     env.reset()
     hand_names = [u.robot.joint_names[i] for i in u._hand_ids_t.tolist()]
@@ -452,7 +474,7 @@ def main() -> None:
             policy_obs = obs["policy"]
             mean, _ = nudge_actor.get_mean_and_std(policy_obs, training=False)
             nudge_action = torch.tanh(mean)
-            grasp_action = grasp_actor(policy_obs).clamp(-1.0, 1.0)
+            grasp_action = grasp_policy(policy_obs)
             retract_action = torch.zeros((n, 21), device=dev)
             if not args_cli.no_retract:
                 retract_action[:, :7] = (
@@ -529,7 +551,10 @@ def main() -> None:
 
     base = {
         "nudge_checkpoint": str(args_cli.nudge_checkpoint.resolve()),
-        "grasp_checkpoint": str(args_cli.grasp_checkpoint.resolve()),
+        "grasp_checkpoint": str(
+            (args_cli.grasp_flashsac_checkpoint or args_cli.grasp_checkpoint).resolve()
+        ),
+        "grasp_actor_kind": "flashsac" if args_cli.grasp_flashsac_checkpoint else "ppo",
         "num_envs": n,
         "seed": args_cli.seed,
         "yaw_range": args_cli.yaw_range,
