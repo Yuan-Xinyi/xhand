@@ -623,6 +623,13 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
     parser.add_argument("--max_vector_steps", type=int, default=None)
     parser.add_argument("--nudge_option", action="store_true", help="evaluate the nudge contract")
     parser.add_argument("--nudge_yaw_range", type=float, default=None)
+    parser.add_argument(
+        "--nudge_spawn_blend",
+        type=float,
+        default=None,
+        help="Fix the spawn-pose blend for evaluation (0 = home pose, 1 = low-ready). "
+        "Sets both blend_min and blend_max.  Omit to keep the cfg default (low-ready).",
+    )
     # Success-clip recording (requires --num_envs 1): every successful episode is written as
     # an mp4 until --max_clips are saved; evaluation statistics are unaffected.
     parser.add_argument("--video", action="store_true")
@@ -715,6 +722,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             cfg_overrides["episode_length_s"] = 6.0
         if args.nudge_yaw_range is not None:
             cfg_overrides["reset_object_yaw_range"] = (-args.nudge_yaw_range, args.nudge_yaw_range)
+        if args.nudge_spawn_blend is not None:
+            if not 0.0 <= args.nudge_spawn_blend <= 1.0:
+                raise ValueError("--nudge_spawn_blend must be in [0, 1]")
+            cfg_overrides["nudge_spawn_blend_min"] = args.nudge_spawn_blend
+            cfg_overrides["nudge_spawn_blend_max"] = args.nudge_spawn_blend
     if args.episode_length_s is not None:
         cfg_overrides["episode_length_s"] = args.episode_length_s
     if args.curriculum_dataset is not None:
