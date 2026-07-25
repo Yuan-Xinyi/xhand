@@ -350,6 +350,13 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         "close_option_confirm_steps.  Spawn is fixed at home unless --nudge_spawn_anneal.",
     )
     parser.add_argument(
+        "--nudge_staging",
+        type=float,
+        default=None,
+        help="Staging-zone occupancy for --nudge_option (reposition training): pays for "
+        "hovering the palm above the posed tool while in the pose family.",
+    )
+    parser.add_argument(
         "--nudge_grasp_staging",
         type=float,
         default=None,
@@ -435,6 +442,11 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "--nudge_option, --close_option and --nudge_grasp_option are mutually exclusive"
         )
+    if args.nudge_staging is not None:
+        if not args.nudge_option:
+            raise ValueError("--nudge_staging only applies with --nudge_option")
+        if args.nudge_staging < 0.0:
+            raise ValueError("--nudge_staging must be >= 0")
     if args.nudge_grasp_staging is not None:
         if not args.nudge_grasp_option:
             raise ValueError("--nudge_grasp_staging only applies with --nudge_grasp_option")
@@ -698,6 +710,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if args.nudge_pregrasp is not None:
             cfg_overrides["nudge_pregrasp_min"] = args.nudge_pregrasp[0]
             cfg_overrides["nudge_pregrasp_occupancy"] = args.nudge_pregrasp[1]
+        if args.nudge_staging is not None:
+            cfg_overrides["nudge_staging_occupancy"] = args.nudge_staging
         if args.nudge_yaw_range is not None:
             cfg_overrides["reset_object_yaw_range"] = (
                 -args.nudge_yaw_range,

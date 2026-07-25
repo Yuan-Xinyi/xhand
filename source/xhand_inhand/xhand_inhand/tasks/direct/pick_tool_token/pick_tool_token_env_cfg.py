@@ -130,6 +130,11 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # from "pushed into place" to "hand parked grasp-ready" (max ~0.3/step << the +100 success).
     nudge_pregrasp_min = 0.0
     nudge_pregrasp_occupancy = 0.0
+    # Staging rung for the nudge/reposition task (same geometry as the nudge_grasp staging):
+    # pays for hovering the palm above the posed tool.  Used by the dedicated REPOSITION stage
+    # (curriculum-spawned at the post-nudge handoff, success = pregrasp readiness, no grasping):
+    # ladder = staging -> pregrasp occupancy -> pregrasp-gated success.
+    nudge_staging_occupancy = 0.0
     nudge_progress_scale = 30.0       # potential-based shaping on the pose error
     # Reach is OCCUPANCY-style, not potential-based.  Two pilots measured zero object contact:
     # a gamma-correct potential telescopes to PHI(end)-PHI(start) (~8 return for a full

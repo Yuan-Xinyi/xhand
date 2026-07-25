@@ -1462,6 +1462,19 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 log["nudge_pregrasp_score_mean"] = pregrasp.mean()
                 log["nudge_pregrasp_in_pose_mean"] = (pregrasp * in_pose.float()).mean()
                 log["r_nudge_pregrasp_mean"] = r_nudge_pregrasp.mean()
+                if cfg.nudge_staging_occupancy > 0.0:
+                    # Ladder rung below the pregrasp occupancy (see cfg comment).
+                    staging_target = self.object.data.root_pos_w.clone()
+                    staging_target[:, 2] += cfg.nudge_grasp_staging_height
+                    staging = torch.exp(
+                        -(self.palm_center_w - staging_target).norm(dim=-1)
+                        / cfg.nudge_grasp_staging_sigma
+                    )
+                    r_nudge_pregrasp = (
+                        r_nudge_pregrasp
+                        + cfg.nudge_staging_occupancy * staging * in_pose.float()
+                    )
+                    log["nudge_staging_mean"] = staging.mean()
             log["nudge_pos_error_mean"] = errors["pos_error"].mean()
             log["nudge_heading_error_mean"] = errors["heading_error"].mean()
             log["nudge_tip_cos_mean"] = errors["tip_cos"].mean()

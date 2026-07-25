@@ -53,6 +53,17 @@ parser.add_argument(
 )
 parser.add_argument("--retract_steps", type=int, default=100)
 parser.add_argument(
+    "--reposition_checkpoint",
+    type=Path,
+    default=None,
+    help="FlashSAC checkpoint dir for a learned REPOSITION stage replacing the scripted "
+    "retract: after the nudge gate, this policy parks the hand grasp-ready (pregrasp "
+    "readiness >= --nudge_pregrasp_min held --reposition_hold frames) before the grasp "
+    "stage takes over.  No home return, no scripted motion.",
+)
+parser.add_argument("--reposition_hold", type=int, default=10)
+parser.add_argument("--reposition_deadline", type=int, default=300)
+parser.add_argument(
     "--no_retract",
     action="store_true",
     help="skip RETRACT: hand the close-specialist grasp policy the nudge end state directly "
@@ -195,6 +206,11 @@ def main() -> None:
     dev = u.device
 
     nudge_actor = load_nudge_actor(args_cli.nudge_checkpoint, dev)
+    reposition_actor = (
+        load_nudge_actor(args_cli.reposition_checkpoint, dev)
+        if args_cli.reposition_checkpoint is not None
+        else None
+    )
     if args_cli.grasp_flashsac_checkpoint is not None:
         close_actor = load_nudge_actor(args_cli.grasp_flashsac_checkpoint, dev)
 
@@ -236,7 +252,7 @@ def main() -> None:
         original_pre_physics(actions)
         if bool(lift_mask.any()):
             u.dof_targets[lift_mask] = commanded[lift_mask]
-        if bool(retract_mask.any()):
+        if bool(retract_mask.any()) and args_cli.reposition_checkpoint is None:
             # The token manifold cannot express the fully OPEN home hand, so the scripted
             # retract opens the fingers at the dof-target level (<=0.05 rad/step) while the
             # arm returns home; otherwise the grasp policy inherits a curled token-0 fist it
@@ -274,6 +290,7 @@ def main() -> None:
         phase = torch.full((n,), initial_phase, dtype=torch.long, device=dev)
         phase_entry = torch.zeros(n, dtype=torch.long, device=dev)
         nudge_hold = torch.zeros(n, dtype=torch.long, device=dev)
+        repos_hold = torch.zeros(n, dtype=torch.long, device=dev)
         cycles = torch.zeros(n, dtype=torch.long, device=dev)
         grasp_confirm = torch.zeros(n, dtype=torch.long, device=dev)
         commanded.copy_(u.dof_targets)
@@ -336,7 +353,10 @@ def main() -> None:
                 & (clearance.abs() <= cfg.nudge_on_table_tolerance)
                 & (obj_speed <= cfg.nudge_max_obj_speed)
             )
-            if args_cli.nudge_pregrasp_min > 0.0:
+            pose_ok = in_target
+            if args_cli.nudge_pregrasp_min > 0.0 and reposition_actor is None:
+                # v7-style single-policy gate; with a reposition stage the pregrasp
+                # requirement moves to that stage's completion instead.
                 in_target = in_target & (
                     u._nudge_pregrasp_score() >= args_cli.nudge_pregrasp_min
                 )
@@ -356,9 +376,26 @@ def main() -> None:
                 phase[nudge_out] = PHASE_DONE
                 failed |= nudge_out
 
-            # ---- RETRACT completion ----
+            # ---- RETRACT / REPOSITION completion ----
             retracting = phase == PHASE_RETRACT
-            retract_done = retracting & (step - phase_entry >= args_cli.retract_steps)
+            if reposition_actor is not None:
+                parked = (
+                    retracting
+                    & pose_ok
+                    & (u._nudge_pregrasp_score() >= args_cli.nudge_pregrasp_min)
+                )
+                repos_hold = torch.where(parked, repos_hold + 1, torch.zeros_like(repos_hold))
+                retract_done = retracting & (repos_hold >= args_cli.reposition_hold)
+                repos_out = (
+                    retracting
+                    & (step - phase_entry >= args_cli.reposition_deadline)
+                    & ~retract_done
+                )
+                if bool(repos_out.any()):
+                    phase[repos_out] = PHASE_DONE
+                    failed |= repos_out
+            else:
+                retract_done = retracting & (step - phase_entry >= args_cli.retract_steps)
             if bool(retract_done.any()) and bool(retract_done[0]) and os.environ.get("CHAIN_DUMP_OBS"):
                 groups = {
                     "joint_pos[0:19]": (0, 19), "joint_vel[19:38]": (19, 38),
@@ -486,11 +523,15 @@ def main() -> None:
             mean, _ = nudge_actor.get_mean_and_std(policy_obs, training=False)
             nudge_action = torch.tanh(mean)
             grasp_action = grasp_policy(policy_obs)
-            retract_action = torch.zeros((n, 21), device=dev)
-            if not args_cli.no_retract:
-                retract_action[:, :7] = (
-                    (home_arm - u.dof_targets[:, u._arm_ids_t]) / realizable_arm_step
-                ).clamp(-1.0, 1.0)
+            if reposition_actor is not None:
+                repos_mean, _ = reposition_actor.get_mean_and_std(policy_obs, training=False)
+                retract_action = torch.tanh(repos_mean)
+            else:
+                retract_action = torch.zeros((n, 21), device=dev)
+                if not args_cli.no_retract:
+                    retract_action[:, :7] = (
+                        (home_arm - u.dof_targets[:, u._arm_ids_t]) / realizable_arm_step
+                    ).clamp(-1.0, 1.0)
             action = torch.zeros((n, 21), device=dev)
             for mask, act in (
                 (phase == PHASE_NUDGE, nudge_action),
