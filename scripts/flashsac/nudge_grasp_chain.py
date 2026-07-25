@@ -37,6 +37,25 @@ parser.add_argument("--yaw_range", type=float, default=1.57, help="reset yaw sam
 parser.add_argument("--nudge_deadline", type=int, default=400)
 parser.add_argument("--nudge_hold", type=int, default=10, help="in-target settled frames to advance")
 parser.add_argument("--retract_steps", type=int, default=100)
+parser.add_argument(
+    "--no_retract",
+    action="store_true",
+    help="skip RETRACT: hand the close-specialist grasp policy the nudge end state directly "
+    "(hand already low over the centered tool -- the close_start pregrasp family).",
+)
+parser.add_argument(
+    "--grasp_only",
+    action="store_true",
+    help="debug bisect: start every env directly in the GRASP phase from the fresh reset "
+    "(no nudge/retract), isolating harness effects from stage contamination.",
+)
+parser.add_argument(
+    "--max_cycles",
+    type=int,
+    default=1,
+    help="grasp retries: on a grasp-deadline miss, cycle back to NUDGE (which re-centers "
+    "whatever the failed attempt pushed away) and try again, up to this many cycles.",
+)
 parser.add_argument("--grasp_deadline", type=int, default=450)
 parser.add_argument("--grasp_confirm", type=int, default=15)
 parser.add_argument("--lift_ramp", type=int, default=220)
@@ -180,12 +199,25 @@ def main() -> None:
 
     commanded = u.dof_targets.detach().clone()
     lift_mask = torch.zeros(n, dtype=torch.bool, device=dev)
+    retract_mask = torch.zeros(n, dtype=torch.bool, device=dev)
+    home_hand = u.robot.data.default_joint_pos[:, u._hand_ids_t].clone()
     original_pre_physics = u._pre_physics_step
 
     def hybrid_pre_physics(actions: torch.Tensor) -> None:
         original_pre_physics(actions)
         if bool(lift_mask.any()):
             u.dof_targets[lift_mask] = commanded[lift_mask]
+        if bool(retract_mask.any()):
+            # The token manifold cannot express the fully OPEN home hand, so the scripted
+            # retract opens the fingers at the dof-target level (<=0.05 rad/step) while the
+            # arm returns home; otherwise the grasp policy inherits a curled token-0 fist it
+            # has never seen (measured: hand joints ~1.0 rad at grasp entry -> garbage acts).
+            current = u.dof_targets[:, u._hand_ids_t]
+            step_open = (home_hand - current).clamp(-0.05, 0.05)
+            opened = current + step_open
+            u.dof_targets[:, u._hand_ids_t] = torch.where(
+                retract_mask.unsqueeze(-1), opened, current
+            )
 
     u._pre_physics_step = hybrid_pre_physics
 
@@ -206,13 +238,14 @@ def main() -> None:
         u.scene.update(dt=u.physics_dt)
 
     def run_attempt(capture: bool) -> dict:
-        nonlocal lift_mask
+        nonlocal lift_mask, retract_mask
+        # Normal home reset: the v6 nudge policy was annealed to operate from the home pose.
         obs, _ = env.reset()
-        apply_ready_pose()
-        obs = u._get_observations()
-        phase = torch.full((n,), PHASE_NUDGE, dtype=torch.long, device=dev)
+        initial_phase = PHASE_GRASP if args_cli.grasp_only else PHASE_NUDGE
+        phase = torch.full((n,), initial_phase, dtype=torch.long, device=dev)
         phase_entry = torch.zeros(n, dtype=torch.long, device=dev)
         nudge_hold = torch.zeros(n, dtype=torch.long, device=dev)
+        cycles = torch.zeros(n, dtype=torch.long, device=dev)
         grasp_confirm = torch.zeros(n, dtype=torch.long, device=dev)
         commanded.copy_(u.dof_targets)
         palm_start = torch.zeros((n, 3), device=dev)
@@ -221,6 +254,7 @@ def main() -> None:
         servo_upper = torch.zeros((n, len(u.ee_names)), device=dev)
         lift_counter = torch.zeros(n, dtype=torch.long, device=dev)
         lift_mask = torch.zeros(n, dtype=torch.bool, device=dev)
+        retract_mask = torch.zeros(n, dtype=torch.bool, device=dev)
         stable_count = torch.zeros(n, dtype=torch.long, device=dev)
         success = torch.zeros(n, dtype=torch.bool, device=dev)
         failed = torch.zeros(n, dtype=torch.bool, device=dev)
@@ -237,16 +271,27 @@ def main() -> None:
         g_entry_palm_z = torch.zeros(n, device=dev)
         g_entry_home_err = torch.zeros(n, device=dev)
         g_min_ft_dist = torch.full((n,), 10.0, device=dev)
+        g_action_arm_abs = torch.zeros(n, device=dev)
+        g_steps = torch.zeros(n, device=dev)
         frames: list = []
 
         total_steps = (
-            args_cli.nudge_deadline
-            + args_cli.retract_steps
-            + args_cli.grasp_deadline
+            args_cli.max_cycles
+            * (args_cli.nudge_deadline + args_cli.retract_steps + args_cli.grasp_deadline)
             + args_cli.lift_ramp
             + args_cli.hold_steps
         )
         for step in range(total_steps):
+            if step == 0 and os.environ.get("CHAIN_DUMP_OBS"):
+                row = obs["policy"][0]
+                print(
+                    "[OBS-DUMP fresh reset env0] obj_pos_b:",
+                    [round(float(x), 3) for x in row[56:59]],
+                    "obj_quat:", [round(float(x), 3) for x in row[59:63]],
+                    "target_pos:", [round(float(x), 3) for x in row[63:66]],
+                    "lift:", round(float(row[86]), 3),
+                    flush=True,
+                )
             u._compute_intermediate_values()
             signals = u._compute_grasp_signals()
             force_max = signals["force_magnitude"].max(dim=-1).values
@@ -266,11 +311,14 @@ def main() -> None:
             nudge_hold = torch.where(nudging & in_target, nudge_hold + 1, torch.zeros_like(nudge_hold))
             advance = nudging & (nudge_hold >= args_cli.nudge_hold)
             if bool(advance.any()):
+                # Even with --no_retract the hand must pass through the opening ramp (the
+                # token manifold's neutral is a fist); --no_retract only skips the arm-home
+                # return, keeping the palm parked low over the tool while the fingers open.
                 phase[advance] = PHASE_RETRACT
                 phase_entry[advance] = step
                 nudged |= advance
                 nudge_step[advance] = step
-            nudge_out = nudging & (step >= args_cli.nudge_deadline) & ~advance
+            nudge_out = nudging & (step - phase_entry >= args_cli.nudge_deadline) & ~advance
             if bool(nudge_out.any()):
                 phase[nudge_out] = PHASE_DONE
                 failed |= nudge_out
@@ -278,6 +326,20 @@ def main() -> None:
             # ---- RETRACT completion ----
             retracting = phase == PHASE_RETRACT
             retract_done = retracting & (step - phase_entry >= args_cli.retract_steps)
+            if bool(retract_done.any()) and bool(retract_done[0]) and os.environ.get("CHAIN_DUMP_OBS"):
+                groups = {
+                    "joint_pos[0:19]": (0, 19), "joint_vel[19:38]": (19, 38),
+                    "ee_pos_b[38:53]": (38, 53), "palm_b[53:56]": (53, 56),
+                    "obj_pos_b[56:59]": (56, 59), "obj_quat[59:63]": (59, 63),
+                    "target_pos[63:66]": (63, 66), "target_quat[66:70]": (66, 70),
+                    "old_action[70:86]": (70, 86), "lift[86:87]": (86, 87),
+                    "residual[87:92]": (87, 92), "phase23[92:115]": (92, 115),
+                }
+                row = obs["policy"][0]
+                print("[OBS-DUMP grasp entry env0]", flush=True)
+                for name, (a, b) in groups.items():
+                    seg = row[a:b]
+                    print(f"  {name}: {[round(float(x), 3) for x in seg]}", flush=True)
             if bool(retract_done.any()):
                 phase[retract_done] = PHASE_GRASP
                 phase_entry[retract_done] = step
@@ -317,8 +379,17 @@ def main() -> None:
                 grasp_step[handoff] = step
             grasp_out = grasping & (step - phase_entry >= args_cli.grasp_deadline) & ~handoff
             if bool(grasp_out.any()):
-                phase[grasp_out] = PHASE_DONE
-                failed |= grasp_out
+                # Retry loop: a failed grasp usually pushed the tool off-pose; NUDGE is exactly
+                # the skill that recovers that, so cycle back instead of giving up.
+                retry = grasp_out & (cycles < args_cli.max_cycles - 1)
+                give_up = grasp_out & ~retry
+                if bool(retry.any()):
+                    cycles[retry] += 1
+                    phase[retry] = PHASE_NUDGE
+                    phase_entry[retry] = step
+                    nudge_hold[retry] = 0
+                phase[give_up] = PHASE_DONE
+                failed |= give_up
             g_max_quality = torch.where(
                 grasping, torch.maximum(g_max_quality, signals["grasp_quality"]), g_max_quality
             )
@@ -333,6 +404,7 @@ def main() -> None:
             )
 
             # ---- IK lift ----
+            retract_mask = phase == PHASE_RETRACT
             lift_mask = phase == PHASE_LIFT
             if bool(lift_mask.any()):
                 height = args_cli.lift_height * (
@@ -382,9 +454,10 @@ def main() -> None:
             nudge_action = torch.tanh(mean)
             grasp_action = grasp_actor(policy_obs).clamp(-1.0, 1.0)
             retract_action = torch.zeros((n, 21), device=dev)
-            retract_action[:, :7] = (
-                (home_arm - u.dof_targets[:, u._arm_ids_t]) / realizable_arm_step
-            ).clamp(-1.0, 1.0)
+            if not args_cli.no_retract:
+                retract_action[:, :7] = (
+                    (home_arm - u.dof_targets[:, u._arm_ids_t]) / realizable_arm_step
+                ).clamp(-1.0, 1.0)
             action = torch.zeros((n, 21), device=dev)
             for mask, act in (
                 (phase == PHASE_NUDGE, nudge_action),
@@ -392,6 +465,11 @@ def main() -> None:
                 (phase == PHASE_GRASP, grasp_action),
             ):
                 action = torch.where(mask.unsqueeze(-1), act, action)
+            in_grasp = phase == PHASE_GRASP
+            g_action_arm_abs += torch.where(
+                in_grasp, grasp_action[:, :7].abs().mean(dim=-1), torch.zeros_like(g_action_arm_abs)
+            )
+            g_steps += in_grasp.float()
             obs, _, _, _, _ = env.step(action)
             if capture:
                 frames.append(env.unwrapped.render())
@@ -438,6 +516,11 @@ def main() -> None:
             "grasp_entry_palm_z": _summary(g_entry_palm_z),
             "grasp_entry_home_err": _summary(g_entry_home_err),
             "grasp_min_fingertip_dist": _summary(g_min_ft_dist),
+            "grasp_action_arm_abs_mean": _summary(g_action_arm_abs / g_steps.clamp_min(1.0)),
+            "cycles_used": _summary(cycles.float()),
+            "success_by_cycle": {
+                str(c): int((success & (cycles == c)).sum()) for c in range(args_cli.max_cycles)
+            },
             "final_phase_counts": {
                 name: int((phase == idx).sum())
                 for idx, name in enumerate(("NUDGE", "RETRACT", "GRASP", "LIFT", "DONE"))
@@ -478,7 +561,10 @@ def main() -> None:
             "grasp_entry_palm_z": r["grasp_entry_palm_z"],
             "grasp_entry_home_err": r["grasp_entry_home_err"],
             "grasp_min_fingertip_dist": r["grasp_min_fingertip_dist"],
+            "grasp_action_arm_abs_mean": r["grasp_action_arm_abs_mean"],
             "final_phase_counts": r["final_phase_counts"],
+            "cycles_used": r["cycles_used"],
+            "success_by_cycle": r["success_by_cycle"],
         }
         args_cli.output.parent.mkdir(parents=True, exist_ok=True)
         args_cli.output.write_text(json.dumps(metrics, indent=2, allow_nan=False), encoding="utf-8")
@@ -504,6 +590,15 @@ def main() -> None:
                 )
                 saved.append(path)
                 print(f"[demo] attempt {attempt}: SUCCESS -> {path}", flush=True)
+            elif attempt == 0 and not r["success_flag"]:
+                # Always keep one failure clip for debugging the stage handoffs.
+                import imageio.v2 as imageio
+
+                path = os.path.join(args_cli.video_folder, "chain_fail_debug.mp4")
+                imageio.mimwrite(
+                    path, [np.asarray(f) for f in r["frames"]], fps=args_cli.fps, macro_block_size=None
+                )
+                print(f"[demo] attempt {attempt}: FAIL (debug clip) -> {path}", flush=True)
             else:
                 print(
                     f"[demo] attempt {attempt}: nudged={r['nudged']} grasped={r['grasped']} "
