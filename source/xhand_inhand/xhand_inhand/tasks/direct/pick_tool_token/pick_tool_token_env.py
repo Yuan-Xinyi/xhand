@@ -1354,6 +1354,21 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 & (errors["heading_error"] <= cfg.nudge_yaw_tolerance)
                 & (errors["tip_cos"] >= cfg.nudge_tip_cos_min)
             )
+            # Staging-zone occupancy (see cfg comment): the ladder rung between the push
+            # posture and the pregrasp stack -- hover the palm above the posed tool.
+            r_ng_staging = torch.zeros_like(r_ng_posture)
+            if cfg.nudge_grasp_staging_occupancy > 0.0:
+                staging_target = self.object.data.root_pos_w.clone()
+                staging_target[:, 2] += cfg.nudge_grasp_staging_height
+                staging_dist = (self.palm_center_w - staging_target).norm(dim=-1)
+                staging = torch.exp(-staging_dist / cfg.nudge_grasp_staging_sigma)
+                r_ng_staging = (
+                    cfg.nudge_grasp_staging_occupancy
+                    * staging
+                    * (in_pose & (~self._is_grasped)).float()
+                )
+                log["nudge_staging_mean"] = staging.mean()
+                log["r_ng_staging_mean"] = r_ng_staging.mean()
             milestone_now = in_pose & (~self._ng_milestone_paid)
             self._ng_milestone_paid |= in_pose
             r_ng_milestone = cfg.nudge_grasp_milestone_bonus * milestone_now.float()
@@ -1382,6 +1397,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 + r_ng_pose
                 + r_ng_close_occ
                 + r_ng_posture
+                + r_ng_staging
                 + r_ng_milestone
                 + r_close_progress
                 + r_wrap_progress

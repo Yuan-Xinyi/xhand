@@ -350,6 +350,14 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         "close_option_confirm_steps.  Spawn is fixed at home unless --nudge_spawn_anneal.",
     )
     parser.add_argument(
+        "--nudge_grasp_staging",
+        type=float,
+        default=None,
+        help="Staging-zone occupancy weight for --nudge_grasp_option (e.g. 0.08): pays for "
+        "hovering the palm above the posed tool -- the ladder rung between the post-nudge "
+        "push posture and the pregrasp/close/latch stack.",
+    )
+    parser.add_argument(
         "--nudge_spawn_anneal",
         type=float,
         nargs=2,
@@ -427,6 +435,11 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "--nudge_option, --close_option and --nudge_grasp_option are mutually exclusive"
         )
+    if args.nudge_grasp_staging is not None:
+        if not args.nudge_grasp_option:
+            raise ValueError("--nudge_grasp_staging only applies with --nudge_grasp_option")
+        if args.nudge_grasp_staging < 0.0:
+            raise ValueError("--nudge_grasp_staging must be >= 0")
     if args.nudge_pregrasp is not None:
         if not args.nudge_option:
             raise ValueError("--nudge_pregrasp only applies with --nudge_option")
@@ -694,6 +707,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         # Merged nudge+grasp: reorient AND hold the latch.  Longer horizon than nudge alone;
         # spawn fixed at home (the v6 regime) unless the anneal knob is driving blend_min.
         cfg_overrides["nudge_grasp_mode"] = True
+        if args.nudge_grasp_staging is not None:
+            cfg_overrides["nudge_grasp_staging_occupancy"] = args.nudge_grasp_staging
         if args.episode_length_s is None:
             cfg_overrides["episode_length_s"] = 10.0
         if args.nudge_spawn_anneal is None:

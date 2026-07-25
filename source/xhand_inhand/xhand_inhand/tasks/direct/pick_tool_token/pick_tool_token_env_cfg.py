@@ -96,6 +96,15 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # would make punting the tool out of the workspace the new refuge.
     nudge_grasp_milestone_bonus = 40.0
     nudge_grasp_escape_penalty = 100.0
+    # Staging-zone occupancy: the missing rung between the post-nudge push posture and the
+    # pregrasp posture ladder.  From a fist beside the tool, "hover the palm ABOVE the tool"
+    # is reachable by contact-free local exploration, and the pregrasp/close/wrap terms take
+    # over from there: staging (this) -> posture occupancy -> close occupancy -> +100 latch.
+    # Paid only while the tool is in the pose family and unlatched; max ~0.08/step keeps a
+    # parked hover strictly dominated by finishing the grasp.
+    nudge_grasp_staging_occupancy = 0.0
+    nudge_grasp_staging_height = 0.12   # palm target height above the tool COM (m)
+    nudge_grasp_staging_sigma = 0.06    # position kernel width (m)
     nudge_target_xy = None            # env-local target COM xy; None -> the default spawn xy
     nudge_target_yaw = 0.0            # target heading vs the rest orientation (rad)
     nudge_pos_tolerance = 0.06        # COM xy distance for success (m)
