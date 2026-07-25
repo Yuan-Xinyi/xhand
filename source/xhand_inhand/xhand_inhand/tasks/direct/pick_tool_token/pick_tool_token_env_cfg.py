@@ -70,7 +70,12 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     nudge_grasp_mode = False
     nudge_grasp_success_bonus = 100.0
     nudge_grasp_failure_penalty = 100.0
-    nudge_grasp_timeout_penalty = 10.0
+    # Timeout must NOT be a refuge.  With timeout at -10 vs failure at -100, the measured
+    # equilibrium (v9-v12 merged runs AND stage-2 close v1/v2: fingertips median 6cm from the
+    # tool, grasp_quality exactly 0) is a standoff hover: while P(success|engage)~0, never
+    # engaging strictly dominates.  With every non-success outcome worth the same -100,
+    # engaging becomes a free option and success probability is the only optimizable term.
+    nudge_grasp_timeout_penalty = 100.0
     # Occupancy on close_quality: potential-difference closure shaping telescopes away under
     # FlashSAC's return normalization (27k warm-started steps produced zero latches), exactly
     # like the reach potentials before it.  Occupancy pays every step of partial closure;
@@ -87,10 +92,10 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # Anti-standoff terms (v11 home rollouts hover centimetres from the tool without touching:
     # with P(latch|engage)~0 the -100 failure risk makes disengagement rational).  A one-shot
     # milestone for reorienting the tool into the pose family restores the v6 engagement
-    # incentive, and escapes (tool pushed out of the workspace -- a routine exploration cost)
-    # are split from the hard -100 failures (table-hit / drop / sustained force).
+    # incentive.  Escape matches the uniform -100: with timeout at -100, a cheaper escape
+    # would make punting the tool out of the workspace the new refuge.
     nudge_grasp_milestone_bonus = 40.0
-    nudge_grasp_escape_penalty = 30.0
+    nudge_grasp_escape_penalty = 100.0
     nudge_target_xy = None            # env-local target COM xy; None -> the default spawn xy
     nudge_target_yaw = 0.0            # target heading vs the rest orientation (rad)
     nudge_pos_tolerance = 0.06        # COM xy distance for success (m)
