@@ -627,6 +627,13 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
     )
     parser.add_argument("--nudge_yaw_range", type=float, default=None)
     parser.add_argument(
+        "--nudge_pregrasp_min",
+        type=float,
+        default=None,
+        help="v7 ending contract: nudge success also requires the pregrasp readiness score "
+        ">= this through the confirm window (0.30 = the oracle close_start capture gate).",
+    )
+    parser.add_argument(
         "--nudge_spawn_blend",
         type=float,
         default=None,
@@ -737,6 +744,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         cfg_overrides["nudge_option_mode"] = True
         if args.episode_length_s is None:
             cfg_overrides["episode_length_s"] = 6.0
+        if args.nudge_pregrasp_min is not None:
+            cfg_overrides["nudge_pregrasp_min"] = args.nudge_pregrasp_min
         if args.nudge_yaw_range is not None:
             cfg_overrides["reset_object_yaw_range"] = (-args.nudge_yaw_range, args.nudge_yaw_range)
         if args.nudge_spawn_blend is not None:

@@ -39,6 +39,12 @@ parser.add_argument(
     help="capture moments: any near-tool engagement, or the post-nudge-success family (tool "
     "reoriented into the pose tolerance, settled on the table, hand nearby, unlatched).",
 )
+parser.add_argument(
+    "--pregrasp_min",
+    type=float,
+    default=0.0,
+    help="post_nudge gate addition (v7): also require pregrasp readiness >= this at capture.",
+)
 parser.add_argument("--max_states", type=int, default=4096)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--output", type=Path, required=True)
@@ -119,6 +125,8 @@ def main() -> None:
                 & (u._curr_fingertip_distances.mean(dim=-1) <= args_cli.engage_dist)
                 & (~u._is_grasped)
             )
+            if args_cli.pregrasp_min > 0.0:
+                engaged = engaged & (u._nudge_pregrasp_score() >= args_cli.pregrasp_min)
         cooldown = (cooldown - 1).clamp_min(0)
         pick = engaged & (cooldown == 0) & ~(terminated | truncated)
         if bool(pick.any()) and kept < args_cli.max_states:

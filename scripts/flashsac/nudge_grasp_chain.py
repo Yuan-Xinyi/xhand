@@ -44,6 +44,13 @@ parser.add_argument("--yaw_range", type=float, default=1.57, help="reset yaw sam
 # stage deadlines/gates (control steps)
 parser.add_argument("--nudge_deadline", type=int, default=400)
 parser.add_argument("--nudge_hold", type=int, default=10, help="in-target settled frames to advance")
+parser.add_argument(
+    "--nudge_pregrasp_min",
+    type=float,
+    default=0.0,
+    help="advance gate addition (v7): the hand must also hold pregrasp readiness >= this, so "
+    "the grasp stage starts inside the close policy's oracle-trained distribution.",
+)
 parser.add_argument("--retract_steps", type=int, default=100)
 parser.add_argument(
     "--no_retract",
@@ -329,6 +336,10 @@ def main() -> None:
                 & (clearance.abs() <= cfg.nudge_on_table_tolerance)
                 & (obj_speed <= cfg.nudge_max_obj_speed)
             )
+            if args_cli.nudge_pregrasp_min > 0.0:
+                in_target = in_target & (
+                    u._nudge_pregrasp_score() >= args_cli.nudge_pregrasp_min
+                )
             nudging = phase == PHASE_NUDGE
             nudge_hold = torch.where(nudging & in_target, nudge_hold + 1, torch.zeros_like(nudge_hold))
             advance = nudging & (nudge_hold >= args_cli.nudge_hold)

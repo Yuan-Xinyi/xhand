@@ -332,6 +332,17 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         "instead of the full [-pi, pi].  Start e.g. at 1.57 and widen in later runs.",
     )
     parser.add_argument(
+        "--nudge_pregrasp",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("MIN", "OCCUPANCY"),
+        help="v7 grasp-ready ending for --nudge_option: success additionally requires the "
+        "pregrasp readiness score >= MIN (0.30 = the oracle close_start capture gate) held "
+        "through the confirm window; OCCUPANCY pays the score per step while the tool is in "
+        "the pose family.  E.g. '0.30 0.3'.",
+    )
+    parser.add_argument(
         "--nudge_grasp_option",
         action="store_true",
         help="Merged nudge+grasp phase: from the home spawn, reorient (guided, not required) "
@@ -416,6 +427,12 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "--nudge_option, --close_option and --nudge_grasp_option are mutually exclusive"
         )
+    if args.nudge_pregrasp is not None:
+        if not args.nudge_option:
+            raise ValueError("--nudge_pregrasp only applies with --nudge_option")
+        minimum, occupancy = args.nudge_pregrasp
+        if not 0.0 < minimum <= 1.0 or occupancy < 0.0:
+            raise ValueError("--nudge_pregrasp MIN must be in (0, 1] and OCCUPANCY >= 0")
     if args.nudge_yaw_range is not None:
         if not (args.nudge_option or args.nudge_grasp_option):
             raise ValueError(
@@ -665,6 +682,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         cfg_overrides["nudge_option_mode"] = True
         if args.episode_length_s is None:
             cfg_overrides["episode_length_s"] = 6.0
+        if args.nudge_pregrasp is not None:
+            cfg_overrides["nudge_pregrasp_min"] = args.nudge_pregrasp[0]
+            cfg_overrides["nudge_pregrasp_occupancy"] = args.nudge_pregrasp[1]
         if args.nudge_yaw_range is not None:
             cfg_overrides["reset_object_yaw_range"] = (
                 -args.nudge_yaw_range,

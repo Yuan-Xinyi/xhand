@@ -108,6 +108,19 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     nudge_success_bonus = 100.0
     nudge_failure_penalty = 100.0
     nudge_timeout_penalty = 10.0
+    # ---- grasp-ready ending (v7) ----
+    # Joint-space interpolation between oracle pregrasp and post-nudge handoff states is not a
+    # bridge (paired arm configs differ by 2.4 rad median / 4.3 rad max -- different solution
+    # branches), and the close policy cannot learn the reposition from the push posture (three
+    # reward designs all converged to a standoff hover).  So the handoff distribution itself is
+    # moved: with nudge_pregrasp_min > 0, nudge success ALSO requires the geometry-only pregrasp
+    # readiness score (same definition and gate value as the oracle close_start capture in
+    # pick_tool_shared.PREGRASP_GATE) held through the confirm window, so successful nudge
+    # episodes END inside the distribution the close policy already latches from.  The occupancy
+    # term pays the score every step once the tool is in the pose family, giving a dense path
+    # from "pushed into place" to "hand parked grasp-ready" (max ~0.3/step << the +100 success).
+    nudge_pregrasp_min = 0.0
+    nudge_pregrasp_occupancy = 0.0
     nudge_progress_scale = 30.0       # potential-based shaping on the pose error
     # Reach is OCCUPANCY-style, not potential-based.  Two pilots measured zero object contact:
     # a gamma-correct potential telescopes to PHI(end)-PHI(start) (~8 return for a full

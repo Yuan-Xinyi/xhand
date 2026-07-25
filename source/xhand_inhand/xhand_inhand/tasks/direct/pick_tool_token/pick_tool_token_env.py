@@ -1431,6 +1431,21 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             r_nudge_success = cfg.nudge_success_bonus * self._nudge_success.float()
             r_nudge_failure = -cfg.nudge_failure_penalty * self._nudge_failure.float()
             r_nudge_timeout = -cfg.nudge_timeout_penalty * self._nudge_timeout.float()
+            # Grasp-ready ending occupancy (v7): once the tool is in the pose family, pay the
+            # pregrasp readiness every step -- the dense path from "pushed into place" to
+            # "hand parked where closure starts".
+            r_nudge_pregrasp = torch.zeros_like(r_nudge_success)
+            if cfg.nudge_pregrasp_occupancy > 0.0 or cfg.nudge_pregrasp_min > 0.0:
+                pregrasp = self._nudge_pregrasp_score()
+                in_pose = (
+                    (errors["pos_error"] <= cfg.nudge_pos_tolerance)
+                    & (errors["heading_error"] <= cfg.nudge_yaw_tolerance)
+                    & (errors["tip_cos"] >= cfg.nudge_tip_cos_min)
+                )
+                r_nudge_pregrasp = cfg.nudge_pregrasp_occupancy * pregrasp * in_pose.float()
+                log["nudge_pregrasp_score_mean"] = pregrasp.mean()
+                log["nudge_pregrasp_in_pose_mean"] = (pregrasp * in_pose.float()).mean()
+                log["r_nudge_pregrasp_mean"] = r_nudge_pregrasp.mean()
             log["nudge_pos_error_mean"] = errors["pos_error"].mean()
             log["nudge_heading_error_mean"] = errors["heading_error"].mean()
             log["nudge_tip_cos_mean"] = errors["tip_cos"].mean()
@@ -1453,6 +1468,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 r_nudge_reach
                 + r_nudge_touch
                 + r_nudge_progress
+                + r_nudge_pregrasp
                 + r_nudge_success
                 + r_nudge_failure
                 + r_nudge_timeout
@@ -1482,6 +1498,31 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             + r_force_penalty
             + r_residual_penalty
         )
+
+    # ------------------------------------------------------------------ nudge pregrasp score
+    def _nudge_pregrasp_score(self) -> torch.Tensor:
+        """Geometry-only grasp readiness; mirrors scripts pick_tool_shared.pregrasp_score.
+
+        Thumb + two nearest opposing fingertips proximity x finger alignment x palm facing,
+        zeroed unless the tool's true mesh minimum still rests on the table.  Used by the v7
+        nudge ending contract so the same gate that selected the oracle close_start states
+        selects the nudge handoff states.
+        """
+        distances = self._curr_fingertip_distances
+        other_distances = distances[:, self._other_ee_idx]
+        nearest_distances, nearest_indices = torch.topk(other_distances, k=2, dim=1, largest=False)
+        grasp_distance = (distances[:, self._thumb_ee_idx] + nearest_distances.sum(dim=-1)) / 3.0
+        other_alignment = self._finger_align[:, self._other_ee_idx]
+        alignment = (
+            self._finger_align[:, self._thumb_ee_idx]
+            + torch.gather(other_alignment, 1, nearest_indices).sum(dim=-1)
+        ) / 3.0
+        to_handle = self.handle_center_w - self.palm_center_w
+        to_handle = to_handle / to_handle.norm(dim=-1, keepdim=True).clamp_min(1.0e-6)
+        palm_facing = 0.5 * (1.0 + (self.palm_normal_w * to_handle).sum(dim=-1))
+        clearance = self._object_true_min_z() - self._table_surface_z
+        score = torch.exp(-grasp_distance / 0.025) * alignment * palm_facing
+        return torch.where(clearance.abs() <= 0.005, score, torch.zeros_like(score))
 
     # ------------------------------------------------------------------ nudge pose errors
     def _nudge_pose_errors(self) -> dict[str, torch.Tensor]:
@@ -1620,6 +1661,11 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 & on_table
                 & settled
             )
+            if cfg.nudge_pregrasp_min > 0.0:
+                # v7 ending contract: the hold window only accumulates while the hand is ALSO
+                # parked grasp-ready, so success states land inside the close policy's
+                # oracle-trained distribution.
+                in_target = in_target & (self._nudge_pregrasp_score() >= cfg.nudge_pregrasp_min)
             self._nudge_hold_steps.copy_(
                 torch.where(in_target, self._nudge_hold_steps + 1, torch.zeros_like(self._nudge_hold_steps))
             )
