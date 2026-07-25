@@ -84,6 +84,13 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # Full-episode maximum ~75 at posture 1.0, but sustained posture~1.0 implies a pregrasp
     # that the +100 latch bonus strictly dominates by finishing.
     nudge_grasp_posture_occupancy = 0.15
+    # Anti-standoff terms (v11 home rollouts hover centimetres from the tool without touching:
+    # with P(latch|engage)~0 the -100 failure risk makes disengagement rational).  A one-shot
+    # milestone for reorienting the tool into the pose family restores the v6 engagement
+    # incentive, and escapes (tool pushed out of the workspace -- a routine exploration cost)
+    # are split from the hard -100 failures (table-hit / drop / sustained force).
+    nudge_grasp_milestone_bonus = 40.0
+    nudge_grasp_escape_penalty = 30.0
     nudge_target_xy = None            # env-local target COM xy; None -> the default spawn xy
     nudge_target_yaw = 0.0            # target heading vs the rest orientation (rad)
     nudge_pos_tolerance = 0.06        # COM xy distance for success (m)

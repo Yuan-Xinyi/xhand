@@ -253,6 +253,8 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._nudge_timeout_total = torch.zeros((), dtype=torch.long, device=dev)
         self._nudge_table_hit_total = torch.zeros((), dtype=torch.long, device=dev)
         # merged nudge+grasp mode state
+        self._ng_milestone_paid = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._ng_escaped = torch.zeros(N, dtype=torch.bool, device=dev)
         self._ng_stable_steps = torch.zeros(N, dtype=torch.long, device=dev)
         self._ng_success = torch.zeros(N, dtype=torch.bool, device=dev)
         self._ng_failure = torch.zeros(N, dtype=torch.bool, device=dev)
@@ -1346,8 +1348,21 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             # Grasp-like approach posture occupancy (see cfg comment): `gated` is the full
             # battle-tested stack, reused here as a dense per-step signal.
             r_ng_posture = cfg.nudge_grasp_posture_occupancy * gated
+            # One-shot reorientation milestone (anti-standoff, see cfg comment).
+            in_pose = (
+                (errors["pos_error"] <= cfg.nudge_pos_tolerance)
+                & (errors["heading_error"] <= cfg.nudge_yaw_tolerance)
+                & (errors["tip_cos"] >= cfg.nudge_tip_cos_min)
+            )
+            milestone_now = in_pose & (~self._ng_milestone_paid)
+            self._ng_milestone_paid |= in_pose
+            r_ng_milestone = cfg.nudge_grasp_milestone_bonus * milestone_now.float()
             r_ng_success = cfg.nudge_grasp_success_bonus * self._ng_success.float()
-            r_ng_failure = -cfg.nudge_grasp_failure_penalty * self._ng_failure.float()
+            hard_failure = self._ng_failure & (~self._ng_escaped)
+            r_ng_failure = (
+                -cfg.nudge_grasp_failure_penalty * hard_failure.float()
+                - cfg.nudge_grasp_escape_penalty * (self._ng_failure & self._ng_escaped).float()
+            )
             r_ng_timeout = -cfg.nudge_grasp_timeout_penalty * self._ng_timeout.float()
             log["nudge_pos_error_mean"] = errors["pos_error"].mean()
             log["nudge_heading_error_mean"] = errors["heading_error"].mean()
@@ -1367,6 +1382,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 + r_ng_pose
                 + r_ng_close_occ
                 + r_ng_posture
+                + r_ng_milestone
                 + r_close_progress
                 + r_wrap_progress
                 + r_grasp
@@ -1562,6 +1578,8 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             success = success & ~failure
             self._ng_success.copy_(success)
             self._ng_failure.copy_(failure)
+            # Escapes are penalized lighter than hard failures in the reward branch.
+            self._ng_escaped.copy_(escaped & ~(table_hit | dropped | unsafe_force))
             terminated = success | failure
             time_out = time_out & ~terminated
             self._ng_timeout.copy_(time_out)
@@ -1759,6 +1777,8 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._ng_success[env_ids] = False
         self._ng_failure[env_ids] = False
         self._ng_timeout[env_ids] = False
+        self._ng_milestone_paid[env_ids] = False
+        self._ng_escaped[env_ids] = False
         if (
             self.cfg.nudge_option_mode or self.cfg.nudge_grasp_mode
         ) and self.cfg.nudge_ready_arm_joints is not None:
