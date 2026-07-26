@@ -74,6 +74,12 @@ STRICT_METRIC_KEYS = (
     "nudge_grasp_stable_steps_mean",
     "r_nudge_reach_mean",
     "r_nudge_progress_mean",
+    # v8 grasp-ready ending diagnostics.
+    "nudge_pregrasp_score_mean",
+    "nudge_pregrasp_in_pose_mean",
+    "r_nudge_pregrasp_mean",
+    "nudge_staging_mean",
+    "r_ng_staging_mean",
 )
 
 _ADAPTER_INFO_KEYS = frozenset(

@@ -350,6 +350,18 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         "close_option_confirm_steps.  Spawn is fixed at home unless --nudge_spawn_anneal.",
     )
     parser.add_argument(
+        "--nudge_pregrasp_anneal",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("START", "END"),
+        help="Contract-space anneal for --nudge_option: nudge_pregrasp_min ramps linearly "
+        "from START to END over the run.  The policy's existing +100 success income is "
+        "ratcheted -- it must gradually END episodes grasp-ready to keep collecting, the "
+        "spawn-anneal trick applied to the success contract instead of the spawn.  "
+        "E.g. '0.02 0.30'.  Requires --nudge_pregrasp for the occupancy weight.",
+    )
+    parser.add_argument(
         "--nudge_staging",
         type=float,
         default=None,
@@ -458,6 +470,12 @@ def _validate_args(args: argparse.Namespace) -> None:
         minimum, occupancy = args.nudge_pregrasp
         if not 0.0 < minimum <= 1.0 or occupancy < 0.0:
             raise ValueError("--nudge_pregrasp MIN must be in (0, 1] and OCCUPANCY >= 0")
+    if args.nudge_pregrasp_anneal is not None:
+        if args.nudge_pregrasp is None:
+            raise ValueError("--nudge_pregrasp_anneal requires --nudge_pregrasp")
+        start, end = args.nudge_pregrasp_anneal
+        if not (0.0 < start <= 1.0 and 0.0 < end <= 1.0):
+            raise ValueError("--nudge_pregrasp_anneal bounds must be in (0, 1]")
     if args.nudge_yaw_range is not None:
         if not (args.nudge_option or args.nudge_grasp_option):
             raise ValueError(
@@ -920,6 +938,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 start, end = args.nudge_spawn_anneal
                 progress = min(1.0, interaction_step / max(1, args.steps))
                 env.unwrapped.cfg.nudge_spawn_blend_min = start + (end - start) * progress
+            if args.nudge_option and args.nudge_pregrasp_anneal is not None:
+                # Contract-space ratchet: the termination gate reads cfg live each step, so
+                # raising nudge_pregrasp_min here tightens what counts as success while the
+                # policy keeps collecting the +100 it already earns -- the spawn-anneal trick
+                # applied to the success contract.
+                start, end = args.nudge_pregrasp_anneal
+                progress = min(1.0, interaction_step / max(1, args.steps))
+                env.unwrapped.cfg.nudge_pregrasp_min = start + (end - start) * progress
             training_ready = agent.can_start_training()
             if args.checkpoint is not None or training_ready:
                 noise_scale = None
