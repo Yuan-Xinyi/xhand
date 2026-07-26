@@ -350,6 +350,17 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         "close_option_confirm_steps.  Spawn is fixed at home unless --nudge_spawn_anneal.",
     )
     parser.add_argument(
+        "--nudge_pregrasp_adaptive",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("START", "TARGET"),
+        help="Self-paced contract ratchet for --nudge_option: nudge_pregrasp_min starts at "
+        "START and moves toward TARGET driven by the recent success rate (raise a notch at "
+        ">=50%%, back off half a notch under 25%%), so the success income is never starved "
+        "by a miscalibrated schedule.  Overrides --nudge_pregrasp_anneal.  E.g. '0.005 0.30'.",
+    )
+    parser.add_argument(
         "--nudge_pregrasp_anneal",
         type=float,
         nargs=2,
@@ -393,6 +404,13 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
     args = parser.parse_args()
     launcher = AppLauncher(args)
     return args, launcher
+
+
+# Self-paced contract ratchet cadence: check the recent success window every N interaction
+# steps and move the pregrasp gate one notch at most.  ~2 episodes' worth of steps keeps the
+# window estimate meaningful at 1024 envs without reacting to single-batch noise.
+ADAPTIVE_GATE_WINDOW = 500
+ADAPTIVE_GATE_STEP = 0.005
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -476,6 +494,12 @@ def _validate_args(args: argparse.Namespace) -> None:
         start, end = args.nudge_pregrasp_anneal
         if not (0.0 < start <= 1.0 and 0.0 < end <= 1.0):
             raise ValueError("--nudge_pregrasp_anneal bounds must be in (0, 1]")
+    if args.nudge_pregrasp_adaptive is not None:
+        if args.nudge_pregrasp is None:
+            raise ValueError("--nudge_pregrasp_adaptive requires --nudge_pregrasp")
+        start, target = args.nudge_pregrasp_adaptive
+        if not (0.0 < start <= target <= 1.0):
+            raise ValueError("--nudge_pregrasp_adaptive needs 0 < START <= TARGET <= 1")
     if args.nudge_yaw_range is not None:
         if not (args.nudge_option or args.nudge_grasp_option):
             raise ValueError(
@@ -728,6 +752,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if args.nudge_pregrasp is not None:
             cfg_overrides["nudge_pregrasp_min"] = args.nudge_pregrasp[0]
             cfg_overrides["nudge_pregrasp_occupancy"] = args.nudge_pregrasp[1]
+        if args.nudge_pregrasp_adaptive is not None:
+            cfg_overrides["nudge_pregrasp_min"] = args.nudge_pregrasp_adaptive[0]
         if args.nudge_staging is not None:
             cfg_overrides["nudge_staging_occupancy"] = args.nudge_staging
         if args.nudge_yaw_range is not None:
@@ -926,6 +952,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     demo_bc_update_count = 0
     instant_strict: dict[str, float] = {}
     run_max_strict: dict[str, float] = {}
+    adaptive_prev_succ = 0.0
+    adaptive_prev_epis = 0.0
+    adaptive_gate_log: dict[str, float] = {}
     started = time.perf_counter()
 
     try:
@@ -938,7 +967,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 start, end = args.nudge_spawn_anneal
                 progress = min(1.0, interaction_step / max(1, args.steps))
                 env.unwrapped.cfg.nudge_spawn_blend_min = start + (end - start) * progress
-            if args.nudge_option and args.nudge_pregrasp_anneal is not None:
+            if (
+                args.nudge_option
+                and args.nudge_pregrasp_anneal is not None
+                and args.nudge_pregrasp_adaptive is None
+            ):
                 # Contract-space ratchet: the termination gate reads cfg live each step, so
                 # raising nudge_pregrasp_min here tightens what counts as success while the
                 # policy keeps collecting the +100 it already earns -- the spawn-anneal trick
@@ -1028,6 +1061,34 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     update_sums[name] = update_sums.get(name, 0.0) + _scalar(value)
                     update_metric_counts[name] = update_metric_counts.get(name, 0) + 1
 
+            if (
+                args.nudge_option
+                and args.nudge_pregrasp_adaptive is not None
+                and interaction_step % ADAPTIVE_GATE_WINDOW == 0
+            ):
+                # Self-paced contract ratchet.  The fixed linear anneal is calibration-fragile
+                # (v8: a 0.02 start sat above the policy's natural ~0.01 operating point, the
+                # success income vanished at step one and the policy collapsed exactly like the
+                # hard-gate v7).  Here the threshold moves only as fast as the policy: raise a
+                # notch while the recent success rate stays high, back off half a notch when it
+                # craters, clamp to [start, target].  Income can never be starved for long.
+                u_env = env.unwrapped
+                succ = float(u_env._nudge_success_total)
+                epis = float(u_env._nudge_episode_total)
+                window_succ = (succ - adaptive_prev_succ) / max(epis - adaptive_prev_epis, 1.0)
+                adaptive_prev_succ, adaptive_prev_epis = succ, epis
+                gate_start, gate_target = args.nudge_pregrasp_adaptive
+                current = float(u_env.cfg.nudge_pregrasp_min)
+                if window_succ >= 0.5:
+                    current = min(gate_target, current + ADAPTIVE_GATE_STEP)
+                elif window_succ < 0.25:
+                    current = max(gate_start, current - 0.5 * ADAPTIVE_GATE_STEP)
+                u_env.cfg.nudge_pregrasp_min = current
+                adaptive_gate_log = {
+                    "nudge_pregrasp_gate": current,
+                    "nudge_gate_window_success": window_succ,
+                }
+
             if interaction_step % args.metrics_every == 0 or interaction_step == args.steps:
                 elapsed = max(time.perf_counter() - started, 1.0e-9)
                 metrics: dict[str, Any] = {
@@ -1090,6 +1151,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                             for name, total in update_sums.items()
                         }
                     )
+                metrics.update(adaptive_gate_log)
                 atomic_write_json(metrics_path, metrics)
 
         checkpoint_dir = output_dir / "checkpoint_final"
