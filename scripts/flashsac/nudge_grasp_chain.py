@@ -503,7 +503,11 @@ def main() -> None:
 
             # ---- IK lift ----
             retract_mask = phase == PHASE_RETRACT
-            lift_mask = phase == PHASE_LIFT
+            # Successful envs KEEP the frozen arm command and the grip servo after DONE:
+            # without this they fall through to the zero action, which drives the hand back
+            # toward the token-0 posture and the held tool slips out on camera right after
+            # the success is latched.
+            lift_mask = (phase == PHASE_LIFT) | (success & (phase == PHASE_DONE))
             if bool(lift_mask.any()):
                 s = (lift_counter.float() / float(args_cli.lift_ramp)).clamp(0.0, 1.0)
                 if args_cli.lift_profile == "minjerk":
