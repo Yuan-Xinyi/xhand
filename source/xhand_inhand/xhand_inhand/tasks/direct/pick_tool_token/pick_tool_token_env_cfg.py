@@ -123,6 +123,13 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     inhand_reach_sigma = 0.05
     inhand_min_clearance = 0.10   # true-mesh clearance below this = dropped -> failure (m)
     inhand_lost_hold_steps = 10   # consecutive unlatched frames -> failure
+    # Head-down operating standard: the hammer-head axis (object frame; computed from the
+    # mesh -- volume center-of-mass leans 2cm toward the head along the principal axis) must
+    # point down: cos(head_axis_world, -z) >= inhand_head_cos_min.  -1 disables (v1
+    # behavior); the trainer ratchets this toward its target like the distance gate.
+    inhand_head_axis = (0.8632, -0.1298, -0.4879)
+    inhand_head_cos_min = -1.0
+    inhand_head_scale = 0.15      # occupancy on (1+cos)/2 while held: dense rotation gradient
     nudge_target_xy = None            # env-local target COM xy; None -> the default spawn xy
     nudge_target_yaw = 0.0            # target heading vs the rest orientation (rad)
     nudge_pos_tolerance = 0.06        # COM xy distance for success (m)

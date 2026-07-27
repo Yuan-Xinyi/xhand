@@ -256,6 +256,8 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._inhand_point_local = torch.tensor(
             self.cfg.inhand_point, dtype=torch.float, device=dev
         )
+        head = torch.tensor(self.cfg.inhand_head_axis, dtype=torch.float, device=dev)
+        self._inhand_head_local = head / head.norm().clamp_min(1.0e-9)
         self._inhand_index_ee = self.ee_names.index("index_rota_link2")
         self._inhand_hold_steps = torch.zeros(N, dtype=torch.long, device=dev)
         self._inhand_lost_steps = torch.zeros(N, dtype=torch.long, device=dev)
@@ -1338,6 +1340,13 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             # occupancy ~0.3/step << +100 success).
             dist = self._inhand_distance()
             r_ih_reach = cfg.inhand_reach_scale * torch.exp(-dist / cfg.inhand_reach_sigma)
+            # Head-down occupancy: dense rotation gradient toward the operating attitude,
+            # paid only while the hold persists (drop is already -100).
+            head_cos = self._inhand_head_cos()
+            r_ih_head = (
+                cfg.inhand_head_scale * 0.5 * (1.0 + head_cos) * self._is_grasped.float()
+            )
+            log["inhand_head_cos_mean"] = head_cos.mean()
             r_ih_success = cfg.inhand_success_bonus * self._inhand_success.float()
             r_ih_failure = -cfg.inhand_failure_penalty * self._inhand_failure.float()
             r_ih_timeout = -cfg.inhand_timeout_penalty * self._inhand_timeout.float()
@@ -1350,6 +1359,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             log["r_inhand_reach_mean"] = r_ih_reach.mean()
             return (
                 r_ih_reach
+                + r_ih_head
                 + r_ih_success
                 + r_ih_failure
                 + r_ih_timeout
@@ -1577,6 +1587,14 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         )
         return (self.ee_pos_w[:, self._inhand_index_ee] - point_w).norm(dim=-1)
 
+    def _inhand_head_cos(self) -> torch.Tensor:
+        """cos of the hammer-head axis (world) against straight DOWN (+1 = head-down)."""
+        head_w = quat_apply(
+            self.object.data.root_quat_w,
+            self._inhand_head_local.unsqueeze(0).expand(self.num_envs, 3),
+        )
+        return -head_w[:, 2]
+
     # ------------------------------------------------------------------ nudge pregrasp score
     def _nudge_pregrasp_score(self) -> torch.Tensor:
         """Geometry-only grasp readiness; mirrors scripts pick_tool_shared.pregrasp_score.
@@ -1680,6 +1698,8 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 & self._is_grasped
                 & (max_force <= cfg.grasp_bonus_max_force)
             )
+            if cfg.inhand_head_cos_min > -1.0:
+                at_point = at_point & (self._inhand_head_cos() >= cfg.inhand_head_cos_min)
             self._inhand_hold_steps.copy_(
                 torch.where(at_point, self._inhand_hold_steps + 1, torch.zeros_like(self._inhand_hold_steps))
             )
@@ -1714,6 +1734,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                     (clearance >= 0.05) & (~self._is_grasped)
                 ).clone(),
                 "inhand_distance": dist.clone(),
+                "inhand_head_cos": self._inhand_head_cos().clone(),
                 **terminal_state,
             }
             return terminated, time_out

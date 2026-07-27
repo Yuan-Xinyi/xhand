@@ -121,7 +121,14 @@ parser.add_argument(
     "policy reorients the held tool until the index fingertip sits on the functional point; "
     "chain success then requires that contact instead of the bare lift.",
 )
-parser.add_argument("--inhand_dist", type=float, default=0.018, help="fingertip-to-point gate (m)")
+parser.add_argument("--inhand_dist", type=float, default=0.020, help="fingertip-to-point gate (m)")
+parser.add_argument(
+    "--inhand_head_cos",
+    type=float,
+    default=-1.0,
+    help="head-down attitude gate: cos(head axis, straight down) must reach this "
+    "(-1 disables; 0.85 ~= 32 deg).",
+)
 parser.add_argument("--inhand_confirm", type=int, default=15)
 parser.add_argument("--inhand_deadline", type=int, default=320)
 parser.add_argument(
@@ -689,6 +696,10 @@ def main() -> None:
                         inhand, torch.minimum(ih_min_dist, ih_dist), ih_min_dist
                     )
                     at_point = inhand & (ih_dist <= args_cli.inhand_dist) & u._is_grasped
+                    if args_cli.inhand_head_cos > -1.0:
+                        at_point = at_point & (
+                            u._inhand_head_cos() >= args_cli.inhand_head_cos
+                        )
                     ih_hold = torch.where(at_point, ih_hold + 1, torch.zeros_like(ih_hold))
                     ih_lost = torch.where(
                         inhand & (~u._is_grasped), ih_lost + 1, torch.zeros_like(ih_lost)

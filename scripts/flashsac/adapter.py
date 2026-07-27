@@ -87,6 +87,7 @@ STRICT_METRIC_KEYS = (
     "inhand_failure_rate_total",
     "inhand_timeout_rate_total",
     "r_inhand_reach_mean",
+    "inhand_head_cos_mean",
 )
 
 _ADAPTER_INFO_KEYS = frozenset(

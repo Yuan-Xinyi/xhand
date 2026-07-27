@@ -405,6 +405,16 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         "contract-ratchet recipe on the success distance.",
     )
     parser.add_argument(
+        "--inhand_head_adaptive",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("START", "TARGET"),
+        help="Self-paced ratchet on inhand_head_cos_min (head-down attitude): start loose "
+        "(e.g. -1.0 = off) and tighten toward TARGET cos (e.g. 0.90 ~= 26 deg) driven by "
+        "the recent success rate.",
+    )
+    parser.add_argument(
         "--nudge_spawn_anneal",
         type=float,
         nargs=2,
@@ -494,6 +504,12 @@ def _validate_args(args: argparse.Namespace) -> None:
         start, target = args.inhand_dist_adaptive
         if not (0.0 < target <= start):
             raise ValueError("--inhand_dist_adaptive needs START >= TARGET > 0")
+    if args.inhand_head_adaptive is not None:
+        if not args.inhand_option:
+            raise ValueError("--inhand_head_adaptive only applies with --inhand_option")
+        start, target = args.inhand_head_adaptive
+        if not (-1.0 <= start <= target <= 1.0):
+            raise ValueError("--inhand_head_adaptive needs -1 <= START <= TARGET <= 1")
     if sum((args.nudge_option, args.close_option, args.nudge_grasp_option, args.inhand_option)) > 1:
         raise ValueError(
             "--nudge_option, --close_option and --nudge_grasp_option are mutually exclusive"
@@ -809,6 +825,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         cfg_overrides["inhand_mode"] = True
         if args.inhand_dist_adaptive is not None:
             cfg_overrides["inhand_dist_threshold"] = args.inhand_dist_adaptive[0]
+        if args.inhand_head_adaptive is not None:
+            cfg_overrides["inhand_head_cos_min"] = args.inhand_head_adaptive[0]
         if args.episode_length_s is None:
             cfg_overrides["episode_length_s"] = 8.0
     env = make_pick_tool_env(
@@ -988,6 +1006,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     run_max_strict: dict[str, float] = {}
     adaptive_prev_succ = 0.0
     adaptive_prev_epis = 0.0
+    head_prev_succ = 0.0
+    head_prev_epis = 0.0
     adaptive_gate_log: dict[str, float] = {}
     started = time.perf_counter()
 
@@ -1117,6 +1137,30 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "inhand_dist_gate": current,
                     "inhand_gate_window_success": window_succ,
                 }
+            if (
+                args.inhand_option
+                and args.inhand_head_adaptive is not None
+                and interaction_step % ADAPTIVE_GATE_WINDOW == 0
+            ):
+                # Head-down attitude ratchet (cos scale), driven by its own success window.
+                u_env = env.unwrapped
+                succ = float(u_env._inhand_success_total)
+                epis = float(u_env._inhand_episode_total)
+                window_succ = (succ - head_prev_succ) / max(epis - head_prev_epis, 1.0)
+                head_prev_succ, head_prev_epis = succ, epis
+                cos_start, cos_target = args.inhand_head_adaptive
+                current = float(u_env.cfg.inhand_head_cos_min)
+                if window_succ >= 0.5:
+                    current = min(cos_target, current + 0.02)
+                elif window_succ < 0.25:
+                    current = max(cos_start, current - 0.01)
+                u_env.cfg.inhand_head_cos_min = current
+                adaptive_gate_log.update(
+                    {
+                        "inhand_head_cos_gate": current,
+                        "inhand_head_window_success": window_succ,
+                    }
+                )
             if (
                 args.nudge_option
                 and args.nudge_pregrasp_adaptive is not None
