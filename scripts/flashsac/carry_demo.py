@@ -1,0 +1,121 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers.
+# All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+"""Record the carry policy reaching consecutive pose goals (goal marker visible).
+
+Single-env carry_mode episodes from fresh-latch curriculum spawns; every episode with at
+least ``--min_goals`` reached goals is written as an mp4 until ``--max_clips`` are saved.
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+from isaaclab.app import AppLauncher
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--checkpoint", type=Path, required=True)
+parser.add_argument("--curriculum_dataset", type=Path, required=True)
+parser.add_argument("--episodes", type=int, default=12)
+parser.add_argument("--min_goals", type=int, default=2)
+parser.add_argument("--max_clips", type=int, default=3)
+parser.add_argument("--pos_tolerance", type=float, default=0.04)
+parser.add_argument("--rot_tolerance", type=float, default=0.35)
+parser.add_argument("--rot_range", type=float, default=0.6)
+parser.add_argument("--episode_length_s", type=float, default=15.0)
+parser.add_argument("--fps", type=int, default=40)
+parser.add_argument("--seed", type=int, default=0)
+parser.add_argument("--video_folder", type=Path, required=True)
+parser.add_argument("--cam_eye", type=float, nargs=3, default=[1.9, 0.95, 0.9])
+parser.add_argument("--cam_lookat", type=float, nargs=3, default=[0.5, 0.0, 0.32])
+AppLauncher.add_app_launcher_args(parser)
+args_cli = parser.parse_args()
+args_cli.enable_cameras = True
+app_launcher = AppLauncher(args_cli)
+simulation_app = app_launcher.app
+
+import sys
+
+import gymnasium as gym
+import numpy as np
+import torch
+from isaaclab_tasks.utils import parse_env_cfg
+
+import xhand_inhand.tasks  # noqa: F401
+
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE.parent / "rl_games"))
+import agent_bridge  # noqa: E402,F401
+from flash_rl.agents.flashSAC.network import FlashSACActor  # noqa: E402
+
+
+def load_actor(checkpoint: Path, device: torch.device) -> FlashSACActor:
+    payload = torch.load(checkpoint / "actor.pt", map_location="cpu", weights_only=True)
+    state = {k.removeprefix("_orig_mod."): v for k, v in payload["network_state_dict"].items()}
+    actor = FlashSACActor(num_blocks=2, input_dim=115, hidden_dim=128, action_dim=21)
+    actor.load_state_dict(state)
+    return actor.to(device).eval()
+
+
+@torch.inference_mode()
+def main() -> None:
+    torch.manual_seed(args_cli.seed)
+    cfg = parse_env_cfg("Pick-Tool-Token-Direct-v0", device=args_cli.device, num_envs=1)
+    cfg.seed = args_cli.seed
+    cfg.carry_mode = True
+    cfg.episode_length_s = args_cli.episode_length_s
+    cfg.carry_pos_tolerance = args_cli.pos_tolerance
+    cfg.carry_rot_tolerance = args_cli.rot_tolerance
+    cfg.target_rot_range_roll = (-args_cli.rot_range, args_cli.rot_range)
+    cfg.target_rot_range_pitch = (-args_cli.rot_range, args_cli.rot_range)
+    cfg.curriculum_dataset = str(args_cli.curriculum_dataset)
+    cfg.curriculum_boundary = "carry_start"
+    cfg.curriculum_reset_probability = 1.0
+    cfg.curriculum_joint_noise = 0.01
+    cfg.viewer.eye = tuple(args_cli.cam_eye)
+    cfg.viewer.lookat = tuple(args_cli.cam_lookat)
+    cfg.viewer.origin_type = "world"
+    env = gym.make("Pick-Tool-Token-Direct-v0", cfg=cfg, render_mode="rgb_array")
+    u = env.unwrapped
+    actor = load_actor(args_cli.checkpoint, u.device)
+
+    args_cli.video_folder.mkdir(parents=True, exist_ok=True)
+    for _ in range(6):
+        u.render()
+    saved = 0
+    import imageio.v2 as imageio
+
+    for episode in range(args_cli.episodes):
+        obs, _ = env.reset()
+        frames = []
+        # The auto-reset inside step() clears per-env counters before step returns, so track
+        # goals via the cumulative total instead of the per-env count.
+        goals_before = int(u._carry_goals_total)
+        done = False
+        dropped = False
+        while not done:
+            mean, _ = actor.get_mean_and_std(obs["policy"], training=False)
+            obs, _, terminated, truncated, _ = env.step(torch.tanh(mean))
+            frames.append(u.render())
+            dropped = bool(terminated[0])
+            done = bool(terminated[0] or truncated[0])
+        goals = int(u._carry_goals_total) - goals_before
+        outcome = "drop" if dropped else "timeout"
+        print(f"[demo] episode {episode}: goals={goals} end={outcome}", flush=True)
+        if goals >= args_cli.min_goals and saved < args_cli.max_clips:
+            saved += 1
+            path = args_cli.video_folder / f"carry_goals{goals}_{saved}.mp4"
+            imageio.mimwrite(
+                path, [np.asarray(f) for f in frames], fps=args_cli.fps, macro_block_size=None
+            )
+            print(f"[demo] saved -> {path}", flush=True)
+        if saved >= args_cli.max_clips:
+            break
+    print(f"[demo] saved {saved} clip(s)", flush=True)
+    env.close()
+
+
+if __name__ == "__main__":
+    main()
+    simulation_app.close()
