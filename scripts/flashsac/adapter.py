@@ -88,6 +88,13 @@ STRICT_METRIC_KEYS = (
     "inhand_timeout_rate_total",
     "r_inhand_reach_mean",
     "inhand_head_cos_mean",
+    # carry (consecutive pose goals) diagnostics.
+    "carry_pos_err_mean",
+    "carry_rot_err_mean",
+    "carry_grasped_frac",
+    "carry_goals_total",
+    "carry_goals_per_episode",
+    "carry_drop_rate_total",
 )
 
 _ADAPTER_INFO_KEYS = frozenset(

@@ -405,6 +405,38 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         "contract-ratchet recipe on the success distance.",
     )
     parser.add_argument(
+        "--carry_option",
+        action="store_true",
+        help="Carry stage (SimToolReal-style): from curriculum-spawned fresh-latch states, "
+        "move the held tool to consecutive random pose goals (goal in the observation); "
+        "each reach pays a bonus and resamples in place; drop terminates.  Requires "
+        "--curriculum_dataset (boundary carry_start).",
+    )
+    parser.add_argument(
+        "--carry_pos_adaptive",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("START", "TARGET"),
+        help="Ratchet on carry_pos_tolerance (m), driven by window goals-per-episode.",
+    )
+    parser.add_argument(
+        "--carry_rot_adaptive",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("START", "TARGET"),
+        help="Ratchet on carry_rot_tolerance (rad), driven by window goals-per-episode.",
+    )
+    parser.add_argument(
+        "--carry_rot_range",
+        type=float,
+        default=0.6,
+        metavar="RAD",
+        help="Goal orientation sampling: roll/pitch ranges become [-RAD, RAD] (yaw stays "
+        "full circle).  Full +-pi roll/pitch goals are unreachable for a held hammer.",
+    )
+    parser.add_argument(
         "--inhand_head_adaptive",
         type=float,
         nargs=2,
@@ -510,7 +542,18 @@ def _validate_args(args: argparse.Namespace) -> None:
         start, target = args.inhand_head_adaptive
         if not (-1.0 <= start <= target <= 1.0):
             raise ValueError("--inhand_head_adaptive needs -1 <= START <= TARGET <= 1")
-    if sum((args.nudge_option, args.close_option, args.nudge_grasp_option, args.inhand_option)) > 1:
+    if args.carry_option:
+        if args.curriculum_dataset is None:
+            raise ValueError("--carry_option requires --curriculum_dataset (carry_start)")
+    for name in ("carry_pos_adaptive", "carry_rot_adaptive"):
+        pair = getattr(args, name)
+        if pair is not None:
+            if not args.carry_option:
+                raise ValueError(f"--{name} only applies with --carry_option")
+            start, target = pair
+            if not (0.0 < target <= start):
+                raise ValueError(f"--{name} needs START >= TARGET > 0")
+    if sum((args.nudge_option, args.close_option, args.nudge_grasp_option, args.inhand_option, args.carry_option)) > 1:
         raise ValueError(
             "--nudge_option, --close_option and --nudge_grasp_option are mutually exclusive"
         )
@@ -829,6 +872,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             cfg_overrides["inhand_head_cos_min"] = args.inhand_head_adaptive[0]
         if args.episode_length_s is None:
             cfg_overrides["episode_length_s"] = 8.0
+    if args.carry_option:
+        cfg_overrides["carry_mode"] = True
+        cfg_overrides["target_rot_range_roll"] = (-args.carry_rot_range, args.carry_rot_range)
+        cfg_overrides["target_rot_range_pitch"] = (-args.carry_rot_range, args.carry_rot_range)
+        if args.carry_pos_adaptive is not None:
+            cfg_overrides["carry_pos_tolerance"] = args.carry_pos_adaptive[0]
+        if args.carry_rot_adaptive is not None:
+            cfg_overrides["carry_rot_tolerance"] = args.carry_rot_adaptive[0]
+        if args.episode_length_s is None:
+            cfg_overrides["episode_length_s"] = 15.0
     env = make_pick_tool_env(
         num_envs=args.num_envs,
         device=device,
@@ -1008,6 +1061,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     adaptive_prev_epis = 0.0
     head_prev_succ = 0.0
     head_prev_epis = 0.0
+    carry_prev_goals = 0.0
+    carry_prev_epis = 0.0
     adaptive_gate_log: dict[str, float] = {}
     started = time.perf_counter()
 
@@ -1137,6 +1192,37 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "inhand_dist_gate": current,
                     "inhand_gate_window_success": window_succ,
                 }
+            if (
+                args.carry_option
+                and (args.carry_pos_adaptive is not None or args.carry_rot_adaptive is not None)
+                and interaction_step % ADAPTIVE_GATE_WINDOW == 0
+            ):
+                # Dual ratchet on the goal tolerances, driven by window goals-per-episode.
+                u_env = env.unwrapped
+                goals = float(u_env._carry_goals_total)
+                epis = float(u_env._carry_episode_total)
+                window_gpe = (goals - carry_prev_goals) / max(epis - carry_prev_epis, 1.0)
+                carry_prev_goals, carry_prev_epis = goals, epis
+                gate_log = {"carry_window_goals_per_episode": window_gpe}
+                if args.carry_pos_adaptive is not None:
+                    start, target = args.carry_pos_adaptive
+                    current = float(u_env.cfg.carry_pos_tolerance)
+                    if window_gpe >= 1.5:
+                        current = max(target, current - 0.002)
+                    elif window_gpe < 0.5:
+                        current = min(start, current + 0.001)
+                    u_env.cfg.carry_pos_tolerance = current
+                    gate_log["carry_pos_gate"] = current
+                if args.carry_rot_adaptive is not None:
+                    start, target = args.carry_rot_adaptive
+                    current = float(u_env.cfg.carry_rot_tolerance)
+                    if window_gpe >= 1.5:
+                        current = max(target, current - 0.01)
+                    elif window_gpe < 0.5:
+                        current = min(start, current + 0.005)
+                    u_env.cfg.carry_rot_tolerance = current
+                    gate_log["carry_rot_gate"] = current
+                adaptive_gate_log.update(gate_log)
             if (
                 args.inhand_option
                 and args.inhand_head_adaptive is not None

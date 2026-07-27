@@ -132,6 +132,13 @@ parser.add_argument(
 parser.add_argument("--inhand_confirm", type=int, default=15)
 parser.add_argument("--inhand_deadline", type=int, default=320)
 parser.add_argument(
+    "--capture_latched",
+    type=Path,
+    default=None,
+    help="capture the boundary snapshot at the GRASP latch confirmation (fresh stable hold, "
+    "pre-lift) -- the spawn states for the carry stage.  Boundary key: 'carry_start'.",
+)
+parser.add_argument(
     "--capture_held",
     type=Path,
     default=None,
@@ -512,6 +519,10 @@ def main() -> None:
                 servo_active[handoff] = handoff_force[handoff] > 1.0
                 grasped |= handoff
                 grasp_step[handoff] = step
+                if args_cli.capture_latched is not None:
+                    snap = capture_boundary(u)
+                    ids = handoff.nonzero(as_tuple=False).squeeze(-1)
+                    latched_snaps.append({k: v[ids].cpu() for k, v in snap.items()})
             grasp_out = grasping & (step - phase_entry >= args_cli.grasp_deadline) & ~handoff
             if bool(grasp_out.any()):
                 # Retry loop: a failed grasp usually pushed the tool off-pose; NUDGE is exactly
@@ -769,6 +780,7 @@ def main() -> None:
     }
 
     held_snaps: list[dict[str, torch.Tensor]] = []
+    latched_snaps: list[dict[str, torch.Tensor]] = []
 
     if not demo_mode:
         r = run_attempt(capture=False)
@@ -806,6 +818,26 @@ def main() -> None:
             flush=True,
         )
         print(f"wrote {args_cli.output}", flush=True)
+        if args_cli.capture_latched is not None and latched_snaps:
+            boundary = {k: torch.cat([s[k] for s in latched_snaps]) for k in latched_snaps[0]}
+            args_cli.capture_latched.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "boundaries": {"carry_start": boundary},
+                    "meta": {
+                        "format_version": 1,
+                        "kind": "chain_fresh_latch_boundaries",
+                        "num_states": int(boundary["joint_pos"].shape[0]),
+                        "seed": args_cli.seed,
+                    },
+                },
+                args_cli.capture_latched,
+            )
+            print(
+                f"captured {int(boundary['joint_pos'].shape[0])} fresh-latch states -> "
+                f"{args_cli.capture_latched}",
+                flush=True,
+            )
         if args_cli.capture_held is not None and held_snaps:
             boundary = {k: torch.cat([s[k] for s in held_snaps]) for k in held_snaps[0]}
             args_cli.capture_held.parent.mkdir(parents=True, exist_ok=True)

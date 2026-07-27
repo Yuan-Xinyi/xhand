@@ -5,5 +5,21 @@
     -0.00635,
     0.07932
   ],
-  "note": "index fingertip target for the in-hand reorientation stage; user-annotated 2026-07-27 via drag annotator"
+  "note": "index fingertip target for the in-hand reorientation stage; user-annotated 2026-07-27 via drag annotator",
+  "head_axis": [
+    0.16574,
+    -0.93217,
+    0.32187
+  ],
+  "head_axis_tail": [
+    0.04837,
+    0.08633,
+    0.0219
+  ],
+  "head_axis_tip": [
+    0.07895,
+    -0.08568,
+    0.08129
+  ],
+  "head_axis_note": "user-annotated 2026-07-27 via two-point axis annotator (replaces the wrong PCA/COM guess)"
 }

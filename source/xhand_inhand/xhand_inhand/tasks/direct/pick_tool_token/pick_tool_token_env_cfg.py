@@ -127,9 +127,31 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # mesh -- volume center-of-mass leans 2cm toward the head along the principal axis) must
     # point down: cos(head_axis_world, -z) >= inhand_head_cos_min.  -1 disables (v1
     # behavior); the trainer ratchets this toward its target like the distance gate.
-    inhand_head_axis = (0.8632, -0.1298, -0.4879)
+    inhand_head_axis = (0.16574, -0.93217, 0.32187)
     inhand_head_cos_min = -1.0
     inhand_head_scale = 0.15      # occupancy on (1+cos)/2 while held: dense rotation gradient
+    # ---- carry mode: SimToolReal-style consecutive pose goals; FlashSAC replaces the IK ----
+    # From curriculum-spawned fresh-latch states (chain --capture_latched, boundary
+    # carry_start), the policy moves the HELD tool to the goal pose already present in the
+    # observation (target_pos 63:66 / target_quat 66:70 -- the base-env goal machinery):
+    # object COM within carry_pos_tolerance AND orientation within carry_rot_tolerance,
+    # latched, held carry_confirm_steps frames.  Reaching a goal pays carry_goal_bonus and
+    # RESAMPLES a fresh goal in place (position uniform in the carry_goal_pos_range box
+    # around cfg.target_pos; orientation from the cfg target_rot_range_* ranges) -- the
+    # episode continues, goals-per-episode is the metric.  Only a drop (latch lost
+    # carry_lost_hold_steps frames) or sustained unsafe force terminates.
+    carry_mode = False
+    carry_goal_pos_range = (0.10, 0.10, 0.08)   # +- box half-extents around target_pos (m)
+    carry_pos_tolerance = 0.05                  # ratcheted
+    carry_rot_tolerance = 0.40                  # rad, ratcheted
+    carry_confirm_steps = 10
+    carry_goal_bonus = 50.0
+    carry_drop_penalty = 100.0
+    carry_pos_scale = 0.3
+    carry_pos_sigma = 0.10
+    carry_rot_scale = 0.3
+    carry_rot_sigma = 0.7
+    carry_lost_hold_steps = 10
     nudge_target_xy = None            # env-local target COM xy; None -> the default spawn xy
     nudge_target_yaw = 0.0            # target heading vs the rest orientation (rad)
     nudge_pos_tolerance = 0.06        # COM xy distance for success (m)

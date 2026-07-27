@@ -268,6 +268,18 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._inhand_success_total = torch.zeros((), dtype=torch.long, device=dev)
         self._inhand_failure_total = torch.zeros((), dtype=torch.long, device=dev)
         self._inhand_timeout_total = torch.zeros((), dtype=torch.long, device=dev)
+        # carry mode state (consecutive pose goals)
+        self._carry_base_target_pos = torch.tensor(
+            self.cfg.target_pos, dtype=torch.float, device=dev
+        )
+        self._carry_hold_steps = torch.zeros(N, dtype=torch.long, device=dev)
+        self._carry_lost_steps = torch.zeros(N, dtype=torch.long, device=dev)
+        self._carry_reached = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._carry_failure = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._carry_goal_count = torch.zeros(N, dtype=torch.long, device=dev)
+        self._carry_goals_total = torch.zeros((), dtype=torch.long, device=dev)
+        self._carry_episode_total = torch.zeros((), dtype=torch.long, device=dev)
+        self._carry_drop_total = torch.zeros((), dtype=torch.long, device=dev)
         # merged nudge+grasp mode state
         self._ng_milestone_paid = torch.zeros(N, dtype=torch.bool, device=dev)
         self._ng_escaped = torch.zeros(N, dtype=torch.bool, device=dev)
@@ -1333,6 +1345,31 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             log["distal_delta_abs_mean"] = self._last_distal_delta.abs().mean()
             log["distal_delta_abs_max"] = self._last_distal_delta.abs().max()
 
+        if cfg.carry_mode:
+            # Consecutive pose goals: dense pos+rot occupancy toward the CURRENT goal, a
+            # per-goal bonus (non-terminal -- the episode keeps going), and the -100 drop.
+            # Timeout carries no penalty: surviving to timeout with many goals is the point.
+            pos_err, rot_err = self._carry_errors()
+            r_c_pos = cfg.carry_pos_scale * torch.exp(-pos_err / cfg.carry_pos_sigma)
+            r_c_rot = cfg.carry_rot_scale * torch.exp(-rot_err / cfg.carry_rot_sigma)
+            r_c_goal = cfg.carry_goal_bonus * self._carry_reached.float()
+            r_c_drop = -cfg.carry_drop_penalty * self._carry_failure.float()
+            log["carry_pos_err_mean"] = pos_err.mean()
+            log["carry_rot_err_mean"] = rot_err.mean()
+            log["carry_grasped_frac"] = self._is_grasped.float().mean()
+            c_epis = self._carry_episode_total.clamp_min(1).float()
+            log["carry_goals_total"] = self._carry_goals_total.float()
+            log["carry_goals_per_episode"] = self._carry_goals_total.float() / c_epis
+            log["carry_drop_rate_total"] = self._carry_drop_total.float() / c_epis
+            return (
+                r_c_pos
+                + r_c_rot
+                + r_c_goal
+                + r_c_drop
+                + r_force_penalty
+                + r_residual_penalty
+            )
+
         if cfg.inhand_mode:
             # Dense occupancy toward the functional point while the hold persists, plus the
             # contract terms.  The hold itself is protected by the -100 on drop; no separate
@@ -1578,6 +1615,25 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             + r_residual_penalty
         )
 
+    # ------------------------------------------------------------------ carry goals
+    def _carry_resample_goals(self, env_ids: torch.Tensor) -> None:
+        """Fresh pose goal: position uniform in the box around the base target, orientation
+        via the base-env sampler (cfg target_rot_range_*).  Marker updates inside."""
+        if env_ids.numel() == 0:
+            return
+        half = torch.tensor(self.cfg.carry_goal_pos_range, dtype=torch.float, device=self.device)
+        offset = sample_uniform(-1.0, 1.0, (env_ids.numel(), 3), self.device) * half
+        self.target_pos[env_ids] = self._carry_base_target_pos.unsqueeze(0) + offset
+        self._resample_goal(env_ids)
+
+    def _carry_errors(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """(position error m, orientation error rad) of the tool vs the current goal pose."""
+        obj_local = self.object_pos_w - self.scene.env_origins
+        pos_err = (obj_local - self.target_pos).norm(dim=-1)
+        dot = (self.object.data.root_quat_w * self.target_quat).sum(dim=-1).abs().clamp(max=1.0)
+        rot_err = 2.0 * torch.acos(dot)
+        return pos_err, rot_err
+
     # ------------------------------------------------------------------ in-hand functional point
     def _inhand_distance(self) -> torch.Tensor:
         """Index-fingertip distance to the tool's functional point (world frame)."""
@@ -1690,6 +1746,58 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             "object_ang_speed": obj_ang.clone(),
             "success_steps": self._success_steps.clone(),
         }
+
+        if cfg.carry_mode:
+            pos_err, rot_err = self._carry_errors()
+            at_goal = (
+                (pos_err <= cfg.carry_pos_tolerance)
+                & (rot_err <= cfg.carry_rot_tolerance)
+                & self._is_grasped
+                & (max_force <= cfg.grasp_bonus_max_force)
+            )
+            self._carry_hold_steps.copy_(
+                torch.where(at_goal, self._carry_hold_steps + 1, torch.zeros_like(self._carry_hold_steps))
+            )
+            self._carry_lost_steps.copy_(
+                torch.where(
+                    self._is_grasped,
+                    torch.zeros_like(self._carry_lost_steps),
+                    self._carry_lost_steps + 1,
+                )
+            )
+            reached = self._carry_hold_steps >= cfg.carry_confirm_steps
+            self._carry_reached.copy_(reached)
+            if bool(reached.any()):
+                # Goal achieved: pay (in rewards), count, and resample IN PLACE -- the
+                # episode continues toward the next goal (SimToolReal consecutive-goals).
+                ids = reached.nonzero(as_tuple=False).squeeze(-1)
+                self._carry_goal_count[ids] += 1
+                self._carry_goals_total.add_(ids.numel())
+                self._carry_hold_steps[ids] = 0
+                self._carry_resample_goals(ids)
+            dropped_hold = self._carry_lost_steps >= cfg.carry_lost_hold_steps
+            failure = dropped_hold | unsafe_force
+            self._carry_failure.copy_(failure)
+            terminated = failure
+            time_out = time_out & ~terminated
+            finished = terminated | time_out
+            self._carry_episode_total.add_(finished.sum())
+            self._carry_drop_total.add_(failure.sum())
+            self.extras["pick_tool_terminal"] = {
+                "success": (time_out & (self._carry_goal_count > 0)).clone(),
+                "failure": failure.clone(),
+                "time_out": time_out.clone(),
+                "dropped": dropped_hold.clone(),
+                "unsafe_force": unsafe_force.clone(),
+                "unlatched_clearance_ge_5cm": (
+                    (clearance >= 0.05) & (~self._is_grasped)
+                ).clone(),
+                "carry_goal_count": self._carry_goal_count.clone(),
+                "carry_pos_err": pos_err.clone(),
+                "carry_rot_err": rot_err.clone(),
+                **terminal_state,
+            }
+            return terminated, time_out
 
         if cfg.inhand_mode:
             dist = self._inhand_distance()
@@ -1968,6 +2076,13 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._inhand_success[env_ids] = False
         self._inhand_failure[env_ids] = False
         self._inhand_timeout[env_ids] = False
+        self._carry_hold_steps[env_ids] = 0
+        self._carry_lost_steps[env_ids] = 0
+        self._carry_reached[env_ids] = False
+        self._carry_failure[env_ids] = False
+        self._carry_goal_count[env_ids] = 0
+        if self.cfg.carry_mode:
+            self._carry_resample_goals(env_ids)
         self._ng_stable_steps[env_ids] = 0
         self._ng_success[env_ids] = False
         self._ng_failure[env_ids] = False
