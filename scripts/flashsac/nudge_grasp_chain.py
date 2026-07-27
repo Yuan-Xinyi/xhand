@@ -114,6 +114,17 @@ parser.add_argument("--grip_servo_range", type=float, default=0.60)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--output", type=Path, default=Path("/tmp/pick_tool_nudge_grasp_chain.json"))
 parser.add_argument(
+    "--inhand_checkpoint",
+    type=Path,
+    default=None,
+    help="FlashSAC checkpoint dir for the IN-HAND stage: after the strict lift success, this "
+    "policy reorients the held tool until the index fingertip sits on the functional point; "
+    "chain success then requires that contact instead of the bare lift.",
+)
+parser.add_argument("--inhand_dist", type=float, default=0.018, help="fingertip-to-point gate (m)")
+parser.add_argument("--inhand_confirm", type=int, default=15)
+parser.add_argument("--inhand_deadline", type=int, default=320)
+parser.add_argument(
     "--capture_held",
     type=Path,
     default=None,
@@ -164,7 +175,7 @@ from pick_tool_shared import capture_boundary  # noqa: E402
 
 _COMPILED_PREFIX = "_orig_mod."
 
-PHASE_NUDGE, PHASE_RETRACT, PHASE_GRASP, PHASE_LIFT, PHASE_DONE = range(5)
+PHASE_NUDGE, PHASE_RETRACT, PHASE_GRASP, PHASE_LIFT, PHASE_INHAND, PHASE_DONE = range(6)
 
 
 def _limit_norm(value: torch.Tensor, limit: float) -> torch.Tensor:
@@ -239,6 +250,11 @@ def main() -> None:
     reposition_actor = (
         load_nudge_actor(args_cli.reposition_checkpoint, dev)
         if args_cli.reposition_checkpoint is not None
+        else None
+    )
+    inhand_actor = (
+        load_nudge_actor(args_cli.inhand_checkpoint, dev)
+        if args_cli.inhand_checkpoint is not None
         else None
     )
     if args_cli.grasp_flashsac_checkpoint is not None:
@@ -341,6 +357,10 @@ def main() -> None:
         grasp_step = torch.full((n,), -1, dtype=torch.long, device=dev)
         success_step = torch.full((n,), -1, dtype=torch.long, device=dev)
         max_clearance = torch.full((n,), -float("inf"), device=dev)
+        lifted = torch.zeros(n, dtype=torch.bool, device=dev)
+        ih_hold = torch.zeros(n, dtype=torch.long, device=dev)
+        ih_lost = torch.zeros(n, dtype=torch.long, device=dev)
+        ih_min_dist = torch.full((n,), 10.0, device=dev)
         # grasp-phase diagnostics
         g_max_quality = torch.zeros(n, device=dev)
         g_max_proximity = torch.zeros(n, device=dev)
@@ -357,6 +377,7 @@ def main() -> None:
             * (args_cli.nudge_deadline + args_cli.retract_steps + args_cli.grasp_deadline)
             + args_cli.lift_ramp
             + args_cli.hold_steps
+            + (args_cli.inhand_deadline if inhand_actor is not None else 0)
         )
         for step in range(total_steps):
             if step == 0 and os.environ.get("CHAIN_DUMP_OBS"):
@@ -512,12 +533,15 @@ def main() -> None:
 
             # ---- IK lift ----
             retract_mask = phase == PHASE_RETRACT
-            # Successful envs KEEP the frozen arm command and the grip servo after DONE:
-            # without this they fall through to the zero action, which drives the hand back
-            # toward the token-0 posture and the held tool slips out on camera right after
-            # the success is latched.
+            # Successful envs KEEP the frozen command after DONE: without this they fall
+            # through to the zero action, which drives the hand back toward the token-0
+            # posture and the held tool slips out on camera right after the success latch.
+            # Only PHASE_LIFT envs get IK/servo UPDATES (ik_mask); DONE envs replay their
+            # frozen `commanded` untouched -- after an in-hand stage the palm has moved and
+            # re-running the lift IK would drag it back to the lift-end pose.
             lift_mask = (phase == PHASE_LIFT) | (success & (phase == PHASE_DONE))
-            if bool(lift_mask.any()):
+            ik_mask = phase == PHASE_LIFT
+            if bool(ik_mask.any()):
                 s = (lift_counter.float() / float(args_cli.lift_ramp)).clamp(0.0, 1.0)
                 if args_cli.lift_profile == "minjerk":
                     # Peak reference speed is 1.875x the average (~1.9mm/step at the default
@@ -556,7 +580,7 @@ def main() -> None:
                     u.dof_lower[:, u._arm_ids_t],
                 )
                 commanded[:, u._arm_ids_t] = torch.where(
-                    lift_mask.unsqueeze(-1), next_arm, commanded[:, u._arm_ids_t]
+                    ik_mask.unsqueeze(-1), next_arm, commanded[:, u._arm_ids_t]
                 )
                 force = u._finger_object_force_magnitudes()
                 distal_cmd = commanded[:, servo_hand_ids]
@@ -570,10 +594,10 @@ def main() -> None:
                 )
                 new_distal = torch.clamp(distal_cmd + delta_grip, servo_lower, servo_upper)
                 commanded[:, servo_hand_ids] = torch.where(
-                    lift_mask.unsqueeze(-1), new_distal, distal_cmd
+                    ik_mask.unsqueeze(-1), new_distal, distal_cmd
                 )
-                lift_counter = torch.where(lift_mask, lift_counter + 1, lift_counter)
-                if os.environ.get("CHAIN_DUMP_LIFT") and bool(lift_mask[0]):
+                lift_counter = torch.where(ik_mask, lift_counter + 1, lift_counter)
+                if os.environ.get("CHAIN_DUMP_LIFT") and bool(ik_mask[0]):
                     print(
                         "[LIFT]",
                         int(lift_counter[0]),
@@ -605,11 +629,15 @@ def main() -> None:
                         (home_arm - u.dof_targets[:, u._arm_ids_t]) / realizable_arm_step
                     ).clamp(-1.0, 1.0)
             action = torch.zeros((n, 21), device=dev)
-            for mask, act in (
+            phase_actions = [
                 (phase == PHASE_NUDGE, nudge_action),
                 (phase == PHASE_RETRACT, retract_action),
                 (phase == PHASE_GRASP, grasp_action),
-            ):
+            ]
+            if inhand_actor is not None:
+                ih_mean, _ = inhand_actor.get_mean_and_std(policy_obs, training=False)
+                phase_actions.append((phase == PHASE_INHAND, torch.tanh(ih_mean)))
+            for mask, act in phase_actions:
                 action = torch.where(mask.unsqueeze(-1), act, action)
             in_grasp = phase == PHASE_GRASP
             g_action_arm_abs += torch.where(
@@ -638,14 +666,48 @@ def main() -> None:
                 & slow
             )
             stable_count = torch.where(strict, stable_count + 1, torch.zeros_like(stable_count))
-            newly = (~success) & (stable_count >= args_cli.stable_steps)
-            success_step[newly] = step
+            newly = (~lifted) & (phase == PHASE_LIFT) & (stable_count >= args_cli.stable_steps)
+            lifted |= newly
             if args_cli.capture_held is not None and bool(newly.any()):
                 snap = capture_boundary(u)
                 ids = newly.nonzero(as_tuple=False).squeeze(-1)
                 held_snaps.append({k: v[ids].cpu() for k, v in snap.items()})
-            success |= newly
-            phase[newly] = PHASE_DONE
+            if inhand_actor is None:
+                success_step[newly] = step
+                success |= newly
+                phase[newly] = PHASE_DONE
+            else:
+                phase[newly] = PHASE_INHAND
+                phase_entry[newly] = step
+
+            # ---- IN-HAND stage: index fingertip onto the functional point ----
+            if inhand_actor is not None:
+                inhand = phase == PHASE_INHAND
+                if bool(inhand.any()):
+                    ih_dist = u._inhand_distance()
+                    ih_min_dist = torch.where(
+                        inhand, torch.minimum(ih_min_dist, ih_dist), ih_min_dist
+                    )
+                    at_point = inhand & (ih_dist <= args_cli.inhand_dist) & u._is_grasped
+                    ih_hold = torch.where(at_point, ih_hold + 1, torch.zeros_like(ih_hold))
+                    ih_lost = torch.where(
+                        inhand & (~u._is_grasped), ih_lost + 1, torch.zeros_like(ih_lost)
+                    )
+                    pointed_now = inhand & (ih_hold >= args_cli.inhand_confirm)
+                    if bool(pointed_now.any()):
+                        # Freeze the exact posture for the post-success hold.
+                        commanded[pointed_now] = u.dof_targets[pointed_now].detach().clone()
+                        success_step[pointed_now] = step
+                        success |= pointed_now
+                        phase[pointed_now] = PHASE_DONE
+                    ih_fail = inhand & (
+                        (ih_lost >= 10)
+                        | (post_clear < 0.10)
+                        | (step - phase_entry >= args_cli.inhand_deadline)
+                    ) & ~pointed_now
+                    if bool(ih_fail.any()):
+                        phase[ih_fail] = PHASE_DONE
+                        failed |= ih_fail
             max_clearance = torch.maximum(
                 max_clearance, torch.where(phase >= PHASE_LIFT, post_clear, max_clearance)
             )
@@ -653,6 +715,8 @@ def main() -> None:
         return {
             "nudged": int(nudged.sum()),
             "grasped": int(grasped.sum()),
+            "lifted": int(lifted.sum()),
+            "inhand_min_dist": _summary(ih_min_dist[lifted]) if bool(lifted.any()) else None,
             "success": int(success.sum()),
             "frames": frames,
             "success_flag": bool(success.any()),
@@ -701,6 +765,8 @@ def main() -> None:
             **base,
             "nudged_count": r["nudged"],
             "grasped_count": r["grasped"],
+            "lifted_count": r["lifted"],
+            "inhand_min_dist": r["inhand_min_dist"],
             "chain_success_count": r["success"],
             "chain_success_rate": r["success"] / n,
             "nudge_rate": r["nudged"] / n,
