@@ -252,6 +252,20 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._nudge_failure_total = torch.zeros((), dtype=torch.long, device=dev)
         self._nudge_timeout_total = torch.zeros((), dtype=torch.long, device=dev)
         self._nudge_table_hit_total = torch.zeros((), dtype=torch.long, device=dev)
+        # in-hand reorientation mode state
+        self._inhand_point_local = torch.tensor(
+            self.cfg.inhand_point, dtype=torch.float, device=dev
+        )
+        self._inhand_index_ee = self.ee_names.index("index_rota_link2")
+        self._inhand_hold_steps = torch.zeros(N, dtype=torch.long, device=dev)
+        self._inhand_lost_steps = torch.zeros(N, dtype=torch.long, device=dev)
+        self._inhand_success = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._inhand_failure = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._inhand_timeout = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._inhand_episode_total = torch.zeros((), dtype=torch.long, device=dev)
+        self._inhand_success_total = torch.zeros((), dtype=torch.long, device=dev)
+        self._inhand_failure_total = torch.zeros((), dtype=torch.long, device=dev)
+        self._inhand_timeout_total = torch.zeros((), dtype=torch.long, device=dev)
         # merged nudge+grasp mode state
         self._ng_milestone_paid = torch.zeros(N, dtype=torch.bool, device=dev)
         self._ng_escaped = torch.zeros(N, dtype=torch.bool, device=dev)
@@ -1317,6 +1331,32 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             log["distal_delta_abs_mean"] = self._last_distal_delta.abs().mean()
             log["distal_delta_abs_max"] = self._last_distal_delta.abs().max()
 
+        if cfg.inhand_mode:
+            # Dense occupancy toward the functional point while the hold persists, plus the
+            # contract terms.  The hold itself is protected by the -100 on drop; no separate
+            # hold occupancy, so a stable-but-idle hold cannot out-earn finishing (max
+            # occupancy ~0.3/step << +100 success).
+            dist = self._inhand_distance()
+            r_ih_reach = cfg.inhand_reach_scale * torch.exp(-dist / cfg.inhand_reach_sigma)
+            r_ih_success = cfg.inhand_success_bonus * self._inhand_success.float()
+            r_ih_failure = -cfg.inhand_failure_penalty * self._inhand_failure.float()
+            r_ih_timeout = -cfg.inhand_timeout_penalty * self._inhand_timeout.float()
+            log["inhand_distance_mean"] = dist.mean()
+            log["inhand_grasped_frac"] = self._is_grasped.float().mean()
+            ih_completed = self._inhand_episode_total.clamp_min(1).float()
+            log["inhand_success_rate_total"] = self._inhand_success_total.float() / ih_completed
+            log["inhand_failure_rate_total"] = self._inhand_failure_total.float() / ih_completed
+            log["inhand_timeout_rate_total"] = self._inhand_timeout_total.float() / ih_completed
+            log["r_inhand_reach_mean"] = r_ih_reach.mean()
+            return (
+                r_ih_reach
+                + r_ih_success
+                + r_ih_failure
+                + r_ih_timeout
+                + r_force_penalty
+                + r_residual_penalty
+            )
+
         if cfg.nudge_grasp_mode:
             # Merged nudge+grasp: the v6 shaping stack guides reach/reorientation, the
             # battle-tested close/wrap potentials guide finger closure, and the strict latch
@@ -1528,6 +1568,15 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             + r_residual_penalty
         )
 
+    # ------------------------------------------------------------------ in-hand functional point
+    def _inhand_distance(self) -> torch.Tensor:
+        """Index-fingertip distance to the tool's functional point (world frame)."""
+        point_w = self.object_pos_w + quat_apply(
+            self.object.data.root_quat_w,
+            self._inhand_point_local.unsqueeze(0).expand(self.num_envs, 3),
+        )
+        return (self.ee_pos_w[:, self._inhand_index_ee] - point_w).norm(dim=-1)
+
     # ------------------------------------------------------------------ nudge pregrasp score
     def _nudge_pregrasp_score(self) -> torch.Tensor:
         """Geometry-only grasp readiness; mirrors scripts pick_tool_shared.pregrasp_score.
@@ -1623,6 +1672,51 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             "object_ang_speed": obj_ang.clone(),
             "success_steps": self._success_steps.clone(),
         }
+
+        if cfg.inhand_mode:
+            dist = self._inhand_distance()
+            at_point = (
+                (dist <= cfg.inhand_dist_threshold)
+                & self._is_grasped
+                & (max_force <= cfg.grasp_bonus_max_force)
+            )
+            self._inhand_hold_steps.copy_(
+                torch.where(at_point, self._inhand_hold_steps + 1, torch.zeros_like(self._inhand_hold_steps))
+            )
+            self._inhand_lost_steps.copy_(
+                torch.where(
+                    self._is_grasped,
+                    torch.zeros_like(self._inhand_lost_steps),
+                    self._inhand_lost_steps + 1,
+                )
+            )
+            fell = clearance < cfg.inhand_min_clearance
+            lost_hold = self._inhand_lost_steps >= cfg.inhand_lost_hold_steps
+            success = self._inhand_hold_steps >= cfg.inhand_confirm_steps
+            failure = fell | lost_hold | unsafe_force
+            success = success & ~failure
+            self._inhand_success.copy_(success)
+            self._inhand_failure.copy_(failure)
+            terminated = success | failure
+            time_out = time_out & ~terminated
+            self._inhand_timeout.copy_(time_out)
+            self._inhand_episode_total.add_((terminated | time_out).sum())
+            self._inhand_success_total.add_(success.sum())
+            self._inhand_failure_total.add_(failure.sum())
+            self._inhand_timeout_total.add_(time_out.sum())
+            self.extras["pick_tool_terminal"] = {
+                "success": success.clone(),
+                "failure": failure.clone(),
+                "time_out": time_out.clone(),
+                "dropped": (fell | lost_hold).clone(),
+                "unsafe_force": unsafe_force.clone(),
+                "unlatched_clearance_ge_5cm": (
+                    (clearance >= 0.05) & (~self._is_grasped)
+                ).clone(),
+                "inhand_distance": dist.clone(),
+                **terminal_state,
+            }
+            return terminated, time_out
 
         if cfg.nudge_grasp_mode:
             errors = self._nudge_pose_errors()
@@ -1848,6 +1942,11 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._nudge_timeout[env_ids] = False
         self._nudge_hold_steps[env_ids] = 0
         self._nudge_touched[env_ids] = False
+        self._inhand_hold_steps[env_ids] = 0
+        self._inhand_lost_steps[env_ids] = 0
+        self._inhand_success[env_ids] = False
+        self._inhand_failure[env_ids] = False
+        self._inhand_timeout[env_ids] = False
         self._ng_stable_steps[env_ids] = 0
         self._ng_success[env_ids] = False
         self._ng_failure[env_ids] = False

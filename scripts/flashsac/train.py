@@ -388,6 +388,23 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         "push posture and the pregrasp/close/latch stack.",
     )
     parser.add_argument(
+        "--inhand_option",
+        action="store_true",
+        help="In-hand reorientation stage: from curriculum-spawned lifted holds, bring the "
+        "INDEX fingertip onto the tool's functional point while keeping the grasp.  "
+        "Requires --curriculum_dataset (boundary inhand_start).",
+    )
+    parser.add_argument(
+        "--inhand_dist_adaptive",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("START", "TARGET"),
+        help="Self-paced ratchet on inhand_dist_threshold: start loose (e.g. 0.08) and "
+        "tighten toward TARGET (e.g. 0.015) driven by the recent success rate, the v9 "
+        "contract-ratchet recipe on the success distance.",
+    )
+    parser.add_argument(
         "--nudge_spawn_anneal",
         type=float,
         nargs=2,
@@ -468,7 +485,16 @@ def _validate_args(args: argparse.Namespace) -> None:
                 "--close_option requires --curriculum_dataset and --curriculum_probability 1.0 "
                 "(every episode must spawn at a pregrasp boundary)"
             )
-    if sum((args.nudge_option, args.close_option, args.nudge_grasp_option)) > 1:
+    if args.inhand_option:
+        if args.curriculum_dataset is None:
+            raise ValueError("--inhand_option requires --curriculum_dataset (inhand_start)")
+    if args.inhand_dist_adaptive is not None:
+        if not args.inhand_option:
+            raise ValueError("--inhand_dist_adaptive only applies with --inhand_option")
+        start, target = args.inhand_dist_adaptive
+        if not (0.0 < target <= start):
+            raise ValueError("--inhand_dist_adaptive needs START >= TARGET > 0")
+    if sum((args.nudge_option, args.close_option, args.nudge_grasp_option, args.inhand_option)) > 1:
         raise ValueError(
             "--nudge_option, --close_option and --nudge_grasp_option are mutually exclusive"
         )
@@ -777,6 +803,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 -args.nudge_yaw_range,
                 args.nudge_yaw_range,
             )
+    if args.inhand_option:
+        # In-hand reorientation: lifted-hold curriculum spawns; drop guards active in mode
+        # logic itself (terminate_on_drop's below-table check never fires from a lifted hold).
+        cfg_overrides["inhand_mode"] = True
+        if args.inhand_dist_adaptive is not None:
+            cfg_overrides["inhand_dist_threshold"] = args.inhand_dist_adaptive[0]
+        if args.episode_length_s is None:
+            cfg_overrides["episode_length_s"] = 8.0
     env = make_pick_tool_env(
         num_envs=args.num_envs,
         device=device,
@@ -1061,6 +1095,28 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     update_sums[name] = update_sums.get(name, 0.0) + _scalar(value)
                     update_metric_counts[name] = update_metric_counts.get(name, 0) + 1
 
+            if (
+                args.inhand_option
+                and args.inhand_dist_adaptive is not None
+                and interaction_step % ADAPTIVE_GATE_WINDOW == 0
+            ):
+                # v9 contract ratchet on the success DISTANCE (shrinking = harder).
+                u_env = env.unwrapped
+                succ = float(u_env._inhand_success_total)
+                epis = float(u_env._inhand_episode_total)
+                window_succ = (succ - adaptive_prev_succ) / max(epis - adaptive_prev_epis, 1.0)
+                adaptive_prev_succ, adaptive_prev_epis = succ, epis
+                dist_start, dist_target = args.inhand_dist_adaptive
+                current = float(u_env.cfg.inhand_dist_threshold)
+                if window_succ >= 0.5:
+                    current = max(dist_target, current - 0.002)
+                elif window_succ < 0.25:
+                    current = min(dist_start, current + 0.001)
+                u_env.cfg.inhand_dist_threshold = current
+                adaptive_gate_log = {
+                    "inhand_dist_gate": current,
+                    "inhand_gate_window_success": window_succ,
+                }
             if (
                 args.nudge_option
                 and args.nudge_pregrasp_adaptive is not None

@@ -113,6 +113,14 @@ parser.add_argument("--grip_servo_step", type=float, default=0.006)
 parser.add_argument("--grip_servo_range", type=float, default=0.60)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--output", type=Path, default=Path("/tmp/pick_tool_nudge_grasp_chain.json"))
+parser.add_argument(
+    "--capture_held",
+    type=Path,
+    default=None,
+    help="capture the full boundary snapshot of every env at its strict-success moment "
+    "(tool lifted and stably held) into this dataset -- the spawn states for the in-hand "
+    "reorientation stage.  Boundary key: 'inhand_start'.",
+)
 # demo recording
 parser.add_argument("--attempts", type=int, default=1)
 parser.add_argument("--max_clips", type=int, default=3)
@@ -151,6 +159,7 @@ import agent_bridge  # noqa: E402,F401  (import side effect installs the pinned 
 from flash_rl.agents.flashSAC.network import FlashSACActor  # noqa: E402
 
 from bc_pick_tool import MigratedActor, clone_state, load_torch  # noqa: E402
+from pick_tool_shared import capture_boundary  # noqa: E402
 
 
 _COMPILED_PREFIX = "_orig_mod."
@@ -631,6 +640,10 @@ def main() -> None:
             stable_count = torch.where(strict, stable_count + 1, torch.zeros_like(stable_count))
             newly = (~success) & (stable_count >= args_cli.stable_steps)
             success_step[newly] = step
+            if args_cli.capture_held is not None and bool(newly.any()):
+                snap = capture_boundary(u)
+                ids = newly.nonzero(as_tuple=False).squeeze(-1)
+                held_snaps.append({k: v[ids].cpu() for k, v in snap.items()})
             success |= newly
             phase[newly] = PHASE_DONE
             max_clearance = torch.maximum(
@@ -680,6 +693,8 @@ def main() -> None:
         },
     }
 
+    held_snaps: list[dict[str, torch.Tensor]] = []
+
     if not demo_mode:
         r = run_attempt(capture=False)
         metrics = {
@@ -714,6 +729,26 @@ def main() -> None:
             flush=True,
         )
         print(f"wrote {args_cli.output}", flush=True)
+        if args_cli.capture_held is not None and held_snaps:
+            boundary = {k: torch.cat([s[k] for s in held_snaps]) for k in held_snaps[0]}
+            args_cli.capture_held.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "boundaries": {"inhand_start": boundary},
+                    "meta": {
+                        "format_version": 1,
+                        "kind": "chain_held_lift_boundaries",
+                        "num_states": int(boundary["joint_pos"].shape[0]),
+                        "seed": args_cli.seed,
+                    },
+                },
+                args_cli.capture_held,
+            )
+            print(
+                f"captured {int(boundary['joint_pos'].shape[0])} held-lift states -> "
+                f"{args_cli.capture_held}",
+                flush=True,
+            )
     else:
         os.makedirs(args_cli.video_folder, exist_ok=True)
         for _ in range(6):

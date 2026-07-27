@@ -80,6 +80,13 @@ STRICT_METRIC_KEYS = (
     "r_nudge_pregrasp_mean",
     "nudge_staging_mean",
     "r_ng_staging_mean",
+    # in-hand reorientation diagnostics.
+    "inhand_distance_mean",
+    "inhand_grasped_frac",
+    "inhand_success_rate_total",
+    "inhand_failure_rate_total",
+    "inhand_timeout_rate_total",
+    "r_inhand_reach_mean",
 )
 
 _ADAPTER_INFO_KEYS = frozenset(

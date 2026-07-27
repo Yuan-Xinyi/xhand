@@ -105,6 +105,24 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     nudge_grasp_staging_occupancy = 0.0
     nudge_grasp_staging_height = 0.12   # palm target height above the tool COM (m)
     nudge_grasp_staging_sigma = 0.06    # position kernel width (m)
+    # ---- in-hand reorientation mode: from a lifted stable hold, bring the INDEX fingertip
+    # onto the tool's functional point (object-frame constant, annotated via the drag tool;
+    # persisted in functional_point.json next to this file).  Success = fingertip-to-point
+    # distance <= inhand_dist_threshold (live-ratcheted by the trainer) while still grasped,
+    # held inhand_confirm_steps frames.  No tool-attitude requirement (user decision).
+    # Failure = the hold is lost (unlatched inhand_lost_hold_steps frames), the tool falls
+    # back below inhand_min_clearance, or sustained unsafe force.
+    inhand_mode = False
+    inhand_point = (0.01936, -0.00635, 0.07932)   # object-frame functional point (m)
+    inhand_dist_threshold = 0.015                 # success distance; ratchet target (m)
+    inhand_confirm_steps = 15
+    inhand_success_bonus = 100.0
+    inhand_failure_penalty = 100.0
+    inhand_timeout_penalty = 10.0
+    inhand_reach_scale = 0.3      # occupancy on exp(-dist/sigma): dense, farm-capped << +100
+    inhand_reach_sigma = 0.05
+    inhand_min_clearance = 0.10   # true-mesh clearance below this = dropped -> failure (m)
+    inhand_lost_hold_steps = 10   # consecutive unlatched frames -> failure
     nudge_target_xy = None            # env-local target COM xy; None -> the default spawn xy
     nudge_target_yaw = 0.0            # target heading vs the rest orientation (rad)
     nudge_pos_tolerance = 0.06        # COM xy distance for success (m)
