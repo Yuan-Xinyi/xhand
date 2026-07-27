@@ -85,6 +85,14 @@ parser.add_argument(
 parser.add_argument("--grasp_deadline", type=int, default=450)
 parser.add_argument("--grasp_confirm", type=int, default=15)
 parser.add_argument("--lift_ramp", type=int, default=220)
+parser.add_argument(
+    "--lift_profile",
+    choices=("minjerk", "linear"),
+    default="minjerk",
+    help="height reference profile for the IK lift: 'minjerk' (10t^3-15t^4+6t^5, zero "
+    "velocity/acceleration at both ends -- smooth start and stop) or the old 'linear' ramp "
+    "(constant-rate with velocity discontinuities at start and top).",
+)
 parser.add_argument("--hold_steps", type=int, default=60)
 parser.add_argument("--stable_steps", type=int, default=15)
 parser.add_argument("--lift_height", type=float, default=0.22)
@@ -477,9 +485,13 @@ def main() -> None:
             retract_mask = phase == PHASE_RETRACT
             lift_mask = phase == PHASE_LIFT
             if bool(lift_mask.any()):
-                height = args_cli.lift_height * (
-                    lift_counter.float() / float(args_cli.lift_ramp)
-                ).clamp(0.0, 1.0)
+                s = (lift_counter.float() / float(args_cli.lift_ramp)).clamp(0.0, 1.0)
+                if args_cli.lift_profile == "minjerk":
+                    # Peak reference speed is 1.875x the average (~1.9mm/step at the default
+                    # 22cm/220 steps), still under the 4mm max_cart_step, so the arm tracks
+                    # the smooth reference instead of saturating the per-step clamp.
+                    s = s * s * s * (10.0 - 15.0 * s + 6.0 * s * s)
+                height = args_cli.lift_height * s
                 current_pos = u.robot.data.body_pos_w[:, u.palm_idx]
                 current_quat = u.robot.data.body_quat_w[:, u.palm_idx]
                 desired_pos = palm_start.clone()
