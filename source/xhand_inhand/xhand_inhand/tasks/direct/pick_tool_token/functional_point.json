@@ -1,9 +1,9 @@
 {
   "frame": "object_root (textured_mesh.obj frame, meters)",
   "index_point": [
-    0.08709,
-    -0.08375,
-    0.07445
+    0.01936,
+    -0.00635,
+    0.07932
   ],
-  "note": "index fingertip target for the in-hand reorientation stage; edit via the drag annotator"
+  "note": "index fingertip target for the in-hand reorientation stage; user-annotated 2026-07-27 via drag annotator"
 }
