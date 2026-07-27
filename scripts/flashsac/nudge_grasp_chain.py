@@ -98,6 +98,13 @@ parser.add_argument("--stable_steps", type=int, default=15)
 parser.add_argument("--lift_height", type=float, default=0.22)
 # IK / grip servo (the validated ppo_grasp_ik_lift settings)
 parser.add_argument("--damping", type=float, default=0.05)
+parser.add_argument("--ik_gain", type=float, default=0.5, help="IK feedback gain on the pose error")
+parser.add_argument(
+    "--ik_pos_deadband", type=float, default=0.0015, help="ignore position errors below this (m)"
+)
+parser.add_argument(
+    "--ik_rot_deadband", type=float, default=0.01, help="ignore rotation errors below this (rad)"
+)
 parser.add_argument("--max_cart_step", type=float, default=0.004)
 parser.add_argument("--max_rot_step", type=float, default=0.05)
 parser.add_argument("--grip_force_target", type=float, default=3.0)
@@ -154,6 +161,12 @@ PHASE_NUDGE, PHASE_RETRACT, PHASE_GRASP, PHASE_LIFT, PHASE_DONE = range(5)
 def _limit_norm(value: torch.Tensor, limit: float) -> torch.Tensor:
     norm = value.norm(dim=-1, keepdim=True).clamp_min(1.0e-9)
     return value * torch.clamp(limit / norm, max=1.0)
+
+
+def _deadband(value: torch.Tensor, band: float) -> torch.Tensor:
+    """Shrink a batched vector toward zero by ``band`` in L2 norm (zero inside the band)."""
+    norm = value.norm(dim=-1, keepdim=True).clamp_min(1.0e-9)
+    return value * ((norm - band).clamp_min(0.0) / norm)
 
 
 def _summary(value: torch.Tensor) -> dict[str, float] | None:
@@ -306,6 +319,7 @@ def main() -> None:
         palm_quat_target = torch.zeros((n, 4), device=dev)
         servo_lower = torch.zeros((n, len(u.ee_names)), device=dev)
         servo_upper = torch.zeros((n, len(u.ee_names)), device=dev)
+        servo_active = torch.zeros((n, len(u.ee_names)), dtype=torch.bool, device=dev)
         lift_counter = torch.zeros(n, dtype=torch.long, device=dev)
         lift_mask = torch.zeros(n, dtype=torch.bool, device=dev)
         retract_mask = torch.zeros(n, dtype=torch.bool, device=dev)
@@ -453,6 +467,12 @@ def main() -> None:
                 servo_upper[handoff] = torch.minimum(
                     frozen + args_cli.grip_servo_range, u.dof_upper[handoff][:, servo_hand_ids]
                 )
+                # Only servo fingers that are actually holding at handoff.  A finger with no
+                # contact (measured: the middle finger at 0N for entire lifts) otherwise
+                # ratchets 0.006 rad EVERY step chasing its 3N target -- a full 0.6 rad sweep
+                # during the lift that stirs the grasp and rocks the tool.
+                handoff_force = u._finger_object_force_magnitudes()
+                servo_active[handoff] = handoff_force[handoff] > 1.0
                 grasped |= handoff
                 grasp_step[handoff] = step
             grasp_out = grasping & (step - phase_entry >= args_cli.grasp_deadline) & ~handoff
@@ -500,10 +520,17 @@ def main() -> None:
                     current_pos, current_quat, desired_pos, palm_quat_target,
                     rot_error_type="axis_angle",
                 )
+                # Anti-limit-cycle conditioning (measured: full-gain P tracking through the
+                # dof-target EMA lag oscillates the palm +-4mm xy / 0.02 rad at ~0.7s period,
+                # amplified into visible tool swing by the ~30cm handle lever).  A deadband
+                # stops the chase below perception scale and the 0.5 gain removes the
+                # overshoot; the vertical (z) reference keeps full authority via the ramp.
+                pos_db = _deadband(pos_error, args_cli.ik_pos_deadband)
+                rot_db = _deadband(rot_error, args_cli.ik_rot_deadband)
                 delta = torch.cat(
                     (
-                        _limit_norm(pos_error, args_cli.max_cart_step),
-                        _limit_norm(rot_error, args_cli.max_rot_step),
+                        _limit_norm(args_cli.ik_gain * pos_db, args_cli.max_cart_step),
+                        _limit_norm(args_cli.ik_gain * rot_db, args_cli.max_rot_step),
                     ),
                     dim=-1,
                 )
@@ -520,15 +547,35 @@ def main() -> None:
                 )
                 force = u._finger_object_force_magnitudes()
                 distal_cmd = commanded[:, servo_hand_ids]
-                delta_grip = args_cli.grip_servo_step * (
-                    (force < args_cli.grip_force_target).float()
-                    - (force > args_cli.grip_force_limit).float()
+                delta_grip = (
+                    args_cli.grip_servo_step
+                    * servo_active.float()
+                    * (
+                        (force < args_cli.grip_force_target).float()
+                        - (force > args_cli.grip_force_limit).float()
+                    )
                 )
                 new_distal = torch.clamp(distal_cmd + delta_grip, servo_lower, servo_upper)
                 commanded[:, servo_hand_ids] = torch.where(
                     lift_mask.unsqueeze(-1), new_distal, distal_cmd
                 )
                 lift_counter = torch.where(lift_mask, lift_counter + 1, lift_counter)
+                if os.environ.get("CHAIN_DUMP_LIFT") and bool(lift_mask[0]):
+                    print(
+                        "[LIFT]",
+                        int(lift_counter[0]),
+                        "palm",
+                        [round(float(x), 4) for x in current_pos[0]],
+                        "des",
+                        [round(float(x), 4) for x in desired_pos[0]],
+                        "err",
+                        [round(float(x), 4) for x in pos_error[0]],
+                        "rot_err",
+                        [round(float(x), 4) for x in rot_error[0]],
+                        "grip",
+                        [round(float(x), 2) for x in force[0]],
+                        flush=True,
+                    )
 
             # ---- action composition per phase ----
             policy_obs = obs["policy"]
