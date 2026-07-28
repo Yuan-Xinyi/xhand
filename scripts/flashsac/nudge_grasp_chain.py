@@ -114,6 +114,22 @@ parser.add_argument("--grip_servo_range", type=float, default=0.60)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--output", type=Path, default=Path("/tmp/pick_tool_nudge_grasp_chain.json"))
 parser.add_argument(
+    "--carry_checkpoint",
+    type=Path,
+    default=None,
+    help="FlashSAC carry policy: takes over at the fresh latch and flies the tool to pose "
+    "goals (the first goal IS the lift -- no IK, no scripted ramp).  Goal positions are "
+    "sampled in an elevated box (never near the table); orientations are relative "
+    "rotations of the current attitude.",
+)
+parser.add_argument("--carry_pos_tol", type=float, default=0.06)
+parser.add_argument("--carry_rot_tol", type=float, default=0.35)
+parser.add_argument("--carry_goal_hold", type=int, default=10)
+parser.add_argument("--carry_first_rel", type=float, default=0.8, help="first-goal max rel angle")
+parser.add_argument("--carry_next_rel", type=float, default=1.8, help="subsequent goals max rel angle")
+parser.add_argument("--carry_stage_steps", type=int, default=650)
+parser.add_argument("--carry_goal_pos", type=float, nargs=3, default=[0.5, 0.0, 0.35])
+parser.add_argument(
     "--inhand_checkpoint",
     type=Path,
     default=None,
@@ -271,6 +287,38 @@ def main() -> None:
         if args_cli.inhand_checkpoint is not None
         else None
     )
+    carry_actor = (
+        load_nudge_actor(args_cli.carry_checkpoint, dev)
+        if args_cli.carry_checkpoint is not None
+        else None
+    )
+
+    def sample_carry_goals(ids: torch.Tensor, max_rel: float) -> None:
+        m = ids.numel()
+        if m == 0:
+            return
+        base = torch.tensor(args_cli.carry_goal_pos, device=dev).unsqueeze(0)
+        u.target_pos[ids] = base + (torch.rand((m, 3), device=dev) - 0.5) * torch.tensor(
+            [0.16, 0.16, 0.12], device=dev
+        )
+        axis = torch.randn((m, 3), device=dev)
+        axis = axis / axis.norm(dim=-1, keepdim=True).clamp_min(1.0e-9)
+        angle = torch.rand((m,), device=dev) * max_rel
+        half = 0.5 * angle
+        dq = torch.cat((torch.cos(half).unsqueeze(-1), torch.sin(half).unsqueeze(-1) * axis), dim=-1)
+        q = u.object.data.root_quat_w[ids]
+        w1, x1, y1, z1 = dq.unbind(-1)
+        w2, x2, y2, z2 = q.unbind(-1)
+        u.target_quat[ids] = torch.stack(
+            (
+                w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+                w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            ),
+            dim=-1,
+        )
+        u._update_goal_marker()
     if args_cli.grasp_flashsac_checkpoint is not None:
         close_actor = load_nudge_actor(args_cli.grasp_flashsac_checkpoint, dev)
 
@@ -375,6 +423,9 @@ def main() -> None:
         ih_hold = torch.zeros(n, dtype=torch.long, device=dev)
         ih_lost = torch.zeros(n, dtype=torch.long, device=dev)
         ih_min_dist = torch.full((n,), 10.0, device=dev)
+        carry_hold = torch.zeros(n, dtype=torch.long, device=dev)
+        carry_lost = torch.zeros(n, dtype=torch.long, device=dev)
+        carry_goals = torch.zeros(n, dtype=torch.long, device=dev)
         # grasp-phase diagnostics
         g_max_quality = torch.zeros(n, device=dev)
         g_max_proximity = torch.zeros(n, device=dev)
@@ -519,6 +570,9 @@ def main() -> None:
                 servo_active[handoff] = handoff_force[handoff] > 1.0
                 grasped |= handoff
                 grasp_step[handoff] = step
+                if carry_actor is not None and bool(handoff.any()):
+                    ids = handoff.nonzero(as_tuple=False).squeeze(-1)
+                    sample_carry_goals(ids, args_cli.carry_first_rel)
                 if args_cli.capture_latched is not None:
                     snap = capture_boundary(u)
                     ids = handoff.nonzero(as_tuple=False).squeeze(-1)
@@ -549,6 +603,41 @@ def main() -> None:
                 g_min_ft_dist,
             )
 
+            # ---- CARRY stage (replaces the IK lift when a carry actor is given) ----
+            if carry_actor is not None:
+                carrying = phase == PHASE_LIFT
+                if bool(carrying.any()):
+                    pos_err_c, rot_err_c = u._carry_errors()
+                    at_goal = (
+                        carrying
+                        & (pos_err_c <= args_cli.carry_pos_tol)
+                        & (rot_err_c <= args_cli.carry_rot_tol)
+                        & u._is_grasped
+                    )
+                    carry_hold = torch.where(at_goal, carry_hold + 1, torch.zeros_like(carry_hold))
+                    goal_hit = carrying & (carry_hold >= args_cli.carry_goal_hold)
+                    if bool(goal_hit.any()):
+                        ids = goal_hit.nonzero(as_tuple=False).squeeze(-1)
+                        carry_goals[ids] += 1
+                        carry_hold[ids] = 0
+                        first = goal_hit & (~success)
+                        if bool(first.any()):
+                            success_step[first] = step
+                            success |= first
+                        sample_carry_goals(ids, args_cli.carry_next_rel)
+                    carry_lost = torch.where(
+                        carrying & (~u._is_grasped), carry_lost + 1, torch.zeros_like(carry_lost)
+                    )
+                    carry_fail = carrying & (
+                        (carry_lost >= 10)
+                        | (step - phase_entry >= args_cli.carry_stage_steps)
+                    )
+                    if bool(carry_fail.any()):
+                        # A dropped or timed-out carry ends the env; first-goal successes
+                        # already latched stay counted.
+                        phase[carry_fail] = PHASE_DONE
+                        failed |= carry_fail & (~success)
+
             # ---- IK lift ----
             retract_mask = phase == PHASE_RETRACT
             # Successful envs KEEP the frozen command after DONE: without this they fall
@@ -558,7 +647,9 @@ def main() -> None:
             # frozen `commanded` untouched -- after an in-hand stage the palm has moved and
             # re-running the lift IK would drag it back to the lift-end pose.
             lift_mask = (phase == PHASE_LIFT) | (success & (phase == PHASE_DONE))
-            ik_mask = phase == PHASE_LIFT
+            if carry_actor is not None:
+                lift_mask = torch.zeros_like(lift_mask)
+            ik_mask = (phase == PHASE_LIFT) & (carry_actor is None)
             if bool(ik_mask.any()):
                 s = (lift_counter.float() / float(args_cli.lift_ramp)).clamp(0.0, 1.0)
                 if args_cli.lift_profile == "minjerk":
@@ -655,6 +746,9 @@ def main() -> None:
             if inhand_actor is not None:
                 ih_mean, _ = inhand_actor.get_mean_and_std(policy_obs, training=False)
                 phase_actions.append((phase == PHASE_INHAND, torch.tanh(ih_mean)))
+            if carry_actor is not None:
+                c_mean, _ = carry_actor.get_mean_and_std(policy_obs, training=False)
+                phase_actions.append((phase == PHASE_LIFT, torch.tanh(c_mean)))
             for mask, act in phase_actions:
                 action = torch.where(mask.unsqueeze(-1), act, action)
             in_grasp = phase == PHASE_GRASP
@@ -684,6 +778,9 @@ def main() -> None:
                 & slow
             )
             stable_count = torch.where(strict, stable_count + 1, torch.zeros_like(stable_count))
+            if carry_actor is not None:
+                # Carry mode: success is the first pose goal, not the bare 20cm lift.
+                stable_count = torch.zeros_like(stable_count)
             newly = (~lifted) & (phase == PHASE_LIFT) & (stable_count >= args_cli.stable_steps)
             lifted |= newly
             if args_cli.capture_held is not None and bool(newly.any()):
@@ -738,6 +835,7 @@ def main() -> None:
             "nudged": int(nudged.sum()),
             "grasped": int(grasped.sum()),
             "lifted": int(lifted.sum()),
+            "carry_goals": int(carry_goals.sum()),
             "inhand_min_dist": _summary(ih_min_dist[lifted]) if bool(lifted.any()) else None,
             "success": int(success.sum()),
             "frames": frames,
@@ -789,6 +887,7 @@ def main() -> None:
             "nudged_count": r["nudged"],
             "grasped_count": r["grasped"],
             "lifted_count": r["lifted"],
+            "carry_goals_total": r["carry_goals"],
             "inhand_min_dist": r["inhand_min_dist"],
             "chain_success_count": r["success"],
             "chain_success_rate": r["success"] / n,
