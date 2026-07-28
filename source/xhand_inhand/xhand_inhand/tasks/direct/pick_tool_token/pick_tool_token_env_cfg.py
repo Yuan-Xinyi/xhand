@@ -176,6 +176,15 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # there is no wrist detour).  Goal positions then track the current object position --
     # a locked arm cannot translate the tool to a sampled box position.
     carry_lock_arm = False
+    # Gradual arm unlock: arm action channels are scaled by this authority factor (0 = the
+    # locked sub-task, 1 = full arm).  The trainer anneals it upward so the arm ASSISTS the
+    # learned finger gaiting instead of replacing it; combined with the arm motion cost the
+    # in-hand-first preference is preserved.
+    carry_arm_authority = 1.0
+    # Goal positions follow the current object position (small box) instead of the fixed
+    # target point -- used with lifted-hold spawns so goals stay reachable at low arm
+    # authority and the tool never has to approach the table.
+    carry_goal_follow_object = False
     nudge_target_xy = None            # env-local target COM xy; None -> the default spawn xy
     nudge_target_yaw = 0.0            # target heading vs the rest orientation (rad)
     nudge_pos_tolerance = 0.06        # COM xy distance for success (m)

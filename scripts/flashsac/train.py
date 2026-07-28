@@ -439,6 +439,21 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         "in-hand repositioning becomes necessary.  Overrides absolute rpy goal sampling.",
     )
     parser.add_argument(
+        "--carry_arm_unlock",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("START", "END"),
+        help="Anneal carry_arm_authority linearly START -> END over the run (0 = locked arm, "
+        "1 = full).  Cap END below 1 to keep the arm an assistant, not a replacement.",
+    )
+    parser.add_argument(
+        "--carry_goal_follow",
+        action="store_true",
+        help="Goal positions follow the current object position (small box) -- pair with "
+        "lifted-hold spawns so reorientation happens high above the table.",
+    )
+    parser.add_argument(
         "--carry_lock_arm",
         action="store_true",
         help="Arm-locked in-hand sub-task: zero arm channels; goal positions track the "
@@ -925,6 +940,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             cfg_overrides["carry_lock_arm"] = True
             cfg_overrides["carry_goal_pos_range"] = (0.02, 0.02, 0.02)
             cfg_overrides["carry_pos_tolerance"] = 0.08
+        if args.carry_goal_follow:
+            cfg_overrides["carry_goal_follow_object"] = True
+            cfg_overrides["carry_goal_pos_range"] = (0.03, 0.03, 0.03)
+            cfg_overrides["carry_pos_tolerance"] = 0.08
+        if args.carry_arm_unlock is not None:
+            cfg_overrides["carry_arm_authority"] = args.carry_arm_unlock[0]
         if args.episode_length_s is None:
             cfg_overrides["episode_length_s"] = 15.0
     env = make_pick_tool_env(
@@ -1237,6 +1258,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "inhand_dist_gate": current,
                     "inhand_gate_window_success": window_succ,
                 }
+            if args.carry_option and args.carry_arm_unlock is not None:
+                start, end = args.carry_arm_unlock
+                progress = min(1.0, interaction_step / max(1, args.steps))
+                env.unwrapped.cfg.carry_arm_authority = start + (end - start) * progress
             if (
                 args.carry_option
                 and (args.carry_pos_adaptive is not None or args.carry_rot_adaptive is not None)

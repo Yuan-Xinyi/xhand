@@ -1016,9 +1016,12 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         """Apply a grasp-phase arm shield before the shared relative-action controller."""
 
         shielded = actions.clone()
-        if self.cfg.carry_mode and self.cfg.carry_lock_arm:
-            # In-hand sub-task: the arm holds position; only the hand acts.
-            shielded[:, : self._n_arm] = 0.0
+        if self.cfg.carry_mode:
+            # Arm authority: 0 = locked in-hand sub-task, annealed upward to let the arm
+            # assist increasingly aggressive reorientations without replacing the fingers.
+            authority = 0.0 if self.cfg.carry_lock_arm else float(self.cfg.carry_arm_authority)
+            if authority < 1.0:
+                shielded[:, : self._n_arm] *= authority
         self._arm_up_shield_fraction.zero_()
         object_force = None
         soft = None
@@ -1647,7 +1650,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             return
         half = torch.tensor(self.cfg.carry_goal_pos_range, dtype=torch.float, device=self.device)
         offset = sample_uniform(-1.0, 1.0, (env_ids.numel(), 3), self.device) * half
-        if self.cfg.carry_lock_arm:
+        if self.cfg.carry_lock_arm or self.cfg.carry_goal_follow_object:
             base = (self.object_pos_w - self.scene.env_origins)[env_ids]
         else:
             base = self._carry_base_target_pos.unsqueeze(0)
