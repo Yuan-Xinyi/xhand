@@ -191,6 +191,9 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # on every reach so runs end by failure or stall, not mid-streak.
     carry_hand_vel_penalty = 0.0
     carry_streak_mode = False
+    # Goal z floor: sampled goal positions are clamped to table_surface + this margin so no
+    # goal pose can require the tool near the table (tool half-diagonal ~0.13m + clearance).
+    carry_goal_z_margin = 0.16
     nudge_target_xy = None            # env-local target COM xy; None -> the default spawn xy
     nudge_target_yaw = 0.0            # target heading vs the rest orientation (rad)
     nudge_pos_tolerance = 0.06        # COM xy distance for success (m)

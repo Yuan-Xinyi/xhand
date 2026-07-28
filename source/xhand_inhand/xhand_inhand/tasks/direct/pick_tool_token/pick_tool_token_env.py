@@ -1661,6 +1661,11 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         else:
             base = self._carry_base_target_pos.unsqueeze(0)
         self.target_pos[env_ids] = base + offset
+        # No goal near the table: clamp env-local goal z above the surface + margin.
+        table_local_z = self._table_surface_z - self.scene.env_origins[:, 2]
+        floor = (table_local_z + self.cfg.carry_goal_z_margin)
+        floor = floor[env_ids] if floor.ndim > 0 else floor
+        self.target_pos[env_ids, 2] = torch.maximum(self.target_pos[env_ids, 2], floor)
         if self.cfg.carry_goal_rel_angle_max > 0.0:
             # Relative goals: rotate the CURRENT object orientation by a random axis-angle
             # whose magnitude the trainer ratchets past the wrist range, forcing in-hand
