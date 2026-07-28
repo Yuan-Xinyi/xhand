@@ -439,6 +439,13 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         "in-hand repositioning becomes necessary.  Overrides absolute rpy goal sampling.",
     )
     parser.add_argument(
+        "--carry_timeout_cost",
+        type=float,
+        default=None,
+        help="carry goal-timeout charge override; ~goal bonus makes skipping a hard goal "
+        "cancel out a reach instead of being a cheap escape valve.",
+    )
+    parser.add_argument(
         "--carry_arm_cost",
         type=float,
         default=None,
@@ -906,6 +913,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             cfg_overrides["carry_goal_rel_angle_max"] = args.carry_gap_adaptive[0]
         if args.carry_arm_cost is not None:
             cfg_overrides["carry_arm_motion_penalty"] = args.carry_arm_cost
+        if args.carry_timeout_cost is not None:
+            cfg_overrides["carry_goal_timeout_penalty"] = args.carry_timeout_cost
         if args.episode_length_s is None:
             cfg_overrides["episode_length_s"] = 15.0
     env = make_pick_tool_env(
