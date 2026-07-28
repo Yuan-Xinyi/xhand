@@ -147,11 +147,30 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     carry_confirm_steps = 10
     carry_goal_bonus = 50.0
     carry_drop_penalty = 100.0
-    carry_pos_scale = 0.3
+    carry_pos_scale = 0.1
     carry_pos_sigma = 0.10
-    carry_rot_scale = 0.3
+    carry_rot_scale = 0.1
     carry_rot_sigma = 0.7
-    carry_lost_hold_steps = 10
+    # Multiplicative pose occupancy: pays only when BOTH errors shrink.  v1's additive terms
+    # financed a stall equilibrium -- park at 1cm position with 1.6rad orientation error and
+    # collect the position stream while ignoring wrist-unreachable goals.
+    carry_pose_scale = 0.4
+    # Goal timeout: v1 goals never expired, so an unreachable goal cost nothing to sit out.
+    # Now a goal not reached within the window is charged and resampled -- every goal exerts
+    # pressure.
+    carry_goal_timeout_steps = 150
+    carry_goal_timeout_penalty = 10.0
+    # Arm-expensive motion cost: mean |arm dof-target delta| / realizable step, arm channels
+    # only -- hand motion stays free, encoding the in-hand-first preference.
+    carry_arm_motion_penalty = 0.0
+    # Relative-orientation goals (0 disables -> v1 absolute rpy sampling): goal orientation =
+    # rotation by theta ~ U(0, carry_goal_rel_angle_max) about a random axis applied to the
+    # CURRENT object orientation.  The trainer ratchets the max angle past the wrist range so
+    # in-hand repositioning becomes the only way to keep earning.
+    carry_goal_rel_angle_max = 0.0
+    # Regrasp grace: 10 frames treated any transient contact reorganization as a drop; a
+    # finger-gait step needs a longer unlatched window before the -100 verdict.
+    carry_lost_hold_steps = 25
     nudge_target_xy = None            # env-local target COM xy; None -> the default spawn xy
     nudge_target_yaw = 0.0            # target heading vs the rest orientation (rad)
     nudge_pos_tolerance = 0.06        # COM xy distance for success (m)

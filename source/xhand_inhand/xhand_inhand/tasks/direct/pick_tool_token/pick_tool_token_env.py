@@ -277,6 +277,10 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._carry_reached = torch.zeros(N, dtype=torch.bool, device=dev)
         self._carry_failure = torch.zeros(N, dtype=torch.bool, device=dev)
         self._carry_goal_count = torch.zeros(N, dtype=torch.long, device=dev)
+        self._carry_goal_age = torch.zeros(N, dtype=torch.long, device=dev)
+        self._carry_goal_timed_out = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._carry_prev_arm_targets = torch.zeros((N, 7), device=dev)
+        self._carry_goal_timeout_total = torch.zeros((), dtype=torch.long, device=dev)
         self._carry_goals_total = torch.zeros((), dtype=torch.long, device=dev)
         self._carry_episode_total = torch.zeros((), dtype=torch.long, device=dev)
         self._carry_drop_total = torch.zeros((), dtype=torch.long, device=dev)
@@ -1350,10 +1354,23 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             # per-goal bonus (non-terminal -- the episode keeps going), and the -100 drop.
             # Timeout carries no penalty: surviving to timeout with many goals is the point.
             pos_err, rot_err = self._carry_errors()
-            r_c_pos = cfg.carry_pos_scale * torch.exp(-pos_err / cfg.carry_pos_sigma)
-            r_c_rot = cfg.carry_rot_scale * torch.exp(-rot_err / cfg.carry_rot_sigma)
+            pos_k = torch.exp(-pos_err / cfg.carry_pos_sigma)
+            rot_k = torch.exp(-rot_err / cfg.carry_rot_sigma)
+            r_c_pos = cfg.carry_pos_scale * pos_k
+            r_c_rot = cfg.carry_rot_scale * rot_k
+            # Multiplicative pose occupancy: parking at the position with a wrong orientation
+            # pays ~nothing (the v1 stall salary is cancelled).
+            r_c_pose = cfg.carry_pose_scale * pos_k * rot_k
             r_c_goal = cfg.carry_goal_bonus * self._carry_reached.float()
+            r_c_goal = r_c_goal - cfg.carry_goal_timeout_penalty * self._carry_goal_timed_out.float()
             r_c_drop = -cfg.carry_drop_penalty * self._carry_failure.float()
+            # Arm-expensive motion cost (hand stays free): mean |arm target delta| per step,
+            # normalized by the realizable per-step arm motion.
+            arm_targets = self.dof_targets[:, self._arm_ids_t]
+            arm_step = (arm_targets - self._carry_prev_arm_targets).abs().mean(dim=-1)
+            self._carry_prev_arm_targets.copy_(arm_targets)
+            realizable = max(float(cfg.act_moving_average * cfg.action_scale), 1.0e-6)
+            r_c_arm = -cfg.carry_arm_motion_penalty * (arm_step / realizable).clamp(max=1.5)
             log["carry_pos_err_mean"] = pos_err.mean()
             log["carry_rot_err_mean"] = rot_err.mean()
             log["carry_grasped_frac"] = self._is_grasped.float().mean()
@@ -1361,11 +1378,15 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             log["carry_goals_total"] = self._carry_goals_total.float()
             log["carry_goals_per_episode"] = self._carry_goals_total.float() / c_epis
             log["carry_drop_rate_total"] = self._carry_drop_total.float() / c_epis
+            log["carry_goal_timeouts_total"] = self._carry_goal_timeout_total.float()
+            log["carry_arm_motion_mean"] = (arm_step / realizable).mean()
             return (
                 r_c_pos
                 + r_c_rot
+                + r_c_pose
                 + r_c_goal
                 + r_c_drop
+                + r_c_arm
                 + r_force_penalty
                 + r_residual_penalty
             )
@@ -1624,7 +1645,32 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         half = torch.tensor(self.cfg.carry_goal_pos_range, dtype=torch.float, device=self.device)
         offset = sample_uniform(-1.0, 1.0, (env_ids.numel(), 3), self.device) * half
         self.target_pos[env_ids] = self._carry_base_target_pos.unsqueeze(0) + offset
-        self._resample_goal(env_ids)
+        if self.cfg.carry_goal_rel_angle_max > 0.0:
+            # Relative goals: rotate the CURRENT object orientation by a random axis-angle
+            # whose magnitude the trainer ratchets past the wrist range, forcing in-hand
+            # repositioning to stay profitable.  Marker still updates below.
+            n = env_ids.numel()
+            axis = torch.randn((n, 3), device=self.device)
+            axis = axis / axis.norm(dim=-1, keepdim=True).clamp_min(1.0e-9)
+            angle = sample_uniform(0.0, self.cfg.carry_goal_rel_angle_max, (n,), self.device)
+            half_a = 0.5 * angle
+            dq = torch.cat((torch.cos(half_a).unsqueeze(-1), torch.sin(half_a).unsqueeze(-1) * axis), dim=-1)
+            q = self.object.data.root_quat_w[env_ids]
+            w1, x1, y1, z1 = dq.unbind(-1)
+            w2, x2, y2, z2 = q.unbind(-1)
+            self.target_quat[env_ids] = torch.stack(
+                (
+                    w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+                    w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                    w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                    w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+                ),
+                dim=-1,
+            )
+            self._update_goal_marker()
+        else:
+            self._resample_goal(env_ids)
+        self._carry_goal_age[env_ids] = 0
 
     def _carry_errors(self) -> tuple[torch.Tensor, torch.Tensor]:
         """(position error m, orientation error rad) of the tool vs the current goal pose."""
@@ -1765,8 +1811,20 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                     self._carry_lost_steps + 1,
                 )
             )
+            self._carry_goal_age.add_(1)
             reached = self._carry_hold_steps >= cfg.carry_confirm_steps
             self._carry_reached.copy_(reached)
+            goal_timed_out = (
+                (self._carry_goal_age >= cfg.carry_goal_timeout_steps) & ~reached
+            )
+            self._carry_goal_timed_out.copy_(goal_timed_out)
+            if bool(goal_timed_out.any()):
+                # Unreached goal expires: charged in rewards, resampled here -- sitting out a
+                # hard goal is no longer free (the v1 stall equilibrium).
+                ids = goal_timed_out.nonzero(as_tuple=False).squeeze(-1)
+                self._carry_goal_timeout_total.add_(ids.numel())
+                self._carry_hold_steps[ids] = 0
+                self._carry_resample_goals(ids)
             if bool(reached.any()):
                 # Goal achieved: pay (in rewards), count, and resample IN PLACE -- the
                 # episode continues toward the next goal (SimToolReal consecutive-goals).
@@ -2081,8 +2139,11 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._carry_reached[env_ids] = False
         self._carry_failure[env_ids] = False
         self._carry_goal_count[env_ids] = 0
+        self._carry_goal_age[env_ids] = 0
+        self._carry_goal_timed_out[env_ids] = False
         if self.cfg.carry_mode:
             self._carry_resample_goals(env_ids)
+            self._carry_prev_arm_targets[env_ids] = self.dof_targets[env_ids][:, self._arm_ids_t]
         self._ng_stable_steps[env_ids] = 0
         self._ng_success[env_ids] = False
         self._ng_failure[env_ids] = False

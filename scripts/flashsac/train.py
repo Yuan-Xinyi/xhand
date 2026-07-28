@@ -429,6 +429,22 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         help="Ratchet on carry_rot_tolerance (rad), driven by window goals-per-episode.",
     )
     parser.add_argument(
+        "--carry_gap_adaptive",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("START", "TARGET"),
+        help="Relative-orientation goal curriculum: goal = current orientation rotated by "
+        "theta ~ U(0, max); max ratchets START -> TARGET (rad) past the wrist range so "
+        "in-hand repositioning becomes necessary.  Overrides absolute rpy goal sampling.",
+    )
+    parser.add_argument(
+        "--carry_arm_cost",
+        type=float,
+        default=None,
+        help="Arm-expensive motion cost weight (carry_arm_motion_penalty); hand motion free.",
+    )
+    parser.add_argument(
         "--carry_rot_range",
         type=float,
         default=0.6,
@@ -545,6 +561,12 @@ def _validate_args(args: argparse.Namespace) -> None:
     if args.carry_option:
         if args.curriculum_dataset is None:
             raise ValueError("--carry_option requires --curriculum_dataset (carry_start)")
+    if args.carry_gap_adaptive is not None:
+        if not args.carry_option:
+            raise ValueError("--carry_gap_adaptive only applies with --carry_option")
+        start, target = args.carry_gap_adaptive
+        if not (0.0 < start <= target):
+            raise ValueError("--carry_gap_adaptive needs 0 < START <= TARGET (it grows)")
     for name in ("carry_pos_adaptive", "carry_rot_adaptive"):
         pair = getattr(args, name)
         if pair is not None:
@@ -880,6 +902,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             cfg_overrides["carry_pos_tolerance"] = args.carry_pos_adaptive[0]
         if args.carry_rot_adaptive is not None:
             cfg_overrides["carry_rot_tolerance"] = args.carry_rot_adaptive[0]
+        if args.carry_gap_adaptive is not None:
+            cfg_overrides["carry_goal_rel_angle_max"] = args.carry_gap_adaptive[0]
+        if args.carry_arm_cost is not None:
+            cfg_overrides["carry_arm_motion_penalty"] = args.carry_arm_cost
         if args.episode_length_s is None:
             cfg_overrides["episode_length_s"] = 15.0
     env = make_pick_tool_env(
@@ -1222,6 +1248,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         current = min(start, current + 0.005)
                     u_env.cfg.carry_rot_tolerance = current
                     gate_log["carry_rot_gate"] = current
+                if args.carry_gap_adaptive is not None:
+                    start, target = args.carry_gap_adaptive
+                    current = float(u_env.cfg.carry_goal_rel_angle_max)
+                    if window_gpe >= 1.5:
+                        current = min(target, current + 0.02)
+                    elif window_gpe < 0.5:
+                        current = max(start, current - 0.01)
+                    u_env.cfg.carry_goal_rel_angle_max = current
+                    gate_log["carry_gap_gate"] = current
                 adaptive_gate_log.update(gate_log)
             if (
                 args.inhand_option
