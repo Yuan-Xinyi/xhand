@@ -460,6 +460,13 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         "object; finger gaiting is the only path to orientation goals.",
     )
     parser.add_argument(
+        "--carry_no_skip",
+        action="store_true",
+        help="Goals never expire: no timeout-swap escape valve.  The only way to keep "
+        "earning is to actually reach each goal; the gap ratchet remains the sole "
+        "difficulty regulator (it backs off when goals-per-episode drops).",
+    )
+    parser.add_argument(
         "--carry_timeout_cost",
         type=float,
         default=None,
@@ -936,6 +943,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             cfg_overrides["carry_arm_motion_penalty"] = args.carry_arm_cost
         if args.carry_timeout_cost is not None:
             cfg_overrides["carry_goal_timeout_penalty"] = args.carry_timeout_cost
+        if args.carry_no_skip:
+            cfg_overrides["carry_goal_timeout_steps"] = 1_000_000_000
+            cfg_overrides["carry_goal_timeout_penalty"] = 0.0
         if args.carry_lock_arm:
             cfg_overrides["carry_lock_arm"] = True
             cfg_overrides["carry_goal_pos_range"] = (0.02, 0.02, 0.02)
