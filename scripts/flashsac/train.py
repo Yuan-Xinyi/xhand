@@ -439,6 +439,12 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         "in-hand repositioning becomes necessary.  Overrides absolute rpy goal sampling.",
     )
     parser.add_argument(
+        "--carry_lock_arm",
+        action="store_true",
+        help="Arm-locked in-hand sub-task: zero arm channels; goal positions track the "
+        "object; finger gaiting is the only path to orientation goals.",
+    )
+    parser.add_argument(
         "--carry_timeout_cost",
         type=float,
         default=None,
@@ -915,6 +921,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             cfg_overrides["carry_arm_motion_penalty"] = args.carry_arm_cost
         if args.carry_timeout_cost is not None:
             cfg_overrides["carry_goal_timeout_penalty"] = args.carry_timeout_cost
+        if args.carry_lock_arm:
+            cfg_overrides["carry_lock_arm"] = True
+            cfg_overrides["carry_goal_pos_range"] = (0.02, 0.02, 0.02)
+            cfg_overrides["carry_pos_tolerance"] = 0.08
         if args.episode_length_s is None:
             cfg_overrides["episode_length_s"] = 15.0
     env = make_pick_tool_env(

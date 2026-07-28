@@ -1016,6 +1016,9 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         """Apply a grasp-phase arm shield before the shared relative-action controller."""
 
         shielded = actions.clone()
+        if self.cfg.carry_mode and self.cfg.carry_lock_arm:
+            # In-hand sub-task: the arm holds position; only the hand acts.
+            shielded[:, : self._n_arm] = 0.0
         self._arm_up_shield_fraction.zero_()
         object_force = None
         soft = None
@@ -1644,7 +1647,11 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             return
         half = torch.tensor(self.cfg.carry_goal_pos_range, dtype=torch.float, device=self.device)
         offset = sample_uniform(-1.0, 1.0, (env_ids.numel(), 3), self.device) * half
-        self.target_pos[env_ids] = self._carry_base_target_pos.unsqueeze(0) + offset
+        if self.cfg.carry_lock_arm:
+            base = (self.object_pos_w - self.scene.env_origins)[env_ids]
+        else:
+            base = self._carry_base_target_pos.unsqueeze(0)
+        self.target_pos[env_ids] = base + offset
         if self.cfg.carry_goal_rel_angle_max > 0.0:
             # Relative goals: rotate the CURRENT object orientation by a random axis-angle
             # whose magnitude the trainer ratchets past the wrist range, forcing in-hand

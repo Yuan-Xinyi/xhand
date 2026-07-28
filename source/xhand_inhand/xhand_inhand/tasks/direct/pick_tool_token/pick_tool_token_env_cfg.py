@@ -171,6 +171,11 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # Regrasp grace: 10 frames treated any transient contact reorganization as a drop; a
     # finger-gait step needs a longer unlatched window before the -100 verdict.
     carry_lost_hold_steps = 25
+    # Arm-locked in-hand sub-task: zero the 7 arm action channels so finger gaiting is the
+    # ONLY path to an orientation goal (the exploration space collapses onto the hand and
+    # there is no wrist detour).  Goal positions then track the current object position --
+    # a locked arm cannot translate the tool to a sampled box position.
+    carry_lock_arm = False
     nudge_target_xy = None            # env-local target COM xy; None -> the default spawn xy
     nudge_target_yaw = 0.0            # target heading vs the rest orientation (rad)
     nudge_pos_tolerance = 0.06        # COM xy distance for success (m)
