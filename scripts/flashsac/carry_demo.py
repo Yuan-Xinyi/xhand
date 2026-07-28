@@ -95,17 +95,42 @@ def main() -> None:
         # The auto-reset inside step() clears per-env counters before step returns, so track
         # goals via the cumulative total instead of the per-env count.
         goals_before = int(u._carry_goals_total)
+        timeouts_before = int(u._carry_goal_timeout_total)
+        prev_goals, prev_timeouts = goals_before, timeouts_before
+        events = []
+        flash = 0  # >0: draw border on this frame; sign encodes color
         done = False
         dropped = False
         while not done:
             mean, _ = actor.get_mean_and_std(obs["policy"], training=False)
             obs, _, terminated, truncated, _ = env.step(torch.tanh(mean))
-            frames.append(u.render())
+            frame = np.asarray(u.render()).copy()
+            now_goals = int(u._carry_goals_total)
+            now_timeouts = int(u._carry_goal_timeout_total)
+            if now_goals > prev_goals:
+                events.append((len(frames), "REACHED"))
+                flash = 12
+            elif now_timeouts > prev_timeouts:
+                events.append((len(frames), "timeout-swap"))
+                flash = -12
+            prev_goals, prev_timeouts = now_goals, now_timeouts
+            if flash != 0:
+                color = (60, 220, 120) if flash > 0 else (230, 70, 60)
+                w = 14
+                frame[:w, :] = color; frame[-w:, :] = color
+                frame[:, :w] = color; frame[:, -w:] = color
+                flash += -1 if flash > 0 else 1
+            frames.append(frame)
             dropped = bool(terminated[0])
             done = bool(terminated[0] or truncated[0])
         goals = int(u._carry_goals_total) - goals_before
+        swaps = int(u._carry_goal_timeout_total) - timeouts_before
         outcome = "drop" if dropped else "timeout"
-        print(f"[demo] episode {episode}: goals={goals} end={outcome}", flush=True)
+        print(
+            f"[demo] episode {episode}: goals={goals} timeout_swaps={swaps} end={outcome} "
+            f"events={[(f, t) for f, t in events]}",
+            flush=True,
+        )
         if goals >= args_cli.min_goals and saved < args_cli.max_clips:
             saved += 1
             path = args_cli.video_folder / f"carry_goals{goals}_{saved}.mp4"
