@@ -2161,9 +2161,10 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._carry_goal_count[env_ids] = 0
         self._carry_goal_age[env_ids] = 0
         self._carry_goal_timed_out[env_ids] = False
-        if self.cfg.carry_mode:
-            self._carry_resample_goals(env_ids)
-            self._carry_prev_arm_targets[env_ids] = self.dof_targets[env_ids][:, self._arm_ids_t]
+        # NOTE: carry goal resampling happens AFTER _apply_curriculum_resets below --
+        # sampling here would base object-following goals on the PREVIOUS episode's final
+        # object pose (often dropped on the table), spawning the first goal below the
+        # workspace (user-observed).
         self._ng_stable_steps[env_ids] = 0
         self._ng_success[env_ids] = False
         self._ng_failure[env_ids] = False
@@ -2220,6 +2221,10 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._prev_lift_potential[env_ids] = 0.0
         self._potential_initialized[env_ids] = False
         self._apply_curriculum_resets(env_ids)
+        if self.cfg.carry_mode:
+            # Goals must see the RESTORED (lifted-hold) object pose, not the stale one.
+            self._carry_resample_goals(env_ids)
+            self._carry_prev_arm_targets[env_ids] = self.dof_targets[env_ids][:, self._arm_ids_t]
         self._close_option_start_xy[env_ids] = self._object_com_position_w()[env_ids, :2]
 
     # ------------------------------------------------------------------ reset object placement (P1-8)
