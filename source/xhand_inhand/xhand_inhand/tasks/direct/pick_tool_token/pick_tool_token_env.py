@@ -1370,13 +1370,18 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             r_c_goal = cfg.carry_goal_bonus * self._carry_reached.float()
             r_c_goal = r_c_goal - cfg.carry_goal_timeout_penalty * self._carry_goal_timed_out.float()
             r_c_drop = -cfg.carry_drop_penalty * self._carry_failure.float()
-            # Arm-expensive motion cost (hand stays free): mean |arm target delta| per step,
+            # Arm-expensive motion cost (hand stays cheap): mean |arm target delta| per step,
             # normalized by the realizable per-step arm motion.
             arm_targets = self.dof_targets[:, self._arm_ids_t]
             arm_step = (arm_targets - self._carry_prev_arm_targets).abs().mean(dim=-1)
             self._carry_prev_arm_targets.copy_(arm_targets)
             realizable = max(float(cfg.act_moving_average * cfg.action_scale), 1.0e-6)
             r_c_arm = -cfg.carry_arm_motion_penalty * (arm_step / realizable).clamp(max=1.5)
+            # SimToolReal hand recipe: a 1/10-weight L1 joint-velocity penalty -- gaiting
+            # stays affordable, jitter does not.
+            r_c_hand = -cfg.carry_hand_vel_penalty * self.robot.data.joint_vel[
+                :, self._hand_ids_t
+            ].abs().mean(dim=-1)
             log["carry_pos_err_mean"] = pos_err.mean()
             log["carry_rot_err_mean"] = rot_err.mean()
             log["carry_grasped_frac"] = self._is_grasped.float().mean()
@@ -1393,6 +1398,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 + r_c_goal
                 + r_c_drop
                 + r_c_arm
+                + r_c_hand
                 + r_force_penalty
                 + r_residual_penalty
             )
@@ -1843,6 +1849,10 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 self._carry_goals_total.add_(ids.numel())
                 self._carry_hold_steps[ids] = 0
                 self._carry_resample_goals(ids)
+                if cfg.carry_streak_mode:
+                    # SimToolReal streak mechanic: a reach resets the episode clock, so
+                    # episodes end on failure or stall, never mid-streak.
+                    self.episode_length_buf[ids] = 0
             dropped_hold = self._carry_lost_steps >= cfg.carry_lost_hold_steps
             failure = dropped_hold | unsafe_force
             self._carry_failure.copy_(failure)

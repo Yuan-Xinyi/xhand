@@ -185,6 +185,12 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # target point -- used with lifted-hold spawns so goals stay reachable at low arm
     # authority and the tool never has to approach the table.
     carry_goal_follow_object = False
+    # SimToolReal-aligned smoothness/streak terms:
+    # hand joint-velocity penalty at 1/10 the arm weight (their -0.03/-0.003 recipe) -- the
+    # hand stays cheap enough to gait but jitter costs; streak mode resets the episode clock
+    # on every reach so runs end by failure or stall, not mid-streak.
+    carry_hand_vel_penalty = 0.0
+    carry_streak_mode = False
     nudge_target_xy = None            # env-local target COM xy; None -> the default spawn xy
     nudge_target_yaw = 0.0            # target heading vs the rest orientation (rad)
     nudge_pos_tolerance = 0.06        # COM xy distance for success (m)

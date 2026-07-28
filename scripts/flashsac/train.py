@@ -460,6 +460,23 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         "object; finger gaiting is the only path to orientation goals.",
     )
     parser.add_argument(
+        "--carry_hand_vel_cost",
+        type=float,
+        default=None,
+        help="Hand joint-velocity L1 penalty (SimToolReal uses arm:hand = 10:1).",
+    )
+    parser.add_argument(
+        "--carry_streak",
+        action="store_true",
+        help="Reach resets the episode clock (SimToolReal streak mode).",
+    )
+    parser.add_argument(
+        "--carry_goal_bonus",
+        type=float,
+        default=None,
+        help="Per-goal bonus override (SimToolReal separates it far above shaping).",
+    )
+    parser.add_argument(
         "--carry_no_skip",
         action="store_true",
         help="Goals never expire: no timeout-swap escape valve.  The only way to keep "
@@ -943,6 +960,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             cfg_overrides["carry_arm_motion_penalty"] = args.carry_arm_cost
         if args.carry_timeout_cost is not None:
             cfg_overrides["carry_goal_timeout_penalty"] = args.carry_timeout_cost
+        if args.carry_hand_vel_cost is not None:
+            cfg_overrides["carry_hand_vel_penalty"] = args.carry_hand_vel_cost
+        if args.carry_streak:
+            cfg_overrides["carry_streak_mode"] = True
+        if args.carry_goal_bonus is not None:
+            cfg_overrides["carry_goal_bonus"] = args.carry_goal_bonus
         if args.carry_no_skip:
             cfg_overrides["carry_goal_timeout_steps"] = 1_000_000_000
             cfg_overrides["carry_goal_timeout_penalty"] = 0.0
