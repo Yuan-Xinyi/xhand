@@ -23,6 +23,7 @@ parser.add_argument("--max_clips", type=int, default=3)
 parser.add_argument("--pos_tolerance", type=float, default=0.04)
 parser.add_argument("--rot_tolerance", type=float, default=0.35)
 parser.add_argument("--rot_range", type=float, default=0.6)
+parser.add_argument("--rel_angle", type=float, default=0.0, help=">0: relative-orientation goals with this max angle (rad)")
 parser.add_argument("--episode_length_s", type=float, default=15.0)
 parser.add_argument("--fps", type=int, default=40)
 parser.add_argument("--seed", type=int, default=0)
@@ -69,6 +70,8 @@ def main() -> None:
     cfg.carry_rot_tolerance = args_cli.rot_tolerance
     cfg.target_rot_range_roll = (-args_cli.rot_range, args_cli.rot_range)
     cfg.target_rot_range_pitch = (-args_cli.rot_range, args_cli.rot_range)
+    if args_cli.rel_angle > 0.0:
+        cfg.carry_goal_rel_angle_max = args_cli.rel_angle
     cfg.curriculum_dataset = str(args_cli.curriculum_dataset)
     cfg.curriculum_boundary = "carry_start"
     cfg.curriculum_reset_probability = 1.0
