@@ -394,6 +394,13 @@ def main() -> None:
         nonlocal lift_mask, retract_mask
         # Normal home reset: the v6 nudge policy was annealed to operate from the home pose.
         obs, _ = env.reset()
+        if carry_actor is not None:
+            # The carry stage rewrites target_pos (obs dims 63:66); nudge/grasp policies
+            # trained with the cfg constant there.  Restore it per attempt or every attempt
+            # after a successful flight sees an off-distribution goal offset (measured:
+            # attempts 2+ collapse to nudged=0 in demo mode).
+            u.target_pos[:] = torch.tensor(cfg.target_pos, device=dev)
+            u._update_goal_marker()
         initial_phase = PHASE_GRASP if args_cli.grasp_only else PHASE_NUDGE
         phase = torch.full((n,), initial_phase, dtype=torch.long, device=dev)
         phase_entry = torch.zeros(n, dtype=torch.long, device=dev)
@@ -443,6 +450,7 @@ def main() -> None:
             + args_cli.lift_ramp
             + args_cli.hold_steps
             + (args_cli.inhand_deadline if inhand_actor is not None else 0)
+            + (args_cli.carry_stage_steps if carry_actor is not None else 0)
         )
         for step in range(total_steps):
             if step == 0 and os.environ.get("CHAIN_DUMP_OBS"):
