@@ -85,12 +85,13 @@ python arm_node.py --dry-run             # standalone, no arm — try the sticks
 | Control | Action |
 |---|---|
 | left stick | translate x/y (base frame: up = forward +x, left = +y) |
-| RT / LT | translate z up / down (analog) |
+| LT / RT | translate z up / down (analog) |
 | right stick horiz. | wrist twist (about tool z) |
 | right stick vert. | pitch (about tool x) |
 | LB / RB | roll left / right (about tool y) |
 | d-pad up/down | speed scale 0.25x–2x |
 | A | hold + re-sync target to actual pose |
+| B | slowly reset orientation to `--reset-rpy` (default = taught neutral, 10 deg/s; any rotation input cancels) |
 | Back | quit cleanly |
 
 Stick deflection maps to velocity through a deadzone (`--deadzone` 0.15) and a
