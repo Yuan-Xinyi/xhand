@@ -268,6 +268,9 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._inhand_success_total = torch.zeros((), dtype=torch.long, device=dev)
         self._inhand_failure_total = torch.zeros((), dtype=torch.long, device=dev)
         self._inhand_timeout_total = torch.zeros((), dtype=torch.long, device=dev)
+        # pipeline mode state
+        self._pipe_flying = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._pipe_just_latched = torch.zeros(N, dtype=torch.bool, device=dev)
         # carry mode state (consecutive pose goals)
         self._carry_base_target_pos = torch.tensor(
             self.cfg.target_pos, dtype=torch.float, device=dev
@@ -1511,7 +1514,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             log["nudge_grasp_timeout_rate_total"] = self._ng_timeout_total.float() / ng_completed
             log["nudge_table_hit_rate_total"] = self._ng_table_hit_total.float() / ng_completed
             log["nudge_grasp_stable_steps_mean"] = self._ng_stable_steps.float().mean()
-            return (
+            ng_stack = (
                 r_ng_reach
                 + r_ng_touch
                 + r_ng_pose
@@ -1522,12 +1525,37 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 + r_close_progress
                 + r_wrap_progress
                 + r_grasp
-                + r_ng_success
                 + r_ng_failure
                 + r_ng_timeout
                 + r_force_penalty
                 + r_residual_penalty
             )
+            if not cfg.pipeline_mode:
+                return ng_stack + r_ng_success
+            # Pipeline: one-shot latch bonus, then the carry stack while flying.
+            flying = self._pipe_flying
+            pos_err, rot_err = self._carry_errors()
+            pos_k = torch.exp(-pos_err / cfg.carry_pos_sigma)
+            rot_k = torch.exp(-rot_err / cfg.carry_rot_sigma)
+            carry_stack = (
+                cfg.carry_pos_scale * pos_k
+                + cfg.carry_rot_scale * rot_k
+                + cfg.carry_pose_scale * pos_k * rot_k
+                + cfg.carry_goal_bonus * self._carry_reached.float()
+                - cfg.carry_drop_penalty * self._carry_failure.float()
+                - cfg.carry_hand_vel_penalty
+                * self.robot.data.joint_vel[:, self._hand_ids_t].abs().mean(dim=-1)
+                + r_force_penalty
+                + r_residual_penalty
+            )
+            r_latch_once = cfg.nudge_grasp_success_bonus * self._pipe_just_latched.float()
+            log["pipe_flying_frac"] = flying.float().mean()
+            c_epis = self._carry_episode_total.clamp_min(1).float()
+            log["carry_goals_per_episode"] = self._carry_goals_total.float() / c_epis
+            log["carry_drop_rate_total"] = self._carry_drop_total.float() / c_epis
+            log["carry_pos_err_mean"] = pos_err.mean()
+            log["carry_rot_err_mean"] = rot_err.mean()
+            return torch.where(flying, carry_stack, ng_stack) + r_latch_once
 
         if cfg.nudge_option_mode:
             # Non-prehensile reorientation: no grasp/close/lift terms at all.  Two potential-based
@@ -1956,6 +1984,66 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             self._ng_failure.copy_(failure)
             # Escapes are penalized lighter than hard failures in the reward branch.
             self._ng_escaped.copy_(escaped & ~(table_hit | dropped | unsafe_force))
+            if cfg.pipeline_mode:
+                # Phase transition: first sustained latch -> flying; not a terminal.
+                newly = success & (~self._pipe_flying)
+                self._pipe_just_latched.copy_(newly)
+                if bool(newly.any()):
+                    ids = newly.nonzero(as_tuple=False).squeeze(-1)
+                    self._pipe_flying[ids] = True
+                    self._carry_resample_goals(ids)
+                flying = self._pipe_flying
+                pos_err, rot_err = self._carry_errors()
+                at_goal = (
+                    flying
+                    & (pos_err <= cfg.carry_pos_tolerance)
+                    & (rot_err <= cfg.carry_rot_tolerance)
+                    & self._is_grasped
+                    & (max_force <= cfg.grasp_bonus_max_force)
+                )
+                self._carry_hold_steps.copy_(
+                    torch.where(at_goal, self._carry_hold_steps + 1, torch.zeros_like(self._carry_hold_steps))
+                )
+                reached = self._carry_hold_steps >= cfg.carry_confirm_steps
+                self._carry_reached.copy_(reached)
+                if bool(reached.any()):
+                    ids = reached.nonzero(as_tuple=False).squeeze(-1)
+                    self._carry_goal_count[ids] += 1
+                    self._carry_goals_total.add_(ids.numel())
+                    self._carry_hold_steps[ids] = 0
+                    self._carry_resample_goals(ids)
+                self._carry_lost_steps.copy_(
+                    torch.where(
+                        flying & (~self._is_grasped),
+                        self._carry_lost_steps + 1,
+                        torch.zeros_like(self._carry_lost_steps),
+                    )
+                )
+                fly_fail = flying & (
+                    (self._carry_lost_steps >= cfg.carry_lost_hold_steps) | unsafe_force
+                )
+                ground_fail = (~flying) & failure
+                self._carry_failure.copy_(fly_fail)
+                terminated = ground_fail | fly_fail
+                time_out = time_out & ~terminated
+                finished = terminated | time_out
+                self._carry_episode_total.add_(finished.sum())
+                self._carry_drop_total.add_(fly_fail.sum())
+                self._ng_timeout.copy_(time_out)
+                self.extras["pick_tool_terminal"] = {
+                    "success": (time_out & (self._carry_goal_count > 0)).clone(),
+                    "failure": (ground_fail | fly_fail).clone(),
+                    "time_out": time_out.clone(),
+                    "dropped": fly_fail.clone(),
+                    "unsafe_force": unsafe_force.clone(),
+                    "unlatched_clearance_ge_5cm": (
+                        (clearance >= 0.05) & (~self._is_grasped)
+                    ).clone(),
+                    "pipeline_flying": flying.clone(),
+                    "carry_goal_count": self._carry_goal_count.clone(),
+                    **terminal_state,
+                }
+                return terminated, time_out
             terminated = success | failure
             time_out = time_out & ~terminated
             self._ng_timeout.copy_(time_out)
@@ -2159,6 +2247,8 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._inhand_success[env_ids] = False
         self._inhand_failure[env_ids] = False
         self._inhand_timeout[env_ids] = False
+        self._pipe_flying[env_ids] = False
+        self._pipe_just_latched[env_ids] = False
         self._carry_hold_steps[env_ids] = 0
         self._carry_lost_steps[env_ids] = 0
         self._carry_reached[env_ids] = False

@@ -194,6 +194,12 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # Goal z floor: sampled goal positions are clamped to table_surface + this margin so no
     # goal pose can require the tool near the table (tool half-diagonal ~0.13m + clearance).
     carry_goal_z_margin = 0.16
+    # ---- sequential-RL pipeline mode: ONE policy, home -> nudge+park -> latch -> carry ----
+    # Phase A (unlatched): the nudge_grasp reward stack and failure gates.  The first
+    # sustained latch does NOT terminate: it pays a one-shot bonus, flags the env as flying
+    # and samples the first elevated carry goal.  Phase B (flying): the carry stack
+    # (consecutive pose goals, no-skip); losing the latch is the only failure.
+    pipeline_mode = False
     nudge_target_xy = None            # env-local target COM xy; None -> the default spawn xy
     nudge_target_yaw = 0.0            # target heading vs the rest orientation (rad)
     nudge_pos_tolerance = 0.06        # COM xy distance for success (m)

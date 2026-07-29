@@ -97,6 +97,7 @@ STRICT_METRIC_KEYS = (
     "carry_drop_rate_total",
     "carry_goal_timeouts_total",
     "carry_arm_motion_mean",
+    "pipe_flying_frac",
 )
 
 _ADAPTER_INFO_KEYS = frozenset(

@@ -460,6 +460,28 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         "object; finger gaiting is the only path to orientation goals.",
     )
     parser.add_argument(
+        "--pipeline_option",
+        action="store_true",
+        help="Sequential-RL unified task: ONE policy, home -> nudge+park -> latch (one-shot "
+        "bonus) -> consecutive elevated carry goals.  Uses the nudge_grasp stack before the "
+        "latch and the carry stack after; goals never expire.",
+    )
+    parser.add_argument(
+        "--pipeline_rel_angle",
+        type=float,
+        default=1.8,
+        help="pipeline carry-goal max relative rotation (rad)",
+    )
+    parser.add_argument(
+        "--curriculum_prob_anneal",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("START", "END"),
+        help="Anneal curriculum_reset_probability linearly over the run (1.0 -> 0.0 slides "
+        "spawns from the stage entry states back to the ordinary home reset).",
+    )
+    parser.add_argument(
         "--carry_hand_vel_cost",
         type=float,
         default=None,
@@ -627,7 +649,13 @@ def _validate_args(args: argparse.Namespace) -> None:
             start, target = pair
             if not (0.0 < target <= start):
                 raise ValueError(f"--{name} needs START >= TARGET > 0")
-    if sum((args.nudge_option, args.close_option, args.nudge_grasp_option, args.inhand_option, args.carry_option)) > 1:
+    if args.pipeline_option and args.curriculum_dataset is None:
+        raise ValueError("--pipeline_option requires --curriculum_dataset for the spawn anneal")
+    if args.curriculum_prob_anneal is not None:
+        start, end = args.curriculum_prob_anneal
+        if not (0.0 <= end <= start <= 1.0):
+            raise ValueError("--curriculum_prob_anneal needs 1 >= START >= END >= 0")
+    if sum((args.nudge_option, args.close_option, args.nudge_grasp_option, args.inhand_option, args.carry_option, args.pipeline_option)) > 1:
         raise ValueError(
             "--nudge_option, --close_option and --nudge_grasp_option are mutually exclusive"
         )
@@ -981,6 +1009,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             cfg_overrides["carry_arm_authority"] = args.carry_arm_unlock[0]
         if args.episode_length_s is None:
             cfg_overrides["episode_length_s"] = 15.0
+    if args.pipeline_option:
+        cfg_overrides["nudge_grasp_mode"] = True
+        cfg_overrides["pipeline_mode"] = True
+        cfg_overrides["carry_goal_rel_angle_max"] = args.pipeline_rel_angle
+        cfg_overrides["carry_goal_bonus"] = 100.0
+        cfg_overrides["carry_hand_vel_penalty"] = 0.01
+        cfg_overrides["nudge_spawn_blend_min"] = 0.0
+        cfg_overrides["nudge_spawn_blend_max"] = 0.0
+        if args.episode_length_s is None:
+            cfg_overrides["episode_length_s"] = 20.0
     env = make_pick_tool_env(
         num_envs=args.num_envs,
         device=device,
@@ -1291,6 +1329,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "inhand_dist_gate": current,
                     "inhand_gate_window_success": window_succ,
                 }
+            if args.curriculum_prob_anneal is not None:
+                start, end = args.curriculum_prob_anneal
+                progress = min(1.0, interaction_step / max(1, args.steps))
+                env.unwrapped.cfg.curriculum_reset_probability = start + (end - start) * progress
             if args.carry_option and args.carry_arm_unlock is not None:
                 start, end = args.carry_arm_unlock
                 progress = min(1.0, interaction_step / max(1, args.steps))
