@@ -46,6 +46,30 @@ python teleop.py --sim-args "--debug" --perc-args "--beta 2.0 --redetect-interva
 The Isaac side is never SIGKILLed on shutdown (that can corrupt the Isaac Sim
 install) — worst case the launcher waits a few extra seconds for its clean exit.
 
+## Real hardware (`real_node.py`)
+
+Drives the physical XHand over RS-485 (`/dev/ttyUSB0` @ 3 Mbaud; protocol ported
+from `one` repo branch `dex-hand`, `Yuan/dexterous_hand/xhand_con/`). Runs in the
+`wilor` env (pyserial installed there). Bring-up order:
+
+```bash
+cd tools/teleop            # (conda activate wilor)
+python real_node.py --ping      # 1. read-only firmware query — checks power+cable
+python real_node.py --check     # 2. slow per-joint sweep — verify id<->joint mapping
+python real_node.py --open      # 3. ramp to flat-open pose
+python teleop.py --real         # 4. full teleop: camera -> REAL hand (one command)
+```
+
+Safety layers (always on): URDF joint-limit clamp (`--limit-margin` 0.02 rad),
+per-joint speed limit (`--max-speed` 2.5 rad/s — also soft-starts), EMA smoothing
+(`--smooth` 0.5), first target initialized from the hand's measured position (no
+enable jump), stream watchdog (stale > `--timeout` 2 s -> hold pose, never snap).
+Firmware-side: `--kp 100 --kd 10 --tor-max 300`. Start gentle on a new setup:
+`python teleop.py --real --real-args "--max-speed 1.5 --tor-max 200"`.
+
+If the hardware finger-id order ever mismatches (a `--check` sweep moves the
+wrong joint), fix `HW_JOINT_NAMES` in real_node.py — one place only.
+
 ## Run (two terminals, manual)
 
 **Terminal 1 — sim driver** (`conda activate env_isaaclab`):
@@ -101,6 +125,7 @@ python fake_source.py --rate 30 --period 3.0
 ## Files
 
 - `teleop.py` — single-command launcher: spawns both nodes in their conda envs, manages shutdown (stdlib only).
+- `real_node.py` — REAL XHand driver: UDP subscribe -> safety layers -> RS-485 position commands (see "Real hardware").
 - `viz_panel.py` — `--show` dashboard: camera+skeleton | MANO 3D pose (mapping input, front/side views) | 12 xhand joint bars with URDF limits (mapping output = the exact wire values the sim/real hand executes).
 - `protocol.py` — UDP wire format + the canonical 12-joint order (stdlib only; imported by both envs).
 - `camera.py` — `CVCamera` (webcam, MJPG + 1-frame buffer) and `RealSenseCamera` (color stream, auto reset-on-busy).

@@ -110,6 +110,11 @@ def main() -> None:
     ap.add_argument("--flip", action="store_true")
     ap.add_argument("--no-show", action="store_true",
                     help="run perception headless (default opens the overlay window)")
+    # real hardware instead of Isaac sim
+    ap.add_argument("--real", action="store_true",
+                    help="drive the REAL xhand over serial (real_node.py) instead of Isaac Sim")
+    ap.add_argument("--real-args", default="",
+                    help="extra args for real_node.py, quoted string (e.g. \"--max-speed 1.5\")")
     # escape hatches for anything else
     ap.add_argument("--sim-args", default="", help="extra args for teleop_sim.py, quoted string")
     ap.add_argument("--perc-args", default="", help="extra args for perception_node.py, quoted string")
@@ -130,7 +135,12 @@ def main() -> None:
         perc_args.append("--show")
     perc_args += shlex.split(args.perc_args)
 
-    print(f"[teleop] sim        ({SIM_ENV}): teleop_sim.py {' '.join(sim_args)}")
+    real_args = link + shlex.split(args.real_args)
+
+    if args.real:
+        print(f"[teleop] REAL hand  ({PERC_ENV}): real_node.py {' '.join(real_args)}")
+    else:
+        print(f"[teleop] sim        ({SIM_ENV}): teleop_sim.py {' '.join(sim_args)}")
     print(f"[teleop] perception ({PERC_ENV}): perception_node.py {' '.join(perc_args)}")
 
     # a SIGTERM to the launcher must also tear the children down cleanly
@@ -142,7 +152,10 @@ def main() -> None:
     procs: dict[str, subprocess.Popen] = {}
     exit_code = 0
     try:
-        procs["sim"] = _spawn(SIM_ENV, "teleop_sim.py", sim_args)
+        if args.real:
+            procs["real"] = _spawn(PERC_ENV, "real_node.py", real_args)
+        else:
+            procs["sim"] = _spawn(SIM_ENV, "teleop_sim.py", sim_args)
         procs["perception"] = _spawn(PERC_ENV, "perception_node.py", perc_args)
 
         # babysit: if either side dies, tear the other down
