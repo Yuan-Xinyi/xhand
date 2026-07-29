@@ -194,6 +194,16 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # Goal z floor: sampled goal positions are clamped to table_surface + this margin so no
     # goal pose can require the tool near the table (tool half-diagonal ~0.13m + clearance).
     carry_goal_z_margin = 0.16
+    # Anti-drop package for complex in-hand reorientations:
+    # contact-security occupancy pays for the FRACTION of fingertips touching the tool while
+    # carrying (momentum flings hold few contacts and drop; secure gaits keep 3+), random
+    # object impulses (SimToolReal DR) train micro-catches, and hard-tail goal mixing spends
+    # half the goals where the drops actually happen.
+    carry_contact_occupancy = 0.0
+    carry_impulse_prob = 0.0          # per-env per-step probability of an object impulse
+    carry_impulse_force = 2.0         # impulse force magnitude (N)
+    carry_impulse_torque = 0.08      # impulse torque magnitude (N*m)
+    carry_goal_hard_frac = 0.0       # fraction of goals sampled from the top-30% angle tail
     # ---- sequential-RL pipeline mode: ONE policy, home -> nudge+park -> latch -> carry ----
     # Phase A (unlatched): the nudge_grasp reward stack and failure gates.  The first
     # sustained latch does NOT terminate: it pays a one-shot bonus, flags the env as flying

@@ -1025,6 +1025,20 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             authority = 0.0 if self.cfg.carry_lock_arm else float(self.cfg.carry_arm_authority)
             if authority < 1.0:
                 shielded[:, : self._n_arm] *= authority
+        if (self.cfg.carry_mode or self.cfg.pipeline_mode) and self.cfg.carry_impulse_prob > 0.0:
+            # SimToolReal-style disturbance DR: random impulses on the held tool teach
+            # micro-catches instead of drops.
+            hit = torch.rand((self.num_envs,), device=self.device) < self.cfg.carry_impulse_prob
+            if bool(hit.any()):
+                forces = torch.zeros((self.num_envs, 1, 3), device=self.device)
+                torques = torch.zeros((self.num_envs, 1, 3), device=self.device)
+                direction = torch.randn((self.num_envs, 3), device=self.device)
+                direction = direction / direction.norm(dim=-1, keepdim=True).clamp_min(1.0e-9)
+                forces[hit, 0] = direction[hit] * self.cfg.carry_impulse_force
+                spin = torch.randn((self.num_envs, 3), device=self.device)
+                spin = spin / spin.norm(dim=-1, keepdim=True).clamp_min(1.0e-9)
+                torques[hit, 0] = spin[hit] * self.cfg.carry_impulse_torque
+                self.object.set_external_force_and_torque(forces, torques)
         self._arm_up_shield_fraction.zero_()
         object_force = None
         soft = None
@@ -1373,6 +1387,13 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             r_c_goal = cfg.carry_goal_bonus * self._carry_reached.float()
             r_c_goal = r_c_goal - cfg.carry_goal_timeout_penalty * self._carry_goal_timed_out.float()
             r_c_drop = -cfg.carry_drop_penalty * self._carry_failure.float()
+            contact_frac = (
+                (self._finger_object_force_magnitudes() >= cfg.contact_force_thr)
+                .float()
+                .mean(dim=-1)
+            )
+            r_c_contact = cfg.carry_contact_occupancy * contact_frac
+            log["carry_contact_frac_mean"] = contact_frac.mean()
             # Arm-expensive motion cost (hand stays cheap): mean |arm target delta| per step,
             # normalized by the realizable per-step arm motion.
             arm_targets = self.dof_targets[:, self._arm_ids_t]
@@ -1400,6 +1421,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 + r_c_pose
                 + r_c_goal
                 + r_c_drop
+                + r_c_contact
                 + r_c_arm
                 + r_c_hand
                 + r_force_penalty
@@ -1542,6 +1564,10 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 + cfg.carry_rot_scale * rot_k
                 + cfg.carry_pose_scale * pos_k * rot_k
                 + cfg.carry_goal_bonus * self._carry_reached.float()
+                + cfg.carry_contact_occupancy
+                * (self._finger_object_force_magnitudes() >= cfg.contact_force_thr)
+                .float()
+                .mean(dim=-1)
                 - cfg.carry_drop_penalty * self._carry_failure.float()
                 - cfg.carry_hand_vel_penalty
                 * self.robot.data.joint_vel[:, self._hand_ids_t].abs().mean(dim=-1)
@@ -1702,6 +1728,15 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             axis = torch.randn((n, 3), device=self.device)
             axis = axis / axis.norm(dim=-1, keepdim=True).clamp_min(1.0e-9)
             angle = sample_uniform(0.0, self.cfg.carry_goal_rel_angle_max, (n,), self.device)
+            if self.cfg.carry_goal_hard_frac > 0.0:
+                hard = sample_uniform(
+                    0.7 * self.cfg.carry_goal_rel_angle_max,
+                    self.cfg.carry_goal_rel_angle_max,
+                    (n,),
+                    self.device,
+                )
+                pick_hard = torch.rand((n,), device=self.device) < self.cfg.carry_goal_hard_frac
+                angle = torch.where(pick_hard, hard, angle)
             half_a = 0.5 * angle
             dq = torch.cat((torch.cos(half_a).unsqueeze(-1), torch.sin(half_a).unsqueeze(-1) * axis), dim=-1)
             q = self.object.data.root_quat_w[env_ids]

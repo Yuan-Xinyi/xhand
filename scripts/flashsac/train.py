@@ -482,6 +482,15 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         "spawns from the stage entry states back to the ordinary home reset).",
     )
     parser.add_argument(
+        "--carry_antidrop",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("CONTACT", "IMPULSE_PROB", "HARD_FRAC"),
+        help="Anti-drop package: contact-security occupancy weight, per-step object impulse "
+        "probability (SimToolReal DR), hard-tail goal fraction.  E.g. '0.1 0.01 0.5'.",
+    )
+    parser.add_argument(
         "--carry_hand_vel_cost",
         type=float,
         default=None,
@@ -990,6 +999,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             cfg_overrides["carry_goal_timeout_penalty"] = args.carry_timeout_cost
         if args.carry_hand_vel_cost is not None:
             cfg_overrides["carry_hand_vel_penalty"] = args.carry_hand_vel_cost
+        if args.carry_antidrop is not None:
+            cfg_overrides["carry_contact_occupancy"] = args.carry_antidrop[0]
+            cfg_overrides["carry_impulse_prob"] = args.carry_antidrop[1]
+            cfg_overrides["carry_goal_hard_frac"] = args.carry_antidrop[2]
         if args.carry_streak:
             cfg_overrides["carry_streak_mode"] = True
         if args.carry_goal_bonus is not None:
