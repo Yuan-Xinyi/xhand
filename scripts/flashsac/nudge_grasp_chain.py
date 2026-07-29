@@ -128,6 +128,13 @@ parser.add_argument("--carry_goal_hold", type=int, default=10)
 parser.add_argument("--carry_first_rel", type=float, default=0.8, help="first-goal max rel angle")
 parser.add_argument("--carry_next_rel", type=float, default=1.8, help="subsequent goals max rel angle")
 parser.add_argument("--carry_stage_steps", type=int, default=650)
+parser.add_argument(
+    "--carry_goal_timeout",
+    type=int,
+    default=250,
+    help="inference-time per-goal budget in control steps (~5s at 50Hz): an unreached goal "
+    "is skipped and resampled (red flash in demo clips; reaches flash green).  0 disables.",
+)
 parser.add_argument("--carry_goal_pos", type=float, nargs=3, default=[0.5, 0.0, 0.35])
 parser.add_argument(
     "--inhand_checkpoint",
@@ -433,6 +440,9 @@ def main() -> None:
         carry_hold = torch.zeros(n, dtype=torch.long, device=dev)
         carry_lost = torch.zeros(n, dtype=torch.long, device=dev)
         carry_goals = torch.zeros(n, dtype=torch.long, device=dev)
+        carry_age = torch.zeros(n, dtype=torch.long, device=dev)
+        carry_skips = torch.zeros(n, dtype=torch.long, device=dev)
+        flash = 0  # demo border flash: +N green (reach), -N red (skip)
         # grasp-phase diagnostics
         g_max_quality = torch.zeros(n, device=dev)
         g_max_proximity = torch.zeros(n, device=dev)
@@ -623,16 +633,30 @@ def main() -> None:
                         & u._is_grasped
                     )
                     carry_hold = torch.where(at_goal, carry_hold + 1, torch.zeros_like(carry_hold))
+                    carry_age = torch.where(carrying, carry_age + 1, torch.zeros_like(carry_age))
                     goal_hit = carrying & (carry_hold >= args_cli.carry_goal_hold)
                     if bool(goal_hit.any()):
                         ids = goal_hit.nonzero(as_tuple=False).squeeze(-1)
                         carry_goals[ids] += 1
                         carry_hold[ids] = 0
+                        carry_age[ids] = 0
                         first = goal_hit & (~success)
                         if bool(first.any()):
                             success_step[first] = step
                             success |= first
                         sample_carry_goals(ids, args_cli.carry_next_rel)
+                        if bool(goal_hit[0]):
+                            flash = 12
+                    if args_cli.carry_goal_timeout > 0:
+                        stale = carrying & (carry_age >= args_cli.carry_goal_timeout) & ~goal_hit
+                        if bool(stale.any()):
+                            ids = stale.nonzero(as_tuple=False).squeeze(-1)
+                            carry_skips[ids] += 1
+                            carry_hold[ids] = 0
+                            carry_age[ids] = 0
+                            sample_carry_goals(ids, args_cli.carry_next_rel)
+                            if bool(stale[0]):
+                                flash = -12
                     carry_lost = torch.where(
                         carrying & (~u._is_grasped), carry_lost + 1, torch.zeros_like(carry_lost)
                     )
@@ -766,7 +790,15 @@ def main() -> None:
             g_steps += in_grasp.float()
             obs, _, _, _, _ = env.step(action)
             if capture:
-                frames.append(env.unwrapped.render())
+                frame = env.unwrapped.render()
+                if flash != 0:
+                    frame = np.asarray(frame).copy()
+                    color = (60, 220, 120) if flash > 0 else (230, 70, 60)
+                    w = 14
+                    frame[:w, :] = color; frame[-w:, :] = color
+                    frame[:, :w] = color; frame[:, -w:] = color
+                    flash += -1 if flash > 0 else 1
+                frames.append(frame)
 
             # ---- strict success (lift phase only) ----
             post = u._compute_grasp_signals()
@@ -844,6 +876,7 @@ def main() -> None:
             "grasped": int(grasped.sum()),
             "lifted": int(lifted.sum()),
             "carry_goals": int(carry_goals.sum()),
+            "carry_skips": int(carry_skips.sum()),
             "inhand_min_dist": _summary(ih_min_dist[lifted]) if bool(lifted.any()) else None,
             "success": int(success.sum()),
             "frames": frames,
