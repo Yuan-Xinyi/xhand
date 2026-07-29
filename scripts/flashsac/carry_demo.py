@@ -55,10 +55,19 @@ import agent_bridge  # noqa: E402,F401
 from flash_rl.agents.flashSAC.network import FlashSACActor  # noqa: E402
 
 
+def _infer_actor_arch(state: dict) -> tuple[int, int]:
+    """(num_blocks, hidden_dim) from weight shapes -- loaders stay valid for any size."""
+    hidden = state["embedder.w.w.weight"].shape[0]
+    blocks = len({k.split(".")[1] for k in state if k.startswith("encoder.")})
+    return blocks, hidden
+
+
+
 def load_actor(checkpoint: Path, device: torch.device) -> FlashSACActor:
     payload = torch.load(checkpoint / "actor.pt", map_location="cpu", weights_only=True)
     state = {k.removeprefix("_orig_mod."): v for k, v in payload["network_state_dict"].items()}
-    actor = FlashSACActor(num_blocks=2, input_dim=115, hidden_dim=128, action_dim=21)
+    blocks, hidden = _infer_actor_arch(canonical if 'canonical' in dir() else state)
+    actor = FlashSACActor(num_blocks=blocks, input_dim=115, hidden_dim=hidden, action_dim=21)
     actor.load_state_dict(state)
     return actor.to(device).eval()
 

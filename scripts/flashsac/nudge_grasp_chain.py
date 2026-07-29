@@ -206,6 +206,14 @@ sys.path.insert(0, str(_HERE.parent / "rl_games"))
 import agent_bridge  # noqa: E402,F401  (import side effect installs the pinned flash_rl path)
 from flash_rl.agents.flashSAC.network import FlashSACActor  # noqa: E402
 
+
+def _infer_actor_arch(state: dict) -> tuple[int, int]:
+    """(num_blocks, hidden_dim) from weight shapes -- loaders stay valid for any size."""
+    hidden = state["embedder.w.w.weight"].shape[0]
+    blocks = len({k.split(".")[1] for k in state if k.startswith("encoder.")})
+    return blocks, hidden
+
+
 from bc_pick_tool import MigratedActor, clone_state, load_torch  # noqa: E402
 from pick_tool_shared import capture_boundary  # noqa: E402
 
@@ -246,7 +254,8 @@ def load_nudge_actor(checkpoint: Path, device: torch.device) -> FlashSACActor:
     for key, value in state.items():
         canonical[key.removeprefix(_COMPILED_PREFIX) if strip else key] = value
     # Production architecture (train.py non-smoke defaults).
-    actor = FlashSACActor(num_blocks=2, input_dim=115, hidden_dim=128, action_dim=21)
+    blocks, hidden = _infer_actor_arch(canonical if 'canonical' in dir() else state)
+    actor = FlashSACActor(num_blocks=blocks, input_dim=115, hidden_dim=hidden, action_dim=21)
     actor.load_state_dict(canonical)
     return actor.to(device).eval()
 
