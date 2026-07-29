@@ -84,9 +84,13 @@ def _crc16(data: bytes) -> bytes:
 
 
 _FINGER_CMD_FMT = "<Hhhh f H H H H H H"   # 24 bytes
-_FINGER_STATE_FMT = "<BB f H H H H H H H H H"  # 22 bytes
-_STATE_BLOCK = 12 * 22                     # finger states in a full response
-_SENSOR_BLOCK = 5 * 366                    # fingertip sensor blob (optional)
+# Per-finger state layout: id(B) sensor_id(B) position(f) + error/temp words.
+# The reference code's size comments are wrong twice over (state "22 B" is
+# really 24, sensor "366 B" is really 3+3*120+20+1 = 384), so match the payload
+# size against the plausible combinations; the position float is at offset 2
+# in every variant. Measured on our unit: 12*24 + 5*384 = 2208 B.
+_STATE_STRIDES = (24, 22)
+_SENSOR_BLOCKS = (5 * 384, 5 * 366)
 
 
 class XHandSerial:
@@ -133,16 +137,30 @@ class XHandSerial:
             for i in range(N_JOINTS))
         return self._parse_positions(self._send(0x02, payload))
 
-    @staticmethod
-    def _parse_positions(data: bytes | None) -> np.ndarray | None:
-        """Extract 12 measured joint positions from a state response, if present."""
-        if data is None or len(data) < _STATE_BLOCK:
+    _warned_payload = False
+
+    @classmethod
+    def _parse_positions(cls, data: bytes | None) -> np.ndarray | None:
+        """Extract 12 measured joint positions from a state response, if present.
+
+        Handles both known state strides (see _STATE_STRIDES) by matching the
+        payload size: 12*stride finger states, optionally + the sensor blob.
+        """
+        if data is None:
             return None
-        pos = np.empty(N_JOINTS, dtype=np.float32)
-        for i in range(N_JOINTS):
-            state = struct.unpack(_FINGER_STATE_FMT, data[i * 22:(i + 1) * 22])
-            pos[i] = state[2]
-        return pos
+        for stride in _STATE_STRIDES:
+            rem = len(data) - N_JOINTS * stride
+            if rem != 0 and rem not in _SENSOR_BLOCKS:
+                continue
+            pos = np.array([struct.unpack_from("<f", data, i * stride + 2)[0]
+                            for i in range(N_JOINTS)], dtype=np.float32)
+            if np.all(np.isfinite(pos)) and np.all(np.abs(pos) < 6.3):
+                return pos
+        if not cls._warned_payload:
+            cls._warned_payload = True
+            print(f"[real][WARN] unrecognized state payload ({len(data)} B) — "
+                  f"running without position readback")
+        return None
 
 
 # ---------------------------------------------------------------------------- helpers
@@ -150,14 +168,15 @@ def _rate_limit(target, current, max_step):
     return current + np.clip(target - current, -max_step, max_step)
 
 
-def _settle_to(hand, goal, start, seconds, hz, label):
+def _settle_to(hand, goal, start, seconds, hz, label=None):
     """Slow linear ramp start->goal (used by --check / --open). Blocking."""
     steps = max(int(seconds * hz), 1)
     for k in range(steps + 1):
         q = start + (goal - start) * (k / steps)
         hand.command_positions(q)
         time.sleep(1.0 / hz)
-    print(f"[real] {label}: done")
+    if label:
+        print(f"[real] {label}: done")
 
 
 def _read_start_pose(hand, args) -> np.ndarray:
@@ -178,16 +197,18 @@ def _read_start_pose(hand, args) -> np.ndarray:
 
 # ---------------------------------------------------------------------------- modes
 def run_check(hand, args):
-    """Sweep each joint alone (slowly) so you can verify the id<->joint mapping."""
+    """Wiggle each joint alone (small back-and-forth) to verify the id<->joint mapping."""
     q = _read_start_pose(hand, args)
     _settle_to(hand, OPEN_POSE, q, 2.0, args.rate, "settle to open")
-    span = 0.35 * (URDF_LIMITS[:, 1] - URDF_LIMITS[:, 0])
+    # small amplitude only: min(--check-span, 30% of range), kept inside limits
+    span = np.minimum(args.check_span, 0.3 * (URDF_LIMITS[:, 1] - URDF_LIMITS[:, 0]))
     for j, name in enumerate(HW_JOINT_NAMES):
-        print(f"[real] check id={j}  ->  should move ONLY {name}")
+        print(f"[real] check id={j:2d}  ->  should wiggle ONLY {name}")
         goal = OPEN_POSE.copy()
-        goal[j] = OPEN_POSE[j] + span[j]
-        _settle_to(hand, goal, OPEN_POSE, 1.2, args.rate, f"  {name} flex")
-        _settle_to(hand, OPEN_POSE, goal, 1.2, args.rate, f"  {name} back")
+        goal[j] = np.clip(OPEN_POSE[j] + span[j], URDF_LIMITS[j, 0], URDF_LIMITS[j, 1])
+        for _ in range(2):  # two gentle back-and-forth cycles
+            _settle_to(hand, goal, OPEN_POSE, 0.7, args.rate)
+            _settle_to(hand, OPEN_POSE, goal, 0.7, args.rate)
     print("[real] mapping check complete.")
 
 
@@ -256,7 +277,10 @@ def main():
     ap.add_argument("--tor-max", type=int, default=300, help="firmware torque cap per joint")
     ap.add_argument("--ping", action="store_true",
                     help="read firmware version and exit (read-only, no motion)")
-    ap.add_argument("--check", action="store_true", help="slow per-joint sweep, then exit")
+    ap.add_argument("--check", action="store_true",
+                    help="small per-joint wiggle to verify id<->joint mapping, then exit")
+    ap.add_argument("--check-span", type=float, default=0.25,
+                    help="wiggle amplitude for --check (rad, capped at 30%% of joint range)")
     ap.add_argument("--open", action="store_true", help="ramp to open pose, then exit")
     ap.add_argument("--dry-run", action="store_true", help="no serial; print stream only")
     args = ap.parse_args()
