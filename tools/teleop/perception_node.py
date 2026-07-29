@@ -84,6 +84,9 @@ def main():
     ap.add_argument("--no-filter", action="store_true", help="disable One-Euro keypoint filtering")
     ap.add_argument("--retarget-alpha", type=float, default=0.8,
                     help="DexPilot temporal low-pass (0..1); higher = less retargeter lag")
+    ap.add_argument("--no-distal-curl", action="store_true",
+                    help="disable human-curl drive of the 5 DexPilot-dead distal joints "
+                         "(they then sit at their limit midpoints, RL-distillation style)")
     args = ap.parse_args()
 
     if args.list_cameras:
@@ -103,7 +106,8 @@ def main():
 
     print("[perception] loading WiLoR ...")
     est = WiLoREstimator(device="cuda", fp16=True, redetect_interval=args.redetect_interval)
-    rt = HandRetargeter(low_pass_alpha=args.retarget_alpha)
+    rt = HandRetargeter(low_pass_alpha=args.retarget_alpha,
+                        curl_distal=not args.no_distal_curl)
     rt.reset()
     euro = None if args.no_filter else OneEuroArray(min_cutoff=args.min_cutoff, beta=args.beta)
     t_prev = time.time()
