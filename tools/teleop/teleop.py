@@ -115,6 +115,10 @@ def main() -> None:
                     help="drive the REAL xhand over serial (real_node.py) instead of Isaac Sim")
     ap.add_argument("--real-args", default="",
                     help="extra args for real_node.py, quoted string (e.g. \"--max-speed 1.5\")")
+    ap.add_argument("--arm", action="store_true",
+                    help="also start arm_node.py: WASD keyboard jog of the real xArm7 TCP")
+    ap.add_argument("--arm-args", default="",
+                    help="extra args for arm_node.py, quoted string (e.g. \"--ip 192.168.1.205\")")
     # escape hatches for anything else
     ap.add_argument("--sim-args", default="", help="extra args for teleop_sim.py, quoted string")
     ap.add_argument("--perc-args", default="", help="extra args for perception_node.py, quoted string")
@@ -137,10 +141,14 @@ def main() -> None:
 
     real_args = link + shlex.split(args.real_args)
 
+    arm_args = shlex.split(args.arm_args)
+
     if args.real:
         print(f"[teleop] REAL hand  ({PERC_ENV}): real_node.py {' '.join(real_args)}")
     else:
         print(f"[teleop] sim        ({SIM_ENV}): teleop_sim.py {' '.join(sim_args)}")
+    if args.arm:
+        print(f"[teleop] REAL arm   ({PERC_ENV}): arm_node.py {' '.join(arm_args)}")
     print(f"[teleop] perception ({PERC_ENV}): perception_node.py {' '.join(perc_args)}")
 
     # a SIGTERM to the launcher must also tear the children down cleanly
@@ -156,6 +164,8 @@ def main() -> None:
             procs["real"] = _spawn(PERC_ENV, "real_node.py", real_args)
         else:
             procs["sim"] = _spawn(SIM_ENV, "teleop_sim.py", sim_args)
+        if args.arm:
+            procs["arm"] = _spawn(PERC_ENV, "arm_node.py", arm_args)
         procs["perception"] = _spawn(PERC_ENV, "perception_node.py", perc_args)
 
         # babysit: if either side dies, tear the other down

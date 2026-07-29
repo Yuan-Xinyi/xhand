@@ -70,6 +70,34 @@ Firmware-side: `--kp 100 --kd 10 --tor-max 300`. Start gentle on a new setup:
 If the hardware finger-id order ever mismatches (a `--check` sweep moves the
 wrong joint), fix `HW_JOINT_NAMES` in real_node.py — one place only.
 
+## Real arm keyboard jog (`arm_node.py`)
+
+WASD jog of the real xArm7 TCP (xArm-Python-SDK servo mode, `ONE_ARM_IP` or
+`--ip`, default 192.168.1.205). Runs in parallel with hand teleop — fingers
+from the camera, wrist from the keyboard:
+
+```bash
+python teleop.py --real --arm            # camera->hand + keyboard->arm, one command
+python arm_node.py --dry-run             # standalone, no arm — try the keys
+```
+
+| Keys | Action |
+|---|---|
+| `W/S` `A/D` `R/F` | translate ±x ±y ±z (base frame) |
+| `Q/E` | wrist twist (about tool z) |
+| `↑/↓` `←/→` | pitch / roll (about the TCP, tool frame) |
+| `[` `]` | speed 0.25x–2x |
+| `SPACE` | hold + re-sync target to actual pose |
+| `ESC` | quit cleanly |
+
+Keys are captured globally (pynput) — keep the dashboard focused and jog blind.
+Safety: workspace clamp box (`--workspace x0,x1,y0,y1,z0,z1`), speed caps
+(`--lin-speed` 0.05 m/s, `--ang-speed` 20 deg/s), target seeded from the arm's
+actual pose (no jump on start), auto-stop after persistent servo errors.
+Rotation is deliberately keyboard-rate-based (not camera wrist tracking): a
+WiLoR wrist orientation is too jittery to stream to a real arm; keys give a
+deterministic, safe angular rate about the TCP.
+
 ## Run (two terminals, manual)
 
 **Terminal 1 — sim driver** (`conda activate env_isaaclab`):
@@ -125,6 +153,7 @@ python fake_source.py --rate 30 --period 3.0
 ## Files
 
 - `teleop.py` — single-command launcher: spawns both nodes in their conda envs, manages shutdown (stdlib only).
+- `arm_node.py` — WASD keyboard jog of the real xArm7 TCP (servo streaming, workspace clamp; see "Real arm keyboard jog").
 - `real_node.py` — REAL XHand driver: UDP subscribe -> safety layers -> RS-485 position commands (see "Real hardware").
 - `viz_panel.py` — `--show` dashboard: camera+skeleton | MANO 3D pose (mapping input, front/side views) | 12 xhand joint bars with URDF limits (mapping output = the exact wire values the sim/real hand executes).
 - `protocol.py` — UDP wire format + the canonical 12-joint order (stdlib only; imported by both envs).
