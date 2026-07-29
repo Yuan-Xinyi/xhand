@@ -101,6 +101,7 @@ python fake_source.py --rate 30 --period 3.0
 ## Files
 
 - `teleop.py` — single-command launcher: spawns both nodes in their conda envs, manages shutdown (stdlib only).
+- `viz_panel.py` — `--show` dashboard: camera+skeleton | MANO 3D pose (mapping input, front/side views) | 12 xhand joint bars with URDF limits (mapping output = the exact wire values the sim/real hand executes).
 - `protocol.py` — UDP wire format + the canonical 12-joint order (stdlib only; imported by both envs).
 - `camera.py` — `CVCamera` (webcam, MJPG + 1-frame buffer) and `RealSenseCamera` (color stream, auto reset-on-busy).
 - `hand_estimator.py` — `HandEstimator` interface + `WiLoREstimator` with detection-skip / ROI tracking. Swap the backend here to try a newer model.

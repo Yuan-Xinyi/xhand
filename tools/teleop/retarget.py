@@ -55,6 +55,18 @@ class HandRetargeter:
         """xhand joint names in wire order (== protocol.HAND_JOINT_NAMES)."""
         return list(HAND_JOINT_NAMES)
 
+    @property
+    def joint_limits(self) -> np.ndarray:
+        """(12, 2) [lower, upper] rad per joint, in wire order.
+
+        NB: SeqRetargeting.joint_limits is in TARGET order (target_joint_names),
+        unlike retarget()'s return which is scattered back to pinocchio dof
+        order (joint_names) — the two need different permutations.
+        """
+        tgt = list(self._rt.optimizer.target_joint_names)[6:]
+        lim = np.asarray(self._rt.joint_limits, dtype=np.float32)[6:]
+        return lim[[tgt.index(n) for n in HAND_JOINT_NAMES]]
+
     def reset(self):
         """Clear the optimizer's warm-start / temporal low-pass state."""
         self._rt.reset()

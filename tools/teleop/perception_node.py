@@ -33,17 +33,6 @@ from hand_estimator import WiLoREstimator, mirror_to_right
 from protocol import make_sender, pack
 from retarget import HandRetargeter
 
-# MANO/WiLoR keypoint connectivity for the overlay (0=wrist, 5 fingers x4).
-_FINGERS = [
-    [0, 1, 2, 3, 4],       # thumb
-    [0, 5, 6, 7, 8],       # index
-    [0, 9, 10, 11, 12],    # middle
-    [0, 13, 14, 15, 16],   # ring
-    [0, 17, 18, 19, 20],   # pinky
-]
-_FINGER_COLORS = [(0, 0, 255), (0, 165, 255), (0, 255, 255), (0, 255, 0), (255, 0, 0)]
-
-
 def _pick_hand(hands, want_right: bool, mirror: bool):
     """Choose one detected hand and return its (21,3) keypoints as a right hand.
 
@@ -63,22 +52,6 @@ def _pick_hand(hands, want_right: bool, mirror: bool):
     if hand.is_right != want_right and mirror:
         kp = mirror_to_right(kp)
     return kp, hand
-
-
-def _draw_overlay(bgr, hand, q, fps, valid):
-    if hand is not None:
-        kp2d = hand.keypoints_2d
-        for finger, col in zip(_FINGERS, _FINGER_COLORS):
-            for a, b in zip(finger[:-1], finger[1:]):
-                pa, pb = kp2d[a].astype(int), kp2d[b].astype(int)
-                cv2.line(bgr, tuple(pa), tuple(pb), col, 2)
-        for p in kp2d.astype(int):
-            cv2.circle(bgr, tuple(p), 3, (255, 255, 255), -1)
-    status = "TRACKING" if valid else "NO HAND"
-    color = (0, 255, 0) if valid else (0, 0, 255)
-    cv2.putText(bgr, f"{status}  {fps:4.1f} FPS", (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-    return bgr
 
 
 def main():
@@ -136,6 +109,11 @@ def main():
     t_prev = time.time()
     print(f"[perception] output joints (wire order): {rt.output_joint_names}")
 
+    dash = None
+    if args.show:
+        from viz_panel import TeleopDashboard
+        dash = TeleopDashboard(rt.joint_limits, cam_size=(args.width, args.height))
+
     sock, send = make_sender(args.host, args.port)
     print(f"[perception] publishing xhand joints -> udp://{args.host}:{args.port}")
 
@@ -171,8 +149,8 @@ def main():
             fps = 1.0 / max(dt, 1e-6)
             ema_fps = fps if ema_fps == 0.0 else 0.9 * ema_fps + 0.1 * fps
             if args.show:
-                _draw_overlay(bgr, hand, q_hold, ema_fps, valid)
-                cv2.imshow("teleop perception (q to quit)", bgr)
+                canvas = dash.render(bgr, hand, kp3d, q_hold, ema_fps, valid)
+                cv2.imshow("xhand teleop (q to quit)", canvas)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
             elif seq % 30 == 0:
