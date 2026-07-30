@@ -63,26 +63,31 @@ class PickHammerTokenEnvCfg(PickToolTokenEnvCfg):
     # A 33 cm object: hand spawns a touch farther out so it can never overlap at reset.
     reset_min_hand_object_dist = 0.10
 
-    # HANDLE grasp keypoints: one central grip cross-section (t=0 through the grip centroid),
-    # four points ON the mesh surface at ~90 deg spacing around the perimeter -- fingers are
-    # driven to their nearest keypoint and wrap the rubber grip.
+    # HANDLE grasp keypoints: CHOKE-UP cross-section (+7 cm from the grip centroid toward the
+    # head), four points ON the mesh surface at ~90 deg spacing around the perimeter -- fingers
+    # are driven to their nearest keypoint and wrap the grip just below the neck.  The scripted
+    # grasp-and-hold probe (scripts/hammer_grasp_probe.py, 2026-07-30) measured held rates of
+    # 12% pinned at the grip centroid vs 62% pinned here: the head-heavy mass distribution
+    # (COM ~9 cm toward the head from the grip centroid) torques mid-grip holds out of the
+    # closed hand, so the reward geometry points the fingers at the choke-up band instead.
     grasp_keypoints = (
-        (0.012113, -0.085621, 0.004338),
-        (-0.008226, -0.093808, 0.004319),
-        (-0.008973, -0.094318, 0.026871),
-        (0.011775, -0.085955, 0.025617),
+        (-0.015251, -0.021192, 0.006236),
+        (-0.033400, -0.028496, 0.006055),
+        (-0.034368, -0.029069, 0.025692),
+        (-0.017111, -0.022118, 0.025345),
     )
     # auto-seed keypoint directions radial-outward (re-freeze via the GUI drag tool if needed)
     grasp_keypoint_dirs = None
 
-    # Analytic handle frame: grip centroid + PCA long axis of the handle vertices.  The
-    # graspable band is the central 10 cm of rubber grip (butt flare at t=-0.10 and the neck
-    # ramp toward the head at t>+0.10 stay outside it).
-    handle_center = (0.001, -0.0902, 0.0157)
+    # Analytic handle frame: choke-up point (grip centroid + 7 cm along the PCA handle axis)
+    # with an asymmetric contact band -- [-8 cm, +5 cm] accepts anything from mid-grip to the
+    # neck ramp (head junction at +6.4 cm) as valid handle contact, while the keypoints above
+    # pull the closure toward the low-torque end of that band.
+    handle_center = (-0.0251, -0.0253, 0.0163)
     handle_axis = (-0.3734, 0.9276, 0.0086)
-    handle_axial_min = -0.05
+    handle_axial_min = -0.08
     handle_axial_max = 0.05
-    # section polygon radius measures 1.31--1.75 cm here (well inside the env sanity window)
+    # section polygon radius measures 1.10--1.56 cm here (well inside the env sanity window)
     handle_axial_margin = 0.002
     handle_section_half_width = 0.002
     handle_contact_margin = 0.008

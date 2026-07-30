@@ -22,8 +22,8 @@ true-clearance hull / handle-polygon source mesh became configurable
 | grip cross-section radius | 1.31–1.75 cm (rubber grip; the old tool's "handle" was a 2 mm web) |
 | strike face center | (−0.125, 0.053, 0.016) |
 | claw center | (−0.025, 0.130, 0.014) |
-| graspable band | t ∈ [−0.05, +0.05] (central 10 cm of grip) |
-| grasp keypoints | 4 surface points at ~90° spacing on the t=0 grip cross-section |
+| graspable band | t ∈ [−0.08, +0.05] around the CHOKE-UP center (grip centroid + 7 cm toward the head) |
+| grasp keypoints | 4 surface points at ~90° spacing on the choke-up cross-section |
 | in-hand functional point | (−0.032, −0.010, 0.027) — top of the handle neck (choke-up band) |
 | in-hand head axis | claw → strike face = (−0.794, −0.608, 0.015); pointing it at −z = striking attitude |
 
@@ -33,6 +33,24 @@ Gentle place at identity, flat drop from 0.35 m, and two tilted drops from 0.50 
 settle to **identity orientation** (residual quat < 0.023) at **z = −0.0004** with the
 converted USD.  Unlike the first tool there is no metastable perch: the authored scan pose
 is the single true rest, so `HAMMER_REST_Z=-0.0004`, `HAMMER_REST_QUAT=identity`.
+
+## Choke-up grasp band (probe-derived, 2026-07-30)
+
+The scripted grasp-and-hold probe (`scripts/hammer_grasp_probe.py`: pin the handle across
+the palm, curl fingers, release, watch 2 s) measured, over 32 envs per variant:
+
+| pin point | close_frac | held |
+|---|---|---|
+| grip centroid | 0.8 | 12% |
+| +7 cm (choke-up) | 0.8 | 44% |
+| +7 cm (choke-up) | 0.95 | **62%** |
+| +9 cm | 0.9 | 44% |
+
+The hammer is head-heavy (COM ≈ 9 cm toward the head from the grip centroid): mid-grip
+holds are torqued out of the closed hand.  `handle_center`/keypoints therefore sit at the
+choke-up cross-section with an asymmetric contact band [−8 cm, +5 cm].  (The probe's
+quality read-out is not meaningful — pinning the handle *at* the palm center degenerates
+the palm-facing gate — the held/fell verdict is the calibrated signal.)
 
 ## Deliberate recipe carry-overs
 
