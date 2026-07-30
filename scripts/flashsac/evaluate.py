@@ -42,6 +42,12 @@ PRODUCTION_ACTOR_HIDDEN = 128
 PRODUCTION_CRITIC_BLOCKS = 2
 PRODUCTION_CRITIC_HIDDEN = 256
 PRODUCTION_CRITIC_BINS = 101
+# "big" = the 78_carry_bignet recipe (train.py --actor_blocks 3 --actor_hidden 512
+# --critic_blocks 3 --critic_hidden 1024); bins/n-step/amp follow production.
+BIG_ACTOR_BLOCKS = 3
+BIG_ACTOR_HIDDEN = 512
+BIG_CRITIC_BLOCKS = 3
+BIG_CRITIC_HIDDEN = 1024
 SMOKE_ACTOR_BLOCKS = 1
 SMOKE_ACTOR_HIDDEN = 32
 SMOKE_CRITIC_BLOCKS = 1
@@ -447,7 +453,7 @@ def build_strict_metrics(
         "policy": "deterministic_tanh_actor_mean",
         "architecture": architecture,
         "critic_bins": (
-            PRODUCTION_CRITIC_BINS if architecture == "production" else SMOKE_CRITIC_BINS
+            PRODUCTION_CRITIC_BINS if architecture in ("production", "big") else SMOKE_CRITIC_BINS
         ),
         "noise_groups": [
             {
@@ -540,6 +546,8 @@ def infer_actor_architecture_from_state(state: Mapping[str, Any]) -> str:
         return "production"
     if signature == (SMOKE_ACTOR_BLOCKS, SMOKE_ACTOR_HIDDEN):
         return "smoke"
+    if signature == (BIG_ACTOR_BLOCKS, BIG_ACTOR_HIDDEN):
+        return "big"
     raise RuntimeError(f"unsupported actor architecture blocks/hidden={signature}")
 
 
@@ -598,15 +606,17 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
     from isaaclab.app import AppLauncher
 
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument("--task", type=str, default="Pick-Tool-Token-Direct-v0")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--episodes", type=int, default=256)
     parser.add_argument("--num_envs", type=int, default=256)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--architecture",
-        choices=("production", "smoke", "auto"),
-        default="production",
-        help="Production exactly matches formal train.py; auto also recognizes its smoke architecture.",
+        choices=("production", "big", "smoke", "auto"),
+        default="auto",
+        help="auto infers production (2x128), big (3x512, the bignet recipe) or smoke from the "
+        "checkpoint weights; an explicit choice still errors on mismatch.",
     )
     parser.add_argument("--use_compile", action="store_true")
     parser.add_argument("--compile_mode", default="reduce-overhead")
@@ -771,11 +781,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         render_mode="rgb_array" if args.video else None,
         cfg_overrides=cfg_overrides,
         validate_finite=args.validate_finite,
+        task_id=args.task,
     )
 
     if architecture == "production":
         actor_blocks, actor_hidden = PRODUCTION_ACTOR_BLOCKS, PRODUCTION_ACTOR_HIDDEN
         critic_blocks, critic_hidden = PRODUCTION_CRITIC_BLOCKS, PRODUCTION_CRITIC_HIDDEN
+    elif architecture == "big":
+        actor_blocks, actor_hidden = BIG_ACTOR_BLOCKS, BIG_ACTOR_HIDDEN
+        critic_blocks, critic_hidden = BIG_CRITIC_BLOCKS, BIG_CRITIC_HIDDEN
     else:
         actor_blocks, actor_hidden = SMOKE_ACTOR_BLOCKS, SMOKE_ACTOR_HIDDEN
         critic_blocks, critic_hidden = SMOKE_CRITIC_BLOCKS, SMOKE_CRITIC_HIDDEN
@@ -791,17 +805,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         buffer_max_length=max(args.num_envs, 32),
         buffer_min_length=1,
         sample_batch_size=1,
-        n_step=3 if architecture == "production" else 1,
+        n_step=3 if architecture in ("production", "big") else 1,
         actor_num_blocks=actor_blocks,
         actor_hidden_dim=actor_hidden,
         critic_num_blocks=critic_blocks,
         critic_hidden_dim=critic_hidden,
         critic_num_bins=(
-            PRODUCTION_CRITIC_BINS if architecture == "production" else SMOKE_CRITIC_BINS
+            PRODUCTION_CRITIC_BINS if architecture in ("production", "big") else SMOKE_CRITIC_BINS
         ),
         use_compile=args.use_compile,
         compile_mode=args.compile_mode,
-        use_amp=architecture == "production",
+        use_amp=architecture in ("production", "big"),
         load_optimizer=False,
         load_reward_normalizer=False,
     )
