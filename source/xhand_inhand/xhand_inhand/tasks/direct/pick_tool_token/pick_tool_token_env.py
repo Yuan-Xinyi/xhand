@@ -258,6 +258,8 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         )
         head = torch.tensor(self.cfg.inhand_head_axis, dtype=torch.float, device=dev)
         self._inhand_head_local = head / head.norm().clamp_min(1.0e-9)
+        roll_axis = torch.tensor(self.cfg.carry_axial_axis, dtype=torch.float, device=dev)
+        self._carry_axial_local = roll_axis / roll_axis.norm().clamp_min(1.0e-9)
         self._inhand_index_ee = self.ee_names.index("index_rota_link2")
         self._inhand_hold_steps = torch.zeros(N, dtype=torch.long, device=dev)
         self._inhand_lost_steps = torch.zeros(N, dtype=torch.long, device=dev)
@@ -1727,7 +1729,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             n = env_ids.numel()
             if self.cfg.carry_goal_axial_mode:
                 # Body-fixed handle axis, random sign: pure axial rolls.
-                axis = self._inhand_head_local.unsqueeze(0).expand(n, 3).contiguous()
+                axis = self._carry_axial_local.unsqueeze(0).expand(n, 3).contiguous()
                 sign = torch.where(
                     torch.rand((n,), device=self.device) < 0.5,
                     torch.ones((n,), device=self.device),

@@ -209,6 +209,9 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # cannot change their relative attitude about the grip axis, so rolling the handle
     # between the fingers is the only solution.  The purest finger-gaiting drill.
     carry_goal_axial_mode = False
+    # In-hand roll axis = the HANDLE long axis (user-annotated; near-perpendicular to the
+    # head axis).  Rolling about this is the pure gaiting drill.
+    carry_axial_axis = (0.86946, -0.18518, -0.45798)
     # ---- sequential-RL pipeline mode: ONE policy, home -> nudge+park -> latch -> carry ----
     # Phase A (unlatched): the nudge_grasp reward stack and failure gates.  The first
     # sustained latch does NOT terminate: it pays a one-shot bonus, flags the env as flying

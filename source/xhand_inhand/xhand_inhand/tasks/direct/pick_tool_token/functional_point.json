@@ -21,5 +21,21 @@
     -0.08568,
     0.08129
   ],
-  "head_axis_note": "user-annotated 2026-07-27 via two-point axis annotator (replaces the wrong PCA/COM guess)"
+  "head_axis_note": "user-annotated 2026-07-27 via two-point axis annotator (replaces the wrong PCA/COM guess)",
+  "handle_axis": [
+    0.86946,
+    -0.18518,
+    -0.45798
+  ],
+  "handle_axis_tail": [
+    -0.08145,
+    0.051,
+    0.12567
+  ],
+  "handle_axis_tip": [
+    0.08427,
+    0.01571,
+    0.03838
+  ],
+  "handle_axis_note": "handle LONG axis (in-hand roll axis), user-annotated 2026-07-30"
 }
