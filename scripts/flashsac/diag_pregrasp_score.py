@@ -16,6 +16,7 @@ from pathlib import Path
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser()
+parser.add_argument("--task", type=str, default="Pick-Tool-Token-Direct-v0")
 parser.add_argument("--checkpoint", type=Path, required=True)
 parser.add_argument("--curriculum_dataset", type=Path, required=True)
 parser.add_argument("--num_envs", type=int, default=128)
@@ -57,7 +58,7 @@ def load_actor(checkpoint: Path, device: torch.device) -> FlashSACActor:
 def main() -> None:
     torch.manual_seed(args_cli.seed)
     n = args_cli.num_envs
-    cfg = parse_env_cfg("Pick-Tool-Token-Direct-v0", device=args_cli.device, num_envs=n)
+    cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=n)
     cfg.seed = args_cli.seed
     cfg.nudge_option_mode = True
     cfg.episode_length_s = 60.0  # no resets during the probe
@@ -65,7 +66,7 @@ def main() -> None:
     cfg.curriculum_boundary = "close_start"
     cfg.curriculum_reset_probability = 1.0
     cfg.curriculum_joint_noise = args_cli.joint_noise
-    env = gym.make("Pick-Tool-Token-Direct-v0", cfg=cfg)
+    env = gym.make(args_cli.task, cfg=cfg)
     u = env.unwrapped
     actor = load_actor(args_cli.checkpoint, u.device)
 

@@ -589,8 +589,13 @@ def make_pick_tool_env(
     action_clip: float = 1.0,
     strict: bool = True,
     validate_finite: bool = False,
+    task_id: str = PICK_TOOL_ENV_ID,
 ) -> PickToolIsaacLabAdapter:
-    """Create the registered PickTool task after Isaac Sim has been launched."""
+    """Create a registered PickTool-family task after Isaac Sim has been launched.
+
+    ``task_id`` selects the object variant (e.g. ``Pick-Hammer-Token-Direct-v0``); every
+    variant shares the PickToolTokenEnv class, 115-D observation and 21-D action layout.
+    """
 
     if num_envs < 1:
         raise ValueError("num_envs must be positive")
@@ -604,12 +609,12 @@ def make_pick_tool_env(
     importlib.import_module("xhand_inhand.tasks")
     from isaaclab_tasks.utils import parse_env_cfg
 
-    cfg = parse_env_cfg(PICK_TOOL_ENV_ID, device=device, num_envs=num_envs)
+    cfg = parse_env_cfg(task_id, device=device, num_envs=num_envs)
     cfg.seed = seed
     for name, value in (cfg_overrides or {}).items():
         _set_cfg_override(cfg, name, value)
 
-    env = gym.make(PICK_TOOL_ENV_ID, cfg=cfg, render_mode=render_mode)
+    env = gym.make(task_id, cfg=cfg, render_mode=render_mode)
     return PickToolIsaacLabAdapter(
         env,
         action_clip=action_clip,

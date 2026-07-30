@@ -1,0 +1,7 @@
+{
+  "index_point": [-0.03162, -0.01035, 0.02656],
+  "head_axis": [-0.794, -0.60773, 0.015],
+  "head_axis_tail": [-0.0246, 0.1301, 0.0144],
+  "head_axis_tip": [-0.1252, 0.0531, 0.0163],
+  "note": "auto-derived from the 048_hammer google_16k mesh 2026-07-29: index_point = top of the handle neck (choke-up band, t=+0.09 along the handle axis); head axis = claw center -> strike face center. Refine via tools/functional_point/build_annotator.py and paste back here + into pick_hammer_token_env_cfg.py."
+}

@@ -15,6 +15,7 @@ from pathlib import Path
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser()
+parser.add_argument("--task", type=str, default="Pick-Tool-Token-Direct-v0")
 parser.add_argument("--checkpoint", type=Path, required=True)
 parser.add_argument("--curriculum_dataset", type=Path, required=True)
 parser.add_argument("--episodes", type=int, default=12)
@@ -75,7 +76,7 @@ def load_actor(checkpoint: Path, device: torch.device) -> FlashSACActor:
 @torch.inference_mode()
 def main() -> None:
     torch.manual_seed(args_cli.seed)
-    cfg = parse_env_cfg("Pick-Tool-Token-Direct-v0", device=args_cli.device, num_envs=1)
+    cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1)
     cfg.seed = args_cli.seed
     cfg.carry_mode = True
     cfg.episode_length_s = args_cli.episode_length_s
@@ -101,7 +102,7 @@ def main() -> None:
     cfg.viewer.eye = tuple(args_cli.cam_eye)
     cfg.viewer.lookat = tuple(args_cli.cam_lookat)
     cfg.viewer.origin_type = "world"
-    env = gym.make("Pick-Tool-Token-Direct-v0", cfg=cfg, render_mode="rgb_array")
+    env = gym.make(args_cli.task, cfg=cfg, render_mode="rgb_array")
     u = env.unwrapped
     actor = load_actor(args_cli.checkpoint, u.device)
 

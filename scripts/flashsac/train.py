@@ -192,6 +192,13 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
     from isaaclab.app import AppLauncher
 
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument(
+        "--task",
+        type=str,
+        default="Pick-Tool-Token-Direct-v0",
+        help="PickTool-family task id (same env class / obs / action layout), "
+        "e.g. Pick-Hammer-Token-Direct-v0 for the YCB 048 hammer object swap.",
+    )
     parser.add_argument("--steps", type=int, default=1_000, help="Vector-environment interaction steps.")
     parser.add_argument("--num_envs", type=int, default=1024)
     parser.add_argument("--buffer", type=int, default=1_000_000, help="Replay capacity in transitions.")
@@ -1038,6 +1045,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         seed=args.seed,
         cfg_overrides=cfg_overrides,
         validate_finite=args.smoke or args.validate_finite,
+        task_id=args.task,
     )
     warmup_transitions = resolve_warmup_transitions(
         buffer=args.buffer,

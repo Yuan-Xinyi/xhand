@@ -110,12 +110,16 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         # mesh, so its rotated min-corner reads FAKE clearance when the object tips -> use real hull verts).
         from .tool_asset import TOOL_OBJ, TOOL_SCALE
         from scipy.spatial import ConvexHull
+        # The raw OBJ source of the SPAWNED object: subclass configs (e.g. pick_hammer_token)
+        # point object_mesh_obj/object_mesh_scale at their own mesh; empty keeps the tool default.
+        _mesh_obj = getattr(cfg, "object_mesh_obj", "") or TOOL_OBJ
+        _mesh_scale = getattr(cfg, "object_mesh_scale", None) or TOOL_SCALE
         _v = []
-        for _ln in open(TOOL_OBJ):
+        for _ln in open(_mesh_obj):
             if _ln.startswith("v "):
                 _p = _ln.split()
                 _v.append((float(_p[1]), float(_p[2]), float(_p[3])))
-        _v = torch.tensor(_v, dtype=torch.float, device=dev) * torch.tensor(TOOL_SCALE, device=dev)
+        _v = torch.tensor(_v, dtype=torch.float, device=dev) * torch.tensor(_mesh_scale, device=dev)
         _hull = ConvexHull(_v.cpu().numpy()).vertices
         self._obj_hull_local = _v[torch.as_tensor(_hull, device=dev)]  # (M,3) hull verts, the min-z is always one
         # true table surface = the object's real lowest mesh point at the rest pose (it sits on the table);

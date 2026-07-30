@@ -342,6 +342,12 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.5, 0.0, TOOL_REST_Z), rot=TOOL_REST_QUAT),
     )
 
+    # Raw OBJ behind object_cfg's USD, used by the env for the true-clearance convex hull and
+    # the handle cross-section polygon.  Empty string -> the default tool mesh; object-swap
+    # subclasses (pick_hammer_token) override BOTH this and object_cfg to their own mesh.
+    object_mesh_obj: str = ""
+    object_mesh_scale = None
+
     # reset randomization on the table: a bulkier object -> keep the hand a touch farther at
     # reset so it never spawns overlapping the tool, and a slightly tighter xy spread.
     reset_object_pos_noise = (0.08, 0.15)

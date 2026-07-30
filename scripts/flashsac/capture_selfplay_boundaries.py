@@ -20,6 +20,7 @@ from pathlib import Path
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Self-play boundary capture for nudge+grasp.")
+parser.add_argument("--task", type=str, default="Pick-Tool-Token-Direct-v0")
 parser.add_argument("--checkpoint", type=Path, required=True, help="FlashSAC checkpoint dir")
 parser.add_argument("--num_envs", type=int, default=256)
 parser.add_argument("--steps", type=int, default=400)
@@ -96,13 +97,13 @@ def load_actor(checkpoint: Path, device: torch.device) -> FlashSACActor:
 def main() -> None:
     torch.manual_seed(args_cli.seed)
     n = args_cli.num_envs
-    cfg = parse_env_cfg("Pick-Tool-Token-Direct-v0", device=args_cli.device, num_envs=n)
+    cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=n)
     cfg.seed = args_cli.seed
     cfg.nudge_grasp_mode = True
     cfg.episode_length_s = 10.0
     cfg.nudge_spawn_blend_min = 0.0
     cfg.nudge_spawn_blend_max = 0.0
-    env = gym.make("Pick-Tool-Token-Direct-v0", cfg=cfg)
+    env = gym.make(args_cli.task, cfg=cfg)
     u = env.unwrapped
     dev = u.device
     actor = load_actor(args_cli.checkpoint, dev)
