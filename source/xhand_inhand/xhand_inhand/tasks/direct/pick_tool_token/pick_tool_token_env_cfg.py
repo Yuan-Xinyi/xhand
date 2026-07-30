@@ -204,6 +204,11 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     carry_impulse_force = 2.0         # impulse force magnitude (N)
     carry_impulse_torque = 0.08      # impulse torque magnitude (N*m)
     carry_goal_hard_frac = 0.0       # fraction of goals sampled from the top-30% angle tail
+    # Axial-rotation goals: rotate about the TOOL'S OWN long axis (the user-annotated handle
+    # axis, body frame) with random sign -- wrist rotation moves hand and tool together and
+    # cannot change their relative attitude about the grip axis, so rolling the handle
+    # between the fingers is the only solution.  The purest finger-gaiting drill.
+    carry_goal_axial_mode = False
     # ---- sequential-RL pipeline mode: ONE policy, home -> nudge+park -> latch -> carry ----
     # Phase A (unlatched): the nudge_grasp reward stack and failure gates.  The first
     # sustained latch does NOT terminate: it pays a one-shot bonus, flags the env as flying

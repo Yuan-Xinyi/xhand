@@ -1725,9 +1725,19 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             # whose magnitude the trainer ratchets past the wrist range, forcing in-hand
             # repositioning to stay profitable.  Marker still updates below.
             n = env_ids.numel()
-            axis = torch.randn((n, 3), device=self.device)
-            axis = axis / axis.norm(dim=-1, keepdim=True).clamp_min(1.0e-9)
-            angle = sample_uniform(0.0, self.cfg.carry_goal_rel_angle_max, (n,), self.device)
+            if self.cfg.carry_goal_axial_mode:
+                # Body-fixed handle axis, random sign: pure axial rolls.
+                axis = self._inhand_head_local.unsqueeze(0).expand(n, 3).contiguous()
+                sign = torch.where(
+                    torch.rand((n,), device=self.device) < 0.5,
+                    torch.ones((n,), device=self.device),
+                    -torch.ones((n,), device=self.device),
+                )
+            else:
+                axis = torch.randn((n, 3), device=self.device)
+                axis = axis / axis.norm(dim=-1, keepdim=True).clamp_min(1.0e-9)
+                sign = torch.ones((n,), device=self.device)
+            angle = sign * sample_uniform(0.0, self.cfg.carry_goal_rel_angle_max, (n,), self.device)
             if self.cfg.carry_goal_hard_frac > 0.0:
                 hard = sample_uniform(
                     0.7 * self.cfg.carry_goal_rel_angle_max,
@@ -1740,8 +1750,13 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             half_a = 0.5 * angle
             dq = torch.cat((torch.cos(half_a).unsqueeze(-1), torch.sin(half_a).unsqueeze(-1) * axis), dim=-1)
             q = self.object.data.root_quat_w[env_ids]
-            w1, x1, y1, z1 = dq.unbind(-1)
-            w2, x2, y2, z2 = q.unbind(-1)
+            if self.cfg.carry_goal_axial_mode:
+                # Right-multiply: rotation about the BODY-frame axis.
+                w1, x1, y1, z1 = q.unbind(-1)
+                w2, x2, y2, z2 = dq.unbind(-1)
+            else:
+                w1, x1, y1, z1 = dq.unbind(-1)
+                w2, x2, y2, z2 = q.unbind(-1)
             self.target_quat[env_ids] = torch.stack(
                 (
                     w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,

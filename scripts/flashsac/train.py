@@ -482,6 +482,13 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         "spawns from the stage entry states back to the ordinary home reset).",
     )
     parser.add_argument(
+        "--carry_axial",
+        action="store_true",
+        help="Goals are pure rotations about the tool's own handle axis (random sign) -- "
+        "the wrist cannot change the grip-relative attitude about that axis, so finger "
+        "gaiting is the only solution.",
+    )
+    parser.add_argument(
         "--carry_antidrop",
         type=float,
         nargs=3,
@@ -999,6 +1006,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             cfg_overrides["carry_goal_timeout_penalty"] = args.carry_timeout_cost
         if args.carry_hand_vel_cost is not None:
             cfg_overrides["carry_hand_vel_penalty"] = args.carry_hand_vel_cost
+        if args.carry_axial:
+            cfg_overrides["carry_goal_axial_mode"] = True
         if args.carry_antidrop is not None:
             cfg_overrides["carry_contact_occupancy"] = args.carry_antidrop[0]
             cfg_overrides["carry_impulse_prob"] = args.carry_antidrop[1]
