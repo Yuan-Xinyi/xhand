@@ -962,6 +962,33 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         palm_inv = quat_conjugate(self.palm_quat)
         wrap["slip_lin_palm"] = quat_apply(palm_inv, slip_lin_w)
         wrap["slip_ang_palm"] = quat_apply(palm_inv, slip_ang_w)
+        # ---- airborne self-proving hold (object-swap opt-in; default off) ----
+        # A fat cylindrical grip (048 hammer) settles into the palm on liftoff: the load
+        # concentrates in a thumb+1 pinch plus palm rest, the remaining pads unload below
+        # contact_force_thr, and the thumb+2 wrap topology zeroes the quality of a hold that
+        # is carrying the object through the air (measured: hold 0.97, in-band pads 1.96,
+        # other_coverage 0.0).  Hanging + moving WITH the palm cannot be faked: reaching
+        # clearance requires transport, and a fling collapses hold_quality.  While that
+        # evidence stands, floor the wrap quality at the latch threshold so the latch, the
+        # strict success contract and the carry/inhand stages see the hold that physics sees.
+        if getattr(self.cfg, "airborne_pinch_hold", False):
+            clearance = self._object_true_min_z() - self._table_surface_z
+            forceful_region = (force_magnitude >= self.cfg.contact_force_thr) & self._handle_contact_region
+            thumb_on = forceful_region[:, self._thumb_ee_idx]
+            others_on = forceful_region.sum(dim=-1) - thumb_on.long() >= 1
+            airborne_held = (
+                (clearance >= self.cfg.airborne_pinch_min_clearance)
+                & (hold >= self.cfg.airborne_pinch_min_hold)
+                & thumb_on
+                & others_on
+            )
+            floor = torch.where(
+                airborne_held,
+                torch.full_like(wrap["quality"], self.cfg.grasp_quality_high),
+                torch.zeros_like(wrap["quality"]),
+            )
+            wrap["quality"] = torch.maximum(wrap["quality"], floor)
+            wrap["airborne_pinch_frac"] = airborne_held.float()
         wrap["grasp_quality"] = torch.minimum(wrap["quality"], hold)
         wrap["force_magnitude"] = force_magnitude
         wrap["palm_facing"] = palm_facing

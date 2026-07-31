@@ -60,6 +60,11 @@ class PickHammerTokenEnvCfg(PickToolTokenEnvCfg):
     object_mesh_scale = HAMMER_SCALE
     expected_object_mass = HAMMER_MASS
 
+    # The 3cm rubber grip settles into the palm on liftoff (thumb+1 pinch + palm rest);
+    # accept the physics-proven airborne hold instead of the tabletop thumb+2 topology.
+    # Chain diagnostics 2026-07-31: hold 0.97 / in-band pads 1.96 / other_coverage 0.0.
+    airborne_pinch_hold = True
+
     # A 33 cm object: hand spawns a touch farther out so it can never overlap at reset.
     reset_min_hand_object_dist = 0.10
 

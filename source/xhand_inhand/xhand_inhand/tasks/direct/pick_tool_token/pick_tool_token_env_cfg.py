@@ -342,11 +342,20 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.5, 0.0, TOOL_REST_Z), rot=TOOL_REST_QUAT),
     )
 
-    # Raw OBJ behind object_cfg's USD, used by the env for the true-clearance convex hull and
+    # Raw OBJ behind object_cfg's USD, used by the env for the true-clearance hull and
     # the handle cross-section polygon.  Empty string -> the default tool mesh; object-swap
     # subclasses (pick_hammer_token) override BOTH this and object_cfg to their own mesh.
     object_mesh_obj: str = ""
     object_mesh_scale = None
+
+    # Airborne self-proving hold (object-swap opt-in; see _compute_grasp_signals).  While the
+    # object is truly airborne, moving WITH the palm, and pinched thumb+>=1 in-band forceful
+    # pad, the wrap quality is floored at grasp_quality_high -- a hanging carried object is
+    # its own proof of grasp even when a fat grip unloads the thumb+2 topology on liftoff.
+    # Default OFF: the original tool keeps its exact contract.
+    airborne_pinch_hold = False
+    airborne_pinch_min_clearance = 0.05
+    airborne_pinch_min_hold = 0.5
 
     # reset randomization on the table: a bulkier object -> keep the hand a touch farther at
     # reset so it never spawns overlapping the tool, and a slightly tighter xy spread.

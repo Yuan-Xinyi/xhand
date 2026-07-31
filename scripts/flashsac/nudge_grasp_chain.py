@@ -443,6 +443,8 @@ def main() -> None:
         success_step = torch.full((n,), -1, dtype=torch.long, device=dev)
         max_clearance = torch.full((n,), -float("inf"), device=dev)
         lifted = torch.zeros(n, dtype=torch.bool, device=dev)
+        _lift_gate_diag = {k: 0 for k in ("steps", "latch", "quality", "hold", "force", "slow_lin", "slow_ang")}
+        _lift_gate_diag["wrap_q"] = 0.0
         ih_hold = torch.zeros(n, dtype=torch.long, device=dev)
         ih_lost = torch.zeros(n, dtype=torch.long, device=dev)
         ih_min_dist = torch.full((n,), 10.0, device=dev)
@@ -826,6 +828,27 @@ def main() -> None:
                 & (post_force <= cfg.grasp_bonus_max_force)
                 & slow
             )
+            # ---- lift-gate component diagnostics: for LIFT steps that already cleared the
+            # height, which co-conditions fail?  (long objects pendulum: slow/hold suspects)
+            _lift_hi = (phase == PHASE_LIFT) & (post_clear >= cfg.lift_success_height)
+            if bool(_lift_hi.any()):
+                _lg = _lift_gate_diag
+                _lg["steps"] += int(_lift_hi.sum())
+                _lg["latch"] += int((_lift_hi & u._is_grasped).sum())
+                _lg["quality"] += int((_lift_hi & (post["grasp_quality"] >= cfg.grasp_quality_high)).sum())
+                _lg["hold"] += int((_lift_hi & (post["hold_quality"] >= cfg.close_option_min_hold_quality)).sum())
+                _lg["force"] += int((_lift_hi & (post_force <= cfg.grasp_bonus_max_force)).sum())
+                _lg["slow_lin"] += int((_lift_hi & (u.object.data.root_com_lin_vel_w.norm(dim=-1) < cfg.success_max_obj_lin_speed)).sum())
+                _lg["slow_ang"] += int((_lift_hi & (u.object.data.root_com_ang_vel_w.norm(dim=-1) < cfg.success_max_obj_ang_speed)).sum())
+                _lg["wrap_q"] += float(post["quality"][_lift_hi].sum())
+                for _ck in ("contact", "thumb_strength", "other_coverage", "palm_score", "alignment_score", "opposition_score"):
+                    if _ck in post:
+                        _lg[_ck] = _lg.get(_ck, 0.0) + float(post[_ck][_lift_hi].float().sum())
+                # where are the contacts? in-band fraction + axial spread of forceful pads
+                _forceful = post["force_magnitude"] >= cfg.contact_force_thr
+                _lg["forceful_pads"] = _lg.get("forceful_pads", 0.0) + float(_forceful[_lift_hi].float().sum())
+                _inband = _forceful & u._handle_contact_region
+                _lg["inband_pads"] = _lg.get("inband_pads", 0.0) + float(_inband[_lift_hi].float().sum())
             stable_count = torch.where(strict, stable_count + 1, torch.zeros_like(stable_count))
             if carry_actor is not None:
                 # Carry mode: success is the first pose goal, not the bare 20cm lift.
@@ -881,6 +904,7 @@ def main() -> None:
             )
 
         return {
+            "lift_gate_diag": dict(_lift_gate_diag),
             "nudged": int(nudged.sum()),
             "grasped": int(grasped.sum()),
             "lifted": int(lifted.sum()),
@@ -959,6 +983,15 @@ def main() -> None:
             "cycles_used": r["cycles_used"],
             "success_by_cycle": r["success_by_cycle"],
         }
+        _lg = r.get("lift_gate_diag", {})
+        if _lg.get("steps", 0) > 0:
+            _s = _lg["steps"]
+            metrics["lift_gate_pass_frac"] = {
+                k: _lg[k] / _s for k in _lg if k not in ("steps", "wrap_q")
+            }
+            metrics["lift_gate_pass_frac"]["wrap_quality_mean"] = _lg["wrap_q"] / _s
+            metrics["lift_gate_pass_frac"]["cleared_steps"] = _s
+            print("LIFT GATE (steps already >= height):", {k: round(v, 3) for k, v in metrics["lift_gate_pass_frac"].items()}, flush=True)
         args_cli.output.parent.mkdir(parents=True, exist_ok=True)
         args_cli.output.write_text(json.dumps(metrics, indent=2, allow_nan=False), encoding="utf-8")
         print(
