@@ -26,6 +26,7 @@ parser.add_argument("--rot_range", type=float, default=0.6)
 parser.add_argument("--rel_angle", type=float, default=0.0, help=">0: relative-orientation goals with this max angle (rad)")
 parser.add_argument("--lock_arm", action="store_true")
 parser.add_argument("--axial", action="store_true")
+parser.add_argument("--spindle", action="store_true")
 parser.add_argument("--goal_follow", action="store_true")
 parser.add_argument("--arm_authority", type=float, default=1.0)
 parser.add_argument("--boundary", default="carry_start")
@@ -97,6 +98,13 @@ def main() -> None:
     cfg.carry_arm_authority = args_cli.arm_authority
     if args_cli.axial:
         cfg.carry_goal_axial_mode = True
+    if args_cli.spindle:
+        cfg.carry_spindle_mode = True
+        cfg.carry_lock_arm = True
+        cfg.carry_goal_axial_mode = True
+        cfg.carry_goal_pos_range = (0.0, 0.0, 0.0)
+        cfg.carry_pos_tolerance = 0.10
+        cfg.carry_goal_follow_object = True
     cfg.curriculum_dataset = str(args_cli.curriculum_dataset)
     cfg.curriculum_boundary = args_cli.boundary
     cfg.curriculum_reset_probability = 1.0
