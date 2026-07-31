@@ -1943,9 +1943,13 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             at_goal = (
                 (pos_err <= cfg.carry_pos_tolerance)
                 & (rot_err <= cfg.carry_rot_tolerance)
-                & self._is_grasped
                 & (max_force <= cfg.grasp_bonus_max_force)
             )
+            if not cfg.carry_spindle_mode:
+                # On the axle nothing can drop; light-contact valve-turning is the intended
+                # technique and demanding a full latch at confirm throttled the ratchet
+                # (measured: rot_err 0.32 with grasped_frac 0.16, gate stuck ~1.0 rad).
+                at_goal = at_goal & self._is_grasped
             self._carry_hold_steps.copy_(
                 torch.where(at_goal, self._carry_hold_steps + 1, torch.zeros_like(self._carry_hold_steps))
             )
