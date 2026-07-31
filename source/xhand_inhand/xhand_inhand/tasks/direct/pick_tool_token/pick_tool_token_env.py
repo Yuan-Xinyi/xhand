@@ -273,6 +273,10 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         # pipeline mode state
         self._pipe_flying = torch.zeros(N, dtype=torch.bool, device=dev)
         self._pipe_just_latched = torch.zeros(N, dtype=torch.bool, device=dev)
+        # spindle drill anchors
+        self._spindle_anchor_pos = torch.zeros((N, 3), device=dev)
+        self._spindle_anchor_quat = torch.zeros((N, 4), device=dev)
+        self._spindle_anchor_quat[:, 0] = 1.0
         # carry mode state (consecutive pose goals)
         self._carry_base_target_pos = torch.tensor(
             self.cfg.target_pos, dtype=torch.float, device=dev
@@ -1021,6 +1025,8 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         """Apply a grasp-phase arm shield before the shared relative-action controller."""
 
         shielded = actions.clone()
+        if self.cfg.carry_mode and self.cfg.carry_spindle_mode:
+            self._spindle_project()
         if self.cfg.carry_mode:
             # Arm authority: 0 = locked in-hand sub-task, annealed upward to let the arm
             # assist increasingly aggressive reorientations without replacing the fingers.
@@ -1773,6 +1779,44 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             self._resample_goal(env_ids)
         self._carry_goal_age[env_ids] = 0
 
+    def _spindle_project(self) -> None:
+        """Pin the object onto its virtual axle: position at the spawn anchor, orientation
+        reduced to the twist about the body-fixed handle axis, velocities projected."""
+        q = self.object.data.root_quat_w
+        rel = torch.stack(
+            (
+                self._spindle_anchor_quat[:, 0] * q[:, 0]
+                + (self._spindle_anchor_quat[:, 1:] * q[:, 1:]).sum(dim=-1),
+                *(
+                    self._spindle_anchor_quat[:, 0:1] * q[:, 1:]
+                    - q[:, 0:1] * self._spindle_anchor_quat[:, 1:]
+                    - torch.cross(self._spindle_anchor_quat[:, 1:], q[:, 1:], dim=-1)
+                ).unbind(-1),
+            ),
+            dim=-1,
+        )
+        axis = self._carry_axial_local
+        proj = (rel[:, 1:] * axis).sum(dim=-1, keepdim=True) * axis
+        twist = torch.cat((rel[:, 0:1], proj), dim=-1)
+        twist = twist / twist.norm(dim=-1, keepdim=True).clamp_min(1.0e-6)
+        w1, xyz1 = self._spindle_anchor_quat[:, 0:1], self._spindle_anchor_quat[:, 1:]
+        w2, xyz2 = twist[:, 0:1], twist[:, 1:]
+        q_new = torch.cat(
+            (
+                w1 * w2 - (xyz1 * xyz2).sum(dim=-1, keepdim=True),
+                w1 * xyz2 + w2 * xyz1 + torch.cross(xyz1, xyz2, dim=-1),
+            ),
+            dim=-1,
+        )
+        q_new = q_new / q_new.norm(dim=-1, keepdim=True).clamp_min(1.0e-6)
+        pose = torch.cat((self._spindle_anchor_pos, q_new), dim=-1)
+        self.object.write_root_pose_to_sim(pose)
+        axis_w = quat_apply(q_new, axis.unsqueeze(0).expand(self.num_envs, 3))
+        ang = self.object.data.root_ang_vel_w
+        ang_axial = (ang * axis_w).sum(dim=-1, keepdim=True) * axis_w
+        vel = torch.cat((torch.zeros_like(ang_axial), ang_axial), dim=-1)
+        self.object.write_root_velocity_to_sim(vel)
+
     def _carry_errors(self) -> tuple[torch.Tensor, torch.Tensor]:
         """(position error m, orientation error rad) of the tool vs the current goal pose."""
         obj_local = self.object_pos_w - self.scene.env_origins
@@ -1939,6 +1983,8 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                     # episodes end on failure or stall, never mid-streak.
                     self.episode_length_buf[ids] = 0
             dropped_hold = self._carry_lost_steps >= cfg.carry_lost_hold_steps
+            if cfg.carry_spindle_mode:
+                dropped_hold = torch.zeros_like(dropped_hold)
             failure = dropped_hold | unsafe_force
             self._carry_failure.copy_(failure)
             terminated = failure
@@ -2369,6 +2415,9 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._potential_initialized[env_ids] = False
         self._apply_curriculum_resets(env_ids)
         if self.cfg.carry_mode:
+            if self.cfg.carry_spindle_mode:
+                self._spindle_anchor_pos[env_ids] = self.object.data.root_pos_w[env_ids]
+                self._spindle_anchor_quat[env_ids] = self.object.data.root_quat_w[env_ids]
             # Goals must see the RESTORED (lifted-hold) object pose, not the stale one.
             self._carry_resample_goals(env_ids)
             self._carry_prev_arm_targets[env_ids] = self.dof_targets[env_ids][:, self._arm_ids_t]

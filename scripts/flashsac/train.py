@@ -482,6 +482,13 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         "spawns from the stage entry states back to the ordinary home reset).",
     )
     parser.add_argument(
+        "--carry_spindle",
+        action="store_true",
+        help="Spindle drill: freeze arm actions AND object translation; the object keeps "
+        "exactly one DoF -- rotation about its own handle axis (virtual axle).  Implies "
+        "--carry_lock_arm and --carry_axial.",
+    )
+    parser.add_argument(
         "--carry_axial",
         action="store_true",
         help="Goals are pure rotations about the tool's own handle axis (random sign) -- "
@@ -1006,6 +1013,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             cfg_overrides["carry_goal_timeout_penalty"] = args.carry_timeout_cost
         if args.carry_hand_vel_cost is not None:
             cfg_overrides["carry_hand_vel_penalty"] = args.carry_hand_vel_cost
+        if args.carry_spindle:
+            cfg_overrides["carry_spindle_mode"] = True
+            cfg_overrides["carry_lock_arm"] = True
+            cfg_overrides["carry_goal_axial_mode"] = True
+            cfg_overrides["carry_goal_pos_range"] = (0.0, 0.0, 0.0)
+            cfg_overrides["carry_pos_tolerance"] = 0.10
+            cfg_overrides["carry_goal_follow_object"] = True
         if args.carry_axial:
             cfg_overrides["carry_goal_axial_mode"] = True
         if args.carry_antidrop is not None:

@@ -212,6 +212,13 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # In-hand roll axis = the HANDLE long axis (user-annotated; near-perpendicular to the
     # head axis).  Rolling about this is the pure gaiting drill.
     carry_axial_axis = (0.86946, -0.18518, -0.45798)
+    # Spindle drill: the object is projected every control step onto a 1-DoF manifold --
+    # position pinned at its spawn anchor, orientation restricted to rotations about the
+    # body-fixed handle axis (twist extraction), velocities projected accordingly.  A virtual
+    # axle: no translation, no swing, no gravity flinging -- pure finger-driven rolling like
+    # turning a valve.  Losing contact cannot drop the tool, so only sustained unsafe force
+    # terminates.
+    carry_spindle_mode = False
     # ---- sequential-RL pipeline mode: ONE policy, home -> nudge+park -> latch -> carry ----
     # Phase A (unlatched): the nudge_grasp reward stack and failure gates.  The first
     # sustained latch does NOT terminate: it pays a one-shot bonus, flags the env as flying
