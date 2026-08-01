@@ -1814,6 +1814,8 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         axis_w = quat_apply(q_new, axis.unsqueeze(0).expand(self.num_envs, 3))
         ang = self.object.data.root_ang_vel_w
         ang_axial = (ang * axis_w).sum(dim=-1, keepdim=True) * axis_w
+        # Axle friction: free-wheeling decays fast; only continuous finger drive sustains it.
+        ang_axial = ang_axial * self.cfg.carry_spindle_damping
         vel = torch.cat((torch.zeros_like(ang_axial), ang_axial), dim=-1)
         self.object.write_root_velocity_to_sim(vel)
 
@@ -1945,10 +1947,15 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 & (rot_err <= cfg.carry_rot_tolerance)
                 & (max_force <= cfg.grasp_bonus_max_force)
             )
-            if not cfg.carry_spindle_mode:
-                # On the axle nothing can drop; light-contact valve-turning is the intended
-                # technique and demanding a full latch at confirm throttled the ratchet
-                # (measured: rot_err 0.32 with grasped_frac 0.16, gate stuck ~1.0 rad).
+            if cfg.carry_spindle_mode:
+                # Free-wheel exploit guard: confirming a goal requires the hand to actually
+                # be TOUCHING the tool (light contact suffices; a full latch is not needed
+                # for valve-turning, but hands-off scoring let a flicked tool spin through
+                # goals unaided in v1).
+                at_goal = at_goal & (
+                    signals["force_magnitude"].max(dim=-1).values >= cfg.contact_force_thr
+                )
+            else:
                 at_goal = at_goal & self._is_grasped
             self._carry_hold_steps.copy_(
                 torch.where(at_goal, self._carry_hold_steps + 1, torch.zeros_like(self._carry_hold_steps))

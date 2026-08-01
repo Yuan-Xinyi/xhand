@@ -219,6 +219,12 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # turning a valve.  Losing contact cannot drop the tool, so only sustained unsafe force
     # terminates.
     carry_spindle_mode = False
+    # Axle friction: axial angular velocity is multiplied by this per control step.  The v1
+    # frictionless axle was exploited -- flick the tool and let it free-wheel through goals
+    # hands-off (grasped_frac 0.16 was the detachment red flag, misread as technique).  At
+    # 0.85 a free spin dies inside ~10 frames; sustained rotation requires continuous
+    # finger drive.
+    carry_spindle_damping = 0.85
     # ---- sequential-RL pipeline mode: ONE policy, home -> nudge+park -> latch -> carry ----
     # Phase A (unlatched): the nudge_grasp reward stack and failure gates.  The first
     # sustained latch does NOT terminate: it pays a one-shot bonus, flags the env as flying
