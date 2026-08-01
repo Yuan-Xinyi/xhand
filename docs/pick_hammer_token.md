@@ -65,6 +65,27 @@ the palm-facing gate — the held/fell verdict is the calibrated signal.)
 * `carry_goal_z_margin` raised 0.16 → 0.22 (half-diagonal 0.19 m vs the tool's 0.13).
 * `reset_min_hand_object_dist` 0.08 → 0.10 (longer object at reset).
 
+## Training ladder & results (2026-07-30 → 08-01, all bignet 3×512/3×1024)
+
+| stage | run | recipe | result |
+|---|---|---|---|
+| nudge pilot | 01 (yaw90) | tool-40 recipe from scratch | 86.6% |
+| nudge fullyaw | 02 (±180°) | warm ← 01 | 92.9% |
+| spawn anneal | 03 | blend 1.0→0.0 | **96.5%** home-blend0 strict (512 eps) |
+| pregrasp gate | 04 | tool-61 flags, ratchet →0.30 | 96.8% (gate full, window 97.6%) |
+| close | 05 | tool-62 flags, 1967 captured post-nudge states, from scratch | **93.1%** latch |
+| chain (lift) | 04+05 | `--lift_height 0.35` (0.22 default is tool-sized!) | 59.0/59.4% e2e after airborne-pinch fix (was 0%) |
+| carry takeoff | 06c | **spawn union** (505 fresh-latch + 308 held), warm ← 05 | 1.0 goals/ep rising; pos gate 0.06 full |
+| in-hand | 07→08 | tool-65 dual ratchet, held_v1, warm ← 06c → 07 | gates FULL (1.8 cm + head_cos 0.92), 63.6% |
+| **full chain** | 04+05+08 | deploy margins 2.0 cm / 0.85 | **41.4% / 30.1%** e2e (2×256 eps) |
+
+Failed attempts recorded: carry from scratch and carry warm-from-close both flatline at 0
+goals (parking is the rational equilibrium; spawn union is the fix, cf. tool 23bd9ee).
+
+Known headroom: close v2 retrain on real handoffs + lift anti-sway (lift loses ~35%),
+in-hand consolidation peaked at 78% mid-run (only final checkpoints are saved), seed
+variance on the in-hand stage (65% vs 48% given lift).
+
 ## Training entry points
 
 ```bash
