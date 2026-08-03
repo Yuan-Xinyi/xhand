@@ -482,6 +482,12 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         "spawns from the stage entry states back to the ordinary home reset).",
     )
     parser.add_argument(
+        "--carry_same_dir",
+        action="store_true",
+        help="Same-direction ratcheting: one rotation direction per episode, each goal a "
+        "fixed step of carry_gap further -- forces finger relay cycles.",
+    )
+    parser.add_argument(
         "--carry_spindle",
         action="store_true",
         help="Spindle drill: freeze arm actions AND object translation; the object keeps "
@@ -1022,6 +1028,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             cfg_overrides["carry_goal_follow_object"] = True
         if args.carry_axial:
             cfg_overrides["carry_goal_axial_mode"] = True
+        if args.carry_same_dir:
+            cfg_overrides["carry_axial_same_dir"] = True
         if args.carry_antidrop is not None:
             cfg_overrides["carry_contact_occupancy"] = args.carry_antidrop[0]
             cfg_overrides["carry_impulse_prob"] = args.carry_antidrop[1]

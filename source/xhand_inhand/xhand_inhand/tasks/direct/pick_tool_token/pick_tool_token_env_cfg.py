@@ -225,6 +225,13 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # 0.85 a free spin dies inside ~10 frames; sustained rotation requires continuous
     # finger drive.
     carry_spindle_damping = 0.85
+    # Same-direction ratcheting drill: each env keeps ONE rotation direction per episode and
+    # every goal advances exactly carry_goal_rel_angle_max further (screwdriver-style
+    # accumulation).  A single coordinated stroke tops out around 0.5-0.8 rad of finger
+    # workspace; after 2-3 consecutive goals the stroke is spent and finger RELAY (release,
+    # re-place, roll again) becomes the only way to keep earning -- the cyclic-gait skill a
+    # ratchet on single-goal angle never forces.
+    carry_axial_same_dir = False
     # ---- sequential-RL pipeline mode: ONE policy, home -> nudge+park -> latch -> carry ----
     # Phase A (unlatched): the nudge_grasp reward stack and failure gates.  The first
     # sustained latch does NOT terminate: it pays a one-shot bonus, flags the env as flying

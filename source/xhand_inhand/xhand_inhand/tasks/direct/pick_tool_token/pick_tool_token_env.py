@@ -273,6 +273,8 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         # pipeline mode state
         self._pipe_flying = torch.zeros(N, dtype=torch.bool, device=dev)
         self._pipe_just_latched = torch.zeros(N, dtype=torch.bool, device=dev)
+        # same-direction drill: per-episode rotation direction
+        self._carry_axial_sign = torch.ones(N, device=dev)
         # spindle drill anchors
         self._spindle_anchor_pos = torch.zeros((N, 3), device=dev)
         self._spindle_anchor_quat = torch.zeros((N, 4), device=dev)
@@ -1736,16 +1738,23 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             if self.cfg.carry_goal_axial_mode:
                 # Body-fixed handle axis, random sign: pure axial rolls.
                 axis = self._carry_axial_local.unsqueeze(0).expand(n, 3).contiguous()
-                sign = torch.where(
-                    torch.rand((n,), device=self.device) < 0.5,
-                    torch.ones((n,), device=self.device),
-                    -torch.ones((n,), device=self.device),
-                )
+                if self.cfg.carry_axial_same_dir:
+                    sign = self._carry_axial_sign[env_ids]
+                else:
+                    sign = torch.where(
+                        torch.rand((n,), device=self.device) < 0.5,
+                        torch.ones((n,), device=self.device),
+                        -torch.ones((n,), device=self.device),
+                    )
             else:
                 axis = torch.randn((n, 3), device=self.device)
                 axis = axis / axis.norm(dim=-1, keepdim=True).clamp_min(1.0e-9)
                 sign = torch.ones((n,), device=self.device)
-            angle = sign * sample_uniform(0.0, self.cfg.carry_goal_rel_angle_max, (n,), self.device)
+            if self.cfg.carry_axial_same_dir and self.cfg.carry_goal_axial_mode:
+                # Fixed screwdriver step: every goal advances exactly max further.
+                angle = sign * self.cfg.carry_goal_rel_angle_max
+            else:
+                angle = sign * sample_uniform(0.0, self.cfg.carry_goal_rel_angle_max, (n,), self.device)
             if self.cfg.carry_goal_hard_frac > 0.0:
                 hard = sample_uniform(
                     0.7 * self.cfg.carry_goal_rel_angle_max,
@@ -2364,6 +2373,10 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._carry_failure[env_ids] = False
         self._carry_goal_count[env_ids] = 0
         self._carry_goal_age[env_ids] = 0
+        sign = torch.where(
+            torch.rand((len(env_ids),), device=self.device) < 0.5, 1.0, -1.0
+        )
+        self._carry_axial_sign[env_ids] = sign
         self._carry_goal_timed_out[env_ids] = False
         # NOTE: carry goal resampling happens AFTER _apply_curriculum_resets below --
         # sampling here would base object-following goals on the PREVIOUS episode's final
