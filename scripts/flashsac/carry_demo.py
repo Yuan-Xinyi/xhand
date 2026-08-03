@@ -27,6 +27,7 @@ parser.add_argument("--rel_angle", type=float, default=0.0, help=">0: relative-o
 parser.add_argument("--lock_arm", action="store_true")
 parser.add_argument("--axial", action="store_true")
 parser.add_argument("--spindle", action="store_true")
+parser.add_argument("--same_dir", action="store_true")
 parser.add_argument("--goal_follow", action="store_true")
 parser.add_argument("--arm_authority", type=float, default=1.0)
 parser.add_argument("--boundary", default="carry_start")
@@ -98,6 +99,8 @@ def main() -> None:
     cfg.carry_arm_authority = args_cli.arm_authority
     if args_cli.axial:
         cfg.carry_goal_axial_mode = True
+    if args_cli.same_dir:
+        cfg.carry_axial_same_dir = True
     if args_cli.spindle:
         cfg.carry_spindle_mode = True
         cfg.carry_lock_arm = True
