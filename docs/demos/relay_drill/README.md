@@ -8,3 +8,6 @@ policy): fleet average 2.7 goals (~1.6 rad) with grasped 92%; best episodes
 run 5-7 consecutive goals = 3.0-4.2 rad (240 deg) of continuous relayed
 rotation.  Consistency, not capability, is the remaining gap -- the phase-
 memory hypothesis for a future obs upgrade.
+
+Clips re-shot with a pulled-back camera (eye 1.5m) so the underside of the
+fingers stays visible: 8 / 6 / 5 consecutive goals = 4.8 / 3.6 / 3.0 rad.
