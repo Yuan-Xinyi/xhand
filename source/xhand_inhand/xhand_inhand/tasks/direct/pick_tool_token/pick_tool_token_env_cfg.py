@@ -24,6 +24,11 @@ from .tool_asset import TOOL_MASS, TOOL_REST_QUAT, TOOL_REST_Z, TOOL_SCALE, TOOL
 
 @configclass
 class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
+    # Optional identity contract for fixed-object specialists.  Functional-pregrasp tasks set
+    # both fields so the trainer can reject a manifest/task mismatch before collecting data.
+    specialist_object_id = ""
+    specialist_intent = ""
+
     # End-to-end DAgger rollouts reach strict 20 cm success at a median of ~630 control steps
     # (observed range extends past step 900).  A 10 s / 500-step horizon therefore censored most
     # successful trajectories before PPO could observe the terminal reward.
@@ -212,16 +217,36 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     pipeline_mode = False
     nudge_target_xy = None            # env-local target COM xy; None -> the default spawn xy
     nudge_target_yaw = 0.0            # target heading vs the rest orientation (rad)
+    # Object-local directed axis whose world-XY projection defines heading.  None derives an
+    # axis that points world +X in the rest pose (legacy behavior).  Cylindrical tools should
+    # use their long/functional axis so axial roll cannot change the measured yaw.
+    nudge_heading_axis = None
+    # Number of equivalent headings in one revolution.  For example, 2 treats yaw and
+    # yaw+pi as the same target.  This is deliberately separate from continuous roll
+    # symmetry (handled by nudge_stable_up_axes) so an asymmetric functional end can still
+    # define the tool heading.
+    nudge_yaw_symmetry_order = 1
+    # Object-local support normals accepted at the terminal pose.  None preserves the
+    # measured rest face; an explicit tuple supports multi-face tools.  An empty tuple means
+    # continuous axial roll symmetry, so table contact + low velocity define support.
+    nudge_stable_up_axes = None
     nudge_pos_tolerance = 0.06        # COM xy distance for success (m)
     nudge_yaw_tolerance = 0.20        # |wrapped heading error| for success (rad)
     nudge_confirm_steps = 15          # consecutive settled in-tolerance frames
     nudge_max_obj_speed = 0.10        # settled COM linear speed for success (m/s)
+    nudge_max_obj_ang_speed = 0.50    # settled COM angular speed for success (rad/s)
     nudge_workspace_radius = 0.22     # COM xy escape distance from the target -> failure (m)
     nudge_tip_cos_min = 0.90          # rest-up axis dot world-z below this = tipped -> failure
+    # Functional preparation may deliberately roll or pivot through a non-supporting pose.
+    # Such motion is allowed during the episode; the terminal state must still match one of
+    # nudge_stable_up_axes.  Set True only for legacy tasks where any tip is unrecoverable.
+    nudge_terminate_on_support_loss = False
     nudge_on_table_tolerance = 0.01   # |true clearance| above this = airborne/embedded guard (m)
     nudge_success_bonus = 100.0
     nudge_failure_penalty = 100.0
-    nudge_timeout_penalty = 10.0
+    # Timeout and hard failure have equal cost: otherwise an uncertain policy can maximize
+    # return by never touching the object and waiting out the episode.
+    nudge_timeout_penalty = 100.0
     # ---- grasp-ready ending (v7) ----
     # Joint-space interpolation between oracle pregrasp and post-nudge handoff states is not a
     # bridge (paired arm configs differ by 2.4 rad median / 4.3 rad max -- different solution
@@ -256,6 +281,24 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # center dipping below table + margin terminates the episode as a failure (same -100
     # failure contract as tipping/escaping).  No reward term.
     nudge_table_margin = 0.004        # minimum hand height above the table surface (m)
+    # Include proximal finger links and wrist/palm origins in the hard table-safety gate;
+    # fingertip pads alone miss knuckle and wrist collisions.
+    nudge_hand_safety_bodies = (
+        "link8",
+        "palm",
+        "thumb_bend_link",
+        "thumb_rota_link1",
+        "thumb_rota_link2",
+        "index_bend_link",
+        "index_rota_link1",
+        "index_rota_link2",
+        "mid_link1",
+        "mid_link2",
+        "ring_link1",
+        "ring_link2",
+        "pinky_link1",
+        "pinky_link2",
+    )
     # Nudge episodes start from a low-ready arm pose instead of the high home pose (three
     # exploration-only runs measured zero object contact from home).  The pose is DLS-solved
     # and its finger-pad clearance is verified in the TRUE reset context -- the hand at the
@@ -482,6 +525,13 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     # the real mesh convex-hull minimum, never this loose box.
     object_aabb_min = (-0.0986, -0.0878, 0.0034)
     object_aabb_max = (0.0955, 0.0884, 0.1667)
+
+    # Independent scene truth for the Seattle table top in env-local coordinates.  Never
+    # infer this from the object rest pose: a bad rest-z would otherwise make an embedded or
+    # floating object self-consistently appear correct.  Startup compares the authored rest
+    # pose against this value and fails outside the tolerance.
+    table_surface_z = -0.003
+    table_rest_clearance_tolerance = 0.01
 
     # Success must remain a slow, safe, strict grasp for this many steps.
     success_hold_steps = 15

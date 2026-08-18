@@ -1,0 +1,255 @@
+{
+  "schema_version": 1,
+  "name": "functional_pregrasp_tools_v1",
+  "body": "xarm7_xhand",
+  "action_contract": {
+    "dimension": 21,
+    "layout": "arm_delta_7+crossdex_token_9+distal_residual_5"
+  },
+  "observation_contract": {
+    "dimension": 115,
+    "goal_pose_slice": [63, 70]
+  },
+  "dataset": {
+    "name": "UniDexFPM OakInk subset",
+    "root_env": "XHAND_UNIDEXFPM_ROOT",
+    "asset_archive_sha256": "e336c37cd2f55ac52ffd9924481ad654c3a2287db53663d81030d367a8f84412",
+    "pose_archive_sha256": "92d8206934cd42654a3845b884a76dcc5763250a0b3c8ed1e6e7e50fd65aed89",
+    "redistribute_raw_data": false,
+    "license_note": "Code and raw data have different licenses. Do not commit or relicense OakInk meshes or poses."
+  },
+  "phase_1": {
+    "policy_scope": "one fixed-intent specialist per object",
+    "joint_training": false,
+    "articulated_parts": "locked_as_one_rigid_body",
+    "terminal_contract": [
+      "symmetry_aware_target_set",
+      "table_supported",
+      "linear_and_angular_settled",
+      "safe_hand_state",
+      "intent_specific_handoff",
+      "frozen_close_lift_probe"
+    ]
+  },
+  "objects": [
+    {
+      "order": 0,
+      "name": "hammer",
+      "object_id": "hammers_2",
+      "category": "hammer",
+      "intent": "use",
+      "mesh": "extracted/oakink/hammers_2/align/design.obj",
+      "collision_mesh": "extracted/oakink/hammers_2/align/decomposed.obj",
+      "pose_files": [
+        "extracted_pose/oakink_shadow_dataset_valid_force_noise_accept_1/hammers_2/000073_use_o22102.json",
+        "extracted_pose/oakink_shadow_dataset_valid_force_noise_accept_1/hammers_2/000047_use_o22102.json"
+      ],
+      "max_length_m": 0.26942,
+      "min_length_m": 0.0869231,
+      "primitives": ["push", "pivot", "yaw", "offset_com"],
+      "symmetry": {"kind": "none", "yaw_order": 1},
+      "rigid_mode": "already_rigid",
+      "special_checks": ["head_handle_mass_distribution", "strike_end_orientation"]
+    },
+    {
+      "order": 1,
+      "name": "flashlight",
+      "object_id": "flashlight_1",
+      "category": "flashlight",
+      "intent": "use",
+      "mesh": "extracted/oakink/flashlight_1/align/design.obj",
+      "collision_mesh": "extracted/oakink/flashlight_1/align/decomposed.obj",
+      "pose_files": [
+        "extracted_pose/oakink_shadow_dataset_valid_force_noise_accept_1/flashlight_1/000064_use_o23101.json",
+        "extracted_pose/oakink_shadow_dataset_valid_force_noise_accept_1/flashlight_1/000044_use_o23101.json"
+      ],
+      "max_length_m": 0.1387663,
+      "min_length_m": 0.0381384,
+      "primitives": ["push", "roll", "yaw", "axial_alignment"],
+      "symmetry": {
+        "kind": "continuous_axial_roll",
+        "axis_local": [0.0, 0.0, 1.0],
+        "axis_sign_sensitive": true,
+        "yaw_order": 1
+      },
+      "rigid_mode": "already_rigid",
+      "mass_kg": 0.15,
+      "aabb_min_m": [-0.0190692, -0.0190692, -0.0694385],
+      "aabb_max_m": [0.0190692, 0.0190692, 0.0693278],
+      "rest_seed": {
+        "quat_wxyz": [0.6876001, -0.66562844, 0.20175872, 0.20841856],
+        "root_z_above_surface_m": 0.01769763,
+        "physx_drop_settle_validated": true,
+        "validation": {
+          "probe": "scripts/functional_pregrasp/drop_settle_probe.py",
+          "num_envs": 8,
+          "steps": 300,
+          "settle_seconds": 6.0,
+          "stable_count": 8,
+          "speed_source": "adjacent_control_frame_pose_delta",
+          "max_pose_delta_linear_speed_mps": 0.00002394,
+          "max_pose_delta_angular_speed_radps": 0.034527
+        }
+      },
+      "functional_axis_local": [0.0, 0.0, 1.0],
+      "functional_point_local_m": [0.0, 0.0, 0.068683],
+      "special_checks": ["functional_end_orientation", "continuous_roll_metric", "physx_drop_settle"]
+    },
+    {
+      "order": 2,
+      "name": "marker_pen",
+      "object_id": "marker_pen8",
+      "category": "pen",
+      "intent": "use",
+      "mesh": "extracted/oakink/marker_pen8/align/scan_align.obj",
+      "collision_mesh": "extracted/oakink/marker_pen8/align/decomposed.obj",
+      "pose_files": [
+        "extracted_pose/oakink_shadow_dataset_valid_force_noise_accept_1/marker_pen8/000346_use_a29205.json",
+        "extracted_pose/oakink_shadow_dataset_valid_force_noise_accept_1/marker_pen8/000147_use_a29205.json"
+      ],
+      "max_length_m": 0.1025209,
+      "min_length_m": 0.01798924,
+      "primitives": ["precision_push", "roll", "pinch_prep"],
+      "symmetry": {"kind": "continuous_axial_roll", "axis": "principal_long_axis", "yaw_order": 1},
+      "rigid_mode": "already_rigid",
+      "special_checks": ["small_contact_patch", "tip_cap_orientation"]
+    },
+    {
+      "order": 3,
+      "name": "screwdriver",
+      "object_id": "screwdriver_1",
+      "category": "screwdriver",
+      "intent": "use",
+      "mesh": "extracted/oakink/screwdriver_1/align/design.obj",
+      "collision_mesh": "extracted/oakink/screwdriver_1/align/decomposed.obj",
+      "pose_files": [
+        "extracted_pose/oakink_shadow_dataset_valid_force_noise_accept_1/screwdriver_1/000018_use_o21101.json",
+        "extracted_pose/oakink_shadow_dataset_valid_force_noise_accept_1/screwdriver_1/000003_use_o21101.json"
+      ],
+      "max_length_m": 0.24015,
+      "min_length_m": 0.0449557,
+      "primitives": ["push", "roll", "tip_pivot", "axial_alignment"],
+      "symmetry": {"kind": "continuous_axial_roll", "axis": "principal_long_axis", "yaw_order": 1},
+      "rigid_mode": "already_rigid",
+      "special_checks": ["shaft_collision_radius", "driver_tip_keepout"]
+    },
+    {
+      "order": 4,
+      "name": "toothbrush",
+      "object_id": "toothbrush_maya3",
+      "category": "toothbrush",
+      "intent": "use",
+      "mesh": "extracted/oakink/toothbrush_maya3/align/design.obj",
+      "collision_mesh": "extracted/oakink/toothbrush_maya3/align/decomposed.obj",
+      "pose_files": [
+        "extracted_pose/oakink_shadow_dataset_valid_force_noise_accept_1/toothbrush_maya3/000010_use_o25102.json",
+        "extracted_pose/oakink_shadow_dataset_valid_force_noise_accept_1/toothbrush_maya3/000024_use_o25102.json",
+        "extracted_pose/oakink_shadow_dataset_valid_force_noise_accept_1/toothbrush_maya3/000040_use_o25102.json"
+      ],
+      "max_length_m": 0.1949022,
+      "min_length_m": 0.0260197,
+      "primitives": ["precision_push", "roll", "functional_tip_alignment"],
+      "symmetry": {"kind": "none", "yaw_order": 1},
+      "rigid_mode": "already_rigid",
+      "special_checks": ["brush_head_keepout", "thin_handle_contact"]
+    },
+    {
+      "order": 5,
+      "name": "knife",
+      "object_id": "knife_s138",
+      "category": "knife",
+      "intent": "use",
+      "mesh": "extracted/oakink/knife_s138/align/model_align.obj",
+      "collision_mesh": "extracted/oakink/knife_s138/align/decomposed.obj",
+      "pose_files": [
+        "extracted_pose/oakink_shadow_dataset_valid_force_noise_accept_1/knife_s138/003028_use_s20138.json",
+        "extracted_pose/oakink_shadow_dataset_valid_force_noise_accept_1/knife_s138/000275_use_s20138.json",
+        "extracted_pose/oakink_shadow_dataset_valid_force_noise_accept_1/knife_s138/003267_use_s20138.json"
+      ],
+      "max_length_m": 0.222536,
+      "min_length_m": 0.0245548,
+      "primitives": ["planar_push", "yaw", "edge_avoidance"],
+      "symmetry": {"kind": "none", "yaw_order": 1},
+      "rigid_mode": "already_rigid",
+      "special_checks": ["thin_collision_quality", "blade_keepout_region"]
+    },
+    {
+      "order": 6,
+      "name": "frying_pan",
+      "object_id": "frying_pan_0",
+      "category": "fryingpan",
+      "intent": "use",
+      "mesh": "extracted/oakink/frying_pan_0/align/design.obj",
+      "collision_mesh": "extracted/oakink/frying_pan_0/align/decomposed.obj",
+      "pose_files": [
+        "extracted_pose/oakink_shadow_dataset_valid_force_noise_accept_1/frying_pan_0/000029_use_o26100.json",
+        "extracted_pose/oakink_shadow_dataset_valid_force_noise_accept_1/frying_pan_0/000011_use_o26100.json"
+      ],
+      "max_length_m": 0.233618,
+      "min_length_m": 0.0584653,
+      "primitives": ["planar_push", "handle_pivot", "offset_com", "multi_support_face"],
+      "symmetry": {"kind": "discrete_support_faces", "yaw_order": 1},
+      "rigid_mode": "already_rigid",
+      "special_checks": ["bowl_collision_concavity", "handle_exposure"]
+    },
+    {
+      "order": 7,
+      "name": "lotion_pump",
+      "object_id": "lotion_pump_s104",
+      "category": "lotion_pump",
+      "intent": "use",
+      "mesh": "extracted/oakink/lotion_pump_s104/align/model_align.obj",
+      "collision_mesh": "extracted/oakink/lotion_pump_s104/align/decomposed.obj",
+      "pose_files": [
+        "extracted_pose/oakink_shadow_dataset_valid_force_noise_accept_1/lotion_pump_s104/000064_use_s02104.json",
+        "extracted_pose/oakink_shadow_dataset_valid_force_noise_accept_1/lotion_pump_s104/000415_use_s02104.json",
+        "extracted_pose/oakink_shadow_dataset_valid_force_noise_accept_1/lotion_pump_s104/000003_use_s02104.json"
+      ],
+      "max_length_m": 0.1796912,
+      "min_length_m": 0.0588286,
+      "primitives": ["upright_recovery", "yaw", "body_grasp_prep"],
+      "symmetry": {"kind": "none", "yaw_order": 1},
+      "rigid_mode": "lock_and_merge_all_parts",
+      "special_checks": ["pump_locked", "upright_stable_pose", "no_function_execution_claim"]
+    },
+    {
+      "order": 8,
+      "name": "power_drill",
+      "object_id": "035_power_drill",
+      "category": "power_drill",
+      "intent": "use",
+      "mesh": "extracted/oakink/035_power_drill/align/textured_simple.obj",
+      "collision_mesh": "extracted/oakink/035_power_drill/align/decomposed.obj",
+      "pose_files": [
+        "extracted_pose/oakink_shadow_dataset_valid_force_noise_accept_1/035_power_drill/000030_use_Y27035.json",
+        "extracted_pose/oakink_shadow_dataset_valid_force_noise_accept_1/035_power_drill/000009_use_Y27035.json"
+      ],
+      "max_length_m": 0.203784,
+      "min_length_m": 0.0586265,
+      "primitives": ["push", "pivot", "offset_com", "multi_stable_pose", "pistol_grip_exposure"],
+      "symmetry": {"kind": "none", "yaw_order": 1},
+      "rigid_mode": "lock_and_merge_all_parts",
+      "special_checks": ["trigger_locked", "pistol_grip_template", "mass_scaled_force_limits"]
+    },
+    {
+      "order": 9,
+      "name": "trigger_sprayer",
+      "object_id": "trigger_sprayer_s101",
+      "category": "trigger_sprayer",
+      "intent": "use",
+      "mesh": "extracted/oakink/trigger_sprayer_s101/align/model_align.obj",
+      "collision_mesh": "extracted/oakink/trigger_sprayer_s101/align/decomposed.obj",
+      "pose_files": [
+        "extracted_pose/oakink_shadow_dataset_valid_force_noise_accept_1/trigger_sprayer_s101/000235_use_s01101.json",
+        "extracted_pose/oakink_shadow_dataset_valid_force_noise_accept_1/trigger_sprayer_s101/000416_use_s01101.json",
+        "extracted_pose/oakink_shadow_dataset_valid_force_noise_accept_1/trigger_sprayer_s101/000455_use_s01101.json"
+      ],
+      "max_length_m": 0.211782,
+      "min_length_m": 0.0922115,
+      "primitives": ["upright_recovery", "pivot", "handle_exposure", "tip_avoidance"],
+      "symmetry": {"kind": "none", "yaw_order": 1},
+      "rigid_mode": "lock_and_merge_all_parts",
+      "special_checks": ["trigger_locked", "neck_collision", "no_function_execution_claim"]
+    }
+  ]
+}

@@ -186,6 +186,37 @@ def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def validate_checkpoint_experiment(
+    checkpoint_dir: Path,
+    expected: Mapping[str, Any],
+    *,
+    weights_only: bool,
+) -> Path | None:
+    """Reject stateful cross-task/object restores; weights-only transfer remains explicit."""
+
+    if weights_only or expected.get("experiment_manifest_sha256") is None:
+        return None
+    metadata_path = checkpoint_dir / "experiment.json"
+    if not metadata_path.is_file():
+        raise FileNotFoundError(
+            f"{metadata_path} is required for a stateful specialist restore; "
+            "use --weights_only for a legacy or cross-object checkpoint"
+        )
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    identity_keys = ("task", "experiment_manifest_sha256", "object_id", "intent")
+    mismatches = {
+        key: (metadata.get(key), expected.get(key))
+        for key in identity_keys
+        if metadata.get(key) != expected.get(key)
+    }
+    if mismatches:
+        raise ValueError(
+            f"checkpoint experiment identity does not match this run: {mismatches}; "
+            "use --weights_only for deliberate transfer"
+        )
+    return metadata_path
+
+
 def _parse_args() -> tuple[argparse.Namespace, Any]:
     # Importing AppLauncher is intentionally delayed until argument parsing;
     # task and simulator modules are imported only after the app is running.
@@ -267,6 +298,11 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
     )
     parser.add_argument("--checkpoint", type=Path, default=None, help="Optional FlashSAC checkpoint to load.")
     parser.add_argument(
+        "--weights_only",
+        action="store_true",
+        help="Warm-start networks from --checkpoint without optimizer, scheduler, reward-normalizer or replay state.",
+    )
+    parser.add_argument(
         "--resume_replay",
         action="store_true",
         help="Load replay_buffer.pt from --checkpoint; fails if it is absent.",
@@ -276,6 +312,14 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         action="store_true",
         help="Save online/permanent-demo replay beside the final network checkpoint.",
     )
+    parser.add_argument(
+        "--experiment_manifest",
+        type=Path,
+        default=None,
+        help="Versioned functional-pregrasp manifest recorded (with SHA256) in every metrics snapshot.",
+    )
+    parser.add_argument("--object_id", type=str, default=None, help="Fixed specialist object id from the manifest.")
+    parser.add_argument("--intent", type=str, default=None, help="Fixed specialist intent from the manifest.")
     parser.add_argument(
         "--demo",
         type=Path,
@@ -721,6 +765,17 @@ def _validate_args(args: argparse.Namespace) -> None:
                 raise ValueError(f"--nudge_spawn_anneal {name} must be in [0, 1]")
     if args.resume_replay and args.checkpoint is None:
         raise ValueError("--resume_replay requires --checkpoint")
+    if args.weights_only and args.checkpoint is None:
+        raise ValueError("--weights_only requires --checkpoint")
+    if args.weights_only and args.resume_replay:
+        raise ValueError("--weights_only cannot be combined with --resume_replay")
+    if args.experiment_manifest is None and (args.object_id is not None or args.intent is not None):
+        raise ValueError("--object_id/--intent require --experiment_manifest")
+    if args.experiment_manifest is not None:
+        if not args.experiment_manifest.is_file():
+            raise FileNotFoundError(f"experiment manifest does not exist: {args.experiment_manifest}")
+        if not args.object_id or not args.intent:
+            raise ValueError("--experiment_manifest requires both --object_id and --intent")
     if args.demo is not None:
         missing_demos = [path for path in args.demo if not path.is_file()]
         if missing_demos:
@@ -902,6 +957,38 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if torch.device(device).type != "cuda" or not torch.cuda.is_available():
         raise RuntimeError(f"FlashSAC PickTool training requires CUDA, got {device}")
 
+    experiment_metrics: dict[str, Any] = {
+        "task": args.task,
+        "experiment_manifest": None,
+        "experiment_manifest_sha256": None,
+        "object_id": args.object_id,
+        "intent": args.intent,
+    }
+    if args.experiment_manifest is not None:
+        manifest_path = args.experiment_manifest.resolve()
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        matching = [
+            item
+            for item in manifest.get("objects", [])
+            if item.get("object_id") == args.object_id and item.get("intent") == args.intent
+        ]
+        if len(matching) != 1:
+            raise ValueError(
+                f"{manifest_path}: expected exactly one {args.object_id}/{args.intent} specialist, "
+                f"found {len(matching)}"
+            )
+        experiment_metrics.update(
+            {
+                "experiment_manifest": str(manifest_path),
+                "experiment_manifest_sha256": _sha256(manifest_path),
+                "object_id": args.object_id,
+                "intent": args.intent,
+                "object_manifest_order": int(matching[0]["order"]),
+                "object_symmetry": matching[0]["symmetry"],
+                "object_rigid_mode": matching[0]["rigid_mode"],
+            }
+        )
+
     curriculum_metrics: dict[str, Any] = {
         "curriculum_dataset": None,
         "curriculum_dataset_sha256": None,
@@ -1047,6 +1134,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         validate_finite=args.smoke or args.validate_finite,
         task_id=args.task,
     )
+    if args.experiment_manifest is not None:
+        specialist_object_id = str(getattr(env.unwrapped.cfg, "specialist_object_id", ""))
+        specialist_intent = str(getattr(env.unwrapped.cfg, "specialist_intent", ""))
+        if args.task.startswith("Functional-Pregrasp-") and (
+            not specialist_object_id or not specialist_intent
+        ):
+            env.close()
+            raise ValueError(f"{args.task} does not declare its fixed specialist identity")
+        if specialist_object_id and (
+            specialist_object_id != args.object_id or specialist_intent != args.intent
+        ):
+            env.close()
+            raise ValueError(
+                f"task specialist is {specialist_object_id}/{specialist_intent}, "
+                f"but manifest arguments select {args.object_id}/{args.intent}"
+            )
     warmup_transitions = resolve_warmup_transitions(
         buffer=args.buffer,
         batch=args.batch,
@@ -1078,8 +1181,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         use_compile=not args.smoke and not args.no_compile,
         compile_mode="default" if args.smoke else "reduce-overhead",
         use_amp=not args.smoke and not args.no_amp,
-        load_optimizer=args.checkpoint is not None,
-        load_reward_normalizer=args.checkpoint is not None,
+        load_optimizer=args.checkpoint is not None and not args.weights_only,
+        load_reward_normalizer=args.checkpoint is not None and not args.weights_only,
     )
     noise_groups = (
         ActionNoiseGroup("arm", 0, 7, scale=1.0, zeta_mu=1.0, zeta_max=64),
@@ -1179,6 +1282,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         }
 
     if args.checkpoint is not None:
+        validate_checkpoint_experiment(
+            args.checkpoint.resolve(), experiment_metrics, weights_only=args.weights_only
+        )
         agent.load(str(args.checkpoint.resolve()))
         if args.resume_replay:
             replay_path = args.checkpoint.resolve() / "replay_buffer.pt"
@@ -1468,8 +1574,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         str(args.checkpoint.resolve()) if args.checkpoint is not None else None
                     ),
                     "resumed_replay": bool(args.resume_replay),
+                    "weights_only_warm_start": bool(args.weights_only),
                     "restore_checkpoint_rng": False,
                     "flashsac_upstream_commit": FLASH_SAC_COMMIT,
+                    **experiment_metrics,
                     "observation_dim": env.observation_dim,
                     "action_dim": env.action_dim,
                     "buffer_capacity": args.buffer,
@@ -1517,10 +1625,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
         checkpoint_dir = output_dir / "checkpoint_final"
         agent.save(str(checkpoint_dir))
+        experiment_metadata = {"schema_version": 1, **experiment_metrics}
+        atomic_write_json(checkpoint_dir / "experiment.json", experiment_metadata)
         if args.save_replay:
             agent.save_replay_buffer(str(checkpoint_dir))
         final_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
         final_metrics["checkpoint"] = str(checkpoint_dir)
+        final_metrics["checkpoint_experiment"] = str(checkpoint_dir / "experiment.json")
         final_metrics["status"] = "complete"
         atomic_write_json(metrics_path, final_metrics)
         return final_metrics

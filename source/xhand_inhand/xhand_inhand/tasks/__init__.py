@@ -21,6 +21,11 @@ _BLACKLIST_PKGS = [
     "simtoolreal.xarm7",
     # asset-build helper (launches an Isaac Sim app in main(); import is safe but pointless)
     "functional_grasping.gen_hammer_nail_assets",
+    # External OakInk asset conversion is intentionally lazy: importing unrelated tasks must
+    # not require the optional UniDexFPM dataset.  The cfg entry point imports these only when
+    # Functional-Pregrasp-Flashlight-Direct-v0 is selected.
+    "functional_pregrasp_flashlight.flashlight_asset",
+    "functional_pregrasp_flashlight.functional_pregrasp_flashlight_env_cfg",
 ]
 # Import all configs in this package
 import_packages(__name__, _BLACKLIST_PKGS)

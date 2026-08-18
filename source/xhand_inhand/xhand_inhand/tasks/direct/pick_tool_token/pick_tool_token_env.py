@@ -25,7 +25,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.sensors import ContactSensor, ContactSensorCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.utils.math import quat_apply, quat_conjugate, sample_uniform, wrap_to_pi
+from isaaclab.utils.math import quat_apply, quat_conjugate, sample_uniform
 
 from ..pick_cube_token.pick_cube_token_env import PickCubeTokenEnv
 from .grasp_signals import (
@@ -37,6 +37,12 @@ from .grasp_signals import (
 )
 from .hybrid_action import apply_asymmetric_joint_residual
 from .pick_tool_token_env_cfg import PickToolTokenEnvCfg
+from .pose_metrics import (
+    compose_yaw_with_rest_quaternion,
+    planar_axis_alignment,
+    pose_delta_speeds,
+    symmetry_aware_angle_error,
+)
 
 
 class PickToolTokenEnv(PickCubeTokenEnv):
@@ -122,10 +128,20 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         _v = torch.tensor(_v, dtype=torch.float, device=dev) * torch.tensor(_mesh_scale, device=dev)
         _hull = ConvexHull(_v.cpu().numpy()).vertices
         self._obj_hull_local = _v[torch.as_tensor(_hull, device=dev)]  # (M,3) hull verts, the min-z is always one
-        # true table surface = the object's real lowest mesh point at the rest pose (it sits on the table);
-        # yaw-invariant (reset only yaws), so a single constant.
+        # Validate the object rest pose against independent scene truth.  Deriving the table from
+        # the object made a bad rest-z self-consistent: an embedded or hovering mesh could pass all
+        # clearance checks.  The explicit table height is the value used by every reward/gate.
         _rest_world_z = quat_apply(rest_quat.expand(self._obj_hull_local.shape[0], 4), self._obj_hull_local)[:, 2]
-        self._table_surface_z = (_rest_world_z + rest_z).min()  # scalar, env-local
+        _derived_rest_surface = (_rest_world_z + rest_z).min()
+        self._table_surface_z = torch.tensor(float(cfg.table_surface_z), dtype=torch.float, device=dev)
+        rest_clearance_error = torch.abs(_derived_rest_surface - self._table_surface_z)
+        if rest_clearance_error > cfg.table_rest_clearance_tolerance:
+            raise RuntimeError(
+                "Object rest pose does not meet the independently configured table surface: "
+                f"mesh_min_z={_derived_rest_surface.item():.6f}, "
+                f"table_surface_z={self._table_surface_z.item():.6f}, "
+                f"error={rest_clearance_error.item():.6f}. Re-run drop-settle calibration."
+            )
 
         # ---- dense analytic handle surface ----
         # The calibrated points form a cross-section of the handle. Build a convex polygon from a
@@ -242,6 +258,32 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         world_z = torch.tensor([0.0, 0.0, 1.0], device=dev).expand(N, 3)
         self._nudge_rest_x_local = quat_apply(quat_conjugate(default_quat), world_x).clone()
         self._nudge_rest_up_local = quat_apply(quat_conjugate(default_quat), world_z).clone()
+        if cfg.nudge_heading_axis is None:
+            self._nudge_heading_axis_local = self._nudge_rest_x_local
+        else:
+            heading_axis = torch.tensor(cfg.nudge_heading_axis, dtype=torch.float, device=dev)
+            if heading_axis.shape != (3,) or heading_axis.norm() < 1.0e-6:
+                raise ValueError("nudge_heading_axis must be a non-zero object-local 3-vector")
+            heading_axis = heading_axis / heading_axis.norm()
+            self._nudge_heading_axis_local = heading_axis.unsqueeze(0).expand(N, -1).clone()
+        rest_heading_axis_w = quat_apply(default_quat, self._nudge_heading_axis_local)
+        if bool((rest_heading_axis_w[:, :2].norm(dim=-1) < 1.0e-4).any()):
+            raise ValueError("nudge_heading_axis is vertical in the rest pose and has no planar heading")
+        self._nudge_rest_heading = torch.atan2(rest_heading_axis_w[:, 1], rest_heading_axis_w[:, 0])
+        stable_axes = cfg.nudge_stable_up_axes
+        if stable_axes is None:
+            self._nudge_stable_up_local = self._nudge_rest_up_local.unsqueeze(1)
+        else:
+            axes = torch.tensor(stable_axes, dtype=torch.float, device=dev).reshape(-1, 3)
+            if axes.numel() == 0:
+                self._nudge_stable_up_local = torch.empty((N, 0, 3), dtype=torch.float, device=dev)
+            else:
+                if bool((axes.norm(dim=-1) < 1.0e-6).any()):
+                    raise ValueError("nudge_stable_up_axes contains a zero-length axis")
+                axes = axes / axes.norm(dim=-1, keepdim=True)
+                self._nudge_stable_up_local = axes.unsqueeze(0).expand(N, -1, -1).clone()
+        if int(cfg.nudge_yaw_symmetry_order) < 1:
+            raise ValueError("nudge_yaw_symmetry_order must be a positive integer")
         self._nudge_target_xy = torch.zeros((N, 2), device=dev)
         self._nudge_success = torch.zeros(N, dtype=torch.bool, device=dev)
         self._nudge_failure = torch.zeros(N, dtype=torch.bool, device=dev)
@@ -256,6 +298,13 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         self._nudge_failure_total = torch.zeros((), dtype=torch.long, device=dev)
         self._nudge_timeout_total = torch.zeros((), dtype=torch.long, device=dev)
         self._nudge_table_hit_total = torch.zeros((), dtype=torch.long, device=dev)
+        self._nudge_previous_object_pos = self.object.data.root_link_pos_w.clone()
+        self._nudge_previous_object_quat = self.object.data.root_link_quat_w.clone()
+        safety_ids, safety_names = self.robot.find_bodies(list(cfg.nudge_hand_safety_bodies))
+        if len(safety_ids) != len(cfg.nudge_hand_safety_bodies):
+            missing = sorted(set(cfg.nudge_hand_safety_bodies) - set(safety_names))
+            raise ValueError(f"nudge_hand_safety_bodies are absent from the robot: {missing}")
+        self._nudge_hand_safety_body_ids = torch.as_tensor(safety_ids, dtype=torch.long, device=dev)
         # in-hand reorientation mode state
         self._inhand_point_local = torch.tensor(
             self.cfg.inhand_point, dtype=torch.float, device=dev
@@ -995,11 +1044,31 @@ class PickToolTokenEnv(PickCubeTokenEnv):
         return wrap
 
     # ------------------------------------------------------------------ reward
+    def _nudge_goal_pose(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the env-local planar preparation goal used by reward and observation."""
+
+        goal_pos = self.object.data.default_root_state[:, :3].clone()
+        goal_pos[:, :2] = self._nudge_target_xy
+        goal_quat = compose_yaw_with_rest_quaternion(
+            self.object.data.default_root_state[:, 3:7], float(self.cfg.nudge_target_yaw)
+        )
+        return goal_pos, goal_quat
+
     def _get_observations(self) -> dict:
         # Preserve the old 87-dimensional observation as an exact prefix.  This permits an explicit
         # old-checkpoint migration without shifting its learned lift-feature column:
         # core70 | arm+token16 | lift1 | residual5 | close/contact/phase/transport23.
         d = super()._get_observations()
+        # The historical nudge reward used _nudge_target_xy/yaw while slots 63:70 still
+        # exposed PickCube's random airborne target.  That is a hidden-goal POMDP as soon as
+        # targets vary.  Replace those exact compatibility slots with the single goal buffer
+        # consumed by the nudge reward/termination.  Pipeline carry keeps its dynamic goal.
+        if self.cfg.nudge_option_mode or (self.cfg.nudge_grasp_mode and not self.cfg.pipeline_mode):
+            base = d["policy"].clone()
+            goal_pos, goal_quat = self._nudge_goal_pose()
+            base[:, 63:66] = goal_pos
+            base[:, 66:70] = goal_quat
+            d["policy"] = base
         clearance = self._object_true_min_z() - self._table_surface_z
         lift_progress = torch.clamp(clearance / self.cfg.lift_success_height, 0.0, 1.0).unsqueeze(-1)
         if not self.cfg.enable_grasp_observations:
@@ -1049,6 +1118,10 @@ class PickToolTokenEnv(PickCubeTokenEnv):
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         """Apply a grasp-phase arm shield before the shared relative-action controller."""
 
+        # Snapshot exactly once per control step.  Intermediate values are evaluated several
+        # times per step, so updating this buffer there would collapse the delta to zero.
+        self._nudge_previous_object_pos.copy_(self.object.data.root_link_pos_w)
+        self._nudge_previous_object_quat.copy_(self.object.data.root_link_quat_w)
         shielded = actions.clone()
         if self.cfg.carry_mode:
             # Arm authority: 0 = locked in-hand sub-task, annealed upward to let the arm
@@ -1839,17 +1912,53 @@ class PickToolTokenEnv(PickCubeTokenEnv):
 
     # ------------------------------------------------------------------ nudge pose errors
     def _nudge_pose_errors(self) -> dict[str, torch.Tensor]:
-        """COM-xy error, wrapped heading error and rest-up alignment of the tool on the table."""
+        """COM-xy, symmetry-aware heading and best stable-support alignment."""
 
         quat = self.object.data.root_quat_w
         com_xy = self._object_com_position_w()[:, :2]
         target_xy = self._nudge_target_xy + self.scene.env_origins[:, :2]
         pos_error = (com_xy - target_xy).norm(dim=-1)
-        x_now = quat_apply(quat, self._nudge_rest_x_local)
-        heading = torch.atan2(x_now[:, 1], x_now[:, 0])
-        heading_error = wrap_to_pi(heading - self.cfg.nudge_target_yaw).abs()
-        tip_cos = quat_apply(quat, self._nudge_rest_up_local)[:, 2]
+        heading_axis_w = quat_apply(quat, self._nudge_heading_axis_local)
+        heading = torch.atan2(heading_axis_w[:, 1], heading_axis_w[:, 0])
+        heading_error = symmetry_aware_angle_error(
+            heading,
+            self._nudge_rest_heading + float(self.cfg.nudge_target_yaw),
+            int(self.cfg.nudge_yaw_symmetry_order),
+        )
+        stable_axes = self._nudge_stable_up_local
+        if stable_axes.shape[1] == 0:
+            # A cylinder may settle at every roll angle, but its long/heading axis must remain
+            # horizontal.  Without this gate an end-standing flashlight could count as a valid
+            # side-rest state merely because its projected heading happened to match.
+            tip_cos = planar_axis_alignment(heading_axis_w)
+        else:
+            n_axes = stable_axes.shape[1]
+            axes_w = quat_apply(
+                quat.unsqueeze(1).expand(-1, n_axes, -1).reshape(-1, 4),
+                stable_axes.reshape(-1, 3),
+            ).reshape(self.num_envs, n_axes, 3)
+            tip_cos = axes_w[:, :, 2].max(dim=1).values
         return {"pos_error": pos_error, "heading_error": heading_error, "tip_cos": tip_cos}
+
+    def _nudge_hand_table_hit(self) -> torch.Tensor:
+        """Hard table-safety gate over pads, palm center, wrist and proximal finger links."""
+
+        body_z = self.robot.data.body_pos_w[:, self._nudge_hand_safety_body_ids, 2]
+        hand_points_z = torch.cat(
+            (self.ee_pos_w[:, :, 2], self.palm_center_w[:, 2:3], body_z), dim=1
+        )
+        return hand_points_z.min(dim=-1).values < self._table_surface_z + self.cfg.nudge_table_margin
+
+    def _nudge_pose_delta_speeds(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Settling speeds from adjacent control-frame poses, immune to Fabric velocity noise."""
+
+        return pose_delta_speeds(
+            self.object.data.root_link_pos_w,
+            self.object.data.root_link_quat_w,
+            self._nudge_previous_object_pos,
+            self._nudge_previous_object_quat,
+            float(self.cfg.sim.dt * self.cfg.decimation),
+        )
 
     # ------------------------------------------------------------------ termination
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2026,13 +2135,7 @@ class PickToolTokenEnv(PickCubeTokenEnv):
 
         if cfg.nudge_grasp_mode:
             errors = self._nudge_pose_errors()
-            hand_points_z = torch.cat(
-                (self.ee_pos_w[:, :, 2], self.palm_center_w[:, 2:3]), dim=1
-            )
-            table_hit = (
-                hand_points_z.min(dim=-1).values
-                < self._table_surface_z + cfg.nudge_table_margin
-            )
+            table_hit = self._nudge_hand_table_hit()
             escaped = errors["pos_error"] > cfg.nudge_workspace_radius
             latched = (
                 self._is_grasped
@@ -2142,7 +2245,8 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             errors = self._nudge_pose_errors()
             upright = errors["tip_cos"] >= cfg.nudge_tip_cos_min
             on_table = clearance.abs() <= cfg.nudge_on_table_tolerance
-            settled = obj_lin <= cfg.nudge_max_obj_speed
+            pose_lin, pose_ang = self._nudge_pose_delta_speeds()
+            settled = (pose_lin <= cfg.nudge_max_obj_speed) & (pose_ang <= cfg.nudge_max_obj_ang_speed)
             in_target = (
                 (errors["pos_error"] <= cfg.nudge_pos_tolerance)
                 & (errors["heading_error"] <= cfg.nudge_yaw_tolerance)
@@ -2161,15 +2265,10 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             escaped = errors["pos_error"] > cfg.nudge_workspace_radius
             # Hand-table collision is a hard constraint: any finger pad or the palm center
             # below table + margin ends the episode as a failure (no reward shaping).
-            hand_points_z = torch.cat(
-                (self.ee_pos_w[:, :, 2], self.palm_center_w[:, 2:3]), dim=1
-            )
-            table_hit = (
-                hand_points_z.min(dim=-1).values
-                < self._table_surface_z + cfg.nudge_table_margin
-            )
+            table_hit = self._nudge_hand_table_hit()
             success = self._nudge_hold_steps >= cfg.nudge_confirm_steps
-            failure = (~upright) | escaped | dropped | unsafe_force | table_hit
+            support_failure = (~upright) & bool(cfg.nudge_terminate_on_support_loss)
+            failure = support_failure | escaped | dropped | unsafe_force | table_hit
             success = success & ~failure
             self._nudge_success.copy_(success)
             self._nudge_failure.copy_(failure)
@@ -2199,6 +2298,8 @@ class PickToolTokenEnv(PickCubeTokenEnv):
                 "nudge_table_hit": table_hit.clone(),
                 "nudge_pos_error": errors["pos_error"].clone(),
                 "nudge_heading_error": errors["heading_error"].clone(),
+                "nudge_pose_delta_lin_speed": pose_lin.clone(),
+                "nudge_pose_delta_ang_speed": pose_ang.clone(),
                 **terminal_state,
             }
             return terminated, time_out
@@ -2387,6 +2488,10 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             self._carry_resample_goals(env_ids)
             self._carry_prev_arm_targets[env_ids] = self.dof_targets[env_ids][:, self._arm_ids_t]
         self._close_option_start_xy[env_ids] = self._object_com_position_w()[env_ids, :2]
+        # Keep direct reset->diagnostic calls well-defined.  Standard training snapshots again
+        # in `_pre_physics_step`, but external probes may query settling before their first step.
+        self._nudge_previous_object_pos[env_ids] = self.object.data.root_link_pos_w[env_ids]
+        self._nudge_previous_object_quat[env_ids] = self.object.data.root_link_quat_w[env_ids]
 
     # ------------------------------------------------------------------ reset object placement (P1-8)
     def _sample_non_overlapping_object_xy(self, env_ids, default_xy):
