@@ -2273,10 +2273,10 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         nargs="+",
         default=None,
         help=(
-            "Successful observation/action-only teacher datasets used exclusively for actor "
-            "rehearsal; they are never inserted into critic replay. Coupled-power sources "
-            "must satisfy the strict 131D phase contract and require --actor_checkpoint "
-            "initially (or --checkpoint plus --resume_actor_demo when resuming)."
+            "Allowlisted observation/action-only supervision used exclusively for actor "
+            "rehearsal; it is never inserted into critic replay. Full-task phase-0 DAgger "
+            "correction labels and successful teacher trajectories have distinct fail-closed "
+            "contracts. Coupled-power sources must satisfy the strict 131D phase contract."
         ),
     )
     parser.add_argument(
@@ -3361,7 +3361,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     from actor_rehearsal import (
         PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS,
         PICK_TOOL_COUPLED_POWER_ACTOR_DEMO_CONTRACTS,
-        PICK_TOOL_LIFT_ACTOR_DEMO_CONTRACTS,
+        PICK_TOOL_FULL_TASK_ACTOR_DEMO_CONTRACTS,
         ActorRehearsalReservoir,
         load_actor_rehearsal,
     )
@@ -3632,7 +3632,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         elif policy_router_enabled:
             actor_demo_contracts = PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS
         else:
-            actor_demo_contracts = PICK_TOOL_LIFT_ACTOR_DEMO_CONTRACTS
+            actor_demo_contracts = PICK_TOOL_FULL_TASK_ACTOR_DEMO_CONTRACTS
         for path in args.actor_demo:
             source_action_dim = (
                 PICK_TOOL_ENVIRONMENT_ACTION_DIM
@@ -4321,8 +4321,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "seed": args.seed,
                     "smoke": bool(args.smoke),
                     "task_mode": task_mode,
+                    "requested_interaction_steps": args.steps,
                     "interaction_step": interaction_step,
+                    "num_envs": env.num_envs,
                     "environment_steps": interaction_step * env.num_envs,
+                    "batch_size": args.batch,
+                    "updates_per_vector_step": args.updates,
                     "gradient_updates": update_count,
                     "actor_updates": actor_update_count,
                     "sac_actor_updates": actor_update_count,
@@ -4353,6 +4357,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "demo_bc_only_deferred_slots": demo_bc_only_deferred_slots,
                     "demo_bc_weight": demo_bc_weight,
                     "demo_bc_group_weights": demo_bc_group_weights,
+                    "demo_bc_target_std": args.demo_bc_target_std,
+                    "demo_bc_std_weight": args.demo_bc_std_weight,
+                    "demo_bc_phases": args.demo_bc_phases,
                     "lr_decay_updates": lr_decay_updates,
                     "lr_warmup_updates": lr_warmup_updates,
                     "initial_checkpoint": (
@@ -4464,6 +4471,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     },
                     "resumed_actor_demo": bool(args.resume_actor_demo),
                     "restore_checkpoint_rng": False,
+                    "save_replay": bool(args.save_replay),
+                    "validate_finite": bool(args.smoke or args.validate_finite),
+                    "compile_enabled": bool(not args.smoke and not args.no_compile),
+                    "amp_enabled": bool(not args.smoke and not args.no_amp),
                     "flashsac_upstream_commit": FLASH_SAC_COMMIT,
                     "flashsac_fork_commit": FLASH_SAC_FORK_COMMIT,
                     **current_runtime_contract,

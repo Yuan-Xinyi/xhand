@@ -74,6 +74,7 @@ class ActorRehearsalSourceContract:
     required_zero_action_slices: tuple[tuple[int, int, int], ...] = ()
     required_observation_values: tuple[tuple[int, float], ...] = ()
     strict_metadata_types: bool = False
+    require_successful_episodes: bool = True
     required_episode_tensors: tuple[EpisodeTensorContract, ...] = ()
     required_episode_conditional_values: tuple[
         tuple[str, float | int, str, float | int], ...
@@ -127,6 +128,8 @@ class ActorRehearsalSourceContract:
             raise ValueError("required SHA256 metadata keys must be non-empty strings")
         if not isinstance(self.strict_metadata_types, bool):
             raise TypeError("strict_metadata_types must be bool")
+        if not isinstance(self.require_successful_episodes, bool):
+            raise TypeError("require_successful_episodes must be bool")
         for phase, start, stop in self.required_zero_action_slices:
             if phase not in self.allowed_phase_values:
                 raise ValueError(
@@ -452,6 +455,91 @@ PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS = tuple(
     contract for contract in PICK_TOOL_ACTOR_DEMO_CONTRACTS if contract.required_phase == 1
 )
 
+_PICK_TOOL_DAGGER_PHASE0_SOURCE_SHA256 = (
+    "e4aaf0eda6a33db4a2ed04bc4d7609639da9b0471408808a5dae1b67760ce57f"
+)
+_PICK_TOOL_DAGGER_PHASE0_SPLIT_SALT = (
+    "pick_tool_candidate44_phase0_correction_split_20260723_v1"
+)
+_PICK_TOOL_DAGGER_PHASE0_COMMON_METADATA = {
+    "format_version": 1,
+    "task_mode": "full_task",
+    "observation_dim": 115,
+    "observation_contract": "pick_tool_markov115_v1",
+    "observation_layout": _PICK_TOOL_OBSERVATION_LAYOUT,
+    "action_dim": 21,
+    "action_layout": _PICK_TOOL_ACTION_LAYOUT,
+    "phase_names": _PICK_TOOL_PHASE_NAMES,
+    "collector": "pick_tool_dagger_oracle_phase0_correction_v1",
+    "dataset_phase": "approach",
+    "action_semantics": "oracle_correction_label_on_logged_state_v1",
+    "episode_semantics": "correction_labels_without_outcome_claim_v1",
+    "critic_replay_eligible": False,
+    "source_dataset_sha256": _PICK_TOOL_DAGGER_PHASE0_SOURCE_SHA256,
+    "source_dataset_rows": 797450,
+    "source_dataset_episodes": 1685,
+    "selection": "phase_eq_0_and_observation_106_eq_0_v1",
+    "split_method": "sha256_rank_source_episode_80_20_v1",
+    "split_salt": _PICK_TOOL_DAGGER_PHASE0_SPLIT_SALT,
+    "row_order": "hash_rank_episode_then_source_row_v1",
+    "episode_id_semantics": "source_episode_id_v1",
+}
+
+PICK_TOOL_APPROACH_CORRECTION_TRAIN_CONTRACTS = (
+    ActorRehearsalSourceContract(
+        name="pick_tool_dagger_phase0_correction_train_v1",
+        required_metadata={
+            **_PICK_TOOL_DAGGER_PHASE0_COMMON_METADATA,
+            "split": "train",
+            "split_episodes": 734,
+            "split_rows": 220181,
+        },
+        required_phase=0,
+        required_sha256_metadata=("source_dataset_sha256",),
+        required_observation_values=((106, 0.0),),
+        strict_metadata_types=True,
+        require_successful_episodes=False,
+        required_episode_tensors=(
+            EpisodeTensorContract(
+                "source_episode_id",
+                torch.int64,
+                minimum=0,
+                maximum=1684,
+            ),
+        ),
+    ),
+)
+
+PICK_TOOL_APPROACH_CORRECTION_VALIDATION_CONTRACTS = (
+    ActorRehearsalSourceContract(
+        name="pick_tool_dagger_phase0_correction_validation_v1",
+        required_metadata={
+            **_PICK_TOOL_DAGGER_PHASE0_COMMON_METADATA,
+            "split": "validation",
+            "split_episodes": 183,
+            "split_rows": 54900,
+        },
+        required_phase=0,
+        required_sha256_metadata=("source_dataset_sha256",),
+        required_observation_values=((106, 0.0),),
+        strict_metadata_types=True,
+        require_successful_episodes=False,
+        required_episode_tensors=(
+            EpisodeTensorContract(
+                "source_episode_id",
+                torch.int64,
+                minimum=0,
+                maximum=1684,
+            ),
+        ),
+    ),
+)
+
+PICK_TOOL_FULL_TASK_ACTOR_DEMO_CONTRACTS = (
+    *PICK_TOOL_LIFT_ACTOR_DEMO_CONTRACTS,
+    *PICK_TOOL_APPROACH_CORRECTION_TRAIN_CONTRACTS,
+)
+
 PICK_TOOL_COUPLED_POWER_ACTOR_DEMO_CONTRACTS = (
     ActorRehearsalSourceContract(
         name="successful_coupled_power_align_close_teacher_v1",
@@ -701,9 +789,15 @@ def _require_phase(
     return phase.detach().to(device=device, dtype=torch.int64, copy=True)
 
 
-def _audit_episode_partition(payload: Mapping[str, Any], *, rows: int) -> int:
+def _audit_episode_partition(
+    payload: Mapping[str, Any],
+    *,
+    rows: int,
+    require_successful_episodes: bool = True,
+) -> int:
     offsets = payload.get("episode_offsets")
-    successes = payload.get("episode_success")
+    if not isinstance(require_successful_episodes, bool):
+        raise TypeError("require_successful_episodes must be bool")
     if not isinstance(offsets, torch.Tensor):
         raise TypeError("actor rehearsal dataset requires tensor episode_offsets")
     if offsets.dtype not in _INTEGER_DTYPES:
@@ -717,12 +811,19 @@ def _audit_episode_partition(payload: Mapping[str, Any], *, rows: int) -> int:
         raise ValueError("episode_offsets must be strictly increasing")
 
     episodes = int(offsets.numel() - 1)
-    if not isinstance(successes, torch.Tensor):
-        raise TypeError("actor rehearsal dataset requires tensor episode_success")
-    if successes.dtype != torch.bool or successes.shape != (episodes,):
-        raise ValueError(f"episode_success must be bool with shape ({episodes},)")
-    if not bool(successes.all()):
-        raise ValueError("actor rehearsal may contain only successful episodes")
+    if require_successful_episodes:
+        successes = payload.get("episode_success")
+        if not isinstance(successes, torch.Tensor):
+            raise TypeError("actor rehearsal dataset requires tensor episode_success")
+        if successes.dtype != torch.bool or successes.shape != (episodes,):
+            raise ValueError(f"episode_success must be bool with shape ({episodes},)")
+        if not bool(successes.all()):
+            raise ValueError("actor rehearsal may contain only successful episodes")
+    elif "episode_success" in payload:
+        raise ValueError(
+            "correction-label actor rehearsal must omit episode_success rather than "
+            "fabricating an outcome claim"
+        )
 
     episode_id = payload.get("episode_id")
     if episode_id is not None:
@@ -1116,7 +1217,7 @@ def load_actor_rehearsal(
     expected_metadata: Mapping[str, Any] | None = None,
     allowed_contracts: Sequence[ActorRehearsalSourceContract] | None = None,
 ) -> tuple[dict[str, torch.Tensor], torch.Tensor | None, dict[str, Any]]:
-    """Load and audit a successful observation/action teacher dataset.
+    """Load and audit an allowlisted observation/action supervision dataset.
 
     ``obs`` is the native key used by the PickTool option-teacher collectors;
     ``observation`` is accepted for projected transition demonstrations.  The
@@ -1151,7 +1252,6 @@ def load_actor_rehearsal(
         for key, value in raw_batch.items()
     }
     phase = _require_phase(payload.get("phase"), rows=rows, device=resolved_device)
-    episodes = _audit_episode_partition(payload, rows=rows)
     metadata, source_contract = audit_actor_rehearsal_metadata(
         payload,
         observation_dim=observation_dim,
@@ -1159,6 +1259,16 @@ def load_actor_rehearsal(
         phase=phase,
         expected_metadata=expected_metadata,
         allowed_contracts=allowed_contracts,
+    )
+    require_successful_episodes = (
+        True
+        if source_contract is None
+        else source_contract.require_successful_episodes
+    )
+    episodes = _audit_episode_partition(
+        payload,
+        rows=rows,
+        require_successful_episodes=require_successful_episodes,
     )
     audit_actor_rehearsal_action_semantics(
         raw_batch["action"],
@@ -1200,6 +1310,11 @@ def load_actor_rehearsal(
         "collector": str(metadata["collector"]),
         "dataset_phase": metadata.get("dataset_phase"),
         "source_contract": source_contract.name if source_contract is not None else None,
+        "episode_semantics": (
+            "successful_only"
+            if require_successful_episodes
+            else "correction_labels_without_outcome_claim"
+        ),
     }
     if source_contract is not None:
         for key in source_contract.required_sha256_metadata:

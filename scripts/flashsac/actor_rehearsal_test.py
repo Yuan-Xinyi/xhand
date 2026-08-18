@@ -18,9 +18,13 @@ if str(HERE) not in sys.path:
 from actor_rehearsal import (  # noqa: E402
     ACTOR_REHEARSAL_KEYS,
     PICK_TOOL_ACTOR_DEMO_CONTRACTS,
+    PICK_TOOL_APPROACH_CORRECTION_TRAIN_CONTRACTS,
+    PICK_TOOL_APPROACH_CORRECTION_VALIDATION_CONTRACTS,
     PICK_TOOL_CLOSE_ACTOR_DEMO_CONTRACTS,
     PICK_TOOL_COUPLED_POWER_ACTOR_DEMO_CONTRACTS,
+    PICK_TOOL_FULL_TASK_ACTOR_DEMO_CONTRACTS,
     PICK_TOOL_LIFT_ACTOR_DEMO_CONTRACTS,
+    ActorRehearsalSourceContract,
     ActorRehearsalReservoir,
     load_actor_rehearsal,
     sha256_file,
@@ -75,6 +79,154 @@ def _write_payload(path: Path, payload: dict[str, Any] | None = None) -> dict[st
     selected = _teacher_payload() if payload is None else payload
     torch.save(selected, path)
     return selected
+
+
+def _small_correction_contract() -> ActorRehearsalSourceContract:
+    return ActorRehearsalSourceContract(
+        name="small_phase0_correction_test",
+        required_metadata={
+            "collector": "test_phase0_correction",
+            "dataset_phase": "approach",
+            "action_semantics": "oracle_correction_label_on_logged_state_v1",
+            "split": "train",
+            "source_dataset_sha256": "e" * 64,
+            "critic_replay_eligible": False,
+        },
+        required_phase=0,
+        required_sha256_metadata=("source_dataset_sha256",),
+        required_observation_values=((4, 0.0),),
+        strict_metadata_types=True,
+        require_successful_episodes=False,
+    )
+
+
+def _small_correction_payload() -> dict[str, Any]:
+    payload = _teacher_payload()
+    payload["phase"] = torch.zeros(6, dtype=torch.uint8)
+    payload["obs"][:, 4] = 0.0
+    del payload["episode_success"]
+    payload["meta"].update(
+        {
+            "collector": "test_phase0_correction",
+            "dataset_phase": "approach",
+            "action_semantics": "oracle_correction_label_on_logged_state_v1",
+            "split": "train",
+            "source_dataset_sha256": "e" * 64,
+            "critic_replay_eligible": False,
+        }
+    )
+    return payload
+
+
+def test_correction_labels_require_an_explicit_non_outcome_contract() -> None:
+    contract = _small_correction_contract()
+    with tempfile.TemporaryDirectory(prefix="actor_rehearsal_correction_") as directory:
+        root = Path(directory)
+        valid = root / "valid.pt"
+        source = _write_payload(valid, _small_correction_payload())
+        batch, phase, audit = load_actor_rehearsal(
+            valid,
+            device="cpu",
+            observation_dim=OBSERVATION_DIM,
+            action_dim=ACTION_DIM,
+            allowed_contracts=(contract,),
+        )
+        torch.testing.assert_close(batch["action"], source["action"])
+        assert phase is not None and bool((phase == 0).all())
+        assert audit["episode_semantics"] == (
+            "correction_labels_without_outcome_claim"
+        )
+
+        fake_success = _small_correction_payload()
+        fake_success["episode_success"] = torch.ones(2, dtype=torch.bool)
+        fake_success_path = root / "fake_success.pt"
+        _write_payload(fake_success_path, fake_success)
+        _expect_error(
+            ValueError,
+            load_actor_rehearsal,
+            fake_success_path,
+            device="cpu",
+            observation_dim=OBSERVATION_DIM,
+            action_dim=ACTION_DIM,
+            allowed_contracts=(contract,),
+        )
+
+        wrong_phase = _small_correction_payload()
+        wrong_phase["phase"][0] = 1
+        wrong_phase_path = root / "wrong_phase.pt"
+        _write_payload(wrong_phase_path, wrong_phase)
+        _expect_error(
+            ValueError,
+            load_actor_rehearsal,
+            wrong_phase_path,
+            device="cpu",
+            observation_dim=OBSERVATION_DIM,
+            action_dim=ACTION_DIM,
+            allowed_contracts=(contract,),
+        )
+
+        latched = _small_correction_payload()
+        latched["obs"][0, 4] = 1.0
+        latched_path = root / "latched.pt"
+        _write_payload(latched_path, latched)
+        _expect_error(
+            ValueError,
+            load_actor_rehearsal,
+            latched_path,
+            device="cpu",
+            observation_dim=OBSERVATION_DIM,
+            action_dim=ACTION_DIM,
+            allowed_contracts=(contract,),
+        )
+
+        for index, (key, value) in enumerate(
+            (
+                ("split", "validation"),
+                ("collector", "unknown"),
+                ("action_semantics", "executed_learner_action"),
+                ("source_dataset_sha256", "f" * 64),
+            )
+        ):
+            rejected = _small_correction_payload()
+            rejected["meta"][key] = value
+            rejected_path = root / f"wrong_metadata_{index}.pt"
+            _write_payload(rejected_path, rejected)
+            _expect_error(
+                ValueError,
+                load_actor_rehearsal,
+                rejected_path,
+                device="cpu",
+                observation_dim=OBSERVATION_DIM,
+                action_dim=ACTION_DIM,
+                allowed_contracts=(contract,),
+            )
+
+        # A metadata-only/generic loader is deliberately not a back door for
+        # non-successful correction labels.
+        _expect_error(
+            TypeError,
+            load_actor_rehearsal,
+            valid,
+            device="cpu",
+            observation_dim=OBSERVATION_DIM,
+            action_dim=ACTION_DIM,
+            expected_metadata={"collector": "test_phase0_correction"},
+        )
+
+    train_names = {
+        contract.name for contract in PICK_TOOL_FULL_TASK_ACTOR_DEMO_CONTRACTS
+    }
+    validation_names = {
+        contract.name
+        for contract in PICK_TOOL_APPROACH_CORRECTION_VALIDATION_CONTRACTS
+    }
+    assert {
+        contract.name for contract in PICK_TOOL_APPROACH_CORRECTION_TRAIN_CONTRACTS
+    }.issubset(train_names)
+    assert validation_names.isdisjoint(train_names)
+    assert {
+        contract.name for contract in PICK_TOOL_LIFT_ACTOR_DEMO_CONTRACTS
+    }.issubset(train_names)
 
 
 def test_loader_accepts_obs_action_only_and_audits_success() -> None:
@@ -1040,6 +1192,8 @@ def main() -> None:
     print("[PASS] PickTool actor-demo allowlist and phase contracts")
     test_v6_success_self_imitation_contract()
     print("[PASS] V6 successful self-imitation source contract")
+    test_correction_labels_require_an_explicit_non_outcome_contract()
+    print("[PASS] phase-0 correction labels are outcome-free and fail closed")
     test_coupled_power_multiphase_contract_and_canonical_actions()
     print("[PASS] coupled-power multi-phase and canonical-action contract")
     test_loader_rejects_ambiguous_failed_or_malformed_sources()
