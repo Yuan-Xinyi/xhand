@@ -579,7 +579,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--xarm-ip", default="192.168.1.205")
     p.add_argument("--xhand-port", default="/dev/ttyUSB0")
     p.add_argument("--hand-start-speed", type=float, default=0.25)
-    p.add_argument("--max-hand-step", type=float, default=0.05, help="max joint target delta per cycle [rad]")
+    # 0.157 = sim actuator velocity limit (3.14 rad/s) x step_dt (0.05 s). Clamping much
+    # tighter starves the policy's stroke depth: the cube gets rocked +-2 deg and springs
+    # back instead of tipping over an edge (measured in /tmp/repose_run1.npz: gross
+    # rotation ~100 deg / 5 s, net ~2 deg with a 0.03 clamp).
+    p.add_argument("--max-hand-step", type=float, default=0.157, help="max joint target delta per cycle [rad]")
     p.add_argument("--arm-q", type=float, nargs=7, default=None,
                    help="arm joints holding the wrist (dry-run only; --real reads the robot)")
     p.add_argument("--print-every", type=int, default=20)
