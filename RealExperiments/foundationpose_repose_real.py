@@ -1,0 +1,777 @@
+#!/usr/bin/env python3
+"""Sim2real pipeline: FoundationPose cube tracking -> repose_cube LSTM policy -> XHand.
+
+Architecture (two processes, UDP IPC — same pattern as the teleop pipeline):
+
+  [env_isaaclab]  foundationpose_repose_tracker.py
+      D435 RGB-D -> FoundationPose register + continuous track
+      -> UDP 127.0.0.1:9877  (seq, t, camera_T_cube 4x4)
+
+  [one]           this script (control loop, 20 Hz = sim env step_dt)
+      XHand joints (open-loop targets) -> one-lib FK -> fingertip positions
+      cube pose -> calib (T_base_cam) -> env frame (palm alignment)
+      obs(34) -> LSTM policy -> action -> position targets -> XHand
+
+The env frame is defined so the real palm coincides with the sim palm pose
+(pos (0,0,0.5), quat (0.7071,-0.7071,0,0), palm up, fingers +Y). The xArm7 only
+HOLDS the wrist there; it is never commanded by the policy.
+
+Default is a dry-run (no hardware, no camera needed with --pose-source synthetic).
+Real execution requires --real --execute and confirms before each motion.
+
+Examples:
+    # offline smoke test (no camera, no robot)
+    python RealExperiments/foundationpose_repose_real.py --pose-source synthetic --steps 200
+
+    # camera + policy, print commands, no robot
+    python RealExperiments/foundationpose_repose_real.py --steps 400
+
+    # full real run
+    python RealExperiments/foundationpose_repose_real.py --real --execute
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+import types
+from pathlib import Path
+
+import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CHECKPOINT = str(
+    REPO_ROOT / "logs/rl_games/xhand_repose_openai_lstm/0_2026-06-26_17-44-10/nn/xhand_repose_openai_lstm.pth"
+)
+DEFAULT_CALIB_YAML = "/home/lqin/one/one/camera/RS435/calibration_result.yaml"
+TRACKER_SCRIPT = str(Path(__file__).resolve().parent / "foundationpose_repose_tracker.py")
+
+# ---------------------------------------------------------------------------
+# Contract constants (verified against the sim via repose_probe_dump.py)
+# ---------------------------------------------------------------------------
+
+# Isaac joint order of the standalone XHand USD (= action order, = limit order)
+ISAAC12 = [
+    "index_joint0", "middle_joint0", "pinky_joint0", "ring_joint0", "thumb_joint0",
+    "index_joint1", "middle_joint1", "pinky_joint1", "ring_joint1", "thumb_joint1",
+    "index_joint2", "thumb_joint2",
+]
+# one-library XHand joint order (thumb..pinky, as in foundationpose_then_real.py)
+ONE12 = [
+    "thumb_joint0", "thumb_joint1", "thumb_joint2",
+    "index_joint0", "index_joint1", "index_joint2",
+    "middle_joint0", "middle_joint1",
+    "ring_joint0", "ring_joint1",
+    "pinky_joint0", "pinky_joint1",
+]
+ISAAC_TO_ONE = np.array([ISAAC12.index(n) for n in ONE12], dtype=np.int64)
+ONE_TO_ISAAC = np.array([ONE12.index(n) for n in ISAAC12], dtype=np.int64)
+
+# joint limits in ISAAC12 order (repose_probe_dump.py)
+LOWER = np.array([-0.175, 0, 0, 0, 0, 0, 0, 0, 0, -1.05, 0, -0.175], dtype=np.float32)
+UPPER = np.array([0.175, 1.92, 1.92, 1.92, 1.83, 1.92, 1.92, 1.92, 1.92, 1.57, 1.92, 1.83], dtype=np.float32)
+
+# fingertip bodies in OBSERVATION order (sorted by Isaac body index)
+FINGERTIP_BODIES = ["mid_link2", "pinky_link2", "ring_link2", "index_rota_link2", "thumb_rota_link2"]
+
+# sim palm pose in the env frame (XHandReposeEnvCfg.robot_cfg.init_state)
+SIM_PALM_POS = np.array([0.0, 0.0, 0.5], dtype=np.float32)
+SIM_PALM_QUAT = np.array([0.7071, -0.7071, 0.0, 0.0], dtype=np.float32)  # wxyz
+
+IN_HAND_POS = np.array([0.0, 0.1, 0.51], dtype=np.float32)  # env frame
+FALL_DIST = 0.24
+ACT_MOVING_AVERAGE = 0.3  # XHandReposeOpenAIEnvCfg
+STEP_DT = 0.05  # 20 Hz (sim dt 1/60 * decimation 3)
+DEFAULT_SUCCESS_TOL = 0.4  # rad, trained tolerance (curriculum start; leave margin on real)
+
+# xArm7 home that holds the hand (only used when the arm is not connected)
+DEFAULT_ARM_Q = np.array([0.0, -0.7494, 0.0, 1.1920, 0.0, 1.9414, 0.0], dtype=np.float32)
+
+MOUNT_RPY = 4.71239  # link8 -> palm fixed yaw (xarm7_xhand.urdf hand_mount)
+
+UDP_ADDR = ("127.0.0.1", 9877)
+POSE_FMT = "<18d"  # seq, t, 16 pose floats
+
+
+# ---------------------------------------------------------------------------
+# math helpers (wxyz quaternions, matching isaaclab.utils.math)
+# ---------------------------------------------------------------------------
+
+def quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    w1, x1, y1, z1 = a
+    w2, x2, y2, z2 = b
+    return np.array(
+        [
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ],
+        dtype=np.float64,
+    )
+
+
+def quat_conj(q: np.ndarray) -> np.ndarray:
+    return np.array([q[0], -q[1], -q[2], -q[3]], dtype=np.float64)
+
+
+def quat_from_angle_axis(angle: float, axis: np.ndarray) -> np.ndarray:
+    axis = np.asarray(axis, dtype=np.float64)
+    axis = axis / np.linalg.norm(axis)
+    s = math.sin(angle / 2.0)
+    return np.array([math.cos(angle / 2.0), *(axis * s)], dtype=np.float64)
+
+
+def rotation_distance(q_obj: np.ndarray, q_goal: np.ndarray) -> float:
+    qd = quat_mul(np.asarray(q_obj, dtype=np.float64), quat_conj(np.asarray(q_goal, dtype=np.float64)))
+    return 2.0 * math.asin(min(1.0, float(np.linalg.norm(qd[1:4]))))
+
+
+def quat_to_rotmat(q: np.ndarray) -> np.ndarray:
+    w, x, y, z = np.asarray(q, dtype=np.float64) / np.linalg.norm(q)
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+        ]
+    )
+
+
+def rotmat_to_quat(m: np.ndarray) -> np.ndarray:
+    m = np.asarray(m, dtype=np.float64)
+    tr = float(np.trace(m))
+    if tr > 0.0:
+        s = math.sqrt(tr + 1.0) * 2.0
+        q = np.array([0.25 * s, (m[2, 1] - m[1, 2]) / s, (m[0, 2] - m[2, 0]) / s, (m[1, 0] - m[0, 1]) / s])
+    else:
+        i = int(np.argmax(np.diag(m)))
+        if i == 0:
+            s = math.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
+            q = np.array([(m[2, 1] - m[1, 2]) / s, 0.25 * s, (m[0, 1] + m[1, 0]) / s, (m[0, 2] + m[2, 0]) / s])
+        elif i == 1:
+            s = math.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
+            q = np.array([(m[0, 2] - m[2, 0]) / s, (m[0, 1] + m[1, 0]) / s, 0.25 * s, (m[1, 2] + m[2, 1]) / s])
+        else:
+            s = math.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
+            q = np.array([(m[1, 0] - m[0, 1]) / s, (m[0, 2] + m[2, 0]) / s, (m[1, 2] + m[2, 1]) / s, 0.25 * s])
+    return q / np.linalg.norm(q)
+
+
+def tf_from_pos_quat(pos: np.ndarray, quat_wxyz: np.ndarray) -> np.ndarray:
+    tf = np.eye(4)
+    tf[:3, :3] = quat_to_rotmat(quat_wxyz)
+    tf[:3, 3] = np.asarray(pos, dtype=np.float64)
+    return tf
+
+
+def tf_inv(tf: np.ndarray) -> np.ndarray:
+    out = np.eye(4)
+    r = tf[:3, :3].T
+    out[:3, :3] = r
+    out[:3, 3] = -r @ tf[:3, 3]
+    return out
+
+
+def scale_action(a: np.ndarray) -> np.ndarray:
+    """[-1,1] -> absolute joint targets (InHandManipulationEnv contract)."""
+    return 0.5 * (a + 1.0) * (UPPER - LOWER) + LOWER
+
+
+def sample_goal_quat(rng: np.random.Generator) -> np.ndarray:
+    """Same distribution as the env's randomize_rotation."""
+    r0, r1 = rng.uniform(-1.0, 1.0, 2)
+    return quat_mul(
+        quat_from_angle_axis(r0 * math.pi, np.array([1.0, 0.0, 0.0])),
+        quat_from_angle_axis(r1 * math.pi, np.array([0.0, 1.0, 0.0])),
+    ).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# observation builder (env obs_type="openai", 34-D)
+# ---------------------------------------------------------------------------
+
+def build_obs(
+    tip_pos_env: np.ndarray,  # (5,3) fingertip link origins, env frame, FINGERTIP_BODIES order
+    obj_pos_env: np.ndarray,  # (3,)
+    obj_quat_env: np.ndarray,  # (4,) wxyz
+    goal_quat: np.ndarray,  # (4,) wxyz
+    prev_action: np.ndarray,  # (12,) ISAAC12 order
+) -> np.ndarray:
+    rel_quat = quat_mul(np.asarray(obj_quat_env, dtype=np.float64), quat_conj(goal_quat))
+    obs = np.concatenate(
+        [
+            np.asarray(tip_pos_env, dtype=np.float32).reshape(15),
+            np.asarray(obj_pos_env, dtype=np.float32),
+            rel_quat.astype(np.float32),
+            np.asarray(prev_action, dtype=np.float32),
+        ]
+    )
+    assert obs.shape == (34,), obs.shape
+    return obs
+
+
+# ---------------------------------------------------------------------------
+# rl_games LSTM actor (obs34 -> LSTM1024+LN -> Linear512+ReLU -> mu12)
+# ---------------------------------------------------------------------------
+
+def _import_torch():
+    try:
+        import torch
+
+        return torch
+    except ModuleNotFoundError:
+        prebundles = [
+            "/disk2/isaacsim/exts/omni.isaac.ml_archive/pip_prebundle",
+            "/disk2/IsaacLab/_isaac_sim/exts/omni.isaac.ml_archive/pip_prebundle",
+        ]
+        for path in prebundles:
+            if Path(path).exists() and path not in sys.path:
+                sys.path.insert(0, path)
+        import torch
+
+        return torch
+
+
+class LstmPolicy:
+    def __init__(self, checkpoint: str, device: str = "cpu"):
+        torch = _import_torch()
+        self.torch = torch
+        self.device = torch.device(device)
+        try:
+            raw = torch.load(checkpoint, map_location=self.device, weights_only=False)
+        except TypeError:
+            raw = torch.load(checkpoint, map_location=self.device)
+        state = raw[0]["model"] if isinstance(raw, dict) and 0 in raw else raw["model"]
+
+        self.obs_mean = state["running_mean_std.running_mean"].to(self.device).float()
+        self.obs_var = state["running_mean_std.running_var"].to(self.device).float()
+
+        obs_dim = self.obs_mean.shape[0]
+        hidden = state["a2c_network.rnn.rnn.weight_hh_l0"].shape[1]
+        self.lstm = torch.nn.LSTM(obs_dim, hidden, num_layers=1, batch_first=False).to(self.device)
+        with torch.no_grad():
+            self.lstm.weight_ih_l0.copy_(state["a2c_network.rnn.rnn.weight_ih_l0"])
+            self.lstm.weight_hh_l0.copy_(state["a2c_network.rnn.rnn.weight_hh_l0"])
+            self.lstm.bias_ih_l0.copy_(state["a2c_network.rnn.rnn.bias_ih_l0"])
+            self.lstm.bias_hh_l0.copy_(state["a2c_network.rnn.rnn.bias_hh_l0"])
+        self.lstm.eval()
+        self.ln_w = state["a2c_network.layer_norm.weight"].to(self.device).float()
+        self.ln_b = state["a2c_network.layer_norm.bias"].to(self.device).float()
+        self.mlp_w = state["a2c_network.actor_mlp.0.weight"].to(self.device).float()
+        self.mlp_b = state["a2c_network.actor_mlp.0.bias"].to(self.device).float()
+        self.mu_w = state["a2c_network.mu.weight"].to(self.device).float()
+        self.mu_b = state["a2c_network.mu.bias"].to(self.device).float()
+        self.hidden = hidden
+        self.reset()
+        print(f"[policy] loaded {checkpoint}")
+        print(f"[policy] obs_dim={obs_dim} lstm_hidden={hidden} actions={self.mu_b.shape[0]}")
+
+    def reset(self):
+        torch = self.torch
+        self.h = torch.zeros(1, 1, self.hidden, device=self.device)
+        self.c = torch.zeros(1, 1, self.hidden, device=self.device)
+
+    def act(self, obs: np.ndarray) -> np.ndarray:
+        torch = self.torch
+        with torch.no_grad():
+            x = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+            x = (x - self.obs_mean) / torch.sqrt(self.obs_var + 1e-5)
+            x = torch.clamp(x, -5.0, 5.0).view(1, 1, -1)  # (seq=1, batch=1, obs)
+            out, (self.h, self.c) = self.lstm(x, (self.h, self.c))
+            out = torch.nn.functional.layer_norm(out.view(-1), (self.hidden,), self.ln_w, self.ln_b)
+            out = torch.nn.functional.relu(torch.nn.functional.linear(out, self.mlp_w, self.mlp_b))
+            mu = torch.nn.functional.linear(out, self.mu_w, self.mu_b)
+            return torch.clamp(mu, -1.0, 1.0).cpu().numpy().astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# self-contained URDF forward kinematics (same URDF that generated the Isaac USD)
+# ---------------------------------------------------------------------------
+
+URDF_PATH = str(REPO_ROOT / "source/xhand_inhand/xhand_inhand/assets/xarm7_xhand/xarm7_xhand.urdf")
+ARM_JOINTS = [f"joint{i}" for i in range(1, 8)]
+
+
+def _rpy_to_rotmat(r: float, p: float, y: float) -> np.ndarray:
+    cr, sr, cp, sp, cy, sy = math.cos(r), math.sin(r), math.cos(p), math.sin(p), math.cos(y), math.sin(y)
+    rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+    ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+    rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+    return rz @ ry @ rx
+
+
+def _axis_angle_rotmat(axis: np.ndarray, angle: float) -> np.ndarray:
+    axis = np.asarray(axis, dtype=np.float64)
+    n = np.linalg.norm(axis)
+    if n < 1e-12:
+        return np.eye(3)
+    x, y, z = axis / n
+    c, s = math.cos(angle), math.sin(angle)
+    C = 1.0 - c
+    return np.array(
+        [
+            [x * x * C + c, x * y * C - z * s, x * z * C + y * s],
+            [y * x * C + z * s, y * y * C + c, y * z * C - x * s],
+            [z * x * C - y * s, z * y * C + x * s, z * z * C + c],
+        ]
+    )
+
+
+class UrdfKinematics:
+    """FK over xarm7_xhand.urdf (base frame = URDF root = xArm base).
+
+    Returns link-frame poses, which is exactly what the Isaac obs uses
+    (fingertip body positions are USD link origins).
+    """
+
+    def __init__(self, urdf_path: str = URDF_PATH):
+        import xml.etree.ElementTree as ET
+
+        root = ET.parse(urdf_path).getroot()
+        self.joints = []  # (name, type, parent, child, T_origin(4x4), axis(3))
+        for j in root.findall("joint"):
+            name = j.get("name")
+            jtype = j.get("type")
+            parent = j.find("parent").get("link")
+            child = j.find("child").get("link")
+            origin = j.find("origin")
+            xyz = [float(v) for v in (origin.get("xyz", "0 0 0") if origin is not None else "0 0 0").split()]
+            rpy = [float(v) for v in (origin.get("rpy", "0 0 0") if origin is not None else "0 0 0").split()]
+            tf = np.eye(4)
+            tf[:3, :3] = _rpy_to_rotmat(*rpy)
+            tf[:3, 3] = xyz
+            axis_el = j.find("axis")
+            axis = np.array(
+                [float(v) for v in (axis_el.get("xyz") if axis_el is not None else "1 0 0").split()]
+            )
+            self.joints.append((name, jtype, parent, child, tf, axis))
+        children = {j[3] for j in self.joints}
+        parents = {j[2] for j in self.joints}
+        roots = parents - children
+        assert len(roots) == 1, f"URDF should have one root, got {roots}"
+        self.root_link = roots.pop()
+        self.link_tf: dict[str, np.ndarray] = {}
+
+    def update(self, arm_q7: np.ndarray, hand_q_isaac: np.ndarray) -> None:
+        qmap = {n: float(v) for n, v in zip(ARM_JOINTS, arm_q7)}
+        qmap.update({n: float(v) for n, v in zip(ISAAC12, hand_q_isaac)})
+        self.link_tf = {self.root_link: np.eye(4)}
+        pending = list(self.joints)
+        while pending:
+            progressed = False
+            rest = []
+            for name, jtype, parent, child, t_origin, axis in pending:
+                if parent not in self.link_tf:
+                    rest.append((name, jtype, parent, child, t_origin, axis))
+                    continue
+                tf = self.link_tf[parent] @ t_origin
+                if jtype == "revolute" and name in qmap:
+                    rot = np.eye(4)
+                    rot[:3, :3] = _axis_angle_rotmat(axis, qmap[name])
+                    tf = tf @ rot
+                self.link_tf[child] = tf
+                progressed = True
+            pending = rest
+            if not progressed and pending:
+                raise RuntimeError(f"URDF kinematic tree disconnected at {[p[0] for p in pending]}")
+
+    def palm_tf_base(self) -> np.ndarray:
+        return self.link_tf["palm"]
+
+    def fingertip_pos_base(self) -> np.ndarray:
+        return np.stack([self.link_tf[n][:3, 3] for n in FINGERTIP_BODIES])
+
+
+# ---------------------------------------------------------------------------
+# one-library imports (hardware drivers only)
+# ---------------------------------------------------------------------------
+
+def _prepare_one_imports() -> None:
+    os.environ.setdefault("PYGLET_HEADLESS", "true")
+    try:
+        import pyglet
+
+        pyglet.options["headless"] = True
+    except Exception:
+        pass
+    if "matplotlib.pyplot" not in sys.modules:
+        mpl = types.ModuleType("matplotlib")
+        pyplot = types.ModuleType("matplotlib.pyplot")
+        pyplot.get_cmap = lambda _name: types.SimpleNamespace(colors=[(0.5, 0.5, 0.5)] * 20)
+        mpl.pyplot = pyplot
+        sys.modules.setdefault("matplotlib", mpl)
+        sys.modules.setdefault("matplotlib.pyplot", pyplot)
+    one_root = "/home/lqin/one"
+    if one_root not in sys.path:
+        sys.path.insert(0, one_root)
+
+
+def _patch_one_mechbase_compat() -> None:
+    """The one-lib MechBase kwarg flipped between is_free/is_floating across versions;
+    translate whichever alias the installed version does not accept."""
+    import inspect
+
+    import one.robots.base.mech_base as mech_base
+
+    init = mech_base.MechBase.__init__
+    if getattr(init, "_kwarg_compat", False):
+        return
+    params = inspect.signature(init).parameters
+    has_free, has_floating = "is_free" in params, "is_floating" in params
+
+    def _compat_init(self, *args, **kwargs):
+        if not has_floating and "is_floating" in kwargs:
+            val = kwargs.pop("is_floating")
+            if has_free:
+                kwargs.setdefault("is_free", val)
+        if not has_free and "is_free" in kwargs:
+            val = kwargs.pop("is_free")
+            if has_floating:
+                kwargs.setdefault("is_floating", val)
+        return init(self, *args, **kwargs)
+
+    _compat_init._kwarg_compat = True
+    mech_base.MechBase.__init__ = _compat_init
+
+
+# ---------------------------------------------------------------------------
+# cube pose sources
+# ---------------------------------------------------------------------------
+
+class UdpPoseReceiver:
+    """Latest camera_T_cube from the tracker process."""
+
+    def __init__(self, addr=UDP_ADDR):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(addr)
+        self.sock.setblocking(False)
+        self.pose = None
+        self.seq = -1
+        self.stamp = 0.0
+
+    def poll(self):
+        while True:
+            try:
+                data, _ = self.sock.recvfrom(1024)
+            except BlockingIOError:
+                break
+            vals = struct.unpack(POSE_FMT, data)
+            self.seq = int(vals[0])
+            self.stamp = vals[1]
+            self.pose = np.array(vals[2:], dtype=np.float64).reshape(4, 4)
+        return self.pose
+
+    def age(self) -> float:
+        return time.time() - self.stamp if self.pose is not None else float("inf")
+
+    def wait_first(self, timeout: float) -> bool:
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if self.poll() is not None:
+                return True
+            time.sleep(0.1)
+        return False
+
+
+class SyntheticPose:
+    """Slowly tumbling cube at the in-hand position, directly in the ENV frame."""
+
+    def __init__(self):
+        self.t0 = time.time()
+
+    def pose_env(self):
+        t = time.time() - self.t0
+        q = quat_mul(
+            quat_from_angle_axis(0.3 * t, np.array([0.0, 0.0, 1.0])),
+            quat_from_angle_axis(0.15 * t, np.array([1.0, 0.0, 0.0])),
+        )
+        pos = IN_HAND_POS + np.array([0.0, 0.0, 0.04])
+        return tf_from_pos_quat(pos, q)
+
+
+# ---------------------------------------------------------------------------
+# hardware
+# ---------------------------------------------------------------------------
+
+class RealHardware:
+    def __init__(self, xarm_ip: str, xhand_port: str):
+        _prepare_one_imports()
+        from one.control.end_effector.xhand.xhand_x import XHandX
+        from one.control.manipulators.xarm7.xarm7 import XArm7X
+
+        self.arm = XArm7X(ip=xarm_ip, reset=False)
+        self.hand = XHandX(port=xhand_port, baudrate=3000000)
+
+    def arm_q(self) -> np.ndarray:
+        return self.arm.get_jnt_values().astype(np.float32)
+
+    def hand_home(self, q_isaac: np.ndarray, speed: float):
+        self.hand.move_to(q_isaac[ISAAC_TO_ONE], speed=speed, freq=50.0)
+
+    def hand_stream(self, q_isaac: np.ndarray):
+        self.hand.move(q_isaac[ISAAC_TO_ONE], read=False)
+
+    def close(self):
+        if getattr(self, "hand", None) is not None:
+            self.hand.close()
+
+
+def load_base_T_cam(calib_yaml: str) -> np.ndarray:
+    import yaml
+
+    path = Path(calib_yaml).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"camera calibration not found: {path}")
+    with open(path) as f:
+        data = yaml.safe_load(f)
+    mat = np.array(data["T_base_cam"]["matrix"], dtype=np.float64)
+    if mat.shape != (4, 4):
+        raise RuntimeError(f"T_base_cam.matrix must be 4x4, got {mat.shape}")
+    return mat
+
+
+# ---------------------------------------------------------------------------
+# orchestration
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
+    p.add_argument("--steps", type=int, default=1200, help="control steps at 20 Hz (1200 = 60 s)")
+    p.add_argument("--success-tol", type=float, default=DEFAULT_SUCCESS_TOL, help="rad")
+    p.add_argument("--goal-seed", type=int, default=0)
+    p.add_argument("--pose-source", choices=["tracker", "npy", "synthetic"], default="tracker")
+    p.add_argument("--pose_npy", default="/tmp/foundationpose_cube_pose.npy")
+    p.add_argument("--calib_yaml", default=DEFAULT_CALIB_YAML)
+    p.add_argument("--no_calib", action="store_true", help="cube pose already in the xArm base frame")
+    p.add_argument("--max-pose-age", type=float, default=0.25, help="hold targets if pose older than this [s]")
+    p.add_argument("--abort-pose-age", type=float, default=2.0, help="abort real run if pose older than this [s]")
+    p.add_argument("--real", action="store_true", help="connect xArm7 (read) + XHand")
+    p.add_argument("--execute", action="store_true", help="actually stream commands; requires --real")
+    p.add_argument("--xarm-ip", default="192.168.1.205")
+    p.add_argument("--xhand-port", default="/dev/ttyUSB0")
+    p.add_argument("--hand-start-speed", type=float, default=0.25)
+    p.add_argument("--max-hand-step", type=float, default=0.05, help="max joint target delta per cycle [rad]")
+    p.add_argument("--arm-q", type=float, nargs=7, default=None,
+                   help="arm joints holding the wrist (dry-run only; --real reads the robot)")
+    p.add_argument("--print-every", type=int, default=20)
+    p.add_argument("--log-npz", default=None, help="record obs/actions/poses for offline analysis")
+    # tracker passthrough
+    p.add_argument("--roi", type=int, nargs=4, default=None, metavar=("X", "Y", "W", "H"))
+    p.add_argument("--serial", default=None, help="RealSense serial")
+    p.add_argument("--no-view", action="store_true", help="tracker: no live overlay window")
+    p.add_argument("--tracker-timeout", type=float, default=300.0)
+    return p.parse_args()
+
+
+def _maybe_reexec_one(args: argparse.Namespace) -> None:
+    """Hardware IO needs the one env; re-exec there (perception runs in a subprocess)."""
+    if not args.real:
+        return
+    one_python = os.environ.get("ONE_PYTHON", "/home/lqin/miniconda3/envs/one/bin/python")
+    if not Path(one_python).exists():
+        return
+    if os.path.realpath(sys.executable) == os.path.realpath(one_python):
+        return
+    env = os.environ.copy()
+    pythonpath = env.get("PYTHONPATH", "")
+    keep = [e for e in pythonpath.split(os.pathsep)
+            if e and "isaac" not in e.lower() and "omni.kit" not in e.lower() and "pip_prebundle" not in e.lower()]
+    if keep:
+        env["PYTHONPATH"] = os.pathsep.join(keep)
+    else:
+        env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+    env["PATH"] = os.path.dirname(one_python) + os.pathsep + env.get("PATH", "")
+    print(f"[real] re-exec into one python: {one_python}")
+    os.execve(one_python, [one_python, os.path.abspath(__file__)] + sys.argv[1:], env)
+
+
+def spawn_tracker(args: argparse.Namespace) -> subprocess.Popen:
+    cmd = (
+        "source ~/miniconda3/etc/profile.d/conda.sh && conda activate env_isaaclab && "
+        f"exec python {TRACKER_SCRIPT}"
+    )
+    if args.roi is not None:
+        cmd += " --roi " + " ".join(str(v) for v in args.roi)
+    if args.serial:
+        cmd += f" --serial {args.serial}"
+    if args.no_view:
+        cmd += " --no-view"
+    print("[tracker] spawning FoundationPose tracker (env_isaaclab)...")
+    return subprocess.Popen(["bash", "-c", cmd], start_new_session=True)
+
+
+def main() -> None:
+    args = parse_args()
+    if args.execute and not args.real:
+        raise ValueError("--execute requires --real")
+    _maybe_reexec_one(args)
+
+    # --- pose source -------------------------------------------------------
+    tracker_proc = None
+    receiver = None
+    synthetic = None
+    static_pose_cam = None
+    if args.pose_source == "tracker":
+        receiver = UdpPoseReceiver()
+        tracker_proc = spawn_tracker(args)
+        print(f"[tracker] waiting for first pose on udp://{UDP_ADDR[0]}:{UDP_ADDR[1]} "
+              f"(load ~40 s + ROI selection)...")
+        if not receiver.wait_first(args.tracker_timeout):
+            if tracker_proc.poll() is not None:
+                raise RuntimeError("tracker process exited before sending a pose")
+            raise TimeoutError("no cube pose received from tracker")
+        print(f"[tracker] pose stream up (seq={receiver.seq})")
+    elif args.pose_source == "npy":
+        static_pose_cam = np.load(args.pose_npy).astype(np.float64)
+        print(f"[pose] static pose from {args.pose_npy}")
+    else:
+        synthetic = SyntheticPose()
+        print("[pose] synthetic tumbling cube (offline smoke test)")
+
+    # --- kinematics + frames ----------------------------------------------
+    kin = UrdfKinematics()
+    hw = None
+    if args.real:
+        hw = RealHardware(args.xarm_ip, args.xhand_port)
+        arm_q = hw.arm_q()
+        print(f"[real] arm q: {np.array2string(arm_q, precision=4)}")
+    else:
+        arm_q = np.array(args.arm_q, dtype=np.float32) if args.arm_q else DEFAULT_ARM_Q
+        print(f"[dry] arm q (assumed): {np.array2string(arm_q, precision=4)}")
+
+    hand_q = np.zeros(12, dtype=np.float32)  # repose home: all joints 0 (open)
+    kin.update(arm_q, hand_q)
+    base_T_palm = kin.palm_tf_base()
+    env_T_base = tf_from_pos_quat(SIM_PALM_POS, SIM_PALM_QUAT) @ tf_inv(base_T_palm)
+
+    # gravity direction check: env -Z must stay -Z, else the sim2real gap is large
+    g_env = env_T_base[:3, :3] @ np.array([0.0, 0.0, -1.0])
+    tilt = math.degrees(math.acos(max(-1.0, min(1.0, -g_env[2]))))
+    print(f"[frames] palm(base): xyz={np.array2string(base_T_palm[:3, 3], precision=3)}")
+    print(f"[frames] gravity tilt vs sim: {tilt:.1f} deg" + ("  <-- WARNING: palm not palm-up like sim!" if tilt > 8.0 else ""))
+
+    base_T_cam = None
+    if args.pose_source in ("tracker", "npy") and not args.no_calib:
+        base_T_cam = load_base_T_cam(args.calib_yaml)
+
+    def cube_env_pose() -> np.ndarray | None:
+        if synthetic is not None:
+            return synthetic.pose_env()
+        pose_cam = receiver.poll() if receiver is not None else static_pose_cam
+        if pose_cam is None:
+            return None
+        pose_base = pose_cam if base_T_cam is None else base_T_cam @ pose_cam
+        return env_T_base @ pose_base
+
+    # --- policy ------------------------------------------------------------
+    policy = LstmPolicy(args.checkpoint)
+    rng = np.random.default_rng(args.goal_seed)
+    goal_quat = sample_goal_quat(rng)
+    successes = 0
+
+    # --- hand to home ------------------------------------------------------
+    if hw is not None and args.execute:
+        input("[real] ENTER to move XHand to open home pose (cube NOT in hand yet)...")
+        hw.hand_home(hand_q, args.hand_start_speed)
+        input("[real] place the cube in the palm, wait for tracking to look stable, then ENTER...")
+
+    # --- control loop ------------------------------------------------------
+    prev_action = np.zeros(12, dtype=np.float32)
+    prev_targets = hand_q.copy()
+    log = {"obs": [], "action": [], "obj_pos": [], "obj_quat": [], "goal_quat": [], "t": []} if args.log_npz else None
+
+    print(f"[run] 20 Hz control, success tol {args.success_tol:.2f} rad, goal #1:"
+          f" quat {np.array2string(goal_quat, precision=3)}")
+    next_t = time.perf_counter()
+    stop_reason = "steps done"
+    try:
+        for step in range(args.steps):
+            pose_env = cube_env_pose()
+            fresh = pose_env is not None and (receiver is None or receiver.age() <= args.max_pose_age)
+            if receiver is not None and receiver.age() > args.abort_pose_age:
+                stop_reason = f"pose stale {receiver.age():.2f}s"
+                break
+
+            if fresh:
+                obj_pos = pose_env[:3, 3]
+                obj_quat = rotmat_to_quat(pose_env[:3, :3])
+
+                # fall check
+                fall_d = float(np.linalg.norm(obj_pos - IN_HAND_POS))
+                if fall_d >= FALL_DIST:
+                    stop_reason = f"cube fell (dist {fall_d:.3f} m)"
+                    break
+
+                kin.update(arm_q, hand_q)
+                tip_env = (env_T_base[:3, :3] @ kin.fingertip_pos_base().T).T + env_T_base[:3, 3]
+                obs = build_obs(tip_env, obj_pos, obj_quat, goal_quat, prev_action)
+                action = policy.act(obs)
+
+                # sim action contract: absolute targets + moving average + saturation
+                targets = ACT_MOVING_AVERAGE * scale_action(action) + (1.0 - ACT_MOVING_AVERAGE) * prev_targets
+                targets = np.clip(targets, LOWER, UPPER)
+                targets = prev_targets + np.clip(targets - prev_targets, -args.max_hand_step, args.max_hand_step)
+                targets = np.clip(targets, LOWER, UPPER).astype(np.float32)
+
+                if hw is not None and args.execute:
+                    hw.hand_stream(targets)
+                prev_targets = targets
+                hand_q = targets  # open-loop hand state (same as pick_cube deployment)
+                prev_action = action
+
+                rot_dist = rotation_distance(obj_quat, goal_quat)
+                if rot_dist <= args.success_tol:
+                    successes += 1
+                    goal_quat = sample_goal_quat(rng)
+                    print(f"[goal] SUCCESS #{successes} at step {step}!"
+                          f" next goal quat {np.array2string(goal_quat, precision=3)}")
+
+                if log is not None:
+                    log["obs"].append(obs)
+                    log["action"].append(action)
+                    log["obj_pos"].append(obj_pos.copy())
+                    log["obj_quat"].append(obj_quat.copy())
+                    log["goal_quat"].append(goal_quat.copy())
+                    log["t"].append(time.time())
+
+                if step % max(1, args.print_every) == 0:
+                    age = 0.0 if receiver is None else receiver.age()
+                    print(f"[run] step {step:4d} rot_dist {math.degrees(rot_dist):6.1f} deg "
+                          f"obj {np.array2string(obj_pos, precision=3)} "
+                          f"pose_age {age:.2f}s succ {successes}")
+            # not fresh: hold targets, skip policy this cycle
+
+            next_t += STEP_DT
+            sleep_t = next_t - time.perf_counter()
+            if sleep_t > 0:
+                time.sleep(sleep_t)
+            else:
+                next_t = time.perf_counter()
+    finally:
+        print(f"[run] stopped: {stop_reason}; consecutive successes: {successes}")
+        if hw is not None:
+            hw.close()
+        if log is not None and log["obs"]:
+            np.savez(args.log_npz, **{k: np.array(v) for k, v in log.items()})
+            print(f"[log] saved {args.log_npz}")
+        if tracker_proc is not None and tracker_proc.poll() is None:
+            os.killpg(os.getpgid(tracker_proc.pid), signal.SIGINT)
+            try:
+                tracker_proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(os.getpgid(tracker_proc.pid), signal.SIGTERM)
+
+
+if __name__ == "__main__":
+    main()

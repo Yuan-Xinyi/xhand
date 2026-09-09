@@ -88,3 +88,53 @@ When `--real` is used from `env_isaaclab`, the script first runs FoundationPose
 there, saves the cube pose, then automatically re-executes itself with
 `/home/lqin/miniconda3/envs/one/bin/python` for xArm/XHand hardware IO. The `one`
 environment already carries the required `xarm` SDK and `pyserial` packages.
+
+---
+
+# Repose Cube FoundationPose Pipeline (sim2real)
+
+Entry point: `foundationpose_repose_real.py` — connects the trained
+`Xhand-Repose-Cube-OpenAI-LSTM-Direct-v0` policy (34-D obs LSTM) to live
+FoundationPose cube tracking and the real XHand.
+
+Two processes over UDP (127.0.0.1:9877), teleop-style:
+
+- `foundationpose_repose_tracker.py` (env_isaaclab): D435 -> FoundationPose
+  register (popup ROI) + continuous tracking -> camera_T_cube stream.
+  Spawned automatically; can also run standalone.
+- `foundationpose_repose_real.py` (one env, auto re-exec on --real): 20 Hz
+  control loop. XHand joint targets -> URDF FK (self-contained, verified 0.00 mm
+  vs Isaac) -> fingertip positions; cube pose -> T_base_cam calib -> env frame
+  (real palm aligned to the sim palm pose (0,0,0.5)/(0.7071,-0.7071,0,0));
+  obs(34) -> LSTM -> absolute joint targets (moving average 0.3, sim contract).
+
+The xArm7 is never commanded — it only HOLDS the wrist palm-up. The script
+prints a gravity-tilt warning if the held palm orientation deviates from sim.
+
+Progressive bring-up:
+
+```bash
+# 1. offline smoke test (no camera, no robot; any env with torch)
+python RealExperiments/foundationpose_repose_real.py --pose-source synthetic --steps 200
+
+# 2. camera-in-the-loop dry-run (tracker + policy, prints commands, no robot)
+python RealExperiments/foundationpose_repose_real.py --steps 400
+
+# 3. hardware connected, still not moving
+python RealExperiments/foundationpose_repose_real.py --real --steps 200
+
+# 4. full run (confirms before each motion; cube placed in palm by hand)
+python RealExperiments/foundationpose_repose_real.py --real --execute
+```
+
+Safety: per-cycle joint step clamp (`--max-hand-step`), joint-limit saturation,
+pose-staleness hold/abort (`--max-pose-age` / `--abort-pose-age`), cube-fall
+stop (0.24 m), success tolerance `--success-tol` (default 0.4 rad = trained).
+
+Verification tools (already run once, all green):
+
+- `repose_probe_dump.py` (env_isaaclab): dumps sim contract constants + FK
+  reference to `repose_probe.npz`.
+- `verify_repose_obs.py` (one env): obs layout (6e-8) + URDF FK (0.00 mm).
+- `verify_repose_policy_sim.py` (env_isaaclab): drives the sim env with the
+  DEPLOYMENT policy stack — 13 goal successes / 30 s, 0 falls.
