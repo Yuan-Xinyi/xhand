@@ -56,9 +56,12 @@ def main():
     ap.add_argument("--port", type=int, default=UDP_ADDR[1])
     args = ap.parse_args()
 
+    import logging
+
     import pyrealsense2 as rs
     live_demo.set_logging_format()
     live_demo.set_seed(0)
+    logging.getLogger().setLevel(logging.WARNING)  # silence FoundationPose per-frame spam
     est, mesh, to_origin, bbox, mt = live_demo.build_estimator(args.mesh_file)
 
     pipeline = rs.pipeline()
