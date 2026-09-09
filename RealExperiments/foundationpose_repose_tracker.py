@@ -31,6 +31,32 @@ import live_demo  # noqa: E402  (build_estimator, annotate, grabcut, set_*)
 
 UDP_ADDR = ("127.0.0.1", 9877)
 POSE_FMT = "<18d"
+GOAL_FMT = "<11d"  # t, R_cam_goal (9), rot_dist (rad, <0 = unknown)
+PANEL = 190
+MGN = 10
+
+
+def compose_goal_column(vis, goal_rot, goal_dist, mt, obj_diam):
+    """Append a right-hand column showing the GOAL orientation (camera view)."""
+    import math
+
+    h, w = vis.shape[:2]
+    canvas = np.full((h, w + PANEL + 2 * MGN, 3), 30, np.uint8)
+    canvas[:, :w] = vis
+    x0, y0 = w + MGN, MGN + 20
+    if goal_rot is not None:
+        pose = np.eye(4)
+        pose[:3, :3] = goal_rot
+        panel = live_demo.render_corner(pose, mt, obj_diam)
+        canvas[y0:y0 + PANEL, x0:x0 + PANEL] = panel
+        cv2.rectangle(canvas, (x0, y0), (x0 + PANEL, y0 + PANEL), (255, 215, 0), 1)
+        cv2.putText(canvas, "GOAL", (x0, y0 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 215, 0), 2)
+        if goal_dist is not None and goal_dist >= 0:
+            cv2.putText(canvas, f"rot err {math.degrees(goal_dist):5.1f} deg", (x0, y0 + PANEL + 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 215, 0), 1)
+    else:
+        cv2.putText(canvas, "GOAL: waiting", (x0, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+    return canvas
 
 
 def gui_available() -> bool:
@@ -54,6 +80,7 @@ def main():
     ap.add_argument("--roi", type=int, nargs=4, default=None, metavar=("X", "Y", "W", "H"))
     ap.add_argument("--no-view", action="store_true", help="no live overlay window")
     ap.add_argument("--port", type=int, default=UDP_ADDR[1])
+    ap.add_argument("--goal-port", type=int, default=9878)
     args = ap.parse_args()
 
     import logging
@@ -106,6 +133,12 @@ def main():
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     addr = (UDP_ADDR[0], args.port)
+    goal_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    goal_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    goal_sock.bind(("127.0.0.1", args.goal_port))
+    goal_sock.setblocking(False)
+    goal_rot, goal_dist = None, None
+    obj_diam = float(np.linalg.norm(bbox[1] - bbox[0]))
     win = "FoundationPose tracker (q=quit)"
     seq, t_prev, fps = 0, time.time(), 0.0
     try:
@@ -121,8 +154,18 @@ def main():
             if seq % 90 == 0:
                 t = pose[:3, 3]
                 print(f"[tracker] seq {seq} xyz(m): {t[0]:+.3f} {t[1]:+.3f} {t[2]:+.3f}  {fps:4.1f} FPS", flush=True)
+            while True:
+                try:
+                    data, _ = goal_sock.recvfrom(256)
+                except BlockingIOError:
+                    break
+                v = struct.unpack(GOAL_FMT, data)
+                goal_rot = np.array(v[1:10]).reshape(3, 3)
+                goal_dist = v[10]
+
             if gui:
                 vis = live_demo.annotate(color, pose, K, to_origin, bbox, mt, fps=fps)
+                vis = compose_goal_column(vis, goal_rot, goal_dist, mt, obj_diam)
                 cv2.imshow(win, vis[..., ::-1])
                 if (cv2.waitKey(1) & 0xFF) in (ord("q"), 27):
                     break

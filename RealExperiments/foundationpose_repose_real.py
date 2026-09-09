@@ -122,6 +122,8 @@ MOUNT_RPY = 4.71239  # link8 -> palm fixed yaw (xarm7_xhand.urdf hand_mount)
 
 UDP_ADDR = ("127.0.0.1", 9877)
 POSE_FMT = "<18d"  # seq, t, 16 pose floats
+GOAL_UDP = ("127.0.0.1", 9878)
+GOAL_FMT = "<11d"  # t, R_cam_goal (9), rot_dist (rad, <0 = unknown)
 
 
 # ---------------------------------------------------------------------------
@@ -695,6 +697,16 @@ def main() -> None:
         synthetic = SyntheticPose()
         print("[pose] synthetic tumbling cube (offline smoke test)")
 
+    # goal visualization: stream the goal orientation (camera view) to the tracker
+    goal_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if receiver is not None else None
+    T_env_cam = env_T_base @ base_T_cam if base_T_cam is not None else env_T_base
+
+    def send_goal(rot_dist_val: float) -> None:
+        if goal_sock is None:
+            return
+        r_cam_goal = T_env_cam[:3, :3].T @ quat_to_rotmat(goal_quat)
+        goal_sock.sendto(struct.pack(GOAL_FMT, time.time(), *r_cam_goal.ravel(), rot_dist_val), GOAL_UDP)
+
     center_offset = np.zeros(3)
 
     def cube_env_pose() -> np.ndarray | None:
@@ -736,6 +748,7 @@ def main() -> None:
     if receiver is not None:
         if not receiver.wait_fresh(args.max_pose_age, 5.0):
             raise RuntimeError("pose stream not fresh at start — is the tracker still running?")
+    send_goal(-1.0)
 
     # --- control loop ------------------------------------------------------
     prev_action = np.zeros(12, dtype=np.float32)
@@ -788,6 +801,7 @@ def main() -> None:
                 prev_action = action
 
                 rot_dist = rotation_distance(obj_quat, goal_quat)
+                send_goal(rot_dist)
                 if rot_dist <= args.success_tol:
                     successes += 1
                     goal_quat = sample_goal_quat(rng)
