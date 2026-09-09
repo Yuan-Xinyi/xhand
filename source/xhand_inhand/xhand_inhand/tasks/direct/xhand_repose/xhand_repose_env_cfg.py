@@ -283,6 +283,47 @@ class XHandReposeEnvCfg(DirectRLEnvCfg):
 
 
 @configclass
+class HardEventCfg(EventCfg):
+    """Sim2real DR for the rubber-fingered real hand: wide friction band + cube size."""
+
+    # rubber pads on a printed cube measure ~1.5-2.5 static friction; train across it
+    robot_physics_material = EventTerm(
+        func=mdp.randomize_rigid_body_material,
+        mode="reset",
+        min_step_count_between_reset=720,
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "static_friction_range": (0.8, 2.5),
+            "dynamic_friction_range": (1.0, 1.0),
+            "restitution_range": (1.0, 1.0),
+            "num_buckets": 250,
+        },
+    )
+    object_physics_material = EventTerm(
+        func=mdp.randomize_rigid_body_material,
+        min_step_count_between_reset=720,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("object"),
+            "static_friction_range": (0.8, 2.5),
+            "dynamic_friction_range": (1.0, 1.0),
+            "restitution_range": (1.0, 1.0),
+            "num_buckets": 250,
+        },
+    )
+    # per-env cube size (fixed for the run; needs replicate_physics=False).
+    # mass follows volume automatically (the cube is authored with density).
+    object_scale = EventTerm(
+        func=mdp.randomize_rigid_body_scale,
+        mode="prestartup",
+        params={
+            "scale_range": (0.85, 1.15),  # 5.1 - 6.9 cm edge
+            "asset_cfg": SceneEntityCfg("object"),
+        },
+    )
+
+
+@configclass
 class XHandReposeOpenAIEnvCfg(XHandReposeEnvCfg):
     """OpenAI-LSTM variant: asymmetric (reduced policy obs + full critic state)."""
 
@@ -341,3 +382,40 @@ class XHandReposeOpenAIEnvCfg(XHandReposeEnvCfg):
         noise_cfg=GaussianNoiseCfg(mean=0.0, std=0.002, operation="add"),
         bias_noise_cfg=GaussianNoiseCfg(mean=0.0, std=0.0001, operation="abs"),
     )
+
+
+@configclass
+class XHandReposeOpenAIHardEnvCfg(XHandReposeOpenAIEnvCfg):
+    """Sim2real retrain variant (2026-09): HARD physics + wider DR.
+
+    Field findings from the first real deployment (repose_run1.npz):
+    - real XHand joints are firmware-stiff and do NOT yield like the soft sim
+      gains (stiffness 3) -> the policy must not learn to make space by
+      compliance. Joints here are stiff and torque-limited near hardware spec.
+    - rubber fingertips on the printed cube have ~1.5-2.5 friction, far above
+      the old (0.7, 1.3) band -> widened to (0.8, 2.5) on both sides.
+    - cube size (0.85-1.15 x 6 cm) and spawn position DR added.
+    """
+
+    # scale randomization parses each env's USD separately
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(
+        num_envs=4096, env_spacing=0.75, replicate_physics=False, clone_in_fabric=False
+    )
+
+    # wider spawn-position randomization (was 0.01)
+    reset_position_noise = 0.025
+
+    # DR with friction band + cube size
+    events: HardEventCfg = HardEventCfg()
+
+    def __post_init__(self):
+        post = getattr(super(), "__post_init__", None)
+        if post is not None:
+            post()
+        # HARD hand: firmware-stiff position loop, torque-limited near hardware.
+        # No yielding: stiffness 50 saturates the 3 Nm budget at ~0.06 rad error.
+        fingers = self.robot_cfg.actuators["fingers"]
+        fingers.stiffness = 50.0
+        fingers.damping = 1.0
+        fingers.effort_limit_sim = 3.0
+        fingers.velocity_limit_sim = 3.14
