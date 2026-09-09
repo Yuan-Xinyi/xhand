@@ -16,15 +16,11 @@ import struct
 import sys
 import time
 
-# Prefer the GUI-capable cv2 (env site-packages) over Isaac's headless prebundle.
-# .cv2gui contains only a cv2 symlink, so nothing else is shadowed. It must be on
-# PYTHONPATH BEFORE the interpreter starts (an in-process sys.path.insert trips
-# OpenCV's bootstrap recursion check), so re-exec ourselves once with it prepended.
-_CV2GUI = "/disk2/FoundationPose/cube/.cv2gui"
-if os.environ.get("_CV2GUI_REEXEC") != "1" and os.path.isdir(_CV2GUI):
-    _pp = os.environ.get("PYTHONPATH", "")
-    _env = dict(os.environ, PYTHONPATH=_CV2GUI + (os.pathsep + _pp if _pp else ""), _CV2GUI_REEXEC="1")
-    os.execve(sys.executable, [sys.executable] + sys.argv, _env)
+# Isaac's omni.pip.compute prebundle ships a HEADLESS cv2 that shadows the env's
+# GUI build. Demote that path to the END of sys.path: cv2 then resolves from
+# site-packages (GUI), while prebundle-only packages (trimesh) still resolve.
+_demoted = [p for p in sys.path if "omni.pip.compute" in p]
+sys.path = [p for p in sys.path if p not in _demoted] + _demoted
 
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
