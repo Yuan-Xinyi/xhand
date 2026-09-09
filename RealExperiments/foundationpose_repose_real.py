@@ -44,7 +44,29 @@ import time
 import types
 from pathlib import Path
 
-import numpy as np
+# An activated env_isaaclab shell exports Isaac's pip_prebundle (cp311) on
+# PYTHONPATH, which breaks numpy/torch for the one env's py312 interpreter.
+# If numpy fails to import, strip those entries and retry.
+def _sanitize_and_import_numpy():
+    try:
+        import numpy
+
+        return numpy
+    except ImportError:
+        bad = [p for p in sys.path if "pip_prebundle" in p or "pip_archive" in p or "isaac" in p.lower()]
+        for p in bad:
+            sys.path.remove(p)
+        keep = [e for e in os.environ.get("PYTHONPATH", "").split(os.pathsep) if e and e not in bad]
+        os.environ["PYTHONPATH"] = os.pathsep.join(keep)
+        for m in [m for m in sys.modules if m == "numpy" or m.startswith("numpy.")]:
+            del sys.modules[m]
+        import numpy
+
+        print("[env] stripped incompatible Isaac pip_prebundle paths from sys.path")
+        return numpy
+
+
+np = _sanitize_and_import_numpy()
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CHECKPOINT = str(
