@@ -566,6 +566,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--steps", type=int, default=1200, help="control steps at 20 Hz (1200 = 60 s)")
     p.add_argument("--success-tol", type=float, default=DEFAULT_SUCCESS_TOL, help="rad")
     p.add_argument("--goal-seed", type=int, default=0)
+    p.add_argument("--stall-timeout", type=float, default=10.0,
+                   help="s without a success -> reopen hand, reset LSTM, new goal (sim episodes "
+                        "reset every 8 s, the policy never trained past that; 0 = off)")
     p.add_argument("--pose-source", choices=["tracker", "npy", "synthetic"], default="tracker")
     p.add_argument("--pose_npy", default="/tmp/foundationpose_cube_pose.npy")
     p.add_argument("--calib_yaml", default=DEFAULT_CALIB_YAML)
@@ -760,10 +763,29 @@ def main() -> None:
     prev_obj_quat = None
     log = {"obs": [], "action": [], "obj_pos": [], "obj_quat": [], "goal_quat": [], "t": []} if args.log_npz else None
 
+    def soft_reset():
+        """Mimic the sim episode reset: ramp the hand open (cube settles back into
+        the palm), clear the LSTM state, sample a fresh goal."""
+        nonlocal prev_targets, prev_action, hand_q, goal_quat
+        for _ in range(40):  # 2 s ramp to the open home pose + settle
+            tg = prev_targets + np.clip(-prev_targets, -args.max_hand_step, args.max_hand_step)
+            if hw is not None and args.execute:
+                hw.hand_stream(tg.astype(np.float32))
+            prev_targets = tg
+            hand_q = tg
+            time.sleep(STEP_DT)
+        policy.reset()
+        prev_action = np.zeros(12, dtype=np.float32)
+        goal_quat = sample_goal_quat(rng)
+        send_goal(-1.0)
+        if receiver is not None:
+            receiver.wait_fresh(args.max_pose_age, 3.0)
+
     print(f"[run] 20 Hz control, success tol {args.success_tol:.2f} rad, goal #1:"
           f" quat {np.array2string(goal_quat, precision=3)}")
     next_t = time.perf_counter()
     stop_reason = "steps done"
+    last_event_t = time.perf_counter()
     try:
         for step in range(args.steps):
             pose_env = cube_env_pose()
@@ -809,8 +831,16 @@ def main() -> None:
                 if rot_dist <= args.success_tol:
                     successes += 1
                     goal_quat = sample_goal_quat(rng)
+                    last_event_t = time.perf_counter()
                     print(f"[goal] SUCCESS #{successes} at step {step}!"
                           f" next goal quat {np.array2string(goal_quat, precision=3)}")
+                elif args.stall_timeout > 0 and time.perf_counter() - last_event_t > args.stall_timeout:
+                    print(f"[stall] no success for {args.stall_timeout:.0f}s at step {step} — "
+                          "reopening hand, resetting policy, new goal")
+                    soft_reset()
+                    last_event_t = time.perf_counter()
+                    next_t = time.perf_counter()
+                    continue
 
                 if log is not None:
                     log["obs"].append(obs)
