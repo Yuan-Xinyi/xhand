@@ -50,7 +50,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CHECKPOINT = str(
     REPO_ROOT / "logs/rl_games/xhand_repose_openai_lstm/0_2026-06-26_17-44-10/nn/xhand_repose_openai_lstm.pth"
 )
-DEFAULT_CALIB_YAML = "/home/lqin/one/one/camera/RS435/calibration_result.yaml"
+DEFAULT_CALIB_YAML = "/home/lqin/one-dexhand/one/camera/RS435/camera_extrinsics.yaml"
 TRACKER_SCRIPT = str(Path(__file__).resolve().parent / "foundationpose_repose_tracker.py")
 
 # ---------------------------------------------------------------------------
@@ -409,7 +409,10 @@ def _prepare_one_imports() -> None:
         mpl.pyplot = pyplot
         sys.modules.setdefault("matplotlib", mpl)
         sys.modules.setdefault("matplotlib.pyplot", pyplot)
-    one_root = "/home/lqin/one"
+    # the dex-hand branch worktree carries the XHand model/driver sources
+    one_root = os.environ.get("ONE_ROOT")
+    if not one_root:
+        one_root = "/home/lqin/one-dexhand" if os.path.isdir("/home/lqin/one-dexhand/one") else "/home/lqin/one"
     if one_root not in sys.path:
         sys.path.insert(0, one_root)
 
@@ -533,9 +536,10 @@ def load_base_T_cam(calib_yaml: str) -> np.ndarray:
         raise FileNotFoundError(f"camera calibration not found: {path}")
     with open(path) as f:
         data = yaml.safe_load(f)
-    mat = np.array(data["T_base_cam"]["matrix"], dtype=np.float64)
+    entry = data["T_base_cam"]
+    mat = np.array(entry["matrix"] if isinstance(entry, dict) else entry, dtype=np.float64)
     if mat.shape != (4, 4):
-        raise RuntimeError(f"T_base_cam.matrix must be 4x4, got {mat.shape}")
+        raise RuntimeError(f"T_base_cam must be 4x4, got {mat.shape}")
     return mat
 
 
