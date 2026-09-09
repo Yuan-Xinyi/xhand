@@ -480,6 +480,21 @@ class UdpPoseReceiver:
             time.sleep(0.1)
         return False
 
+    def wait_fresh(self, max_age: float, timeout: float) -> bool:
+        """Drain stale packets and wait for a genuinely fresh one.
+
+        Needed after any long blocking pause (input() prompts): when the UDP
+        receive buffer fills, the kernel drops NEW packets and keeps OLD ones,
+        so the freshest packet in the buffer can be arbitrarily stale.
+        """
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            self.poll()  # drains the whole buffer
+            if self.age() <= max_age:
+                return True
+            time.sleep(0.02)
+        return False
+
 
 class SyntheticPose:
     """Slowly tumbling cube at the in-hand position, directly in the ENV frame."""
@@ -716,6 +731,11 @@ def main() -> None:
 
     if hw is not None and args.execute:
         input("[real] ENTER to start streaming policy commands, or Ctrl-C to abort...")
+
+    # after any blocking prompt the UDP buffer holds only stale packets; resync
+    if receiver is not None:
+        if not receiver.wait_fresh(args.max_pose_age, 5.0):
+            raise RuntimeError("pose stream not fresh at start — is the tracker still running?")
 
     # --- control loop ------------------------------------------------------
     prev_action = np.zeros(12, dtype=np.float32)
