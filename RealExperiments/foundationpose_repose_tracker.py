@@ -16,11 +16,15 @@ import struct
 import sys
 import time
 
-# prefer the GUI-capable cv2 (env site-packages) over Isaac's headless prebundle;
-# .cv2gui contains only a cv2 symlink, so nothing else is shadowed.
+# Prefer the GUI-capable cv2 (env site-packages) over Isaac's headless prebundle.
+# .cv2gui contains only a cv2 symlink, so nothing else is shadowed. It must be on
+# PYTHONPATH BEFORE the interpreter starts (an in-process sys.path.insert trips
+# OpenCV's bootstrap recursion check), so re-exec ourselves once with it prepended.
 _CV2GUI = "/disk2/FoundationPose/cube/.cv2gui"
-if os.path.isdir(_CV2GUI) and _CV2GUI not in sys.path:
-    sys.path.insert(0, _CV2GUI)
+if os.environ.get("_CV2GUI_REEXEC") != "1" and os.path.isdir(_CV2GUI):
+    _pp = os.environ.get("PYTHONPATH", "")
+    _env = dict(os.environ, PYTHONPATH=_CV2GUI + (os.pathsep + _pp if _pp else ""), _CV2GUI_REEXEC="1")
+    os.execve(sys.executable, [sys.executable] + sys.argv, _env)
 
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
