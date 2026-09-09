@@ -131,6 +131,15 @@ Safety: per-cycle joint step clamp (`--max-hand-step`), joint-limit saturation,
 pose-staleness hold/abort (`--max-pose-age` / `--abort-pose-age`), cube-fall
 stop (0.24 m), success tolerance `--success-tol` (default 0.4 rad = trained).
 
+Auto-center (default ON, disable with `--no-auto-center`): at startup the cube
+rests in the open palm at a known sim position (0, 0.101, 0.551), so the mean
+measured position defines a constant offset that cancels the calibration
+TRANSLATION error entirely — no camera re-calibration needed after small camera
+moves. The extrinsic ROTATION error is NOT cancelled (it biases the perceived
+cube orientation); the July-2026 `camera_extrinsics.yaml` rotation is still
+used, and a >15 cm offset triggers a warning that rotation is probably off too.
+Real-run order: hand home -> place cube -> tracker ROI -> auto-center -> go.
+
 Verification tools (already run once, all green):
 
 - `repose_probe_dump.py` (env_isaaclab): dumps sim contract constants + FK

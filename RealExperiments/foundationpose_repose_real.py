@@ -86,6 +86,8 @@ SIM_PALM_POS = np.array([0.0, 0.0, 0.5], dtype=np.float32)
 SIM_PALM_QUAT = np.array([0.7071, -0.7071, 0.0, 0.0], dtype=np.float32)  # wxyz
 
 IN_HAND_POS = np.array([0.0, 0.1, 0.51], dtype=np.float32)  # env frame
+# settled rest position of the cube in the open palm (measured in sim, 5 s hold)
+REST_POS = np.array([0.0, 0.101, 0.551], dtype=np.float32)
 FALL_DIST = 0.24
 ACT_MOVING_AVERAGE = 0.3  # XHandReposeOpenAIEnvCfg
 STEP_DT = 0.05  # 20 Hz (sim dt 1/60 * decimation 3)
@@ -417,34 +419,6 @@ def _prepare_one_imports() -> None:
         sys.path.insert(0, one_root)
 
 
-def _patch_one_mechbase_compat() -> None:
-    """The one-lib MechBase kwarg flipped between is_free/is_floating across versions;
-    translate whichever alias the installed version does not accept."""
-    import inspect
-
-    import one.robots.base.mech_base as mech_base
-
-    init = mech_base.MechBase.__init__
-    if getattr(init, "_kwarg_compat", False):
-        return
-    params = inspect.signature(init).parameters
-    has_free, has_floating = "is_free" in params, "is_floating" in params
-
-    def _compat_init(self, *args, **kwargs):
-        if not has_floating and "is_floating" in kwargs:
-            val = kwargs.pop("is_floating")
-            if has_free:
-                kwargs.setdefault("is_free", val)
-        if not has_free and "is_free" in kwargs:
-            val = kwargs.pop("is_free")
-            if has_floating:
-                kwargs.setdefault("is_floating", val)
-        return init(self, *args, **kwargs)
-
-    _compat_init._kwarg_compat = True
-    mech_base.MechBase.__init__ = _compat_init
-
-
 # ---------------------------------------------------------------------------
 # cube pose sources
 # ---------------------------------------------------------------------------
@@ -557,6 +531,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pose_npy", default="/tmp/foundationpose_cube_pose.npy")
     p.add_argument("--calib_yaml", default=DEFAULT_CALIB_YAML)
     p.add_argument("--no_calib", action="store_true", help="cube pose already in the xArm base frame")
+    p.add_argument("--no-auto-center", action="store_true",
+                   help="skip the startup position zeroing (cube at rest in palm -> cancels calib translation error)")
     p.add_argument("--max-pose-age", type=float, default=0.25, help="hold targets if pose older than this [s]")
     p.add_argument("--abort-pose-age", type=float, default=2.0, help="abort real run if pose older than this [s]")
     p.add_argument("--real", action="store_true", help="connect xArm7 (read) + XHand")
@@ -621,28 +597,6 @@ def main() -> None:
         raise ValueError("--execute requires --real")
     _maybe_reexec_one(args)
 
-    # --- pose source -------------------------------------------------------
-    tracker_proc = None
-    receiver = None
-    synthetic = None
-    static_pose_cam = None
-    if args.pose_source == "tracker":
-        receiver = UdpPoseReceiver()
-        tracker_proc = spawn_tracker(args)
-        print(f"[tracker] waiting for first pose on udp://{UDP_ADDR[0]}:{UDP_ADDR[1]} "
-              f"(load ~40 s + ROI selection)...")
-        if not receiver.wait_first(args.tracker_timeout):
-            if tracker_proc.poll() is not None:
-                raise RuntimeError("tracker process exited before sending a pose")
-            raise TimeoutError("no cube pose received from tracker")
-        print(f"[tracker] pose stream up (seq={receiver.seq})")
-    elif args.pose_source == "npy":
-        static_pose_cam = np.load(args.pose_npy).astype(np.float64)
-        print(f"[pose] static pose from {args.pose_npy}")
-    else:
-        synthetic = SyntheticPose()
-        print("[pose] synthetic tumbling cube (offline smoke test)")
-
     # --- kinematics + frames ----------------------------------------------
     kin = UrdfKinematics()
     hw = None
@@ -669,6 +623,43 @@ def main() -> None:
     if args.pose_source in ("tracker", "npy") and not args.no_calib:
         base_T_cam = load_base_T_cam(args.calib_yaml)
 
+    # --- policy (load before any hardware motion so failures abort early) --
+    policy = LstmPolicy(args.checkpoint)
+    rng = np.random.default_rng(args.goal_seed)
+    goal_quat = sample_goal_quat(rng)
+    successes = 0
+
+    # --- hand to home + cube placement (BEFORE the tracker: the ROI must be
+    # drawn around the cube already resting in the palm) ---------------------
+    if hw is not None and args.execute:
+        input("[real] ENTER to move XHand to open home pose (cube NOT in hand yet)...")
+        hw.hand_home(hand_q, args.hand_start_speed)
+        input("[real] place the cube at rest in the palm, then ENTER to start the tracker...")
+
+    # --- pose source -------------------------------------------------------
+    tracker_proc = None
+    receiver = None
+    synthetic = None
+    static_pose_cam = None
+    if args.pose_source == "tracker":
+        receiver = UdpPoseReceiver()
+        tracker_proc = spawn_tracker(args)
+        print(f"[tracker] waiting for first pose on udp://{UDP_ADDR[0]}:{UDP_ADDR[1]} "
+              f"(load ~40 s + ROI selection)...")
+        if not receiver.wait_first(args.tracker_timeout):
+            if tracker_proc.poll() is not None:
+                raise RuntimeError("tracker process exited before sending a pose")
+            raise TimeoutError("no cube pose received from tracker")
+        print(f"[tracker] pose stream up (seq={receiver.seq})")
+    elif args.pose_source == "npy":
+        static_pose_cam = np.load(args.pose_npy).astype(np.float64)
+        print(f"[pose] static pose from {args.pose_npy}")
+    else:
+        synthetic = SyntheticPose()
+        print("[pose] synthetic tumbling cube (offline smoke test)")
+
+    center_offset = np.zeros(3)
+
     def cube_env_pose() -> np.ndarray | None:
         if synthetic is not None:
             return synthetic.pose_env()
@@ -676,23 +667,38 @@ def main() -> None:
         if pose_cam is None:
             return None
         pose_base = pose_cam if base_T_cam is None else base_T_cam @ pose_cam
-        return env_T_base @ pose_base
+        pose = env_T_base @ pose_base
+        pose[:3, 3] -= center_offset
+        return pose
 
-    # --- policy ------------------------------------------------------------
-    policy = LstmPolicy(args.checkpoint)
-    rng = np.random.default_rng(args.goal_seed)
-    goal_quat = sample_goal_quat(rng)
-    successes = 0
+    # --- auto-center: cube at rest in the palm defines the position zero ----
+    # Cancels the calib translation error entirely (rotation error remains).
+    if synthetic is None and not args.no_auto_center:
+        samples = []
+        t0 = time.time()
+        while len(samples) < 30 and time.time() - t0 < 5.0:
+            p = cube_env_pose()
+            if p is not None:
+                samples.append(p[:3, 3].copy())
+            time.sleep(0.05)
+        arr = np.asarray(samples)
+        spread = float(arr.std(axis=0).max()) if len(arr) > 1 else 0.0
+        if spread > 0.01:
+            print(f"[center][WARN] cube not still during zeroing (std {spread * 1000:.0f} mm) — offset may be poor")
+        center_offset = arr.mean(axis=0) - REST_POS
+        mag = float(np.linalg.norm(center_offset))
+        print(f"[center] position offset zeroed: {np.array2string(center_offset, precision=3)} (|{mag * 100:.1f} cm|)")
+        if mag > 0.15:
+            print("[center][WARN] offset > 15 cm — the camera moved a lot since calibration;"
+                  " its ROTATION is probably also off. Consider re-calibrating anyway.")
 
-    # --- hand to home ------------------------------------------------------
     if hw is not None and args.execute:
-        input("[real] ENTER to move XHand to open home pose (cube NOT in hand yet)...")
-        hw.hand_home(hand_q, args.hand_start_speed)
-        input("[real] place the cube in the palm, wait for tracking to look stable, then ENTER...")
+        input("[real] ENTER to start streaming policy commands, or Ctrl-C to abort...")
 
     # --- control loop ------------------------------------------------------
     prev_action = np.zeros(12, dtype=np.float32)
     prev_targets = hand_q.copy()
+    prev_obj_quat = None
     log = {"obs": [], "action": [], "obj_pos": [], "obj_quat": [], "goal_quat": [], "t": []} if args.log_npz else None
 
     print(f"[run] 20 Hz control, success tol {args.success_tol:.2f} rad, goal #1:"
@@ -710,6 +716,11 @@ def main() -> None:
             if fresh:
                 obj_pos = pose_env[:3, 3]
                 obj_quat = rotmat_to_quat(pose_env[:3, :3])
+                # keep the quaternion sign continuous across frames (PhysX streams
+                # are continuous in sim; matrix->quat conversion is not)
+                if prev_obj_quat is not None and float(np.dot(obj_quat, prev_obj_quat)) < 0.0:
+                    obj_quat = -obj_quat
+                prev_obj_quat = obj_quat
 
                 # fall check
                 fall_d = float(np.linalg.norm(obj_pos - IN_HAND_POS))
