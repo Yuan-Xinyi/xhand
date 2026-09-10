@@ -42,7 +42,10 @@ SPANS = [100, 100, 100, 300, 300, 300]  # trackbar range; value = pos - span/2
 def values():
     out = []
     for name, span in zip(NAMES, SPANS):
-        v = cv2.getTrackbarPos(name, WIN) - span // 2
+        raw = cv2.getTrackbarPos(name, WIN)
+        if raw < 0:  # window destroyed -> cv2 returns -1: never stream that
+            return None
+        v = raw - span // 2
         out.append(v / 1000.0 if "mm" in name else np.radians(v / 10.0))
     return out
 
@@ -62,6 +65,15 @@ def load_base():
 
 
 def main():
+    # single-instance lock: a zombie panel (window closed but process alive)
+    # would keep streaming stale/garbage values and fight the new one
+    lock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        lock.bind(("127.0.0.1", 9881))
+    except OSError:
+        print("[calib] another calib panel is already running — kill it first "
+              "(pkill -f repose_calib_gui) or use that window")
+        return
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WIN, 560, 420)
     for name, span in zip(NAMES, SPANS):
@@ -75,7 +87,17 @@ def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     canvas = np.full((165, 560, 3), 28, np.uint8)
     while True:
-        delta = np.array(values())
+        try:
+            if cv2.getWindowProperty(WIN, cv2.WND_PROP_VISIBLE) < 1:
+                print("[calib] window closed — exiting (values streamed so far stay active)")
+                break
+        except cv2.error:
+            break
+        raw = values()
+        if raw is None:
+            print("[calib] trackbars gone — exiting")
+            break
+        delta = np.array(raw)
         total = base + delta
         sock.sendto(struct.pack(CALIB_FMT, *total), CALIB_UDP)
         img = canvas.copy()

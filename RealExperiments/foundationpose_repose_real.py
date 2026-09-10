@@ -842,11 +842,18 @@ def main() -> None:
                 return
             if len(data) == struct.calcsize(CALIB_COMMIT_FMT):
                 vals = struct.unpack(CALIB_COMMIT_FMT, data)
-                manual = np.array(vals[:6])
-                if vals[6] > 0.5:
-                    recenter_requested = True
+                cand = np.array(vals[:6])
+                flag = vals[6] > 0.5
             else:
-                manual = np.array(struct.unpack(CALIB_FMT, data))
+                cand = np.array(struct.unpack(CALIB_FMT, data))
+                flag = False
+            # reject corrupt packets (beyond the panel's physical slider range,
+            # e.g. a zombie panel reading -1 from destroyed trackbars)
+            if np.any(np.abs(cand[:3]) > 0.055) or np.any(np.abs(cand[3:]) > np.radians(16.0)):
+                continue
+            manual = cand
+            if flag:
+                recenter_requested = True
 
     def apply_manual(pose: np.ndarray) -> np.ndarray:
         """Manual calib: rotation acts on the WHOLE pose about the rest anchor.
