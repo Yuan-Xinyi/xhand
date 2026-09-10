@@ -847,9 +847,13 @@ def main() -> None:
             else:
                 cand = np.array(struct.unpack(CALIB_FMT, data))
                 flag = False
-            # reject corrupt packets (beyond the panel's physical slider range,
-            # e.g. a zombie panel reading -1 from destroyed trackbars)
-            if np.any(np.abs(cand[:3]) > 0.055) or np.any(np.abs(cand[3:]) > np.radians(16.0)):
+            # reject corrupt packets: the destroyed-trackbar signature (cv2
+            # returns -1 -> exactly -51 mm / -15.1 deg on ALL six axes), plus a
+            # generous absurdity bound (totals accumulate across saves, so the
+            # per-slider range is NOT a valid bound here)
+            garbage = (np.allclose(cand[:3], -0.051, atol=1e-9)
+                       and np.allclose(cand[3:], np.radians(-15.1), atol=1e-6))
+            if garbage or np.any(np.abs(cand[:3]) > 0.15) or np.any(np.abs(cand[3:]) > np.radians(45.0)):
                 continue
             manual = cand
             if flag:

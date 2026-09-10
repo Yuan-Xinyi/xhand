@@ -86,13 +86,21 @@ def main():
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     canvas = np.full((165, 560, 3), 28, np.uint8)
+    it = 0
+    invisible = 0
     while True:
-        try:
-            if cv2.getWindowProperty(WIN, cv2.WND_PROP_VISIBLE) < 1:
+        it += 1
+        # visibility check only after the window is realized (first imshow /
+        # waitKey cycles), and only on two consecutive misses — a fresh GTK
+        # window can read VISIBLE=0 before its first event loop pass
+        if it > 10:
+            try:
+                invisible = invisible + 1 if cv2.getWindowProperty(WIN, cv2.WND_PROP_VISIBLE) < 1 else 0
+            except cv2.error:
+                invisible += 1
+            if invisible >= 2:
                 print("[calib] window closed — exiting (values streamed so far stay active)")
                 break
-        except cv2.error:
-            break
         raw = values()
         if raw is None:
             print("[calib] trackbars gone — exiting")
