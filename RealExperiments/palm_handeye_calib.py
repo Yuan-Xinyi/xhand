@@ -92,8 +92,27 @@ def solve_handeye(base_T_palm_list, cam_T_marker_list):
         rots.append(np.degrees(np.arccos(np.clip((np.trace(dR) - 1) / 2, -1, 1))))
         poss.append(np.linalg.norm(pred[:3, 3] - c[:3, 3]) * 1000)
     res = {"rot_deg_mean": float(np.mean(rots)), "rot_deg_max": float(np.max(rots)),
-           "pos_mm_mean": float(np.mean(poss)), "pos_mm_max": float(np.max(poss))}
+           "pos_mm_mean": float(np.mean(poss)), "pos_mm_max": float(np.max(poss)),
+           "per_rot_deg": [float(r) for r in rots], "per_pos_mm": [float(x) for x in poss]}
     return base_T_cam, palm_T_marker, res
+
+
+def solve_trimmed(base_T_palm_list, cam_T_marker_list, min_keep=10, rot_tol=2.5, pos_tol=15.0):
+    """Iteratively drop the worst sample until residuals are sane (outlier armor)."""
+    idx = list(range(len(base_T_palm_list)))
+    dropped = []
+    while True:
+        bp = [base_T_palm_list[i] for i in idx]
+        cm = [cam_T_marker_list[i] for i in idx]
+        base_T_cam, palm_T_marker, res = solve_handeye(bp, cm)
+        if (res["rot_deg_max"] <= rot_tol and res["pos_mm_max"] <= pos_tol) or len(idx) <= min_keep:
+            return base_T_cam, palm_T_marker, res, idx, dropped
+        worst_local = int(np.argmax(res["per_rot_deg"]))
+        worst = idx[worst_local]
+        dropped.append((worst, res["per_rot_deg"][worst_local], res["per_pos_mm"][worst_local]))
+        print(f"[handeye] dropping outlier sample #{worst}: "
+              f"{res['per_rot_deg'][worst_local]:.1f} deg / {res['per_pos_mm'][worst_local]:.0f} mm")
+        idx.pop(worst_local)
 
 
 def main():
@@ -139,6 +158,24 @@ def main():
         raise RuntimeError(f"get_servo_angle failed: {code}")
     q0 = np.array(q0[:7], dtype=np.float64)
     print(f"[handeye] home arm q [deg]: {np.round(q0, 2)}")
+
+    # FK cross-check: one-lib FK flange position vs SDK TCP position.
+    # A mismatch that GROWS with pose changes means the URDF FK does not match
+    # the real arm (joint sign/offset) — hand-eye would then be garbage.
+    try:
+        code, tcp = arm.get_position(is_radian=True)
+        if code == 0:
+            kin.update(np.radians(q0), hand_q0)
+            fk_flange = kin.link_tf["link8"][:3, 3] * 1000.0  # mm
+            tcp_off = np.array(arm.tcp_offset[:3], dtype=np.float64)  # mm, flange frame
+            d = np.linalg.norm(np.array(tcp[:3]) - fk_flange)
+            print(f"[handeye] FK check @home: |SDK tcp - FK flange| = {d:.1f} mm"
+                  f" (tcp offset set: {np.round(tcp_off, 1)} mm)")
+            if d > 30 and np.linalg.norm(tcp_off) < 1e-6:
+                print("[handeye][WARN] FK deviates >30 mm with zero tcp-offset — URDF/SDK mismatch?"
+                      " Capture 2-3 samples at very different poses and watch the residual report.")
+    except Exception as e:  # informational only
+        print(f"[handeye] FK check skipped: {e}")
     if args.auto:
         print(f"[handeye] will visit {len(POSE_DELTAS)} wrist poses, deltas up to +-12 deg on j4..j7,")
         print(f"[handeye] speed {args.speed} deg/s. Marker on palm, hand OPEN, NO cube, area CLEAR.")
@@ -158,7 +195,17 @@ def main():
         pipeline.wait_for_frames()
 
     def capture_marker():
-        quats, ts, K = [], [], None
+        """Multi-frame capture robust to the planar-PnP two-fold ambiguity.
+
+        IPPE on a single flat marker has two candidate poses; near-frontal
+        views make them nearly tied and noise picks the wrong branch (this is
+        what produced 50-deg outliers in the field). Keep BOTH solutions per
+        frame, choose branches by cross-frame consensus, and reject the whole
+        sample if the frames still disagree.
+        """
+        frames_sol, K = [], None
+        s = args.size / 2
+        obj = np.array([[-s, s, 0], [s, s, 0], [s, -s, 0], [-s, -s, 0]])
         for _ in range(args.frames_per_pose):
             cf = pipeline.wait_for_frames().get_color_frame()
             if K is None:
@@ -169,22 +216,51 @@ def main():
             if ids is None or args.id not in ids.ravel():
                 continue
             c = corners[list(ids.ravel()).index(args.id)]
-            s = args.size / 2
-            obj = np.array([[-s, s, 0], [s, s, 0], [s, -s, 0], [-s, -s, 0]])
-            ok, rvec, tvec = cv2.solvePnP(obj, c.reshape(4, 2).astype(np.float64), K, np.zeros(5),
-                                          flags=cv2.SOLVEPNP_IPPE_SQUARE)
-            if not ok:
+            try:
+                n_sol, rvecs, tvecs, errs = cv2.solvePnPGeneric(
+                    obj, c.reshape(4, 2).astype(np.float64), K, np.zeros(5),
+                    flags=cv2.SOLVEPNP_IPPE_SQUARE)
+            except cv2.error:
                 continue
-            rm, _ = cv2.Rodrigues(rvec)
-            quats.append(rr.rotmat_to_quat(rm))
-            ts.append(tvec.ravel())
-        if len(quats) < max(4, args.frames_per_pose // 3):
+            if n_sol < 1:
+                continue
+            sols = []
+            for rv, tv in zip(rvecs, tvecs):
+                rm, _ = cv2.Rodrigues(rv)
+                sols.append((rr.rotmat_to_quat(rm), tv.ravel()))
+            frames_sol.append(sols)
+        if len(frames_sol) < max(4, args.frames_per_pose // 3):
             return None
-        q = np.array(quats)
-        q[np.sum(q * q[0], axis=1) < 0] *= -1
-        qm = q.mean(axis=0)
+        # consensus branch selection: iterate mean-rotation -> nearest branch
+        sel = [0] * len(frames_sol)
+        for _ in range(4):
+            qs = []
+            for fs, si in zip(frames_sol, sel):
+                q = fs[si][0].copy()
+                if qs and np.dot(q, qs[0]) < 0:
+                    q = -q
+                qs.append(q)
+            qm = np.mean(qs, axis=0)
+            qm /= np.linalg.norm(qm)
+            sel = []
+            for fs in frames_sol:
+                dots = [abs(np.dot(sol[0], qm)) for sol in fs]
+                sel.append(int(np.argmax(dots)))
+        qs, ts_sel = [], []
+        for fs, si in zip(frames_sol, sel):
+            q = fs[si][0].copy()
+            if qs and np.dot(q, qs[0]) < 0:
+                q = -q
+            qs.append(q)
+            ts_sel.append(fs[si][1])
+        qm = np.mean(qs, axis=0)
         qm /= np.linalg.norm(qm)
-        return tf(rr.quat_to_rotmat(qm), np.array(ts).mean(axis=0))
+        spread = np.degrees(2 * np.arccos(np.clip(np.abs(np.array(qs) @ qm), -1, 1))).max()
+        if spread > 3.0:
+            print(f"[handeye][WARN] frames disagree ({spread:.1f} deg) — view too frontal/unstable;"
+                  " TILT the palm 30-45 deg to the camera and retry")
+            return None
+        return tf(rr.quat_to_rotmat(qm), np.array(ts_sel).mean(axis=0))
 
     base_T_palm_list, cam_T_marker_list = [], []
     try:
@@ -216,6 +292,8 @@ def main():
             if code != 0:
                 raise RuntimeError(f"set_mode(2) failed ({code}) — enable Manual Mode in xArm Studio")
             print("[handeye] TEACH MODE ON — the arm is free to drag.")
+            print("[handeye] TIP: keep the marker TILTED 20-45 deg to the camera in most samples —")
+            print("[handeye] frontal views are ambiguous for a flat marker and get rejected/deweighted.")
 
             def try_capture():
                 code, qa = arm.get_servo_angle()
@@ -327,16 +405,23 @@ def main():
         pipeline.stop()
 
     n = len(base_T_palm_list)
-    if n < 12:
-        print(f"[handeye] only {n} good poses (<12) — aborting without writing calibration")
+    raw_npz = os.path.join(HERE, "handeye_samples.npz")
+    np.savez(raw_npz, base_T_palm=np.array(base_T_palm_list), cam_T_marker=np.array(cam_T_marker_list))
+    print(f"[handeye] raw samples dumped -> {raw_npz}")
+    if n < args.min_samples:
+        print(f"[handeye] only {n} good poses (<{args.min_samples}) — aborting without writing calibration")
         sys.exit(1)
 
-    base_T_cam, palm_T_marker, res = solve_handeye(base_T_palm_list, cam_T_marker_list)
-    print(f"[handeye] solved from {n} poses.")
+    base_T_cam, palm_T_marker, res, kept, dropped = solve_trimmed(
+        base_T_palm_list, cam_T_marker_list, min_keep=max(10, args.min_samples - 2))
+    print(f"[handeye] solved from {len(kept)}/{n} poses ({len(dropped)} outliers dropped).")
     print(f"[handeye] residuals: rot mean {res['rot_deg_mean']:.2f} / max {res['rot_deg_max']:.2f} deg,"
           f" pos mean {res['pos_mm_mean']:.1f} / max {res['pos_mm_max']:.1f} mm")
-    if res["rot_deg_max"] > 2.0 or res["pos_mm_max"] > 15.0:
-        print("[handeye][WARN] residuals high — sticker not rigid / marker size wrong / FK mismatch?")
+    if res["rot_deg_max"] > 3.0 or res["pos_mm_max"] > 20.0:
+        print("[handeye][FAIL] residuals still high after trimming — NOT writing the calibration.")
+        print("[handeye]  likely causes: sticker moved / wrong --size / FK mismatch (see startup check).")
+        print(f"[handeye]  raw samples kept at {raw_npz} for offline analysis.")
+        sys.exit(1)
     print(f"[handeye] palm_T_marker: t={np.round(palm_T_marker[:3, 3] * 1000, 1)}mm (sticker placement, FYI)")
 
     # env frame at the HOME pose (same formula as the control script)
