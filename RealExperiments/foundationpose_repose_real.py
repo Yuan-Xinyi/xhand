@@ -874,12 +874,12 @@ def main() -> None:
         return apply_manual(pose)
 
     # --- auto-center: cube at rest in the palm defines the position zero ----
-    # Cancels the calib translation error entirely (rotation error remains).
-    # Skipped when a MANUAL calibration exists: the hand-tuned offset is the
-    # ground truth and auto-center would silently cancel its translation part.
-    if np.any(manual[:3]) and not args.no_auto_center:
-        print("[center] manual calibration present — auto-center skipped (manual takes precedence)")
-    elif synthetic is None and not args.no_auto_center:
+    # ALWAYS on: it anchors the rest position to what the policy expects
+    # (REST_POS), robust to camera bumps. Consequence: the TRANSLATION part of
+    # the manual calibration is neutralized at runtime by construction — use
+    # the sliders' translation only for temporary visual exploration; the
+    # ROTATION part is the persistent, meaningful correction.
+    if synthetic is None and not args.no_auto_center:
         samples = []
         t0 = time.time()
         while len(samples) < 30 and time.time() - t0 < 5.0:
