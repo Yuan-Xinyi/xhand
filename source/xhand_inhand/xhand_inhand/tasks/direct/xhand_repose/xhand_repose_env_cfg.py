@@ -419,3 +419,24 @@ class XHandReposeOpenAIHardEnvCfg(XHandReposeOpenAIEnvCfg):
         fingers.damping = 1.0
         fingers.effort_limit_sim = 3.0
         fingers.velocity_limit_sim = 3.14
+
+
+@configclass
+class XHandReposeOpenAIHardSmoothEnvCfg(XHandReposeOpenAIHardEnvCfg):
+    """Hard variant + smoothness/limit-avoidance shaping (wuji-mjlab inspired).
+
+    Field evidence: the Hard policy spends 23% of its time within 5% of the
+    joint limits and 30-50% at velocity saturation — regions where clean sim
+    clipping and real end stops / motor speed droop diverge. Penalize:
+    - action rate  ||a_t - a_{t-1}||^2
+    - exp barrier on limit-normalized joint position beyond |u| > 0.9
+    - exp barrier on joint speed beyond 2.5 rad/s (hard sim clip: 3.14)
+    """
+
+    action_rate_penalty_scale = -0.01
+    pos_limit_penalty_scale = -0.02
+    pos_limit_soft = 0.9
+    pos_limit_temp = 0.05
+    vel_limit_penalty_scale = -0.01
+    vel_limit_soft = 2.5
+    vel_limit_temp = 0.3

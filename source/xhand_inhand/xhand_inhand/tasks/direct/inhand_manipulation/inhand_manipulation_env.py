@@ -84,6 +84,11 @@ class InHandManipulationEnv(DirectRLEnv):
         )
         self._steps_since_tol_update = 0
 
+        # previous policy action (for the optional action-rate penalty)
+        self.prev_policy_actions = torch.zeros(
+            (self.num_envs, self.cfg.action_space), dtype=torch.float, device=self.device
+        )
+
         # unit tensors
         self.x_unit_tensor = torch.tensor([1, 0, 0], dtype=torch.float, device=self.device).repeat((self.num_envs, 1))
         self.y_unit_tensor = torch.tensor([0, 1, 0], dtype=torch.float, device=self.device).repeat((self.num_envs, 1))
@@ -116,6 +121,7 @@ class InHandManipulationEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
+        self.prev_policy_actions.copy_(self.actions)
         self.actions = actions.clone()
 
     def _apply_action(self) -> None:
@@ -188,11 +194,44 @@ class InHandManipulationEnv(DirectRLEnv):
             self.cfg.av_factor,
         )
 
-        # tighten the success tolerance once the policy is competent at the current one
-        self._update_success_tolerance()
-
+        # optional smoothness / limit-avoidance penalties (cfg-driven, default off).
+        # Motivation: the trained policy ran 23% of the time within 5% of the joint
+        # limits and saturated the velocity limit 30-50% of the time — regions where
+        # sim (clean clipping) and real hardware (end stops, motor speed-torque
+        # droop) behave very differently.
         if "log" not in self.extras:
             self.extras["log"] = dict()
+        ar_scale = getattr(self.cfg, "action_rate_penalty_scale", 0.0)
+        if ar_scale != 0.0:
+            act_rate = torch.sum(torch.square(self.actions - self.prev_policy_actions), dim=-1)
+            total_reward += ar_scale * act_rate
+            self.extras["log"]["penalty/action_rate"] = act_rate.mean()
+        pl_scale = getattr(self.cfg, "pos_limit_penalty_scale", 0.0)
+        if pl_scale != 0.0:
+            u_norm = unscale(self.hand_dof_pos, self.hand_dof_lower_limits, self.hand_dof_upper_limits)
+            pos_pen = torch.sum(
+                torch.exp(
+                    (torch.abs(u_norm) - getattr(self.cfg, "pos_limit_soft", 0.9))
+                    / getattr(self.cfg, "pos_limit_temp", 0.05)
+                ).clamp(max=100.0),
+                dim=-1,
+            )
+            total_reward += pl_scale * pos_pen
+            self.extras["log"]["penalty/pos_limit"] = pos_pen.mean()
+        vl_scale = getattr(self.cfg, "vel_limit_penalty_scale", 0.0)
+        if vl_scale != 0.0:
+            vel_pen = torch.sum(
+                torch.exp(
+                    (torch.abs(self.hand_dof_vel) - getattr(self.cfg, "vel_limit_soft", 2.5))
+                    / getattr(self.cfg, "vel_limit_temp", 0.3)
+                ).clamp(max=100.0),
+                dim=-1,
+            )
+            total_reward += vl_scale * vel_pen
+            self.extras["log"]["penalty/vel_limit"] = vel_pen.mean()
+
+        # tighten the success tolerance once the policy is competent at the current one
+        self._update_success_tolerance()
         self.extras["log"]["consecutive_successes"] = self.consecutive_successes.mean()
         self.extras["log"]["success_tolerance"] = self.success_tolerance
 
@@ -316,6 +355,7 @@ class InHandManipulationEnv(DirectRLEnv):
         self.hand.write_joint_state_to_sim(dof_pos, dof_vel, env_ids=env_ids)
 
         self.successes[env_ids] = 0
+        self.prev_policy_actions[env_ids] = 0.0
         self._compute_intermediate_values()
 
     def _reset_target_pose(self, env_ids: Sequence[int] | torch.Tensor):
