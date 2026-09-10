@@ -109,6 +109,8 @@ def main():
     ap.add_argument("--frames-per-pose", type=int, default=12)
     ap.add_argument("--speed", type=float, default=12.0, help="joint speed [deg/s]")
     ap.add_argument("--serial", default=None)
+    ap.add_argument("--no-preview", action="store_true",
+                    help="terminal-input teach mode instead of the live camera window")
     args = ap.parse_args()
 
     if args.self_test:
@@ -207,52 +209,113 @@ def main():
                 cam_T_marker_list.append(ctm)
                 print(f"[handeye] pose {i + 1}/{len(POSE_DELTAS)}: ok ({len(base_T_palm_list)} collected)")
         else:
-            # -------- teach mode: user drags the arm, ENTER captures --------
+            # -------- teach mode: user drags the arm, captures on demand ----
             code = arm.set_mode(2)  # manual (gravity-compensated drag) mode
             arm.set_state(0)
             time.sleep(0.3)
             if code != 0:
                 raise RuntimeError(f"set_mode(2) failed ({code}) — enable Manual Mode in xArm Studio")
             print("[handeye] TEACH MODE ON — the arm is free to drag.")
-            print("[handeye] Drag to a pose (vary the ORIENTATION between samples, keep the marker")
-            print("[handeye] visible to the camera), let go, then press ENTER. ~20 samples recommended.")
-            while True:
-                n = len(base_T_palm_list)
-                cmd = input(f"[handeye] {n} samples | ENTER=capture  u=undo  d=done  q=abort > ").strip().lower()
-                if cmd == "q":
-                    print("[handeye] aborted by user")
-                    sys.exit(1)
-                if cmd == "u":
-                    if base_T_palm_list:
-                        base_T_palm_list.pop()
-                        cam_T_marker_list.pop()
-                        print("[handeye] last sample removed")
-                    continue
-                if cmd == "d":
-                    if n < args.min_samples:
-                        print(f"[handeye] need at least {args.min_samples} samples (have {n})")
-                        continue
-                    break
+
+            def try_capture():
                 code, qa = arm.get_servo_angle()
                 if code != 0:
                     print(f"[handeye][WARN] joint read failed ({code})")
-                    continue
+                    return
                 ctm = capture_marker()
                 code, qb = arm.get_servo_angle()
                 if code != 0:
-                    continue
+                    return
                 moved = np.max(np.abs(np.array(qa[:7]) - np.array(qb[:7])))
                 if moved > 0.3:
                     print(f"[handeye][WARN] arm moved {moved:.2f} deg during capture — hold still, retry")
-                    continue
+                    return
                 if ctm is None:
-                    print("[handeye][WARN] marker not detected — adjust the pose / lighting, retry")
-                    continue
+                    print("[handeye][WARN] marker not detected steadily — adjust pose / lighting, retry")
+                    return
                 q_act = (np.array(qa[:7]) + np.array(qb[:7])) / 2.0
                 kin.update(np.radians(q_act), hand_q0)
                 base_T_palm_list.append(kin.palm_tf_base().astype(np.float64))
                 cam_T_marker_list.append(ctm)
                 print(f"[handeye] sample {len(base_T_palm_list)} captured ✓")
+
+            if args.no_preview:
+                print("[handeye] Drag, let go, press ENTER to capture. ~20 samples recommended.")
+                while True:
+                    n = len(base_T_palm_list)
+                    cmd = input(f"[handeye] {n} samples | ENTER=capture u=undo d=done q=abort > ").strip().lower()
+                    if cmd == "q":
+                        print("[handeye] aborted by user")
+                        sys.exit(1)
+                    if cmd == "u":
+                        if base_T_palm_list:
+                            base_T_palm_list.pop()
+                            cam_T_marker_list.pop()
+                            print("[handeye] last sample removed")
+                        continue
+                    if cmd == "d":
+                        if n < args.min_samples:
+                            print(f"[handeye] need at least {args.min_samples} samples (have {n})")
+                            continue
+                        break
+                    try_capture()
+            else:
+                # live preview window with detection overlay; keys act HERE
+                win = "handeye teach  (SPACE=capture  u=undo  d=done  q=abort)"
+                cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+                print("[handeye] live window up — keys work IN THE WINDOW, not the terminal.")
+                K_prev = None
+                s_half = args.size / 2
+                obj_pts = np.array([[-s_half, s_half, 0], [s_half, s_half, 0],
+                                    [s_half, -s_half, 0], [-s_half, -s_half, 0]])
+                while True:
+                    cf = pipeline.wait_for_frames().get_color_frame()
+                    if K_prev is None:
+                        intr = cf.profile.as_video_stream_profile().intrinsics
+                        K_prev = np.array([[intr.fx, 0, intr.ppx], [0, intr.fy, intr.ppy], [0, 0, 1]], float)
+                    img = cv2.cvtColor(np.asarray(cf.get_data()), cv2.COLOR_RGB2BGR)
+                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                    corners, ids, _ = detector.detectMarkers(gray)
+                    seen = ids is not None and args.id in ids.ravel()
+                    if seen:
+                        c = corners[list(ids.ravel()).index(args.id)]
+                        cv2.aruco.drawDetectedMarkers(img, [c])
+                        ok, rvec, tvec = cv2.solvePnP(obj_pts, c.reshape(4, 2).astype(np.float64),
+                                                      K_prev, np.zeros(5), flags=cv2.SOLVEPNP_IPPE_SQUARE)
+                        if ok:
+                            cv2.drawFrameAxes(img, K_prev, np.zeros(5), rvec, tvec, args.size * 0.75)
+                        cv2.rectangle(img, (0, 0), (img.shape[1], 34), (40, 160, 40), -1)
+                        cv2.putText(img, "MARKER OK", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                    else:
+                        cv2.rectangle(img, (0, 0), (img.shape[1], 34), (30, 30, 200), -1)
+                        cv2.putText(img, "MARKER NOT VISIBLE", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                                    (255, 255, 255), 2)
+                    cv2.putText(img, f"samples: {len(base_T_palm_list)}/{args.min_samples}+  "
+                                     "SPACE=capture u=undo d=done q=abort",
+                                (10, img.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+                    cv2.imshow(win, img)
+                    k = cv2.waitKey(1) & 0xFF
+                    if k == ord(" "):
+                        if not seen:
+                            print("[handeye][WARN] marker not visible — not capturing")
+                        else:
+                            try_capture()
+                    elif k == ord("u"):
+                        if base_T_palm_list:
+                            base_T_palm_list.pop()
+                            cam_T_marker_list.pop()
+                            print("[handeye] last sample removed")
+                    elif k == ord("d"):
+                        if len(base_T_palm_list) < args.min_samples:
+                            print(f"[handeye] need at least {args.min_samples} samples"
+                                  f" (have {len(base_T_palm_list)})")
+                        else:
+                            break
+                    elif k in (ord("q"), 27):
+                        print("[handeye] aborted by user")
+                        cv2.destroyAllWindows()
+                        sys.exit(1)
+                cv2.destroyAllWindows()
     finally:
         if not args.auto:
             print("[handeye] leaving teach mode (position mode restored)")
