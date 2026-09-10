@@ -97,7 +97,8 @@ def solve_handeye(base_T_palm_list, cam_T_marker_list):
     return base_T_cam, palm_T_marker, res
 
 
-def solve_trimmed(base_T_palm_list, cam_T_marker_list, min_keep=10, rot_tol=2.5, pos_tol=15.0):
+def solve_trimmed(base_T_palm_list, cam_T_marker_list, min_keep=10, rot_tol=2.5, pos_tol=15.0,
+                  verbose=True):
     """Iteratively drop the worst sample until residuals are sane (outlier armor)."""
     idx = list(range(len(base_T_palm_list)))
     dropped = []
@@ -110,9 +111,61 @@ def solve_trimmed(base_T_palm_list, cam_T_marker_list, min_keep=10, rot_tol=2.5,
         worst_local = int(np.argmax(res["per_rot_deg"]))
         worst = idx[worst_local]
         dropped.append((worst, res["per_rot_deg"][worst_local], res["per_pos_mm"][worst_local]))
-        print(f"[handeye] dropping outlier sample #{worst}: "
-              f"{res['per_rot_deg'][worst_local]:.1f} deg / {res['per_pos_mm'][worst_local]:.0f} mm")
+        if verbose:
+            print(f"[handeye] dropping outlier sample #{worst}: "
+                  f"{res['per_rot_deg'][worst_local]:.1f} deg / {res['per_pos_mm'][worst_local]:.0f} mm")
         idx.pop(worst_local)
+
+
+# accept gates for a FULL-quality calibration (rotation AND translation)
+GATES = {"rot_max": 3.0, "pos_max": 20.0, "boot_rot": 1.5, "boot_pos": 20.0, "div_min": 40.0}
+
+
+def bootstrap_spread(bp, cm, ref_btc, iters=25):
+    rng = np.random.default_rng(0)
+    n = len(bp)
+    k = max(6, int(round(0.8 * n)))
+    rots, poss = [], []
+    for _ in range(iters):
+        idx = rng.choice(n, k, replace=False)
+        btc, _, _ = solve_handeye([bp[i] for i in idx], [cm[i] for i in idx])
+        dR = btc[:3, :3] @ ref_btc[:3, :3].T
+        rots.append(np.degrees(np.arccos(np.clip((np.trace(dR) - 1) / 2, -1, 1))))
+        poss.append(np.linalg.norm(btc[:3, 3] - ref_btc[:3, 3]) * 1000)
+    return float(np.percentile(rots, 95)), float(np.percentile(poss, 95))
+
+
+def rotation_diversity_deg(bp):
+    best = 0.0
+    for i in range(len(bp)):
+        for j in range(i + 1, len(bp)):
+            dR = bp[i][:3, :3] @ bp[j][:3, :3].T
+            best = max(best, np.degrees(np.arccos(np.clip((np.trace(dR) - 1) / 2, -1, 1))))
+    return best
+
+
+def full_quality(bp, cm, min_keep):
+    """Solve + all quality gates. Returns (ok, summary_str, details...)."""
+    btc, ptm, res, kept, dropped = solve_trimmed(bp, cm, min_keep=min_keep, verbose=False)
+    bpk = [bp[i] for i in kept]
+    cmk = [cm[i] for i in kept]
+    b_rot, b_pos = bootstrap_spread(bpk, cmk, btc)
+    div = rotation_diversity_deg(bpk)
+    fails = []
+    if res["rot_deg_max"] > GATES["rot_max"]:
+        fails.append(f"residual rot {res['rot_deg_max']:.1f}>{GATES['rot_max']} deg")
+    if res["pos_mm_max"] > GATES["pos_max"]:
+        fails.append(f"residual pos {res['pos_mm_max']:.0f}>{GATES['pos_max']:.0f} mm")
+    if b_rot > GATES["boot_rot"]:
+        fails.append(f"solution rot spread {b_rot:.1f}>{GATES['boot_rot']} deg")
+    if b_pos > GATES["boot_pos"]:
+        fails.append(f"solution pos spread {b_pos:.0f}>{GATES['boot_pos']:.0f} mm (need BIGGER wrist rotations)")
+    if div < GATES["div_min"]:
+        fails.append(f"rotation diversity {div:.0f}<{GATES['div_min']:.0f} deg (tilt the wrist much more)")
+    summary = (f"res {res['rot_deg_max']:.1f}deg/{res['pos_mm_max']:.0f}mm  "
+               f"boot {b_rot:.1f}deg/{b_pos:.0f}mm  div {div:.0f}deg  "
+               f"drop {len(dropped)}")
+    return len(fails) == 0, summary, fails, btc, ptm, res, kept, dropped
 
 
 def main():
@@ -341,6 +394,17 @@ def main():
                 # live preview window with detection overlay; keys act HERE
                 win = "handeye teach  (SPACE=capture  u=undo  d=done  q=abort)"
                 cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+                quality_line, quality_ok = "", False
+
+                def refresh_quality():
+                    nonlocal quality_line, quality_ok
+                    if len(base_T_palm_list) < args.min_samples:
+                        quality_line, quality_ok = f"need {args.min_samples - len(base_T_palm_list)} more samples", False
+                        return
+                    ok, summary, fails, *_ = full_quality(base_T_palm_list, cam_T_marker_list,
+                                                          max(10, args.min_samples - 2))
+                    quality_ok = ok
+                    quality_line = ("PASS - press d | " if ok else "not yet | ") + summary
                 print("[handeye] live window up — keys work IN THE WINDOW, not the terminal.")
                 K_prev = None
                 s_half = args.size / 2
@@ -370,7 +434,11 @@ def main():
                                     (255, 255, 255), 2)
                     cv2.putText(img, f"samples: {len(base_T_palm_list)}/{args.min_samples}+  "
                                      "SPACE=capture u=undo d=done q=abort",
-                                (10, img.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+                                (10, img.shape[0] - 34), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+                    if quality_line:
+                        color = (0, 255, 0) if quality_ok else (0, 200, 255)
+                        cv2.putText(img, quality_line, (10, img.shape[0] - 12),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
                     cv2.imshow(win, img)
                     k = cv2.waitKey(1) & 0xFF
                     if k == ord(" "):
@@ -378,17 +446,27 @@ def main():
                             print("[handeye][WARN] marker not visible — not capturing")
                         else:
                             try_capture()
+                            refresh_quality()
+                            if quality_line:
+                                print(f"[handeye] quality: {quality_line}")
                     elif k == ord("u"):
                         if base_T_palm_list:
                             base_T_palm_list.pop()
                             cam_T_marker_list.pop()
                             print("[handeye] last sample removed")
+                            refresh_quality()
                     elif k == ord("d"):
                         if len(base_T_palm_list) < args.min_samples:
                             print(f"[handeye] need at least {args.min_samples} samples"
                                   f" (have {len(base_T_palm_list)})")
-                        else:
+                            continue
+                        ok, summary, fails, *_ = full_quality(base_T_palm_list, cam_T_marker_list,
+                                                              max(10, args.min_samples - 2))
+                        if ok:
                             break
+                        print(f"[handeye] NOT GOOD YET — keep sampling. Failing gates:")
+                        for fmsg in fails:
+                            print(f"[handeye]   - {fmsg}")
                     elif k in (ord("q"), 27):
                         print("[handeye] aborted by user")
                         cv2.destroyAllWindows()
@@ -414,6 +492,11 @@ def main():
 
     base_T_cam, palm_T_marker, res, kept, dropped = solve_trimmed(
         base_T_palm_list, cam_T_marker_list, min_keep=max(10, args.min_samples - 2))
+    b_rot, b_pos = bootstrap_spread([base_T_palm_list[i] for i in kept],
+                                    [cam_T_marker_list[i] for i in kept], base_T_cam)
+    div = rotation_diversity_deg([base_T_palm_list[i] for i in kept])
+    print(f"[handeye] solution stability (bootstrap p95): rot {b_rot:.2f} deg, pos {b_pos:.0f} mm;"
+          f" rotation diversity {div:.0f} deg")
     print(f"[handeye] solved from {len(kept)}/{n} poses ({len(dropped)} outliers dropped).")
     print(f"[handeye] residuals: rot mean {res['rot_deg_mean']:.2f} / max {res['rot_deg_max']:.2f} deg,"
           f" pos mean {res['pos_mm_mean']:.1f} / max {res['pos_mm_max']:.1f} mm")
