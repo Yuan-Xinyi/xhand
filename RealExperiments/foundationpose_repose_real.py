@@ -605,6 +605,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--steps", type=int, default=1200, help="control steps at 20 Hz (1200 = 60 s)")
     p.add_argument("--success-tol", type=float, default=DEFAULT_SUCCESS_TOL, help="rad")
     p.add_argument("--goal-seed", type=int, default=0)
+    p.add_argument("--cube-edge", type=float, default=0.06,
+                   help="physical cube edge length [m]. Scales the FoundationPose mesh and "
+                        "shifts the auto-center rest anchor. Trained size DR band: 0.051-0.069 m.")
     p.add_argument("--stall-timeout", type=float, default=10.0,
                    help="s without a success -> reopen hand, reset LSTM, new goal (sim episodes "
                         "reset every 8 s, the policy never trained past that; 0 = off)")
@@ -666,11 +669,33 @@ def _maybe_reexec_one(args: argparse.Namespace) -> None:
     os.execve(one_python, [one_python, os.path.abspath(__file__)] + sys.argv[1:], env)
 
 
+FP_MESH_DIR = "/disk2/FoundationPose/cube/mesh"
+
+
+def scaled_cube_mesh(edge: float) -> str:
+    """Write a vertex-scaled copy of the FoundationPose cube obj (same dir, so the
+    relative mtl/texture references keep working) and return its path."""
+    scale = edge / 0.06
+    out = os.path.join(FP_MESH_DIR, f"textured_scaled_{int(round(edge * 1000))}mm.obj")
+    if not os.path.exists(out):
+        with open(os.path.join(FP_MESH_DIR, "textured.obj")) as f_in, open(out, "w") as f_out:
+            for line in f_in:
+                if line.startswith("v "):
+                    _, x, y, z = line.split()[:4]
+                    f_out.write(f"v {float(x) * scale:.8f} {float(y) * scale:.8f} {float(z) * scale:.8f}\n")
+                else:
+                    f_out.write(line)
+        print(f"[mesh] wrote scaled cube mesh ({edge * 1000:.0f} mm): {out}")
+    return out
+
+
 def spawn_tracker(args: argparse.Namespace) -> subprocess.Popen:
     cmd = (
         "source ~/miniconda3/etc/profile.d/conda.sh && conda activate env_isaaclab && "
         f"exec python {TRACKER_SCRIPT}"
     )
+    if abs(args.cube_edge - 0.06) > 1e-6:
+        cmd += f" --mesh_file {scaled_cube_mesh(args.cube_edge)}"
     if args.roi is not None:
         cmd += " --roi " + " ".join(str(v) for v in args.roi)
     if args.serial:
@@ -686,6 +711,10 @@ def main() -> None:
     if args.execute and not args.real:
         raise ValueError("--execute requires --real")
     _maybe_reexec_one(args)
+
+    if not 0.051 <= args.cube_edge <= 0.069:
+        print(f"[WARN] cube edge {args.cube_edge * 1000:.0f} mm is OUTSIDE the trained size band "
+              "(51-69 mm) — the policy has never seen this size; sim-check it first.")
 
     # --- kinematics + frames ----------------------------------------------
     kin = UrdfKinematics()
@@ -785,7 +814,9 @@ def main() -> None:
         spread = float(arr.std(axis=0).max()) if len(arr) > 1 else 0.0
         if spread > 0.01:
             print(f"[center][WARN] cube not still during zeroing (std {spread * 1000:.0f} mm) — offset may be poor")
-        center_offset = arr.mean(axis=0) - REST_POS
+        rest = REST_POS.copy()
+        rest[2] += (args.cube_edge - 0.06) / 2.0  # bigger cube rests higher in the palm
+        center_offset = arr.mean(axis=0) - rest
         mag = float(np.linalg.norm(center_offset))
         print(f"[center] position offset zeroed: {np.array2string(center_offset, precision=3)} (|{mag * 100:.1f} cm|)")
         if mag > 0.15:
