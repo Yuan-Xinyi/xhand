@@ -807,6 +807,9 @@ def main() -> None:
     prev_obj_quat = None
     prev_pose_env = None
     prev_pose_t = 0.0
+    work_times: list[float] = []
+    serial_times: list[float] = []
+    overruns = 0
     log = {"obs": [], "action": [], "obj_pos": [], "obj_quat": [], "goal_quat": [], "t": []} if args.log_npz else None
 
     def soft_reset():
@@ -834,6 +837,7 @@ def main() -> None:
     last_event_t = time.perf_counter()
     try:
         for step in range(args.steps):
+            cycle_start = time.perf_counter()
             pose_env = cube_env_pose()
             fresh = pose_env is not None and (receiver is None or receiver.age() <= args.max_pose_age)
             if receiver is not None and receiver.age() > args.abort_pose_age:
@@ -877,7 +881,9 @@ def main() -> None:
                 targets = np.clip(targets, LOWER, UPPER).astype(np.float32)
 
                 if hw is not None and args.execute:
+                    t_ser = time.perf_counter()
                     q_meas = hw.hand_stream(targets, read=not args.no_hand_read)
+                    serial_times.append(time.perf_counter() - t_ser)
                     # closed-loop obs: the policy sees where the fingers ARE (a
                     # finger blocked by the cube no longer lies in the obs)
                     hand_q = q_meas if q_meas is not None else targets
@@ -917,14 +923,31 @@ def main() -> None:
                           f"pose_age {age:.2f}s succ {successes}")
             # not fresh: hold targets, skip policy this cycle
 
+            work_times.append(time.perf_counter() - cycle_start)
             next_t += STEP_DT
             sleep_t = next_t - time.perf_counter()
             if sleep_t > 0:
-                time.sleep(sleep_t)
+                # hybrid pacing: coarse sleep, then spin the last ~2 ms
+                # (plain time.sleep oversleeps ~2 ms -> loop ran at 19.3 Hz, not 20)
+                if sleep_t > 0.002:
+                    time.sleep(sleep_t - 0.002)
+                while time.perf_counter() < next_t:
+                    pass
             else:
+                overruns += 1
                 next_t = time.perf_counter()
     finally:
         print(f"[run] stopped: {stop_reason}; consecutive successes: {successes}")
+        if len(work_times) > 10:
+            wt = np.array(work_times[1:])
+            print(f"[timing] work/cycle p50 {np.percentile(wt, 50) * 1000:.1f}ms "
+                  f"p95 {np.percentile(wt, 95) * 1000:.1f}ms  overruns {overruns} "
+                  f"({overruns / max(1, len(wt)) * 100:.1f}%)")
+        if serial_times:
+            st = np.array(serial_times)
+            print(f"[timing] hand serial p50 {np.percentile(st, 50) * 1000:.1f}ms "
+                  f"p95 {np.percentile(st, 95) * 1000:.1f}ms "
+                  f"({'read-back ON' if not args.no_hand_read else 'fire-and-forget'})")
         if hw is not None:
             hw.close()
         if log is not None and log["obs"]:
