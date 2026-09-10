@@ -534,5 +534,5 @@
     <limit lower="0.0" upper="1.92" effort="10" velocity="3.14" />
   </joint>
 
-<joint name="hand_mount" type="fixed"><parent link="link8" /><child link="palm" /><origin xyz="0 0 -0.025" rpy="0 0 4.71239" /></joint>
+<joint name="hand_mount" type="fixed"><parent link="link8" /><child link="palm" /><origin xyz="0 0 0.025" rpy="0 0 4.71239" /></joint>
 </robot>
