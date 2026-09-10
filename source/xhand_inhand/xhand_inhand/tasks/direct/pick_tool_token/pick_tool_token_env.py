@@ -1040,8 +1040,67 @@ class PickToolTokenEnv(PickCubeTokenEnv):
             raise RuntimeError(
                 f"Built {obs.shape[1]} observations, cfg declares {self.cfg.observation_space}."
             )
+        obs = self._apply_obs_domain_randomization(obs)
         self._policy_obs_cache = obs
         return {"policy": obs, "critic": obs}
+
+    def _apply_obs_domain_randomization(self, obs: torch.Tensor) -> torch.Tensor:
+        """Sim2real observation DR: per-episode delay, pose noise, force-feature dropout."""
+        cfg = self.cfg
+        delay_max = int(getattr(cfg, "obs_delay_steps_max", 0))
+        pos_sigma = float(getattr(cfg, "obs_object_pos_noise", 0.0))
+        yaw_sigma = float(getattr(cfg, "obs_object_yaw_noise", 0.0))
+        force_drop = float(getattr(cfg, "obs_force_dropout", 0.0))
+        if delay_max == 0 and pos_sigma == 0.0 and yaw_sigma == 0.0 and force_drop == 0.0:
+            return obs
+        N = self.num_envs
+        if delay_max > 0:
+            if not hasattr(self, "_obs_dr_hist"):
+                self._obs_dr_hist = obs.unsqueeze(1).repeat(1, delay_max + 1, 1).clone()
+                self._obs_dr_delay = torch.randint(0, delay_max + 1, (N,), device=self.device)
+            # fresh episodes start with a filled history (no cross-episode leakage)
+            fresh = self.episode_length_buf == 0
+            if bool(fresh.any()):
+                self._obs_dr_hist[fresh] = obs[fresh].unsqueeze(1)
+                self._obs_dr_delay[fresh] = torch.randint(
+                    0, delay_max + 1, (int(fresh.sum()),), device=self.device
+                )
+            self._obs_dr_hist = torch.roll(self._obs_dr_hist, shifts=1, dims=1)
+            self._obs_dr_hist[:, 0] = obs
+            out = self._obs_dr_hist[torch.arange(N, device=self.device), self._obs_dr_delay].clone()
+        else:
+            out = obs.clone()
+        if pos_sigma > 0.0:
+            out[:, 56:59] += torch.randn((N, 3), device=self.device) * pos_sigma
+        if yaw_sigma > 0.0:
+            half = torch.randn((N,), device=self.device) * yaw_sigma * 0.5
+            dq = torch.zeros((N, 4), device=self.device)
+            dq[:, 0] = torch.cos(half)
+            dq[:, 3] = torch.sin(half)
+            q = out[:, 59:63]
+            aw, ax, ay, az = dq.unbind(-1)
+            bw, bx, by, bz = q.unbind(-1)
+            out[:, 59:63] = torch.stack(
+                (
+                    aw * bw - ax * bx - ay * by - az * bz,
+                    aw * bx + ax * bw + ay * bz - az * by,
+                    aw * by - ax * bz + ay * bw + az * bx,
+                    aw * bz + ax * by - ay * bx + az * bw,
+                ),
+                dim=-1,
+            )
+        if force_drop > 0.0:
+            if not hasattr(self, "_obs_dr_force_drop"):
+                self._obs_dr_force_drop = torch.rand((N,), device=self.device) < force_drop
+            fresh = self.episode_length_buf == 0
+            if bool(fresh.any()):
+                self._obs_dr_force_drop[fresh] = (
+                    torch.rand((int(fresh.sum()),), device=self.device) < force_drop
+                )
+            mask = self._obs_dr_force_drop
+            out[mask, 97:105] = 0.0
+            out[mask, 109:115] = 0.0
+        return out
 
     def _get_states(self) -> torch.Tensor:
         return getattr(self, "_policy_obs_cache", None)

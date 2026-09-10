@@ -199,6 +199,16 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         help="PickTool-family task id (same env class / obs / action layout), "
         "e.g. Pick-Hammer-Token-Direct-v0 for the YCB 048 hammer object swap.",
     )
+    parser.add_argument(
+        "--obs_dr",
+        type=float,
+        nargs=4,
+        default=None,
+        metavar=("DELAY_MAX", "POS_NOISE", "YAW_NOISE_RAD", "FORCE_DROPOUT"),
+        help="Sim2real observation domain randomization: per-episode delay in [0, DELAY_MAX] "
+        "control steps, Gaussian object pos/yaw noise, and per-episode force-feature dropout "
+        "probability.  E.g. '3 0.005 0.035 0.5'.",
+    )
     parser.add_argument("--steps", type=int, default=1_000, help="Vector-environment interaction steps.")
     parser.add_argument("--num_envs", type=int, default=1024)
     parser.add_argument("--buffer", type=int, default=1_000_000, help="Replay capacity in transitions.")
@@ -926,6 +936,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     cfg_overrides = {}
+    if args.obs_dr is not None:
+        cfg_overrides["obs_delay_steps_max"] = int(args.obs_dr[0])
+        cfg_overrides["obs_object_pos_noise"] = args.obs_dr[1]
+        cfg_overrides["obs_object_yaw_noise"] = args.obs_dr[2]
+        cfg_overrides["obs_force_dropout"] = args.obs_dr[3]
     if args.episode_length_s is not None:
         cfg_overrides["episode_length_s"] = args.episode_length_s
     if args.curriculum_dataset is not None:

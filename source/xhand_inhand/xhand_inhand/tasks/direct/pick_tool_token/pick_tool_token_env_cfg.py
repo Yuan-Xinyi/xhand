@@ -348,6 +348,15 @@ class PickToolTokenEnvCfg(PickCubeTokenEnvCfg):
     object_mesh_obj: str = ""
     object_mesh_scale = None
 
+    # ---- sim2real observation domain randomization (all default OFF) ----
+    # Models the real perception pipeline: FoundationPose pose noise, control-loop
+    # observation delay, and unreliable force-derived features.  Applied to the POLICY
+    # observation only, after the clean features are built; rewards/contracts unaffected.
+    obs_delay_steps_max = 0        # per-episode uniform delay in [0, max] control steps
+    obs_object_pos_noise = 0.0     # m, Gaussian on object pos_b (cols 56:59)
+    obs_object_yaw_noise = 0.0     # rad, Gaussian yaw perturbation on object quat (59:63)
+    obs_force_dropout = 0.0        # per-episode prob of zeroing force-derived cols (97:105, 109:115)
+
     # Airborne self-proving hold (object-swap opt-in; see _compute_grasp_signals).  While the
     # object is truly airborne, moving WITH the palm, and pinched thumb+>=1 in-band forceful
     # pad, the wrap quality is floored at grasp_quality_high -- a hanging carried object is
