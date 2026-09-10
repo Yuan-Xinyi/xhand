@@ -119,7 +119,7 @@ DEFAULT_SUCCESS_TOL = 0.4  # rad, trained tolerance (curriculum start; leave mar
 DEFAULT_ARM_Q = np.array([0.0, -0.7494, 0.0, 1.1920, 0.0, 1.9414, 0.0], dtype=np.float32)
 
 MOUNT_RPY = 4.71239  # link8 -> palm fixed yaw (xarm7_xhand.urdf hand_mount)
-MOUNT_DZ = 0.025  # 2.5 cm adapter plate between the xArm7 TCP flange and the XHand
+MOUNT_DZ = 0.020  # adapter plate between the xArm7 TCP flange and the XHand (tuned on live render)
 
 UDP_ADDR = ("127.0.0.1", 9877)
 POSE_FMT = "<18d"  # seq, t, 16 pose floats
