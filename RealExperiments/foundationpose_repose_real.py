@@ -902,6 +902,7 @@ def main() -> None:
         ] + [f"[extrinsic]   {np.array2string(row, precision=6, separator=', ')}" for row in base_t_cam_eff] + [
             f"[extrinsic] as pos(m) + quat(wxyz): {np.round(base_t_cam_eff[:3, 3], 5).tolist()}"
             f" + {np.round(quat, 6).tolist()}",
+            "[extrinsic] NOTE: manual translation affects the MIRROR only; policy obs stays rest-anchored",
         ]
         for ln in lines:
             print(ln)
@@ -912,17 +913,17 @@ def main() -> None:
             print(f"[extrinsic][WARN] history write failed: {e}")
 
     def apply_manual(pose: np.ndarray) -> np.ndarray:
-        """Manual calib: rotation acts on the WHOLE pose about the rest anchor.
+        """Manual ROTATION calib: acts on the whole pose about the rest anchor.
 
         An extrinsic rotation error moves positions with a lever arm (worse the
         further the cube is from the pivot) — rotating orientation only cannot
         express that. Pivoting at the rest anchor is equivalent to correcting
         the camera extrinsic rotation up to a constant translation, which
         auto-center absorbs; the rest position stays invariant by construction.
-        The translation part is a session-local probe: auto-center re-absorbs
-        it on the next startup.
+        The manual TRANSLATION is applied by vis_pose() to the mirror stream
+        ONLY — it must never shift the policy obs off the sim contract.
         """
-        if not np.any(manual):
+        if not np.any(manual[3:]):
             return pose
         out = pose.copy()
         cr = (_axis_angle_rotmat(np.array([0, 0, 1.0]), manual[5])
@@ -931,7 +932,21 @@ def main() -> None:
         pivot = REST_POS.copy()
         pivot[2] += (args.cube_edge - 0.06) / 2.0
         out[:3, :3] = cr @ pose[:3, :3]
-        out[:3, 3] = pivot + cr @ (pose[:3, 3] - pivot) + manual[:3]
+        out[:3, 3] = pivot + cr @ (pose[:3, 3] - pivot)
+        return out
+
+    def vis_pose(pose: np.ndarray | None) -> np.ndarray | None:
+        """Mirror-only view: manual TRANSLATION on top of the policy pose.
+
+        The real hand's rest geometry differs from the sim's by a few cm; the
+        translation sliders reconcile the MIRROR with reality, but the policy
+        obs must stay anchored to the sim contract (rest -> REST_POS), so the
+        translation is never applied to what the policy sees.
+        """
+        if pose is None or not np.any(manual[:3]):
+            return pose
+        out = pose.copy()
+        out[:3, 3] = pose[:3, 3] + manual[:3]
         return out
 
     def send_state(q12: np.ndarray, pose_env: np.ndarray | None) -> None:
@@ -971,7 +986,7 @@ def main() -> None:
             p = cube_env_pose()
             if p is not None:
                 samples.append(p[:3, 3].copy())
-                send_state(hand_q, p)
+                send_state(hand_q, vis_pose(p))
             time.sleep(0.05)
         if not samples:
             print("[center][WARN] no poses received — auto-center skipped")
@@ -1076,7 +1091,7 @@ def main() -> None:
                 prev_pose_env = pose_env.copy()
                 prev_pose_t = now_pose_t
 
-                send_state(hand_q, pose_env)
+                send_state(hand_q, vis_pose(pose_env))
                 obj_pos = pose_for_obs[:3, 3]
                 obj_quat = rotmat_to_quat(pose_for_obs[:3, :3])
                 # keep the quaternion sign continuous across frames (PhysX streams
