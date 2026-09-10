@@ -31,6 +31,7 @@ import yaml  # noqa: E402
 
 CALIB_UDP = ("127.0.0.1", 9880)
 CALIB_FMT = "<6d"  # dx, dy, dz [m], rx, ry, rz [rad]
+CALIB_COMMIT_FMT = "<7d"  # + flag 1.0: tell the control loop to re-run auto-center
 YAML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "repose_manual_calib.yaml")
 
 WIN = "cube calib  (s=save  r=reset  q=quit)"
@@ -105,7 +106,9 @@ def main():
             with open(YAML_PATH, "w") as f:
                 yaml.safe_dump(d, f)
             set_values([0.0] * 6)
-            print(f"[calib] saved -> {YAML_PATH}: {d} (sliders re-zeroed)", flush=True)
+            sock.sendto(struct.pack(CALIB_COMMIT_FMT, *base, 1.0), CALIB_UDP)
+            print(f"[calib] saved -> {YAML_PATH}: {d} — control loop re-centers now "
+                  "(keep the cube at rest!)", flush=True)
     cv2.destroyAllWindows()
 
 

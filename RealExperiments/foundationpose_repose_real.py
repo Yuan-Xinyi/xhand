@@ -128,6 +128,7 @@ STATE_UDP = ("127.0.0.1", 9879)
 STATE_FMT = "<29d"  # t, hand_q (12), env_T_cube (16) — mirror-viewer stream
 CALIB_UDP = ("127.0.0.1", 9880)
 CALIB_FMT = "<6d"  # dx, dy, dz [m], rx, ry, rz [rad] — manual calib panel
+CALIB_COMMIT_FMT = "<7d"  # + flag: 1.0 = saved -> re-run auto-center
 MANUAL_CALIB_YAML = str(Path(__file__).resolve().parent / "repose_manual_calib.yaml")
 
 
@@ -830,14 +831,22 @@ def main() -> None:
     calib_sock.bind(CALIB_UDP)
     calib_sock.setblocking(False)
 
+    recenter_requested = False
+
     def poll_manual_calib() -> None:
-        nonlocal manual
+        nonlocal manual, recenter_requested
         while True:
             try:
                 data, _ = calib_sock.recvfrom(64)
             except BlockingIOError:
                 return
-            manual = np.array(struct.unpack(CALIB_FMT, data))
+            if len(data) == struct.calcsize(CALIB_COMMIT_FMT):
+                vals = struct.unpack(CALIB_COMMIT_FMT, data)
+                manual = np.array(vals[:6])
+                if vals[6] > 0.5:
+                    recenter_requested = True
+            else:
+                manual = np.array(struct.unpack(CALIB_FMT, data))
 
     def apply_manual(pose: np.ndarray) -> np.ndarray:
         if not np.any(manual):
@@ -879,7 +888,8 @@ def main() -> None:
     # the manual calibration is neutralized at runtime by construction — use
     # the sliders' translation only for temporary visual exploration; the
     # ROTATION part is the persistent, meaningful correction.
-    if synthetic is None and not args.no_auto_center:
+    def run_auto_center() -> None:
+        nonlocal center_offset
         samples = []
         t0 = time.time()
         while len(samples) < 30 and time.time() - t0 < 5.0:
@@ -888,18 +898,25 @@ def main() -> None:
                 samples.append(p[:3, 3].copy())
                 send_state(hand_q, p)
             time.sleep(0.05)
+        if not samples:
+            print("[center][WARN] no poses received — auto-center skipped")
+            return
         arr = np.asarray(samples)
         spread = float(arr.std(axis=0).max()) if len(arr) > 1 else 0.0
         if spread > 0.01:
             print(f"[center][WARN] cube not still during zeroing (std {spread * 1000:.0f} mm) — offset may be poor")
         rest = REST_POS.copy()
         rest[2] += (args.cube_edge - 0.06) / 2.0  # bigger cube rests higher in the palm
-        center_offset = arr.mean(axis=0) - rest
+        # samples already include the CURRENT center_offset -> accumulate
+        center_offset = center_offset + (arr.mean(axis=0) - rest)
         mag = float(np.linalg.norm(center_offset))
         print(f"[center] position offset zeroed: {np.array2string(center_offset, precision=3)} (|{mag * 100:.1f} cm|)")
         if mag > 0.15:
             print("[center][WARN] offset > 15 cm — the camera moved a lot since calibration;"
                   " its ROTATION is probably also off. Consider re-calibrating anyway.")
+
+    if synthetic is None and not args.no_auto_center:
+        run_auto_center()
 
     if hw is not None and args.execute:
         input("[real] ENTER to start streaming policy commands, or Ctrl-C to abort...")
@@ -950,6 +967,15 @@ def main() -> None:
             cycle_start = time.perf_counter()
             pose_env = cube_env_pose()
             fresh = pose_env is not None and (receiver is None or receiver.age() <= args.max_pose_age)
+            if recenter_requested:
+                recenter_requested = False
+                if hw is not None and args.execute:
+                    print("[center] re-center request ignored while EXECUTING (cube must be at rest)")
+                else:
+                    print("[center] calib saved — re-anchoring rest position (keep the cube still)...")
+                    run_auto_center()
+                    last_event_t = time.perf_counter()
+                    next_t = time.perf_counter()
             if receiver is not None and receiver.age() > args.abort_pose_age:
                 if hw is not None and args.execute:
                     stop_reason = f"pose stale {receiver.age():.2f}s"
