@@ -15,6 +15,7 @@ from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--checkpoint", type=str, required=True)
+parser.add_argument("--task", type=str, default="Pick-Hammer-Token-Direct-v0")
 parser.add_argument("--num_envs", type=int, default=256)
 parser.add_argument("--episodes", type=int, default=512)
 parser.add_argument("--pos_noise", type=float, default=0.0, help="object pos noise sigma (m)")
@@ -22,6 +23,9 @@ parser.add_argument("--yaw_noise_deg", type=float, default=0.0)
 parser.add_argument("--delay", type=int, default=0, help="observation delay in control steps")
 parser.add_argument("--zero_force", action="store_true")
 parser.add_argument("--seed", type=int, default=11)
+parser.add_argument("--video_folder", type=str, default="", help="record success clips (forces num_envs=1)")
+parser.add_argument("--max_clips", type=int, default=3)
+parser.add_argument("--fps", type=int, default=25)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 args_cli.headless = True
@@ -102,7 +106,7 @@ def degrade(obs: torch.Tensor) -> torch.Tensor:
 
 
 def main():
-    task = "Pick-Hammer-Token-Direct-v0"
+    task = args_cli.task
     cfg = parse_env_cfg(task, device="cuda:0", num_envs=args_cli.num_envs)
     cfg.seed = args_cli.seed
     cfg.nudge_option_mode = True
@@ -110,7 +114,13 @@ def main():
     cfg.nudge_spawn_blend_min = 0.0
     cfg.nudge_spawn_blend_max = 0.0
     cfg.episode_length_s = 6.0
-    env = gym.make(task, cfg=cfg)
+    if args_cli.video_folder:
+        args_cli.num_envs = 1
+        cfg.scene.num_envs = 1
+        cfg.viewer.eye = (1.9, 0.95, 0.9)
+        cfg.viewer.lookat = (0.5, 0.0, 0.32)
+        cfg.viewer.origin_type = "world"
+    env = gym.make(task, cfg=cfg, render_mode="rgb_array" if args_cli.video_folder else None)
     dev = env.unwrapped.device
     actor = load_actor(Path(args_cli.checkpoint), torch.device(str(dev)))
 
@@ -118,6 +128,12 @@ def main():
     obs_d, _ = env.reset(seed=args_cli.seed)
     buf: deque = deque(maxlen=args_cli.delay + 1)
     succ = fail = timeout = 0
+    frames, saved = [], 0
+    if args_cli.video_folder:
+        import os
+        os.makedirs(args_cli.video_folder, exist_ok=True)
+        for _ in range(8):
+            env.unwrapped.render()
     with torch.inference_mode():
         while succ + fail + timeout < args_cli.episodes:
             buf.append(obs_d["policy"].clone())
@@ -125,6 +141,17 @@ def main():
             mean, _ = actor.get_mean_and_std(fed, training=False)
             act = torch.tanh(mean)
             obs_d, rew, term, trunc, _ = env.step(act)
+            if args_cli.video_folder and saved < args_cli.max_clips:
+                frames.append(env.unwrapped.render())
+                if bool(term[0]) or bool(trunc[0]):
+                    if bool(term[0] & (rew[0] > 50.0)) and len(frames) > 10:
+                        import imageio
+                        import numpy as np
+                        path = f"{args_cli.video_folder}/nudge_forcefree_{saved+1}.mp4"
+                        imageio.mimwrite(path, [np.asarray(f) for f in frames], fps=args_cli.fps, macro_block_size=None)
+                        saved += 1
+                        print(f"[video] saved {path}", flush=True)
+                    frames = []
             succ += int((term & (rew > 50.0)).sum())
             fail += int((term & (rew <= 50.0)).sum())
             timeout += int((trunc & ~term).sum())

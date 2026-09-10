@@ -200,6 +200,13 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         "e.g. Pick-Hammer-Token-Direct-v0 for the YCB 048 hammer object swap.",
     )
     parser.add_argument(
+        "--nudge_timeout_penalty",
+        type=float,
+        default=None,
+        help="Override nudge_option timeout penalty (anti-refuge: set 100 so timeout never "
+        "dominates the -100 failure under hard DR).",
+    )
+    parser.add_argument(
         "--obs_dr",
         type=float,
         nargs=4,
@@ -936,6 +943,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     cfg_overrides = {}
+    if args.nudge_timeout_penalty is not None:
+        cfg_overrides["nudge_timeout_penalty"] = args.nudge_timeout_penalty
     if args.obs_dr is not None:
         cfg_overrides["obs_delay_steps_max"] = int(args.obs_dr[0])
         cfg_overrides["obs_object_pos_noise"] = args.obs_dr[1]
