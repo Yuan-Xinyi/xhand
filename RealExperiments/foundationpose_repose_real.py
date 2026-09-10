@@ -625,6 +625,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--xarm-ip", default="192.168.1.205")
     p.add_argument("--xhand-port", default="/dev/ttyUSB0")
     p.add_argument("--hand-start-speed", type=float, default=0.25)
+    p.add_argument("--skip-home", action="store_true",
+                   help="do not move the hand to the open home pose at startup (NOT recommended: "
+                        "the obs and the mirror assume the hand starts at home)")
     p.add_argument("--no-hand-read", action="store_true",
                    help="disable joint read-back (obs falls back to commanded targets)")
     p.add_argument("--pose-lead", type=float, default=0.10,
@@ -764,9 +767,13 @@ def main() -> None:
 
     # --- hand to home + cube placement (BEFORE the tracker: the ROI must be
     # drawn around the cube already resting in the palm) ---------------------
-    if hw is not None and args.execute:
+    # Homing is NOT gated on --execute: the observation model and the mirror
+    # viewer assume the hand starts at the open home pose, so a dry-run with a
+    # mis-posed hand would compare apples to oranges.
+    if hw is not None and not args.skip_home:
         input("[real] ENTER to move XHand to open home pose (cube NOT in hand yet)...")
         hw.hand_home(hand_q, args.hand_start_speed)
+    if hw is not None:
         input("[real] place the cube at rest in the palm, then ENTER to start the tracker...")
 
     # --- pose source -------------------------------------------------------
