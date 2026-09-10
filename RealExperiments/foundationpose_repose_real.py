@@ -198,6 +198,37 @@ def tf_from_pos_quat(pos: np.ndarray, quat_wxyz: np.ndarray) -> np.ndarray:
     return tf
 
 
+def extrapolate_pose(pose_prev: np.ndarray, pose_now: np.ndarray, dt_pair: float, lead: float,
+                     max_angle: float = 0.3, max_shift: float = 0.03) -> np.ndarray:
+    """Constant-velocity extrapolation of a pose by `lead` seconds (latency compensation).
+
+    Rotation delta is scaled via axis-angle; both the extrapolated angle and the
+    translation shift are capped so tracking noise cannot be amplified unboundedly.
+    """
+    if dt_pair <= 1e-4 or lead <= 0.0:
+        return pose_now
+    s = lead / dt_pair
+    out = pose_now.copy()
+    # rotation: R_delta = R_now @ R_prev^T -> axis-angle -> scale -> apply
+    r_delta = pose_now[:3, :3] @ pose_prev[:3, :3].T
+    cos_a = max(-1.0, min(1.0, (np.trace(r_delta) - 1.0) / 2.0))
+    angle = math.acos(cos_a)
+    if angle > 1e-6:
+        axis = np.array([r_delta[2, 1] - r_delta[1, 2],
+                         r_delta[0, 2] - r_delta[2, 0],
+                         r_delta[1, 0] - r_delta[0, 1]])
+        axis /= max(np.linalg.norm(axis), 1e-9)
+        lead_angle = min(angle * s, max_angle)
+        out[:3, :3] = _axis_angle_rotmat(axis, lead_angle) @ pose_now[:3, :3]
+    # translation
+    shift = (pose_now[:3, 3] - pose_prev[:3, 3]) * s
+    norm = np.linalg.norm(shift)
+    if norm > max_shift:
+        shift *= max_shift / norm
+    out[:3, 3] = pose_now[:3, 3] + shift
+    return out
+
+
 def tf_inv(tf: np.ndarray) -> np.ndarray:
     out = np.eye(4)
     r = tf[:3, :3].T
@@ -533,8 +564,16 @@ class RealHardware:
     def hand_home(self, q_isaac: np.ndarray, speed: float):
         self.hand.move_to(q_isaac[ISAAC_TO_ONE], speed=speed, freq=50.0)
 
-    def hand_stream(self, q_isaac: np.ndarray):
-        self.hand.move(q_isaac[ISAAC_TO_ONE], read=False)
+    def hand_stream(self, q_isaac: np.ndarray, read: bool = False) -> np.ndarray | None:
+        """Stream targets; with read=True also return the MEASURED joints (Isaac order)."""
+        states = self.hand.move(q_isaac[ISAAC_TO_ONE], read=read)
+        if not read or states is None:
+            return None
+        try:
+            q_one = np.array([float(s.position) for s in states], dtype=np.float32)
+        except (AttributeError, TypeError):
+            return None
+        return q_one[ONE_TO_ISAAC]
 
     def close(self):
         if getattr(self, "hand", None) is not None:
@@ -582,6 +621,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--xarm-ip", default="192.168.1.205")
     p.add_argument("--xhand-port", default="/dev/ttyUSB0")
     p.add_argument("--hand-start-speed", type=float, default=0.25)
+    p.add_argument("--no-hand-read", action="store_true",
+                   help="disable joint read-back (obs falls back to commanded targets)")
+    p.add_argument("--pose-lead", type=float, default=0.10,
+                   help="extrapolate the cube pose forward by this many seconds to cancel "
+                        "the camera->action latency (0 = off)")
     # 0.157 = sim actuator velocity limit (3.14 rad/s) x step_dt (0.05 s). Clamping much
     # tighter starves the policy's stroke depth: the cube gets rocked +-2 deg and springs
     # back instead of tipping over an edge (measured in /tmp/repose_run1.npz: gross
@@ -761,6 +805,8 @@ def main() -> None:
     prev_action = np.zeros(12, dtype=np.float32)
     prev_targets = hand_q.copy()
     prev_obj_quat = None
+    prev_pose_env = None
+    prev_pose_t = 0.0
     log = {"obs": [], "action": [], "obj_pos": [], "obj_quat": [], "goal_quat": [], "t": []} if args.log_npz else None
 
     def soft_reset():
@@ -795,8 +841,18 @@ def main() -> None:
                 break
 
             if fresh:
-                obj_pos = pose_env[:3, 3]
-                obj_quat = rotmat_to_quat(pose_env[:3, :3])
+                # latency compensation: lead the measured pose by the camera->action delay
+                now_pose_t = time.perf_counter()
+                pose_for_obs = pose_env
+                if args.pose_lead > 0 and prev_pose_env is not None:
+                    pose_for_obs = extrapolate_pose(
+                        prev_pose_env, pose_env, now_pose_t - prev_pose_t, args.pose_lead
+                    )
+                prev_pose_env = pose_env.copy()
+                prev_pose_t = now_pose_t
+
+                obj_pos = pose_for_obs[:3, 3]
+                obj_quat = rotmat_to_quat(pose_for_obs[:3, :3])
                 # keep the quaternion sign continuous across frames (PhysX streams
                 # are continuous in sim; matrix->quat conversion is not)
                 if prev_obj_quat is not None and float(np.dot(obj_quat, prev_obj_quat)) < 0.0:
@@ -821,9 +877,13 @@ def main() -> None:
                 targets = np.clip(targets, LOWER, UPPER).astype(np.float32)
 
                 if hw is not None and args.execute:
-                    hw.hand_stream(targets)
+                    q_meas = hw.hand_stream(targets, read=not args.no_hand_read)
+                    # closed-loop obs: the policy sees where the fingers ARE (a
+                    # finger blocked by the cube no longer lies in the obs)
+                    hand_q = q_meas if q_meas is not None else targets
+                else:
+                    hand_q = targets
                 prev_targets = targets
-                hand_q = targets  # open-loop hand state (same as pick_cube deployment)
                 prev_action = action
 
                 rot_dist = rotation_distance(obj_quat, goal_quat)
