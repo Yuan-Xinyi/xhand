@@ -810,7 +810,8 @@ def main() -> None:
     work_times: list[float] = []
     serial_times: list[float] = []
     overruns = 0
-    log = {"obs": [], "action": [], "obj_pos": [], "obj_quat": [], "goal_quat": [], "t": []} if args.log_npz else None
+    log = ({"obs": [], "action": [], "obj_pos": [], "obj_quat": [], "goal_quat": [], "t": [],
+            "hand_q": [], "targets": []} if args.log_npz else None)
 
     def soft_reset():
         """Mimic the sim episode reset: ramp the hand open (cube settles back into
@@ -909,6 +910,8 @@ def main() -> None:
                     continue
 
                 if log is not None:
+                    log["hand_q"].append(hand_q.copy())
+                    log["targets"].append(targets.copy())
                     log["obs"].append(obs)
                     log["action"].append(action)
                     log["obj_pos"].append(obj_pos.copy())
