@@ -727,8 +727,12 @@ def spawn_mirror(args: argparse.Namespace) -> subprocess.Popen:
     return subprocess.Popen(["bash", "-c", cmd], start_new_session=True)
 
 
+PIPELINE_VERSION = "2026-09-10-r6 (calib-persist-check)"
+
+
 def main() -> None:
     args = parse_args()
+    print(f"[version] {PIPELINE_VERSION}")
     if args.execute and not args.real:
         raise ValueError("--execute requires --real")
     _maybe_reexec_one(args)
@@ -854,7 +858,13 @@ def main() -> None:
             garbage = (np.allclose(cand[:3], -0.051, atol=1e-9)
                        and np.allclose(cand[3:], np.radians(-15.1), atol=1e-6))
             if garbage or np.any(np.abs(cand[:3]) > 0.15) or np.any(np.abs(cand[3:]) > np.radians(45.0)):
+                print(f"[calib][REJECT] {np.round(cand[:3] * 1000, 1)}mm "
+                      f"{np.round(np.degrees(cand[3:]), 1)}deg")
                 continue
+            if (np.any(np.abs(cand[:3] - manual[:3]) > 0.001)
+                    or np.any(np.abs(cand[3:] - manual[3:]) > np.radians(0.1))):
+                print(f"[calib] manual now d={np.round(cand[:3] * 1000, 1)}mm "
+                      f"r={np.round(np.degrees(cand[3:]), 2)}deg")
             manual = cand
             if flag:
                 recenter_requested = True
