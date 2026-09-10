@@ -119,6 +119,10 @@ DEFAULT_SUCCESS_TOL = 0.4  # rad, trained tolerance (curriculum start; leave mar
 DEFAULT_ARM_Q = np.array([0.0, -0.7494, 0.0, 1.1920, 0.0, 1.9414, 0.0], dtype=np.float32)
 
 MOUNT_RPY = 4.71239  # link8 -> palm fixed yaw (xarm7_xhand.urdf hand_mount)
+MOUNT_DZ = -0.025  # net flange->palm z correction [m]: the real assembly (with its
+# 2.5 cm adapter plate) puts the palm 2.5 cm CLOSER along the flange axis than the
+# original URDF assumed. Sign determined empirically: with -0.025 the live
+# FoundationPose cube matches the FK rest spot to <1 cm on all axes.
 
 UDP_ADDR = ("127.0.0.1", 9877)
 POSE_FMT = "<18d"  # seq, t, 16 pose floats
