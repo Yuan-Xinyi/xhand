@@ -849,14 +849,26 @@ def main() -> None:
                 manual = np.array(struct.unpack(CALIB_FMT, data))
 
     def apply_manual(pose: np.ndarray) -> np.ndarray:
+        """Manual calib: rotation acts on the WHOLE pose about the rest anchor.
+
+        An extrinsic rotation error moves positions with a lever arm (worse the
+        further the cube is from the pivot) — rotating orientation only cannot
+        express that. Pivoting at the rest anchor is equivalent to correcting
+        the camera extrinsic rotation up to a constant translation, which
+        auto-center absorbs; the rest position stays invariant by construction.
+        The translation part is a session-local probe: auto-center re-absorbs
+        it on the next startup.
+        """
         if not np.any(manual):
             return pose
         out = pose.copy()
         cr = (_axis_angle_rotmat(np.array([0, 0, 1.0]), manual[5])
               @ _axis_angle_rotmat(np.array([0, 1.0, 0]), manual[4])
               @ _axis_angle_rotmat(np.array([1.0, 0, 0]), manual[3]))
+        pivot = REST_POS.copy()
+        pivot[2] += (args.cube_edge - 0.06) / 2.0
         out[:3, :3] = cr @ pose[:3, :3]
-        out[:3, 3] = pose[:3, 3] + manual[:3]
+        out[:3, 3] = pivot + cr @ (pose[:3, 3] - pivot) + manual[:3]
         return out
 
     def send_state(q12: np.ndarray, pose_env: np.ndarray | None) -> None:

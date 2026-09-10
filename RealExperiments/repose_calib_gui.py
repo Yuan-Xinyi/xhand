@@ -73,7 +73,7 @@ def main():
               f"r={np.round(np.degrees(base[3:]), 2)}deg (sliders = delta on top)")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    canvas = np.full((150, 560, 3), 28, np.uint8)
+    canvas = np.full((165, 560, 3), 28, np.uint8)
     while True:
         delta = np.array(values())
         total = base + delta
@@ -88,8 +88,10 @@ def main():
         cv2.putText(img, f"TOTAL d=({total[0]*1000:+.0f},{total[1]*1000:+.0f},{total[2]*1000:+.0f})mm "
                          f"r=({np.degrees(total[3]):+.1f},{np.degrees(total[4]):+.1f},{np.degrees(total[5]):+.1f})deg",
                     (12, 96), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 255, 0), 2)
+        cv2.putText(img, "ROTATION persists; translation = session probe (re-absorbed on restart)",
+                    (12, 114), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 180, 255), 1)
         cv2.putText(img, "s=save(base+=delta)  r=delta->0  z=zero all  q=quit",
-                    (12, 132), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
+                    (12, 148), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
         cv2.imshow(WIN, img)
         k = cv2.waitKey(50) & 0xFF
         if k == ord("q") or k == 27:
