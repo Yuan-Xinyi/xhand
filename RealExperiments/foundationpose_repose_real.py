@@ -875,7 +875,11 @@ def main() -> None:
 
     # --- auto-center: cube at rest in the palm defines the position zero ----
     # Cancels the calib translation error entirely (rotation error remains).
-    if synthetic is None and not args.no_auto_center:
+    # Skipped when a MANUAL calibration exists: the hand-tuned offset is the
+    # ground truth and auto-center would silently cancel its translation part.
+    if np.any(manual[:3]) and not args.no_auto_center:
+        print("[center] manual calibration present — auto-center skipped (manual takes precedence)")
+    elif synthetic is None and not args.no_auto_center:
         samples = []
         t0 = time.time()
         while len(samples) < 30 and time.time() - t0 < 5.0:
