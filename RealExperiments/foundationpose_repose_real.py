@@ -773,10 +773,18 @@ def main() -> None:
 
         with open(palm_yaml) as f:
             _d = _y.safe_load(f)
-        env_T_base = np.array(_d["env_T_cam"]["matrix"], dtype=np.float64)  # env <- cam directly
-        base_T_cam = None  # cam pose feeds straight into env_T_base
-        print(f"[calib] palm-marker env_T_cam loaded ({_d.get('stamp')}, spread "
-              f"{_d.get('rot_spread_deg', 0):.2f} deg) — overrides camera_extrinsics + arm FK chain")
+        if "base_T_cam" in _d:
+            # hand-eye result: pose-independent, compose with runtime FK
+            base_T_cam = np.array(_d["base_T_cam"]["matrix"], dtype=np.float64)
+            _res = _d.get("residuals", {})
+            print(f"[calib] hand-eye base_T_cam loaded ({_d.get('stamp')}, {_d.get('poses_used')} poses, "
+                  f"residual max {_res.get('rot_deg_max', 0):.2f} deg / {_res.get('pos_mm_max', 0):.1f} mm)"
+                  " — overrides camera_extrinsics.yaml")
+        else:
+            env_T_base = np.array(_d["env_T_cam"]["matrix"], dtype=np.float64)  # env <- cam directly
+            base_T_cam = None  # cam pose feeds straight into env_T_base
+            print(f"[calib] palm-marker env_T_cam loaded ({_d.get('stamp')}, spread "
+                  f"{_d.get('rot_spread_deg', 0):.2f} deg) — overrides camera_extrinsics + arm FK chain")
     elif args.pose_source in ("tracker", "npy") and not args.no_calib:
         base_T_cam = load_base_T_cam(args.calib_yaml)
 

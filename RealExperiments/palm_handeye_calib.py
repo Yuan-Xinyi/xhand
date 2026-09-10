@@ -97,6 +97,9 @@ def solve_handeye(base_T_palm_list, cam_T_marker_list):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--auto", action="store_true",
+                    help="scripted wrist motion instead of teach mode (default: teach — you drag the arm)")
+    ap.add_argument("--min-samples", type=int, default=12)
     ap.add_argument("--xarm-ip", default="192.168.1.205")
     ap.add_argument("--dict", default="DICT_4X4_50")
     ap.add_argument("--id", type=int, default=0)
@@ -132,9 +135,14 @@ def main():
         raise RuntimeError(f"get_servo_angle failed: {code}")
     q0 = np.array(q0[:7], dtype=np.float64)
     print(f"[handeye] home arm q [deg]: {np.round(q0, 2)}")
-    print(f"[handeye] will visit {len(POSE_DELTAS)} wrist poses, deltas up to +-12 deg on j4..j7,")
-    print(f"[handeye] speed {args.speed} deg/s. Marker on palm, hand OPEN, NO cube, area CLEAR.")
-    input("[handeye] ENTER to start the motion sequence, Ctrl-C to abort...")
+    if args.auto:
+        print(f"[handeye] will visit {len(POSE_DELTAS)} wrist poses, deltas up to +-12 deg on j4..j7,")
+        print(f"[handeye] speed {args.speed} deg/s. Marker on palm, hand OPEN, NO cube, area CLEAR.")
+        input("[handeye] ENTER to start the motion sequence, Ctrl-C to abort...")
+    else:
+        print("[handeye] teach mode: marker on palm, hand OPEN, NO cube.")
+        print("[handeye] base_T_cam is pose-independent — end wherever you like; the pipeline")
+        print("[handeye] composes it with its own FK at runtime.")
 
     pipeline = rs.pipeline()
     config = rs.config()
@@ -176,28 +184,81 @@ def main():
 
     base_T_palm_list, cam_T_marker_list = [], []
     try:
-        for i, d in enumerate(POSE_DELTAS):
-            target = q0.copy()
-            target[3:7] += np.array(d, dtype=np.float64)
-            code = arm.set_servo_angle(angle=target.tolist(), speed=args.speed, wait=True)
+        if args.auto:
+            for i, d in enumerate(POSE_DELTAS):
+                target = q0.copy()
+                target[3:7] += np.array(d, dtype=np.float64)
+                code = arm.set_servo_angle(angle=target.tolist(), speed=args.speed, wait=True)
+                if code != 0:
+                    print(f"[handeye][WARN] pose {i}: move failed ({code}), skipping")
+                    continue
+                time.sleep(0.6)
+                code, q_act = arm.get_servo_angle()
+                if code != 0:
+                    continue
+                ctm = capture_marker()
+                if ctm is None:
+                    print(f"[handeye][WARN] pose {i}: marker not detected, skipping")
+                    continue
+                kin.update(np.radians(np.array(q_act[:7])), hand_q0)
+                base_T_palm_list.append(kin.palm_tf_base().astype(np.float64))
+                cam_T_marker_list.append(ctm)
+                print(f"[handeye] pose {i + 1}/{len(POSE_DELTAS)}: ok ({len(base_T_palm_list)} collected)")
+        else:
+            # -------- teach mode: user drags the arm, ENTER captures --------
+            code = arm.set_mode(2)  # manual (gravity-compensated drag) mode
+            arm.set_state(0)
+            time.sleep(0.3)
             if code != 0:
-                print(f"[handeye][WARN] pose {i}: move failed ({code}), skipping")
-                continue
-            time.sleep(0.6)
-            code, q_act = arm.get_servo_angle()
-            if code != 0:
-                continue
-            ctm = capture_marker()
-            if ctm is None:
-                print(f"[handeye][WARN] pose {i}: marker not detected, skipping")
-                continue
-            kin.update(np.radians(np.array(q_act[:7])), hand_q0)
-            base_T_palm_list.append(kin.palm_tf_base().astype(np.float64))
-            cam_T_marker_list.append(ctm)
-            print(f"[handeye] pose {i + 1}/{len(POSE_DELTAS)}: ok ({len(base_T_palm_list)} collected)")
+                raise RuntimeError(f"set_mode(2) failed ({code}) — enable Manual Mode in xArm Studio")
+            print("[handeye] TEACH MODE ON — the arm is free to drag.")
+            print("[handeye] Drag to a pose (vary the ORIENTATION between samples, keep the marker")
+            print("[handeye] visible to the camera), let go, then press ENTER. ~20 samples recommended.")
+            while True:
+                n = len(base_T_palm_list)
+                cmd = input(f"[handeye] {n} samples | ENTER=capture  u=undo  d=done  q=abort > ").strip().lower()
+                if cmd == "q":
+                    print("[handeye] aborted by user")
+                    sys.exit(1)
+                if cmd == "u":
+                    if base_T_palm_list:
+                        base_T_palm_list.pop()
+                        cam_T_marker_list.pop()
+                        print("[handeye] last sample removed")
+                    continue
+                if cmd == "d":
+                    if n < args.min_samples:
+                        print(f"[handeye] need at least {args.min_samples} samples (have {n})")
+                        continue
+                    break
+                code, qa = arm.get_servo_angle()
+                if code != 0:
+                    print(f"[handeye][WARN] joint read failed ({code})")
+                    continue
+                ctm = capture_marker()
+                code, qb = arm.get_servo_angle()
+                if code != 0:
+                    continue
+                moved = np.max(np.abs(np.array(qa[:7]) - np.array(qb[:7])))
+                if moved > 0.3:
+                    print(f"[handeye][WARN] arm moved {moved:.2f} deg during capture — hold still, retry")
+                    continue
+                if ctm is None:
+                    print("[handeye][WARN] marker not detected — adjust the pose / lighting, retry")
+                    continue
+                q_act = (np.array(qa[:7]) + np.array(qb[:7])) / 2.0
+                kin.update(np.radians(q_act), hand_q0)
+                base_T_palm_list.append(kin.palm_tf_base().astype(np.float64))
+                cam_T_marker_list.append(ctm)
+                print(f"[handeye] sample {len(base_T_palm_list)} captured ✓")
     finally:
-        print("[handeye] returning to home pose...")
-        arm.set_servo_angle(angle=q0.tolist(), speed=args.speed, wait=True)
+        if not args.auto:
+            print("[handeye] leaving teach mode (position mode restored)")
+            arm.set_mode(0)
+            arm.set_state(0)
+        else:
+            print("[handeye] returning to home pose...")
+            arm.set_servo_angle(angle=q0.tolist(), speed=args.speed, wait=True)
         pipeline.stop()
 
     n = len(base_T_palm_list)
