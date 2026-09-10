@@ -947,8 +947,11 @@ def main() -> None:
             pose_env = cube_env_pose()
             fresh = pose_env is not None and (receiver is None or receiver.age() <= args.max_pose_age)
             if receiver is not None and receiver.age() > args.abort_pose_age:
-                stop_reason = f"pose stale {receiver.age():.2f}s"
-                break
+                if hw is not None and args.execute:
+                    stop_reason = f"pose stale {receiver.age():.2f}s"
+                    break
+                if step % 100 == 0:
+                    print(f"[dry] pose stale {receiver.age():.1f}s — tracking lost? (no stop in dry run)")
 
             if fresh:
                 # latency compensation: lead the measured pose by the camera->action delay
@@ -970,11 +973,15 @@ def main() -> None:
                     obj_quat = -obj_quat
                 prev_obj_quat = obj_quat
 
-                # fall check
+                # fall check — hard stop only while actually driving the hand;
+                # in dry/calib runs the cube is routinely carried around by hand
                 fall_d = float(np.linalg.norm(obj_pos - IN_HAND_POS))
                 if fall_d >= FALL_DIST:
-                    stop_reason = f"cube fell (dist {fall_d:.3f} m)"
-                    break
+                    if hw is not None and args.execute:
+                        stop_reason = f"cube fell (dist {fall_d:.3f} m)"
+                        break
+                    if step % 100 == 0:
+                        print(f"[dry] cube {fall_d:.2f} m from palm — calibration move? (no stop)")
 
                 kin.update(arm_q, hand_q)
                 tip_env = (env_T_base[:3, :3] @ kin.fingertip_pos_base().T).T + env_T_base[:3, 3]
