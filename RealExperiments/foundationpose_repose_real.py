@@ -124,6 +124,8 @@ UDP_ADDR = ("127.0.0.1", 9877)
 POSE_FMT = "<18d"  # seq, t, 16 pose floats
 GOAL_UDP = ("127.0.0.1", 9878)
 GOAL_FMT = "<11d"  # t, R_cam_goal (9), rot_dist (rad, <0 = unknown)
+STATE_UDP = ("127.0.0.1", 9879)
+STATE_FMT = "<29d"  # t, hand_q (12), env_T_cube (16) — mirror-viewer stream
 
 
 # ---------------------------------------------------------------------------
@@ -641,6 +643,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--roi", type=int, nargs=4, default=None, metavar=("X", "Y", "W", "H"))
     p.add_argument("--serial", default=None, help="RealSense serial")
     p.add_argument("--no-view", action="store_true", help="tracker: no live overlay window")
+    p.add_argument("--mirror", action="store_true",
+                   help="spawn the Isaac mirror viewer (renders what the pipeline believes: "
+                        "measured hand joints + estimated cube pose) for calibration checking")
     p.add_argument("--tracker-timeout", type=float, default=300.0)
     return p.parse_args()
 
@@ -702,6 +707,16 @@ def spawn_tracker(args: argparse.Namespace) -> subprocess.Popen:
     if args.no_view:
         cmd += " --no-view"
     print("[tracker] spawning FoundationPose tracker (env_isaaclab)...")
+    return subprocess.Popen(["bash", "-c", cmd], start_new_session=True)
+
+
+def spawn_mirror(args: argparse.Namespace) -> subprocess.Popen:
+    mirror_script = str(Path(__file__).resolve().parent / "repose_mirror_viewer.py")
+    cmd = (
+        "source ~/miniconda3/etc/profile.d/conda.sh && conda activate env_isaaclab && "
+        f"exec python {mirror_script} --cube-edge {args.cube_edge}"
+    )
+    print("[mirror] spawning Isaac mirror viewer (env_isaaclab, GUI)...")
     return subprocess.Popen(["bash", "-c", cmd], start_new_session=True)
 
 
@@ -776,6 +791,8 @@ def main() -> None:
         synthetic = SyntheticPose()
         print("[pose] synthetic tumbling cube (offline smoke test)")
 
+    mirror_proc = spawn_mirror(args) if args.mirror else None
+
     # goal visualization: stream the goal orientation (camera view) to the tracker
     goal_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if receiver is not None else None
     T_env_cam = env_T_base @ base_T_cam if base_T_cam is not None else env_T_base
@@ -785,6 +802,17 @@ def main() -> None:
             return
         r_cam_goal = T_env_cam[:3, :3].T @ quat_to_rotmat(goal_quat)
         goal_sock.sendto(struct.pack(GOAL_FMT, time.time(), *r_cam_goal.ravel(), rot_dist_val), GOAL_UDP)
+
+    state_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def send_state(q12: np.ndarray, pose_env: np.ndarray | None) -> None:
+        if pose_env is None:
+            return
+        state_sock.sendto(
+            struct.pack(STATE_FMT, time.time(), *np.asarray(q12, dtype=np.float64),
+                        *np.asarray(pose_env, dtype=np.float64).ravel()),
+            STATE_UDP,
+        )
 
     center_offset = np.zeros(3)
 
@@ -808,6 +836,7 @@ def main() -> None:
             p = cube_env_pose()
             if p is not None:
                 samples.append(p[:3, 3].copy())
+                send_state(hand_q, p)
             time.sleep(0.05)
         arr = np.asarray(samples)
         spread = float(arr.std(axis=0).max()) if len(arr) > 1 else 0.0
@@ -886,6 +915,7 @@ def main() -> None:
                 prev_pose_env = pose_env.copy()
                 prev_pose_t = now_pose_t
 
+                send_state(hand_q, pose_env)
                 obj_pos = pose_for_obs[:3, 3]
                 obj_quat = rotmat_to_quat(pose_for_obs[:3, :3])
                 # keep the quaternion sign continuous across frames (PhysX streams
@@ -986,6 +1016,8 @@ def main() -> None:
         if log is not None and log["obs"]:
             np.savez(args.log_npz, **{k: np.array(v) for k, v in log.items()})
             print(f"[log] saved {args.log_npz}")
+        if args.mirror and mirror_proc is not None and mirror_proc.poll() is None:
+            os.killpg(os.getpgid(mirror_proc.pid), signal.SIGINT)
         if tracker_proc is not None and tracker_proc.poll() is None:
             os.killpg(os.getpgid(tracker_proc.pid), signal.SIGINT)
             try:
