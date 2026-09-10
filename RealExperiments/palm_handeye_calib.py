@@ -20,12 +20,14 @@ import os
 import sys
 import time
 
-import cv2
-import numpy as np
-
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+# import rr FIRST: it strips Isaac's cp311 pip_prebundle paths (exported by an
+# activated env_isaaclab shell) that would poison numpy/cv2 for this py312 env
 import foundationpose_repose_real as rr  # UrdfKinematics, SIM_PALM_*, tf helpers
+
+import cv2
+import numpy as np
 
 OUT_YAML = os.path.join(HERE, "palm_env_T_cam.yaml")
 
