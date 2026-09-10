@@ -82,7 +82,14 @@ def main():
     sock.bind(("127.0.0.1", args_cli.port))
     sock.setblocking(False)
 
-    print(f"[mirror] listening on udp://127.0.0.1:{args_cli.port} — waiting for the control loop", flush=True)
+    # hide the spawn-placeholder cube until real data arrives — an untracked
+    # cube sitting at the scene default reads as "calibration wrong"
+    hidden = torch.zeros((1, 7), device=u.device)
+    hidden[0, :3] = origins + torch.tensor([0.0, 0.0, -1.0], device=u.device)
+    hidden[0, 3] = 1.0
+    u.object.write_root_pose_to_sim(hidden)
+    print(f"[mirror] listening on udp://127.0.0.1:{args_cli.port} — cube HIDDEN until the control"
+          " loop streams (press through to the final ENTER)", flush=True)
     last_stamp, shown = 0.0, 0
     q12, pose = None, None
     while simulation_app.is_running():
