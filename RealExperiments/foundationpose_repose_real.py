@@ -623,8 +623,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no_calib", action="store_true", help="cube pose already in the xArm base frame")
     p.add_argument("--no-palm-calib", action="store_true",
                    help="ignore palm_env_T_cam.yaml (fall back to camera_extrinsics + arm FK)")
-    p.add_argument("--no-auto-center", action="store_true",
-                   help="skip the startup position zeroing (cube at rest in palm -> cancels calib translation error)")
+    p.add_argument("--auto-center", action="store_true",
+                   help="OPT-IN startup position zeroing. Off by default: the extrinsic is measured "
+                        "(table board + 2 cm plate), so the geometric truth needs no anchoring.")
     p.add_argument("--max-pose-age", type=float, default=0.25, help="hold targets if pose older than this [s]")
     p.add_argument("--abort-pose-age", type=float, default=2.0, help="abort real run if pose older than this [s]")
     p.add_argument("--real", action="store_true", help="connect xArm7 (read) + XHand")
@@ -1034,7 +1035,7 @@ def main() -> None:
             print("[center][WARN] offset > 15 cm — the camera moved a lot since calibration;"
                   " its ROTATION is probably also off. Consider re-calibrating anyway.")
 
-    if synthetic is None and not args.no_auto_center:
+    if synthetic is None and args.auto_center:
         run_auto_center()
 
     if hw is not None and args.execute:
