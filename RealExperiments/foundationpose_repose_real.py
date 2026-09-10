@@ -249,6 +249,25 @@ def scale_action(a: np.ndarray) -> np.ndarray:
     return 0.5 * (a + 1.0) * (UPPER - LOWER) + LOWER
 
 
+def sample_goal_quat_mode(rng: np.random.Generator, mode: str) -> np.ndarray:
+    """Goal sampling constrained to sim-verified difficulty tiers.
+
+    Bucket study (256 envs each, deployment obs stack): yaw 45/90 deg and
+    roll(x) 45-180 deg all >=99.6% success; pitch(y) 90/180 and yaw 180 are
+    the hard tail (77-89%).
+    """
+    if mode == "yaw":
+        ang = rng.uniform(np.radians(30), np.radians(90)) * rng.choice([-1.0, 1.0])
+        return quat_from_angle_axis(ang, np.array([0.0, 0.0, 1.0]))
+    if mode == "easy":
+        if rng.random() < 0.5:
+            ang = rng.uniform(np.radians(30), np.radians(90)) * rng.choice([-1.0, 1.0])
+            return quat_from_angle_axis(ang, np.array([0.0, 0.0, 1.0]))
+        ang = rng.uniform(np.radians(45), np.radians(180)) * rng.choice([-1.0, 1.0])
+        return quat_from_angle_axis(ang, np.array([1.0, 0.0, 0.0]))
+    return sample_goal_quat(rng)
+
+
 def sample_goal_quat(rng: np.random.Generator) -> np.ndarray:
     """Same distribution as the env's randomize_rotation."""
     r0, r1 = rng.uniform(-1.0, 1.0, 2)
@@ -611,6 +630,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--steps", type=int, default=1200, help="control steps at 20 Hz (1200 = 60 s)")
     p.add_argument("--success-tol", type=float, default=DEFAULT_SUCCESS_TOL, help="rad")
     p.add_argument("--goal-seed", type=int, default=0)
+    p.add_argument("--goal-mode", choices=["all", "easy", "yaw"], default="all",
+                   help="goal difficulty tier: yaw = vertical-axis 30-90 deg only (sim ~100%%), "
+                        "easy = yaw + roll(x) (sim >=99.6%%), all = uniform random")
     p.add_argument("--cube-edge", type=float, default=0.06,
                    help="physical cube edge length [m]. Scales the FoundationPose mesh and "
                         "shifts the auto-center rest anchor. Trained size DR band: 0.051-0.069 m.")
@@ -793,7 +815,7 @@ def main() -> None:
     # --- policy (load before any hardware motion so failures abort early) --
     policy = LstmPolicy(args.checkpoint)
     rng = np.random.default_rng(args.goal_seed)
-    goal_quat = sample_goal_quat(rng)
+    goal_quat = sample_goal_quat_mode(rng, args.goal_mode)
     successes = 0
 
     # --- hand to home + cube placement (BEFORE the tracker: the ROI must be
@@ -1072,7 +1094,7 @@ def main() -> None:
             time.sleep(STEP_DT)
         policy.reset()
         prev_action = np.zeros(12, dtype=np.float32)
-        goal_quat = sample_goal_quat(rng)
+        goal_quat = sample_goal_quat_mode(rng, args.goal_mode)
         send_goal(-1.0)
         if receiver is not None:
             receiver.wait_fresh(args.max_pose_age, 3.0)
@@ -1160,7 +1182,7 @@ def main() -> None:
                 send_goal(rot_dist)
                 if rot_dist <= args.success_tol:
                     successes += 1
-                    goal_quat = sample_goal_quat(rng)
+                    goal_quat = sample_goal_quat_mode(rng, args.goal_mode)
                     last_event_t = time.perf_counter()
                     print(f"[goal] SUCCESS #{successes} at step {step}!"
                           f" next goal quat {np.array2string(goal_quat, precision=3)}")
