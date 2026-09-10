@@ -620,6 +620,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pose_npy", default="/tmp/foundationpose_cube_pose.npy")
     p.add_argument("--calib_yaml", default=DEFAULT_CALIB_YAML)
     p.add_argument("--no_calib", action="store_true", help="cube pose already in the xArm base frame")
+    p.add_argument("--no-palm-calib", action="store_true",
+                   help="ignore palm_env_T_cam.yaml (fall back to camera_extrinsics + arm FK)")
     p.add_argument("--no-auto-center", action="store_true",
                    help="skip the startup position zeroing (cube at rest in palm -> cancels calib translation error)")
     p.add_argument("--max-pose-age", type=float, default=0.25, help="hold targets if pose older than this [s]")
@@ -764,7 +766,18 @@ def main() -> None:
     print(f"[frames] gravity tilt vs sim: {tilt:.1f} deg" + ("  <-- WARNING: palm not palm-up like sim!" if tilt > 8.0 else ""))
 
     base_T_cam = None
-    if args.pose_source in ("tracker", "npy") and not args.no_calib:
+    palm_yaml = Path(__file__).resolve().parent / "palm_env_T_cam.yaml"
+    if (args.pose_source in ("tracker", "npy") and not args.no_calib
+            and palm_yaml.exists() and not args.no_palm_calib):
+        import yaml as _y
+
+        with open(palm_yaml) as f:
+            _d = _y.safe_load(f)
+        env_T_base = np.array(_d["env_T_cam"]["matrix"], dtype=np.float64)  # env <- cam directly
+        base_T_cam = None  # cam pose feeds straight into env_T_base
+        print(f"[calib] palm-marker env_T_cam loaded ({_d.get('stamp')}, spread "
+              f"{_d.get('rot_spread_deg', 0):.2f} deg) — overrides camera_extrinsics + arm FK chain")
+    elif args.pose_source in ("tracker", "npy") and not args.no_calib:
         base_T_cam = load_base_T_cam(args.calib_yaml)
 
     # --- policy (load before any hardware motion so failures abort early) --
