@@ -847,9 +847,11 @@ def main() -> None:
             if len(data) == struct.calcsize(CALIB_COMMIT_FMT):
                 vals = struct.unpack(CALIB_COMMIT_FMT, data)
                 cand = np.array(vals[:6])
-                flag = vals[6] > 0.5
+                vals_flag = vals[6]
+                flag = vals_flag > 0.5
             else:
                 cand = np.array(struct.unpack(CALIB_FMT, data))
+                vals_flag = 0.0
                 flag = False
             # reject corrupt packets: the destroyed-trackbar signature (cv2
             # returns -1 -> exactly -51 mm / -15.1 deg on ALL six axes), plus a
@@ -867,7 +869,47 @@ def main() -> None:
                       f"r={np.round(np.degrees(cand[3:]), 2)}deg")
             manual = cand
             if flag:
-                recenter_requested = True
+                if vals_flag >= 1.5:
+                    log_extrinsic_snapshot()
+                else:
+                    recenter_requested = True
+
+    def log_extrinsic_snapshot() -> None:
+        """Print + append the EFFECTIVE extrinsic with the manual calib folded in.
+
+        apply_manual acts in env coords as T_corr = [R_cr | pivot - R_cr@pivot + d],
+        so the corrected env_T_cam = T_corr @ env_T_base @ base_T_cam and the
+        equivalent camera extrinsic is base_T_cam' = inv(env_T_base) @ env_T_cam'.
+        Useful to restore or bake the calibration later.
+        """
+        cr = (_axis_angle_rotmat(np.array([0, 0, 1.0]), manual[5])
+              @ _axis_angle_rotmat(np.array([0, 1.0, 0]), manual[4])
+              @ _axis_angle_rotmat(np.array([1.0, 0, 0]), manual[3]))
+        pivot = REST_POS.copy()
+        pivot[2] += (args.cube_edge - 0.06) / 2.0
+        t_corr = np.eye(4)
+        t_corr[:3, :3] = cr
+        t_corr[:3, 3] = pivot - cr @ pivot + manual[:3]
+        env_t_cam = t_corr @ (env_T_base @ base_T_cam if base_T_cam is not None else env_T_base)
+        base_t_cam_eff = np.linalg.inv(env_T_base) @ env_t_cam
+        quat = rotmat_to_quat(base_t_cam_eff[:3, :3])
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        lines = [
+            f"[extrinsic] snapshot @ {stamp}",
+            f"[extrinsic] manual d={np.round(manual[:3] * 1000, 1)}mm r={np.round(np.degrees(manual[3:]), 2)}deg"
+            f"  center_offset={np.round(center_offset, 4)}",
+            f"[extrinsic] effective base_T_cam (manual folded in){' [NO CALIB YAML: env_T_cam shown]' if base_T_cam is None else ''}:",
+        ] + [f"[extrinsic]   {np.array2string(row, precision=6, separator=', ')}" for row in base_t_cam_eff] + [
+            f"[extrinsic] as pos(m) + quat(wxyz): {np.round(base_t_cam_eff[:3, 3], 5).tolist()}"
+            f" + {np.round(quat, 6).tolist()}",
+        ]
+        for ln in lines:
+            print(ln)
+        try:
+            with open(str(Path(__file__).resolve().parent / "calib_history.log"), "a") as f:
+                f.write("\n".join(lines) + "\n\n")
+        except OSError as e:
+            print(f"[extrinsic][WARN] history write failed: {e}")
 
     def apply_manual(pose: np.ndarray) -> np.ndarray:
         """Manual calib: rotation acts on the WHOLE pose about the rest anchor.

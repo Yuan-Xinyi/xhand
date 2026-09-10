@@ -142,6 +142,7 @@ def main():
             with open(YAML_PATH, "w") as f:
                 yaml.safe_dump(d, f)
             set_values([0.0] * 6)
+            sock.sendto(struct.pack(CALIB_COMMIT_FMT, *base, 2.0), CALIB_UDP)  # 2.0 = log extrinsic snapshot
             print(f"[calib] saved -> {YAML_PATH}: {d} (rotation pivots about the rest"
                   " anchor, so no re-center is needed — no jump)", flush=True)
     cv2.destroyAllWindows()
