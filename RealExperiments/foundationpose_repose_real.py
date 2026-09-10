@@ -452,26 +452,25 @@ class UrdfKinematics:
 # ---------------------------------------------------------------------------
 
 def _prepare_one_imports() -> None:
-    os.environ.setdefault("PYGLET_HEADLESS", "true")
-    try:
-        import pyglet
+    """Make the one-lib DRIVER modules importable WITHOUT executing one/__init__.py.
 
-        pyglet.options["headless"] = True
-    except Exception:
-        pass
-    if "matplotlib.pyplot" not in sys.modules:
-        mpl = types.ModuleType("matplotlib")
-        pyplot = types.ModuleType("matplotlib.pyplot")
-        pyplot.get_cmap = lambda _name: types.SimpleNamespace(colors=[(0.5, 0.5, 0.5)] * 20)
-        mpl.pyplot = pyplot
-        sys.modules.setdefault("matplotlib", mpl)
-        sys.modules.setdefault("matplotlib.pyplot", pyplot)
+    The package init imports pyglet and builds a GL context at import time,
+    which dies in headless shells / under VRAM pressure (EGL NoSuchConfig).
+    The drivers themselves (xhand_x, xarm7) only need numpy/scipy/serial/xarm,
+    and every package level under one/control is a namespace package — so a
+    shell module carrying just __path__ lets them resolve cleanly.
+    """
     # the dex-hand branch worktree carries the XHand model/driver sources
     one_root = os.environ.get("ONE_ROOT")
     if not one_root:
         one_root = "/home/lqin/one-dexhand" if os.path.isdir("/home/lqin/one-dexhand/one") else "/home/lqin/one"
     if one_root not in sys.path:
         sys.path.insert(0, one_root)
+    if "one" not in sys.modules:
+        shell = types.ModuleType("one")
+        shell.__path__ = [os.path.join(one_root, "one")]
+        shell.__package__ = "one"
+        sys.modules["one"] = shell
 
 
 # ---------------------------------------------------------------------------
