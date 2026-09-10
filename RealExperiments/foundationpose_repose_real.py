@@ -126,6 +126,9 @@ GOAL_UDP = ("127.0.0.1", 9878)
 GOAL_FMT = "<11d"  # t, R_cam_goal (9), rot_dist (rad, <0 = unknown)
 STATE_UDP = ("127.0.0.1", 9879)
 STATE_FMT = "<29d"  # t, hand_q (12), env_T_cube (16) — mirror-viewer stream
+CALIB_UDP = ("127.0.0.1", 9880)
+CALIB_FMT = "<6d"  # dx, dy, dz [m], rx, ry, rz [rad] — manual calib panel
+MANUAL_CALIB_YAML = str(Path(__file__).resolve().parent / "repose_manual_calib.yaml")
 
 
 # ---------------------------------------------------------------------------
@@ -812,6 +815,41 @@ def main() -> None:
 
     state_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
+    # manual calibration: yaml-persisted, live-updatable from repose_calib_gui.py
+    manual = np.zeros(6)  # dx dy dz [m], rx ry rz [rad]
+    if os.path.exists(MANUAL_CALIB_YAML):
+        import yaml as _yaml
+
+        with open(MANUAL_CALIB_YAML) as f:
+            _d = _yaml.safe_load(f) or {}
+        manual = np.array([_d.get(k, 0.0) for k in ["dx", "dy", "dz", "rx", "ry", "rz"]])
+        print(f"[calib] loaded manual offset {MANUAL_CALIB_YAML}: "
+              f"d={np.round(manual[:3] * 1000, 1)}mm r={np.round(np.degrees(manual[3:]), 2)}deg")
+    calib_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    calib_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    calib_sock.bind(CALIB_UDP)
+    calib_sock.setblocking(False)
+
+    def poll_manual_calib() -> None:
+        nonlocal manual
+        while True:
+            try:
+                data, _ = calib_sock.recvfrom(64)
+            except BlockingIOError:
+                return
+            manual = np.array(struct.unpack(CALIB_FMT, data))
+
+    def apply_manual(pose: np.ndarray) -> np.ndarray:
+        if not np.any(manual):
+            return pose
+        out = pose.copy()
+        cr = (_axis_angle_rotmat(np.array([0, 0, 1.0]), manual[5])
+              @ _axis_angle_rotmat(np.array([0, 1.0, 0]), manual[4])
+              @ _axis_angle_rotmat(np.array([1.0, 0, 0]), manual[3]))
+        out[:3, :3] = cr @ pose[:3, :3]
+        out[:3, 3] = pose[:3, 3] + manual[:3]
+        return out
+
     def send_state(q12: np.ndarray, pose_env: np.ndarray | None) -> None:
         if pose_env is None:
             return
@@ -824,15 +862,16 @@ def main() -> None:
     center_offset = np.zeros(3)
 
     def cube_env_pose() -> np.ndarray | None:
+        poll_manual_calib()
         if synthetic is not None:
-            return synthetic.pose_env()
+            return apply_manual(synthetic.pose_env())
         pose_cam = receiver.poll() if receiver is not None else static_pose_cam
         if pose_cam is None:
             return None
         pose_base = pose_cam if base_T_cam is None else base_T_cam @ pose_cam
         pose = env_T_base @ pose_base
         pose[:3, 3] -= center_offset
-        return pose
+        return apply_manual(pose)
 
     # --- auto-center: cube at rest in the palm defines the position zero ----
     # Cancels the calib translation error entirely (rotation error remains).
