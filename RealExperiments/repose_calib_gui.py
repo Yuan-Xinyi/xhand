@@ -90,7 +90,7 @@ def main():
                     (12, 96), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 255, 0), 2)
         cv2.putText(img, "ROTATION persists; translation = session probe (re-absorbed on restart)",
                     (12, 114), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 180, 255), 1)
-        cv2.putText(img, "s=save(base+=delta)  r=delta->0  z=zero all  q=quit",
+        cv2.putText(img, "s=save (no jump)  c=re-anchor(cube at rest)  r=delta->0  z=zero all  q=quit",
                     (12, 148), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
         cv2.imshow(WIN, img)
         k = cv2.waitKey(50) & 0xFF
@@ -98,6 +98,10 @@ def main():
             break
         if k == ord("r"):
             set_values([0.0] * 6)
+        if k == ord("c"):
+            vals = base + np.array(values())
+            sock.sendto(struct.pack(CALIB_COMMIT_FMT, *vals, 1.0), CALIB_UDP)
+            print("[calib] explicit re-anchor requested (cube MUST be at rest in the palm)")
         if k == ord("z"):
             base = np.zeros(6)
             set_values([0.0] * 6)
@@ -108,9 +112,8 @@ def main():
             with open(YAML_PATH, "w") as f:
                 yaml.safe_dump(d, f)
             set_values([0.0] * 6)
-            sock.sendto(struct.pack(CALIB_COMMIT_FMT, *base, 1.0), CALIB_UDP)
-            print(f"[calib] saved -> {YAML_PATH}: {d} — control loop re-centers now "
-                  "(keep the cube at rest!)", flush=True)
+            print(f"[calib] saved -> {YAML_PATH}: {d} (rotation pivots about the rest"
+                  " anchor, so no re-center is needed — no jump)", flush=True)
     cv2.destroyAllWindows()
 
 

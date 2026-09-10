@@ -900,7 +900,7 @@ def main() -> None:
     # the manual calibration is neutralized at runtime by construction — use
     # the sliders' translation only for temporary visual exploration; the
     # ROTATION part is the persistent, meaningful correction.
-    def run_auto_center() -> None:
+    def run_auto_center(strict: bool = False) -> None:
         nonlocal center_offset
         samples = []
         t0 = time.time()
@@ -915,10 +915,17 @@ def main() -> None:
             return
         arr = np.asarray(samples)
         spread = float(arr.std(axis=0).max()) if len(arr) > 1 else 0.0
-        if spread > 0.01:
-            print(f"[center][WARN] cube not still during zeroing (std {spread * 1000:.0f} mm) — offset may be poor")
         rest = REST_POS.copy()
         rest[2] += (args.cube_edge - 0.06) / 2.0  # bigger cube rests higher in the palm
+        if strict:
+            # mid-session re-anchor: refuse rather than jump the world
+            dev = float(np.linalg.norm(arr.mean(axis=0) - rest))
+            if spread > 0.01 or dev > 0.05:
+                print(f"[center] re-anchor REFUSED (std {spread * 1000:.0f} mm, off-rest {dev * 100:.1f} cm)"
+                      " — put the cube at rest in the palm first")
+                return
+        elif spread > 0.01:
+            print(f"[center][WARN] cube not still during zeroing (std {spread * 1000:.0f} mm) — offset may be poor")
         # samples already include the CURRENT center_offset -> accumulate
         center_offset = center_offset + (arr.mean(axis=0) - rest)
         mag = float(np.linalg.norm(center_offset))
@@ -984,8 +991,8 @@ def main() -> None:
                 if hw is not None and args.execute:
                     print("[center] re-center request ignored while EXECUTING (cube must be at rest)")
                 else:
-                    print("[center] calib saved — re-anchoring rest position (keep the cube still)...")
-                    run_auto_center()
+                    print("[center] explicit re-anchor requested...")
+                    run_auto_center(strict=True)
                     last_event_t = time.perf_counter()
                     next_t = time.perf_counter()
             if receiver is not None and receiver.age() > args.abort_pose_age:
