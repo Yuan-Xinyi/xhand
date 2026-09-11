@@ -373,6 +373,7 @@ class LstmPolicy:
         sig = state.get("a2c_network.sigma")
         self.sigma = torch.exp(sig).to(self.device).float() if sig is not None else None
         self.noise_scale = 0.0
+        self.gain = 1.0
         self.rng = np.random.default_rng(0)
         self.reset()
         print(f"[policy] loaded {checkpoint}")
@@ -393,7 +394,7 @@ class LstmPolicy:
             out = torch.nn.functional.layer_norm(out.view(-1), (self.hidden,), self.ln_w, self.ln_b)
             out = torch.nn.functional.relu(torch.nn.functional.linear(out, self.mlp_w, self.mlp_b))
             mu = torch.nn.functional.linear(out, self.mu_w, self.mu_b)
-            a = torch.clamp(mu, -1.0, 1.0).cpu().numpy().astype(np.float32)
+            a = torch.clamp(mu * getattr(self, "gain", 1.0), -1.0, 1.0).cpu().numpy().astype(np.float32)
         if self.noise_scale > 0.0:
             std = (self.sigma.cpu().numpy() if self.sigma is not None else np.full(a.shape, 0.09))
             a = np.clip(a + self.rng.normal(0.0, std * self.noise_scale).astype(np.float32), -1.0, 1.0)
@@ -662,10 +663,15 @@ def parse_args() -> argparse.Namespace:
                    help="max rad a joint TARGET may lead its MEASURED position [rad]. Emulates the "
                         "sim's torque limit (effort 3 Nm / stiffness 50 = 0.06 rad): a blocked "
                         "finger stops pushing instead of crushing the cube. 0 = off (raw stiff hand).")
-    p.add_argument("--hand-tor-max", type=int, default=300,
+    p.add_argument("--hand-tor-max", type=int, default=150,
                    help="XHand firmware torque cap (default 300 = full). Lower = more compliant.")
     p.add_argument("--hand-kp", type=int, default=100, help="XHand firmware position-loop gain")
-    p.add_argument("--action-noise", type=float, default=1.0,
+    p.add_argument("--action-gain", type=float, default=1.15,
+                   help="multiply the policy action before rescaling to joint targets "
+                        "(>1 = larger commanded motion; clipped to [-1,1])")
+    p.add_argument("--act-ema", type=float, default=ACT_MOVING_AVERAGE,
+                   help="action moving-average weight (sim contract 0.3; higher = snappier)")
+    p.add_argument("--action-noise", type=float, default=1.3,
                    help="exploration dither as a multiple of the policy's trained sigma "
                         "(1.0 = training-like, 0 = deterministic). Deterministic locks into "
                         "frozen fixed points: sim 79.7%% vs 93.0%% with dither.")
@@ -675,7 +681,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cube-edge", type=float, default=0.06,
                    help="physical cube edge length [m]. Scales the FoundationPose mesh and "
                         "shifts the auto-center rest anchor. Trained size DR band: 0.051-0.069 m.")
-    p.add_argument("--stall-timeout", type=float, default=10.0,
+    p.add_argument("--stall-timeout", type=float, default=30.0,
                    help="s without a success -> reopen hand, reset LSTM, new goal (sim episodes "
                         "reset every 8 s, the policy never trained past that; 0 = off)")
     p.add_argument("--pose-source", choices=["tracker", "npy", "synthetic"], default="tracker")
@@ -706,7 +712,7 @@ def parse_args() -> argparse.Namespace:
     # tighter starves the policy's stroke depth: the cube gets rocked +-2 deg and springs
     # back instead of tipping over an edge (measured in /tmp/repose_run1.npz: gross
     # rotation ~100 deg / 5 s, net ~2 deg with a 0.03 clamp).
-    p.add_argument("--max-hand-step", type=float, default=0.157, help="max joint target delta per cycle [rad]")
+    p.add_argument("--max-hand-step", type=float, default=0.25, help="max joint target delta per cycle [rad]")
     p.add_argument("--arm-q", type=float, nargs=7, default=None,
                    help="arm joints holding the wrist (dry-run only; --real reads the robot)")
     p.add_argument("--print-every", type=int, default=20)
@@ -858,6 +864,10 @@ def main() -> None:
     # --- policy (load before any hardware motion so failures abort early) --
     policy = LstmPolicy(args.checkpoint)
     policy.noise_scale = float(args.action_noise)
+    policy.gain = float(args.action_gain)
+    print(f"[policy] action gain {args.action_gain:.2f}  ema {args.act_ema:.2f}"
+          f"  step cap {args.max_hand_step:.3f} rad/cycle ({args.max_hand_step / STEP_DT:.1f} rad/s)"
+          f"  stall timeout {args.stall_timeout:.0f}s")
     if policy.noise_scale > 0:
         sig = policy.sigma.cpu().numpy() if policy.sigma is not None else np.full(12, 0.09)
         print(f"[policy] action dither ON: {args.action_noise:.2f} x trained sigma "
@@ -1216,7 +1226,7 @@ def main() -> None:
                 action = policy.act(obs)
 
                 # sim action contract: absolute targets + moving average + saturation
-                targets = ACT_MOVING_AVERAGE * scale_action(action) + (1.0 - ACT_MOVING_AVERAGE) * prev_targets
+                targets = args.act_ema * scale_action(action) + (1.0 - args.act_ema) * prev_targets
                 targets = np.clip(targets, LOWER, UPPER)
                 targets = prev_targets + np.clip(targets - prev_targets, -args.max_hand_step, args.max_hand_step)
                 # Torque-limit emulation: never let a target lead the MEASURED
