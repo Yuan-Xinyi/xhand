@@ -353,6 +353,15 @@ class LstmPolicy:
         self.mu_w = state["a2c_network.mu.weight"].to(self.device).float()
         self.mu_b = state["a2c_network.mu.bias"].to(self.device).float()
         self.hidden = hidden
+        # Training sampled actions from N(mu, sigma); a deterministic (mu-only)
+        # deployment can lock into fixed points where obs stops changing ->
+        # action stops changing -> the cube wedges. Sim A/B (256 envs, flat
+        # start, yaw goals): deterministic 79.7% with 2.0% frozen steps vs
+        # 93.0% / 0.2% with the learned sigma, 96.5% with sigma=0.10.
+        sig = state.get("a2c_network.sigma")
+        self.sigma = torch.exp(sig).to(self.device).float() if sig is not None else None
+        self.noise_scale = 0.0
+        self.rng = np.random.default_rng(0)
         self.reset()
         print(f"[policy] loaded {checkpoint}")
         print(f"[policy] obs_dim={obs_dim} lstm_hidden={hidden} actions={self.mu_b.shape[0]}")
@@ -372,7 +381,11 @@ class LstmPolicy:
             out = torch.nn.functional.layer_norm(out.view(-1), (self.hidden,), self.ln_w, self.ln_b)
             out = torch.nn.functional.relu(torch.nn.functional.linear(out, self.mlp_w, self.mlp_b))
             mu = torch.nn.functional.linear(out, self.mu_w, self.mu_b)
-            return torch.clamp(mu, -1.0, 1.0).cpu().numpy().astype(np.float32)
+            a = torch.clamp(mu, -1.0, 1.0).cpu().numpy().astype(np.float32)
+        if self.noise_scale > 0.0:
+            std = (self.sigma.cpu().numpy() if self.sigma is not None else np.full(a.shape, 0.09))
+            a = np.clip(a + self.rng.normal(0.0, std * self.noise_scale).astype(np.float32), -1.0, 1.0)
+        return a.astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -630,6 +643,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--steps", type=int, default=1200, help="control steps at 20 Hz (1200 = 60 s)")
     p.add_argument("--success-tol", type=float, default=DEFAULT_SUCCESS_TOL, help="rad")
     p.add_argument("--goal-seed", type=int, default=0)
+    p.add_argument("--action-noise", type=float, default=1.0,
+                   help="exploration dither as a multiple of the policy's trained sigma "
+                        "(1.0 = training-like, 0 = deterministic). Deterministic locks into "
+                        "frozen fixed points: sim 79.7%% vs 93.0%% with dither.")
     p.add_argument("--goal-mode", choices=["all", "easy", "yaw"], default="all",
                    help="goal difficulty tier: yaw = vertical-axis 30-90 deg only (sim ~100%%), "
                         "easy = yaw + roll(x) (sim >=99.6%%), all = uniform random")
@@ -814,6 +831,13 @@ def main() -> None:
 
     # --- policy (load before any hardware motion so failures abort early) --
     policy = LstmPolicy(args.checkpoint)
+    policy.noise_scale = float(args.action_noise)
+    if policy.noise_scale > 0:
+        sig = policy.sigma.cpu().numpy() if policy.sigma is not None else np.full(12, 0.09)
+        print(f"[policy] action dither ON: {args.action_noise:.2f} x trained sigma "
+              f"(mean {sig.mean() * args.action_noise:.3f})")
+    else:
+        print("[policy][WARN] deterministic actions — prone to frozen fixed points (sim: -13%% success)")
     rng = np.random.default_rng(args.goal_seed)
     goal_quat = sample_goal_quat_mode(rng, args.goal_mode)
     successes = 0
