@@ -602,9 +602,12 @@ class RealHardware:
     def hand_home(self, q_isaac: np.ndarray, speed: float):
         self.hand.move_to(q_isaac[ISAAC_TO_ONE], speed=speed, freq=50.0)
 
+    def set_gains(self, kp: int, tor_max: int) -> None:
+        self.move_kwargs = {"kp": int(kp), "tor_max": int(tor_max)}
+
     def hand_stream(self, q_isaac: np.ndarray, read: bool = False) -> np.ndarray | None:
         """Stream targets; with read=True also return the MEASURED joints (Isaac order)."""
-        states = self.hand.move(q_isaac[ISAAC_TO_ONE], read=read)
+        states = self.hand.move(q_isaac[ISAAC_TO_ONE], read=read, **getattr(self, "move_kwargs", {}))
         if not read or states is None:
             return None
         try:
@@ -643,6 +646,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--steps", type=int, default=1200, help="control steps at 20 Hz (1200 = 60 s)")
     p.add_argument("--success-tol", type=float, default=DEFAULT_SUCCESS_TOL, help="rad")
     p.add_argument("--goal-seed", type=int, default=0)
+    p.add_argument("--lead-cap", type=float, default=0.06,
+                   help="max rad a joint TARGET may lead its MEASURED position [rad]. Emulates the "
+                        "sim's torque limit (effort 3 Nm / stiffness 50 = 0.06 rad): a blocked "
+                        "finger stops pushing instead of crushing the cube. 0 = off (raw stiff hand).")
+    p.add_argument("--hand-tor-max", type=int, default=300,
+                   help="XHand firmware torque cap (default 300 = full). Lower = more compliant.")
+    p.add_argument("--hand-kp", type=int, default=100, help="XHand firmware position-loop gain")
     p.add_argument("--action-noise", type=float, default=1.0,
                    help="exploration dither as a multiple of the policy's trained sigma "
                         "(1.0 = training-like, 0 = deterministic). Deterministic locks into "
@@ -789,6 +799,10 @@ def main() -> None:
     hw = None
     if args.real:
         hw = RealHardware(args.xarm_ip, args.xhand_port)
+        hw.set_gains(args.hand_kp, args.hand_tor_max)
+        print(f"[real] XHand gains: kp={args.hand_kp} tor_max={args.hand_tor_max}"
+              f"  lead cap {args.lead_cap * 1000:.0f} mrad"
+              + ("" if args.lead_cap > 0 else "  (OFF — stiff hand crushes wedged cubes)"))
         arm_q = hw.arm_q()
         print(f"[real] arm q: {np.array2string(arm_q, precision=4)}")
     else:
@@ -1188,6 +1202,14 @@ def main() -> None:
                 targets = ACT_MOVING_AVERAGE * scale_action(action) + (1.0 - ACT_MOVING_AVERAGE) * prev_targets
                 targets = np.clip(targets, LOWER, UPPER)
                 targets = prev_targets + np.clip(targets - prev_targets, -args.max_hand_step, args.max_hand_step)
+                # Torque-limit emulation: never let a target lead the MEASURED
+                # joint by more than lead_cap. In sim a blocked finger saturates
+                # at effort/stiffness = 3/50 = 0.06 rad of lead and yields; the
+                # real firmware loop (kp 100, tor_max 300) instead pushes until
+                # the cube is crushed, which is why dither never moved the
+                # contacting fingers (user observation, 2026-09-11).
+                if args.lead_cap > 0 and hand_q is not None:
+                    targets = np.clip(targets, hand_q - args.lead_cap, hand_q + args.lead_cap)
                 targets = np.clip(targets, LOWER, UPPER).astype(np.float32)
 
                 if hw is not None and args.execute:
