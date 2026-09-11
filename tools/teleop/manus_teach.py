@@ -8,7 +8,7 @@ by watching the hand move wrong.  Here nothing is guessed:
     1. drive the real XHand to a joint vector this script chose, so the label is
        exact by construction
     2. the operator looks at the hand and matches it with their gloved hand
-    3. record the 20 ergonomics channels
+    3. record a 20-feature vector describing the human hand
 
 Repeat, then fit e -> q.  Assignment, sign, range and cross-coupling all fall
 out of the regression.  The correspondence is established by the operator's own
@@ -17,8 +17,11 @@ eyes, which is the one judgement neither of us can get wrong.
     python manus_teach.py --out manus_fit.json     # ~5 minutes, hand moves
     python manus_node.py --fit manus_fit.json      # use it
 
-Needs the ergonomics bridge (ManusUdpBridge, udp 9881) streaming.  Both Unity
-bridges can run at once -- they use different ports.
+Either Unity bridge will do -- both ports are bound and whichever is actually
+streaming gets used.  From ManusUdpBridge the 20 ergonomics channels are taken
+as-is; from ManusSkeletonBridge an equivalent 20 features (per finger: two bend
+angles, elevation out of the palm plane, direction within it) are computed here
+from the 3D nodes, so nothing depends on what MANUS calls its channels.
 """
 from __future__ import annotations
 
@@ -31,10 +34,35 @@ import time
 
 import numpy as np
 
+from manus_skel_node import build_index_map, canonical_frame, forward_kinematics
 from protocol import HAND_JOINT_NAMES
 from real_node import OPEN_POSE, URDF_LIMITS, XHandSerial, _settle_to
 
 N_CH = 20
+FINGERS = ("thumb", "index", "middle", "ring", "pinky")
+# 4 features per finger, same width as MANUS ergonomics but computed by us from
+# the 3D skeleton, so nothing depends on what MANUS calls its channels.
+FEAT_LABELS = [f"{f}.{k}" for f in FINGERS
+               for k in ("curl1", "curl2", "elev", "azim")]
+
+
+def skeleton_features(world, meta):
+    """21 MANO keypoints -> 20 geometric features, in the hand's own frame."""
+    kp = canonical_frame(world[build_index_map(meta)])
+    feats = []
+    for i, f in enumerate(FINGERS):
+        b = kp[1 + 4 * i: 5 + 4 * i]                 # mcp, pip, dip, tip
+        v = np.diff(b, axis=0)                        # 3 bone vectors
+        n = np.linalg.norm(v, axis=1) + 1e-9
+        u = v / n[:, None]
+        curl1 = float(np.arccos(np.clip(u[0] @ u[1], -1, 1)))
+        curl2 = float(np.arccos(np.clip(u[1] @ u[2], -1, 1)))
+        elev = float(np.arcsin(np.clip(u[0][2], -1, 1)))   # out of the palm plane
+        azim = float(np.arctan2(u[0][0], u[0][1]))         # within it
+        feats += [curl1, curl2, elev, azim]
+    return np.asarray(feats)
+
+
 LO, HI = URDF_LIMITS[:, 0], URDF_LIMITS[:, 1]
 
 
@@ -89,48 +117,83 @@ def teach_poses():
     return P
 
 
-def drain(rx):
-    while True:
-        try:
-            rx.recv(4096)
-        except (BlockingIOError, OSError):
-            return
+def open_sources(bind, ergo_port, skel_port):
+    """Bind both bridges; whichever is actually streaming gets used."""
+    out = []
+    for port, src in ((ergo_port, "ergo"), (skel_port, "skel")):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((bind, port))
+        s.setblocking(False)
+        out.append((s, src))
+    return out
 
 
-def sample(rx, seconds, settle):
-    """Mean of the ergonomics channels over the tail of a hold."""
-    t_end = time.time() + seconds
-    keep = time.time() + settle
-    rows = []
-    while time.time() < t_end:
-        select.select([rx], [], [], 0.02)
-        newest = None
+def drain(socks):
+    for s, _ in socks:
         while True:
             try:
-                newest = rx.recv(4096)
+                s.recv(65535)
             except (BlockingIOError, OSError):
                 break
-        if newest is None:
-            continue
-        try:
-            e = np.asarray(json.loads(newest.decode("ascii"))["ergo"], dtype=float)
-        except (ValueError, KeyError, UnicodeDecodeError):
-            continue
-        if e.size == N_CH and time.time() >= keep:
-            rows.append(e)
-        left = t_end - time.time()
-        print(f"\r      保持 ... {left:3.1f}s  ({len(rows)} 帧)", end="", flush=True)
-    print()
-    return np.mean(rows, axis=0) if rows else None
 
 
-def countdown(rx, n, msg):
+def decode(payload, source):
+    """One datagram -> a 20-vector of features, or None."""
+    try:
+        msg = json.loads(payload.decode("ascii"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if source == "ergo":
+        e = np.asarray(msg.get("ergo", []), dtype=float)
+        return e if e.size == N_CH else None
+    local = np.asarray(msg.get("skel", []), dtype=float)
+    meta = msg.get("meta", [])
+    if local.ndim != 2 or local.shape[1] != 7 or any(len(m) < 4 for m in meta):
+        return None
+    try:
+        world = forward_kinematics(local, msg.get("ids") or [m[2] for m in meta],
+                                   [m[3] for m in meta])
+        return skeleton_features(world, meta)
+    except (ValueError, IndexError):
+        return None
+
+
+def sample(socks, seconds, settle, quiet=False):
+    """Mean feature vector over the tail of a hold. Returns (vec, source)."""
+    t_end = time.time() + seconds
+    keep = time.time() + settle
+    rows, src_used = [], None
+    while time.time() < t_end:
+        select.select([s for s, _ in socks], [], [], 0.02)
+        for s, src in socks:
+            newest = None
+            while True:
+                try:
+                    newest = s.recv(65535)
+                except (BlockingIOError, OSError):
+                    break
+            if newest is None:
+                continue
+            e = decode(newest, src)
+            if e is not None and time.time() >= keep:
+                rows.append(e)
+                src_used = src
+        if not quiet:
+            print(f"\r      保持 ... {t_end - time.time():3.1f}s  ({len(rows)} 帧)",
+                  end="", flush=True)
+    if not quiet:
+        print()
+    return (np.mean(rows, axis=0), src_used) if rows else (None, None)
+
+
+def countdown(socks, n, msg):
     for k in range(n, 0, -1):
         print(f"\r      {msg} {k} ...", end="", flush=True)
         t_end = time.time() + 1.0
         while time.time() < t_end:
-            select.select([rx], [], [], 0.02)
-            drain(rx)          # a full UDP buffer drops NEW packets, keeps stale
+            select.select([s for s, _ in socks], [], [], 0.02)
+            drain(socks)       # a full UDP buffer drops NEW packets, keeps stale
     print("\r" + " " * 40, end="\r")
 
 
@@ -165,7 +228,10 @@ def pick_alpha(E, Q):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bind", default="0.0.0.0")
-    ap.add_argument("--glove-port", type=int, default=9881)
+    ap.add_argument("--ergo-port", type=int, default=9881,
+                    help="ManusUdpBridge (20 ergonomics channels)")
+    ap.add_argument("--skel-port", type=int, default=9882,
+                    help="ManusSkeletonBridge (3D nodes; features computed here)")
     ap.add_argument("--out", default="manus_fit.json")
     ap.add_argument("--hold", type=float, default=3.5, help="seconds recorded per pose")
     ap.add_argument("--settle", type=float, default=1.5, help="ignored while you get set")
@@ -178,15 +244,15 @@ def main():
     ap.add_argument("--tor-max", type=int, default=150)
     args = ap.parse_args()
 
-    rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    rx.bind((args.bind, args.glove_port))
-    rx.setblocking(False)
-    print(f"[teach] 监听手套数据 udp://{args.bind}:{args.glove_port}")
-    print("[teach] 等待手套 ...")
-    while sample(rx, 1.0, 0.0) is None:
-        pass
-    print("[teach] 手套在线。\n")
+    socks = open_sources(args.bind, args.ergo_port, args.skel_port)
+    print(f"[teach] 监听 udp://{args.bind}:{args.ergo_port} (ergonomics) "
+          f"和 :{args.skel_port} (skeleton)")
+    print("[teach] 等待手套 ... (两条流哪条有数据就用哪条)")
+    source = None
+    while source is None:
+        _, source = sample(socks, 1.0, 0.0, quiet=True)
+    print(f"[teach] 手套在线,数据源 = {source}"
+          f"{' (20 通道 ergonomics)' if source == 'ergo' else ' (3D 骨架, 特征本地计算)'}\n")
 
     hand = XHandSerial(args.serial_port, args.baud,
                        kp=args.kp, kd=args.kd, tor_max=args.tor_max)
@@ -197,7 +263,7 @@ def main():
     print(f"共 {len(poses)} 个姿势。每个:机械手先摆好 → 你照着摆 → 采 {args.hold:.0f} 秒。")
     print("⚠️  机械手会动。先把 cube 和障碍物拿开。")
     print("=" * 68)
-    countdown(rx, 5, "准备开始")
+    countdown(socks, 5, "准备开始")
 
     E, Q, names = [], [], []
     q_prev = OPEN_POSE.copy()
@@ -206,8 +272,8 @@ def main():
             print(f"\n[{i}/{len(poses)}] {name} — {desc}")
             _settle_to(hand, q, q_prev, args.move_time, args.rate)
             q_prev = q
-            countdown(rx, 3, "看着机械手,把你的手摆成一样;开始采集前")
-            e = sample(rx, args.hold, args.settle)
+            countdown(socks, 3, "看着机械手,把你的手摆成一样;开始采集前")
+            e, _ = sample(socks, args.hold, args.settle)
             if e is None:
                 print("      [!] 没采到手套数据,跳过")
                 continue
@@ -221,7 +287,8 @@ def main():
             hand.close()
         except (KeyboardInterrupt, OSError):
             pass
-        rx.close()
+        for s, _ in socks:
+            s.close()
 
     if len(E) < 8:
         sys.exit(f"[teach] 只采到 {len(E)} 个姿势,不足以拟合")
@@ -233,8 +300,8 @@ def main():
           f"({np.sqrt(loo):.3f} rad RMS)")
 
     print(f"\n{'joint':>15s} {'R^2':>7s}   主导通道(权重最大的三个)")
-    labels = [f"{f}.{c}" for f in ("thumb", "index", "middle", "ring", "pinky")
-              for c in ("spread", "mcp", "pip", "dip")]
+    labels = FEAT_LABELS if source == "skel" else [
+        f"{f}.{c}" for f in FINGERS for c in ("spread", "mcp", "pip", "dip")]
     for j, jn in enumerate(HAND_JOINT_NAMES):
         top = np.argsort(-np.abs(A[j]))[:3]
         bits = ", ".join(f"{labels[k]}{A[j][k]:+.3f}" for k in top)
@@ -244,7 +311,7 @@ def main():
     with open(args.out, "w") as fh:
         json.dump({"A": A.tolist(), "b": b.tolist(), "alpha": float(alpha),
                    "joints": list(HAND_JOINT_NAMES), "poses": names,
-                   "r2": r2.tolist()}, fh, indent=2)
+                   "source": source, "r2": r2.tolist()}, fh, indent=2)
     print(f"\n[teach] 写入 {args.out}")
     print(f"[teach] 用它:  python manus_node.py --fit {args.out} --listen-only --print")
 
