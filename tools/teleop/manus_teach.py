@@ -198,22 +198,38 @@ def countdown(socks, n, msg):
 
 
 def fit(E, Q, alpha):
-    """Ridge-regress q = A e + b. Returns (A, b, per-joint R^2)."""
-    X = np.hstack([E, np.ones((len(E), 1))])          # bias column
+    """Ridge-regress q = A e + b. Returns (A, b, per-joint R^2).
+
+    Features are standardised first. Ridge penalises every coefficient equally,
+    so without this the channels carrying 130 degrees of travel are shrunk far
+    harder than those carrying 10 -- the regularisation strength ends up being
+    an accident of each channel's units. A and b are folded back afterwards so
+    the returned map still consumes raw features.
+    """
+    mu = E.mean(axis=0)
+    sd = E.std(axis=0)
+    sd[sd < 1e-9] = 1.0                                # a channel that never moved
+    Z = (E - mu) / sd
+
+    X = np.hstack([Z, np.ones((len(Z), 1))])
     reg = alpha * np.eye(X.shape[1])
     reg[-1, -1] = 0.0                                  # never penalise the bias
-    W = np.linalg.solve(X.T @ X + reg, X.T @ Q)        # (21, 12)
+    W = np.linalg.solve(X.T @ X + reg, X.T @ Q)        # (nfeat+1, 12)
+
     pred = X @ W
     ss_res = ((Q - pred) ** 2).sum(axis=0)
     ss_tot = ((Q - Q.mean(axis=0)) ** 2).sum(axis=0)
     r2 = 1.0 - ss_res / np.maximum(ss_tot, 1e-12)
-    return W[:-1].T, W[-1], r2
+
+    A = (W[:-1] / sd[:, None]).T                       # unstandardise
+    b = W[-1] - A @ mu
+    return A, b, r2
 
 
 def pick_alpha(E, Q):
     """Leave-one-out over a log sweep; few poses, so this is cheap and honest."""
     best, best_err = 1.0, np.inf
-    for alpha in np.logspace(-4, 3, 29):
+    for alpha in np.logspace(-3, 4, 36):
         err = 0.0
         for i in range(len(E)):
             m = np.ones(len(E), bool)
@@ -242,7 +258,21 @@ def main():
     ap.add_argument("--kp", type=int, default=100)
     ap.add_argument("--kd", type=int, default=10)
     ap.add_argument("--tor-max", type=int, default=150)
+    ap.add_argument("--refit", default="", metavar="manus_fit.json",
+                    help="re-fit from a previous session's saved samples and exit; "
+                         "touches neither the robot nor the glove")
     args = ap.parse_args()
+
+    if args.refit:
+        with open(args.refit) as fh:
+            d = json.load(fh)
+        if "E" not in d:
+            sys.exit(f"[teach] {args.refit} has no raw samples (written before "
+                     f"they were saved); a new session is needed")
+        E, Q = np.asarray(d["E"]), np.asarray(d["Q"])
+        labels, names, source = d["labels"], d["poses"], d.get("source", "?")
+        report_and_save(E, Q, labels, names, source, args.out)
+        return
 
     socks = open_sources(args.bind, args.ergo_port, args.skel_port)
     print(f"[teach] 监听 udp://{args.bind}:{args.ergo_port} (ergonomics) "
@@ -294,26 +324,34 @@ def main():
         sys.exit(f"[teach] 只采到 {len(E)} 个姿势,不足以拟合")
 
     E, Q = np.asarray(E), np.asarray(Q)
+    labels = FEAT_LABELS if source == "skel" else [
+        f"{f}.{c}" for f in FINGERS for c in ("spread", "mcp", "pip", "dip")]
+    report_and_save(E, Q, labels, names, source, args.out)
+
+
+def report_and_save(E, Q, labels, names, source, out):
     alpha, loo = pick_alpha(E, Q)
     A, b, r2 = fit(E, Q, alpha)
     print(f"\n[teach] ridge alpha={alpha:.4g}  留一法均方误差={loo:.4f} rad^2 "
           f"({np.sqrt(loo):.3f} rad RMS)")
 
     print(f"\n{'joint':>15s} {'R^2':>7s}   主导通道(权重最大的三个)")
-    labels = FEAT_LABELS if source == "skel" else [
-        f"{f}.{c}" for f in FINGERS for c in ("spread", "mcp", "pip", "dip")]
     for j, jn in enumerate(HAND_JOINT_NAMES):
         top = np.argsort(-np.abs(A[j]))[:3]
         bits = ", ".join(f"{labels[k]}{A[j][k]:+.3f}" for k in top)
         flag = "  <- 拟合差" if r2[j] < 0.6 else ""
         print(f"{jn:>15s} {r2[j]:7.3f}   {bits}{flag}")
 
-    with open(args.out, "w") as fh:
+    with open(out, "w") as fh:
         json.dump({"A": A.tolist(), "b": b.tolist(), "alpha": float(alpha),
                    "joints": list(HAND_JOINT_NAMES), "poses": names,
-                   "source": source, "r2": r2.tolist()}, fh, indent=2)
-    print(f"\n[teach] 写入 {args.out}")
-    print(f"[teach] 用它:  python manus_node.py --fit {args.out} --listen-only --print")
+                   "source": source, "r2": r2.tolist(),
+                   "labels": labels,
+                   # raw samples, so the fit can be revisited without asking the
+                   # operator to pose nineteen times again
+                   "E": E.tolist(), "Q": Q.tolist()}, fh, indent=2)
+    print(f"\n[teach] 写入 {out}")
+    print(f"[teach] 用它:  python manus_node.py --fit {out} --listen-only --print")
 
 
 if __name__ == "__main__":
