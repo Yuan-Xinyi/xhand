@@ -53,16 +53,16 @@ public class ManusUdpBridge : MonoBehaviour
         if (Time.unscaledTime < _next) return;
         _next = Time.unscaledTime + 1f / Mathf.Max(1f, sendRateHz);
 
+        // NOTE: this is CommunicationHub.ErgonomicsStream, the plugin's own
+        // wrapper -- a List<CoreSDK.ErgonomicsData>, NOT the flat SDK struct
+        // with its fixed array and dataCount.  Only the inner ErgonomicsData
+        // (isUserID + float[40]) comes straight from the SDK.
         var stream = CommunicationHub.ergonomicsData;
-        if (stream.data == null) return;
+        if (stream.data == null || stream.data.Count == 0) return;
 
-        // data is a fixed 32-entry array; dataCount says how many are live.
-        int n = Mathf.Min((int)stream.dataCount, stream.data.Length);
         int offset = rightHand ? 20 : 0;
-
-        for (int k = 0; k < n; k++)
+        foreach (var ergo in stream.data)
         {
-            var ergo = stream.data[k];
             if (ergo.isUserID || ergo.data == null || ergo.data.Length < offset + 20) continue;
 
             bool any = false;
