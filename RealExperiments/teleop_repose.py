@@ -35,7 +35,18 @@ import foundationpose_repose_real as rr
 
 import numpy as np
 
-GLOVE_UDP = ("127.0.0.1", 9881)
+GLOVE_UDP = ("0.0.0.0", 9881)   # bind all: the bridge may come from another host
+
+# Manus Core ergonomics layout: 20 values per hand, degrees, in this order.
+MANUS_ERGO = [
+    "thumb_cmc_spread", "thumb_cmc", "thumb_mcp", "thumb_ip",
+    "index_spread", "index_mcp", "index_pip", "index_dip",
+    "middle_spread", "middle_mcp", "middle_pip", "middle_dip",
+    "ring_spread", "ring_mcp", "ring_pip", "ring_dip",
+    "pinky_spread", "pinky_mcp", "pinky_pip", "pinky_dip",
+]
+# Manus "thumb_cmc_spread" drives the XHand thumb rotation joint
+ERGO_ALIAS = {"thumb_cmc_spread": "thumb_rot"}
 
 # human joint -> (xhand joint, human range [rad], invert)
 RETARGET = {
@@ -54,12 +65,51 @@ RETARGET = {
 }
 
 
-def retarget(human: dict) -> np.ndarray:
+CALIB_YAML = os.path.join(HERE, "teleop_glove_calib.yaml")
+
+
+def load_calib() -> dict:
+    if not os.path.exists(CALIB_YAML):
+        return {}
+    import yaml
+    with open(CALIB_YAML) as f:
+        return yaml.safe_load(f) or {}
+
+
+def run_calibration(glove, secs: float = 12.0) -> dict:
+    """Record each human joint's min/max while the user opens and closes."""
+    print(f"[calib] open and close your hand fully, a few times, for {secs:.0f} s ...")
+    lo: dict[str, float] = {}
+    hi: dict[str, float] = {}
+    t0 = time.time()
+    while time.time() - t0 < secs:
+        human, _ = glove.poll()
+        for k, v in human.items():
+            lo[k] = min(lo.get(k, v), v)
+            hi[k] = max(hi.get(k, v), v)
+        left = secs - (time.time() - t0)
+        if int(left * 2) % 4 == 0:
+            print(f"\r[calib] {left:4.1f}s  joints seen: {len(lo)}   ", end="", flush=True)
+        time.sleep(0.02)
+    print()
+    calib = {k: [float(lo[k]), float(hi[k])] for k in lo if hi[k] - lo[k] > math.radians(5)}
+    import yaml
+    with open(CALIB_YAML, "w") as f:
+        yaml.safe_dump(calib, f)
+    print(f"[calib] saved {len(calib)} joint ranges -> {CALIB_YAML}")
+    for k, (a, b) in sorted(calib.items()):
+        print(f"    {k:18s} {math.degrees(a):+6.1f} .. {math.degrees(b):+6.1f} deg")
+    return calib
+
+
+def retarget(human: dict, calib: dict | None = None) -> np.ndarray:
     """Human joint angles -> XHand 12 targets (Isaac order), linearly range-mapped."""
     q = np.zeros(12, dtype=np.float32)
     for hname, (xname, (h_lo, h_hi), inv) in RETARGET.items():
         if hname not in human:
             continue
+        if calib and hname in calib:
+            h_lo, h_hi = calib[hname]
         j = rr.ISAAC12.index(xname)
         a = float(np.clip((human[hname] - h_lo) / max(1e-6, h_hi - h_lo), 0.0, 1.0))
         if inv:
@@ -86,6 +136,12 @@ class UdpGlove:
                 msg = json.loads(data.decode())
             except (UnicodeDecodeError, json.JSONDecodeError):
                 continue
+            if "ergo" in msg:   # raw Manus ergonomics array (degrees)
+                vals = msg["ergo"]
+                got = {}
+                for name, v in zip(MANUS_ERGO, vals):
+                    got[ERGO_ALIAS.get(name, name)] = math.radians(float(v))
+                self.human.update(got)
             self.human.update(msg.get("joints", {}))
             self.stamp = time.time()
         return self.human, self.stamp
@@ -122,6 +178,8 @@ def main():
     p.add_argument("--pose-source", choices=["tracker", "none"], default="tracker")
     p.add_argument("--run-log-dir", default=os.path.join(HERE, "runlogs"))
     p.add_argument("--print-every", type=int, default=20)
+    p.add_argument("--calibrate", action="store_true",
+                   help="record your hand's joint ranges first (open/close for 12 s)")
     args = p.parse_args()
     args.log_npz = None
     log_path, npz_path = rr.start_run_log(args)
@@ -129,7 +187,17 @@ def main():
 
     glove = SyntheticGlove() if args.source == "synthetic" else UdpGlove()
     if args.source == "udp":
-        print(f"[teleop] waiting for glove packets on udp://{GLOVE_UDP[0]}:{GLOVE_UDP[1]} ...")
+        print(f"[teleop] listening for glove packets on udp://{GLOVE_UDP[0]}:{GLOVE_UDP[1]} ...")
+        t0 = time.time()
+        while not glove.poll()[0] and time.time() - t0 < 60:
+            time.sleep(0.1)
+        if not glove.poll()[0]:
+            raise RuntimeError("no glove packets in 60 s — is the Windows bridge running "
+                               "and pointed at this host:9881?")
+        print(f"[teleop] glove connected ({len(glove.poll()[0])} joints)")
+    calib = run_calibration(glove) if args.calibrate else load_calib()
+    if calib:
+        print(f"[teleop] using calibrated ranges for {len(calib)} joints")
 
     hw = None
     if args.real:
@@ -182,7 +250,7 @@ def main():
                     print("[teleop] no fresh glove data — holding")
                 desired = prev_targets
             else:
-                desired = retarget(human)
+                desired = retarget(human, calib)
             smooth = desired if smooth is None else args.ema * desired + (1 - args.ema) * smooth
             targets = smooth.copy()
             if args.lead_cap > 0:
