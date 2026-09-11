@@ -666,6 +666,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hand-tor-max", type=int, default=150,
                    help="XHand firmware torque cap (default 300 = full). Lower = more compliant.")
     p.add_argument("--hand-kp", type=int, default=100, help="XHand firmware position-loop gain")
+    p.add_argument("--release-after", type=float, default=1.0,
+                   help="s a joint may sit blocked (target pinned at the lead cap, joint not moving) "
+                        "before it is briefly retracted. This is the unlock the policy itself uses in "
+                        "sim: forces drop to ~0, the cube frees up, fingers re-grip. 0 = off.")
+    p.add_argument("--release-rad", type=float, default=0.12, help="retraction depth per release [rad]")
+    p.add_argument("--release-hold", type=float, default=0.3, help="retraction duration [s]")
     p.add_argument("--action-gain", type=float, default=1.15,
                    help="multiply the policy action before rescaling to joint targets "
                         "(>1 = larger commanded motion; clipped to [-1,1])")
@@ -1065,6 +1071,7 @@ def main() -> None:
             STATE_UDP,
         )
 
+    prev_hand_q = None
     center_offset = np.zeros(3)
 
     def cube_env_pose() -> np.ndarray | None:
@@ -1144,6 +1151,11 @@ def main() -> None:
             "hand_q": [], "targets": []} if args.log_npz else None)
 
     last_obj_quat = None
+    blocked_steps = np.zeros(12, dtype=np.int32)
+    q_hist: list[np.ndarray] = []   # recent measured joints, for the windowed stall test
+    release_left = np.zeros(12, dtype=np.int32)
+    release_ref = np.zeros(12, dtype=np.float32)
+    release_count = 0
 
     def soft_reset():
         """Mimic the sim episode reset: ramp the hand open (cube settles back into
@@ -1236,7 +1248,36 @@ def main() -> None:
                 # the cube is crushed, which is why dither never moved the
                 # contacting fingers (user observation, 2026-09-11).
                 if args.lead_cap > 0 and hand_q is not None:
+                    # detect joints pinned at the cap that are not actually moving
+                    if args.release_after > 0 and prev_hand_q is not None:
+                        # windowed travel test: per-step deltas sit at the encoder
+                        # jitter floor (0.0014 rad) for BOTH blocked and moving
+                        # joints, but 1 s travel separates them 25x (0.004 vs 0.105
+                        # rad, measured in repose_run5).
+                        q_hist.append(hand_q.copy())
+                        if len(q_hist) > 20:
+                            q_hist.pop(0)
+                        qh = np.asarray(q_hist)
+                        travel = qh.max(axis=0) - qh.min(axis=0) if len(q_hist) >= 10 else np.ones(12)
+                        pinned = (targets - hand_q) >= 0.95 * args.lead_cap
+                        frozen = travel < 0.02
+                        blocked_steps = np.where(pinned & frozen, blocked_steps + 1, 0)
+                        trigger = (blocked_steps >= int(args.release_after / STEP_DT)) & (release_left <= 0)
+                        if trigger.any():
+                            release_left[trigger] = int(args.release_hold / STEP_DT)
+                            release_ref[trigger] = hand_q[trigger]
+                            blocked_steps[trigger] = 0
+                            q_hist.clear()
+                            release_count += int(trigger.sum())
+                            if step % 20 == 0 or release_count < 5:
+                                names = [ISAAC12[j] for j in np.where(trigger)[0]]
+                                print(f"[release] step {step}: freeing {', '.join(names)}")
                     targets = np.clip(targets, hand_q - args.lead_cap, hand_q + args.lead_cap)
+                    # active retraction overrides the cap (opening never crushes)
+                    act_rel = release_left > 0
+                    if act_rel.any():
+                        targets[act_rel] = release_ref[act_rel] - args.release_rad
+                        release_left[act_rel] -= 1
                 targets = np.clip(targets, LOWER, UPPER).astype(np.float32)
 
                 if hw is not None and args.execute:
@@ -1245,8 +1286,10 @@ def main() -> None:
                     serial_times.append(time.perf_counter() - t_ser)
                     # closed-loop obs: the policy sees where the fingers ARE (a
                     # finger blocked by the cube no longer lies in the obs)
+                    prev_hand_q = hand_q
                     hand_q = q_meas if q_meas is not None else targets
                 else:
+                    prev_hand_q = hand_q
                     hand_q = targets
                 prev_targets = targets
                 prev_action = action
@@ -1305,6 +1348,8 @@ def main() -> None:
                 next_t = time.perf_counter()
     finally:
         print(f"[run] stopped: {stop_reason}; consecutive successes: {successes}")
+    if args.release_after > 0:
+        print(f"[release] {release_count} blocked-joint releases triggered")
         if len(work_times) > 10:
             wt = np.array(work_times[1:])
             print(f"[timing] work/cycle p50 {np.percentile(wt, 50) * 1000:.1f}ms "
