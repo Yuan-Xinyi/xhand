@@ -44,6 +44,62 @@ SLOTS_4 = (JT_PROXIMAL, JT_INTERMEDIATE, JT_DISTAL, JT_TIP)
 SLOTS_THUMB = (JT_METACARPAL, JT_PROXIMAL, JT_DISTAL, JT_TIP)
 
 
+def quat_to_R(q):
+    """(x, y, z, w) -> 3x3 rotation matrix."""
+    x, y, z, w = q
+    n = x * x + y * y + z * z + w * w
+    if n < 1e-12:
+        return np.eye(3)
+    s = 2.0 / n
+    xx, yy, zz = x * x * s, y * y * s, z * z * s
+    xy, xz, yz = x * y * s, x * z * s, y * z * s
+    wx, wy, wz = w * x * s, w * y * s, w * z * s
+    return np.array([
+        [1.0 - (yy + zz), xy - wz, xz + wy],
+        [xy + wz, 1.0 - (xx + zz), yz - wx],
+        [xz - wy, yz + wx, 1.0 - (xx + yy)],
+    ])
+
+
+def forward_kinematics(local, node_ids, parent_ids):
+    """Compose a parent-relative pose tree into world positions.
+
+    MANUS's raw skeleton is a LOCAL tree -- every non-metacarpal node reads
+    (0, 0, boneLength) in its parent's frame -- so the positions mean nothing
+    until the chain is walked.  `local` is (N, 7): xyz then quaternion xyzw.
+    """
+    n = len(local)
+    row_of = {int(nid): i for i, nid in enumerate(node_ids)}
+
+    children = [[] for _ in range(n)]
+    roots = []
+    for i in range(n):
+        par = row_of.get(int(parent_ids[i]))
+        if par is None or par == i:          # parent outside this skeleton
+            roots.append(i)
+        else:
+            children[par].append(i)
+    if not roots:
+        raise ValueError("skeleton has no root node")
+
+    Rw = [None] * n
+    pw = [None] * n
+    stack = [(r, None) for r in roots]
+    while stack:
+        i, par = stack.pop()
+        Rl, pl = quat_to_R(local[i, 3:7]), local[i, 0:3]
+        if par is None:
+            Rw[i], pw[i] = Rl, pl.copy()
+        else:
+            Rw[i] = Rw[par] @ Rl
+            pw[i] = pw[par] + Rw[par] @ pl
+        stack.extend((c, i) for c in children[i])
+
+    if any(p is None for p in pw):
+        raise ValueError("skeleton parentage is cyclic; some nodes unreachable")
+    return np.asarray(pw)
+
+
 def build_index_map(meta):
     """(chainType, fingerJointType) per node -> indices of the 21 MANO slots.
 
@@ -51,7 +107,8 @@ def build_index_map(meta):
     enough of the hand to fill them.
     """
     idx = [None] * 21
-    for node_i, (chain, jt) in enumerate(meta):
+    for node_i, row in enumerate(meta):
+        chain, jt = row[0], row[1]
         if chain == CHAIN_HAND and idx[0] is None:
             idx[0] = node_i
             continue
@@ -125,6 +182,17 @@ class SkeletonRetargeter:
         return self.rt.retarget(canonical_frame(kp))
 
 
+_last_warn = [0.0]
+
+
+def warn(msg):
+    """Rate-limited: a malformed stream would otherwise print at 60 Hz."""
+    now = time.time()
+    if now - _last_warn[0] > 1.0:
+        _last_warn[0] = now
+        print(f"[skel][WARN] {msg}", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bind", default="0.0.0.0")
@@ -160,8 +228,25 @@ def main():
             return None
         try:
             msg = json.loads(newest.decode("ascii"))
-            return np.asarray(msg["skel"], dtype=float), msg["meta"]
-        except (ValueError, KeyError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError):
+            return None            # truncated datagram; the next one will do
+
+        local = np.asarray(msg.get("skel", []), dtype=float)
+        meta = msg.get("meta", [])
+        if local.ndim != 2 or local.shape[1] != 7 or len(meta) != len(local):
+            warn(f"expected N x 7 local poses with matching meta, got "
+                 f"{local.shape} and {len(meta)} meta rows -- is the Unity side "
+                 f"still running the OLD ManusUdpBridge?")
+            return None
+        if any(len(m) < 4 for m in meta):
+            warn("meta rows lack nodeId/parentId; update ManusSkeletonBridge.cs")
+            return None
+
+        ids = msg.get("ids") or [m[2] for m in meta]
+        try:
+            return forward_kinematics(local, ids, [m[3] for m in meta]), meta
+        except ValueError as e:
+            warn(str(e))
             return None
 
     if args.dump:
@@ -174,10 +259,23 @@ def main():
                 continue
             kp, meta = got
             print(f"\n{len(meta)} nodes:\n")
-            print(f"{'node':>5s} {'chain':>10s} {'joint':>13s}   position")
-            for i, (c, j) in enumerate(meta):
-                print(f"{i:5d} {names.get(c, str(c)):>10s} {jts.get(j, str(j)):>13s}   "
+            print(f"{'node':>5s} {'id':>4s} {'par':>4s} {'chain':>10s} "
+                  f"{'joint':>13s}   WORLD position (after FK)")
+            for i, row in enumerate(meta):
+                c, j = row[0], row[1]
+                nid = row[2] if len(row) > 2 else i
+                par = row[3] if len(row) > 3 else -1
+                print(f"{i:5d} {nid:4d} {par:4d} {names.get(c, str(c)):>10s} "
+                      f"{jts.get(j, str(j)):>13s}   "
                       f"[{kp[i][0]:8.4f} {kp[i][1]:8.4f} {kp[i][2]:8.4f}]")
+            try:
+                k = kp[build_index_map(meta)]
+                print(f"\n  wrist -> middle tip : {np.linalg.norm(k[12] - k[0]):.4f}")
+                print(f"  index MCP -> pinky  : {np.linalg.norm(k[17] - k[5]):.4f}")
+                print("  a real hand is ~0.18 and ~0.08; near-zero means the FK "
+                      "did not compose")
+            except ValueError:
+                pass
             try:
                 print("\nderived MANO map:", build_index_map(meta))
             except ValueError as e:

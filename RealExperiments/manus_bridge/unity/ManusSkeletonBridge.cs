@@ -12,11 +12,13 @@
 //   3. Disable any ManusUdpBridge component on the same scene
 //
 // Wire format (matches tools/teleop/manus_skel_node.py), one datagram per frame:
-//   {"skel":[[x,y,z],...],"meta":[[chainType,fingerJointType],...]}
+//   {"skel":[[x,y,z, qx,qy,qz,qw], ...],          // LOCAL pose, parent-relative
+//    "meta":[[chainType,fingerJointType,nodeId,parentId], ...],
+//    "ids" :[nodeId, ...]}                        // per skel row, to match meta
 //
-// meta rides along every frame on purpose: it is small, and it lets the Linux
-// side work out which node is which without this file having to encode any
-// assumption about MANUS's node ordering.
+// meta and ids ride along every frame on purpose: they are small, and they let
+// the Linux side work out which node is which and how the chain composes,
+// without this file encoding any assumption about MANUS's node ordering.
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
@@ -104,21 +106,34 @@ public class ManusSkeletonBridge : MonoBehaviour
                 if (info[i].side == wantSide) { sideMatches = true; break; }
             if (!sideMatches) continue;
 
+            // The raw skeleton is a LOCAL pose tree -- each node's transform is
+            // relative to its parent, which is why every non-metacarpal node
+            // reads (0, 0, boneLength). Ship rotation and parentage too so the
+            // Linux side can compose the chain into world positions.
             _sb.Clear();
             _sb.Append("{\"skel\":[");
             for (int i = 0; i < skel.nodes.Length; i++)
             {
-                var p = skel.nodes[i].transform.position;
+                var t = skel.nodes[i].transform;
                 if (i > 0) _sb.Append(',');
-                _sb.Append('[').Append(F(p.x)).Append(',').Append(F(p.y))
-                   .Append(',').Append(F(p.z)).Append(']');
+                _sb.Append('[').Append(F(t.position.x)).Append(',').Append(F(t.position.y))
+                   .Append(',').Append(F(t.position.z)).Append(',')
+                   .Append(F(t.rotation.x)).Append(',').Append(F(t.rotation.y)).Append(',')
+                   .Append(F(t.rotation.z)).Append(',').Append(F(t.rotation.w)).Append(']');
             }
             _sb.Append("],\"meta\":[");
             for (int i = 0; i < info.Length; i++)
             {
                 if (i > 0) _sb.Append(',');
                 _sb.Append('[').Append((int)info[i].chainType).Append(',')
-                   .Append((int)info[i].fingerJointType).Append(']');
+                   .Append((int)info[i].fingerJointType).Append(',')
+                   .Append(info[i].nodeId).Append(',').Append(info[i].parentId).Append(']');
+            }
+            _sb.Append("],\"ids\":[");
+            for (int i = 0; i < skel.nodes.Length; i++)
+            {
+                if (i > 0) _sb.Append(',');
+                _sb.Append(skel.nodes[i].id);
             }
             _sb.Append("]}");
 
