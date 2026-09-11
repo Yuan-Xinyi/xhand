@@ -722,6 +722,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--arm-q", type=float, nargs=7, default=None,
                    help="arm joints holding the wrist (dry-run only; --real reads the robot)")
     p.add_argument("--print-every", type=int, default=20)
+    p.add_argument("--run-log-dir", default=str(Path(__file__).resolve().parent / "runlogs"),
+                   help="every run tees its console output and data here (latest.log / latest.npz)")
     p.add_argument("--log-npz", default=None, help="record obs/actions/poses for offline analysis")
     # tracker passthrough
     p.add_argument("--roi", type=int, nargs=4, default=None, metavar=("X", "Y", "W", "H"))
@@ -777,6 +779,52 @@ def scaled_cube_mesh(edge: float) -> str:
     return out
 
 
+class _Tee:
+    """Mirror a stream to a file so every run leaves an analysable log."""
+
+    def __init__(self, stream, fh):
+        self._s, self._f = stream, fh
+
+    def write(self, data):
+        self._s.write(data)
+        self._f.write(data)
+        self._f.flush()
+        return len(data)
+
+    def flush(self):
+        self._s.flush()
+        self._f.flush()
+
+    def isatty(self):
+        return self._s.isatty()
+
+    def fileno(self):
+        return self._s.fileno()
+
+
+def start_run_log(args: argparse.Namespace) -> tuple[str, str]:
+    """Tee stdout/stderr into runlogs/run_<stamp>.log and point latest.* at it."""
+    d = Path(args.run_log_dir).expanduser()
+    d.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    log_path = d / f"run_{stamp}.log"
+    fh = open(log_path, "w", buffering=1)
+    sys.stdout = _Tee(sys.stdout, fh)
+    sys.stderr = _Tee(sys.stderr, fh)
+    npz_path = args.log_npz or str(d / f"run_{stamp}.npz")
+    for name, target in (("latest.log", log_path), ("latest.npz", Path(npz_path))):
+        link = d / name
+        try:
+            if link.is_symlink() or link.exists():
+                link.unlink()
+            link.symlink_to(target)
+        except OSError:
+            pass
+    print(f"[log] console -> {log_path}")
+    print(f"[log] data    -> {npz_path}   (symlinks: {d}/latest.log, latest.npz)")
+    return str(log_path), npz_path
+
+
 def spawn_tracker(args: argparse.Namespace) -> subprocess.Popen:
     cmd = (
         "source ~/miniconda3/etc/profile.d/conda.sh && conda activate env_isaaclab && "
@@ -790,8 +838,12 @@ def spawn_tracker(args: argparse.Namespace) -> subprocess.Popen:
         cmd += f" --serial {args.serial}"
     if args.no_view:
         cmd += " --no-view"
-    print("[tracker] spawning FoundationPose tracker (env_isaaclab)...")
-    return subprocess.Popen(["bash", "-c", cmd], start_new_session=True)
+    tlog = getattr(args, "_tracker_log", None)
+    print(f"[tracker] spawning FoundationPose tracker (env_isaaclab)"
+          + (f", output -> {tlog}" if tlog else "") + "...")
+    out = open(tlog, "w", buffering=1) if tlog else None
+    return subprocess.Popen(["bash", "-c", cmd], start_new_session=True,
+                            stdout=out, stderr=subprocess.STDOUT if out else None)
 
 
 def spawn_mirror(args: argparse.Namespace) -> subprocess.Popen:
@@ -809,6 +861,8 @@ PIPELINE_VERSION = "2026-09-10-r6 (calib-persist-check)"
 
 def main() -> None:
     args = parse_args()
+    log_path, args.log_npz = start_run_log(args)
+    args._tracker_log = log_path.replace(".log", ".tracker.log")
     print(f"[version] {PIPELINE_VERSION}")
     if args.execute and not args.real:
         raise ValueError("--execute requires --real")
