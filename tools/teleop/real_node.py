@@ -322,14 +322,17 @@ def main():
             run_teleop(hand, args)
     finally:
         if hand is not None:
-            # An impatient second Ctrl-C lands mid-close(); retry once so the fd
-            # is released rather than left busy for the next run.
+            # An impatient second Ctrl-C lands mid-close(); retry so the fd is
+            # released rather than left busy. EBADF on the retry just means the
+            # first attempt had already closed it before being interrupted.
             for _ in range(2):
                 try:
                     hand.close()
                     break
                 except KeyboardInterrupt:
                     continue
+                except OSError:
+                    break
             print("[real] serial closed.", flush=True)
 
 

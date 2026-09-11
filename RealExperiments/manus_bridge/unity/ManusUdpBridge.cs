@@ -21,8 +21,10 @@ using Manus;          // CommunicationHub / ManusManager
 
 public class ManusUdpBridge : MonoBehaviour
 {
-    [Tooltip("IP of the Linux machine running manus_node.py")]
-    public string linuxHost = "192.168.1.33";
+    [Tooltip("Where manus_node.py listens. Prefer the subnet broadcast address " +
+             "(x.y.z.255) so a DHCP lease change on the Linux box cannot silently " +
+             "strand the stream -- manus_node binds 0.0.0.0 and takes it either way.")]
+    public string linuxHost = "192.168.1.255";
     public int linuxPort = 9881;
     [Tooltip("XHand is a right hand; uncheck only to stream the left glove")]
     public bool rightHand = true;
@@ -49,6 +51,7 @@ public class ManusUdpBridge : MonoBehaviour
         // before we start reading its static stream.
         var hub = ManusManager.communicationHub;
         _udp = new UdpClient();
+        _udp.EnableBroadcast = true;   // required if linuxHost is a .255 address
         _dst = new IPEndPoint(IPAddress.Parse(linuxHost), linuxPort);
         Debug.Log($"[ManusUdpBridge] hub={(hub != null ? "up" : "NULL")}, sending " +
                   $"{(rightHand ? "RIGHT" : "LEFT")} hand to {linuxHost}:{linuxPort}");
