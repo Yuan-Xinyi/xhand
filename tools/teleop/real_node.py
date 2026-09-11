@@ -322,8 +322,15 @@ def main():
             run_teleop(hand, args)
     finally:
         if hand is not None:
-            hand.close()
-            print("[real] serial closed.")
+            # An impatient second Ctrl-C lands mid-close(); retry once so the fd
+            # is released rather than left busy for the next run.
+            for _ in range(2):
+                try:
+                    hand.close()
+                    break
+                except KeyboardInterrupt:
+                    continue
+            print("[real] serial closed.", flush=True)
 
 
 if __name__ == "__main__":
