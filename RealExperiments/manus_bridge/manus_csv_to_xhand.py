@@ -105,12 +105,15 @@ RETARGET = {
 }
 
 # Joints whose URDF positive direction opposes the channel now driving them.
-# thumb_joint0 rising sweeps the tip from x=+0.105 (splayed outboard of the index
-# at +0.026) in to x=+0.044, i.e. toward the fingers, while mcpstretch is HIGH
-# when the thumb is splayed out and LOW across the palm -- hence the flip.
-# thumb_joint1 rising lifts the tip +53 mm clear of the palm and mcpspread rises
-# on exactly that motion, so it needs no flip.
-INVERT = {"thumb_joint0"}
+# Both entries are from watching the real hand, not from reading the URDF: two
+# earlier attempts to derive thumb directions geometrically were wrong because
+# the palm frame is not what it looks like. The four finger bases all sit at
+# z~0.105, y~-0.006, spread along x -- so +z runs out along the fingers and the
+# palm normal is y, not z. Anything reasoned from "z is the palm normal" is void.
+#
+# Use --invert to re-test on hardware if a joint ever looks backwards again;
+# that takes seconds, whereas re-deriving it on paper has now cost two rounds.
+INVERT = {"thumb_joint0", "thumb_joint1"}
 
 
 def norm_key(s):
