@@ -249,8 +249,20 @@ def scale_action(a: np.ndarray) -> np.ndarray:
     return 0.5 * (a + 1.0) * (UPPER - LOWER) + LOWER
 
 
+def goal_from_delta(delta: np.ndarray, q_now: np.ndarray) -> np.ndarray:
+    """Goal = rotate the CURRENT cube pose by delta (world/env frame).
+
+    The real cube's canonical mesh frame is whatever FoundationPose registered,
+    so an ABSOLUTE goal quat means an arbitrary (often ~180 deg) target the
+    moment the run starts — exactly what the field log showed. Goals must be
+    relative to where the cube actually is.
+    """
+    g = quat_mul(np.asarray(delta, dtype=np.float64), np.asarray(q_now, dtype=np.float64))
+    return (g / np.linalg.norm(g)).astype(np.float64)
+
+
 def sample_goal_quat_mode(rng: np.random.Generator, mode: str) -> np.ndarray:
-    """Goal sampling constrained to sim-verified difficulty tiers.
+    """Sample a goal DELTA rotation, constrained to sim-verified difficulty tiers.
 
     Bucket study (256 envs each, deployment obs stack): yaw 45/90 deg and
     roll(x) 45-180 deg all >=99.6% success; pitch(y) 90/180 and yaw 180 are
@@ -853,7 +865,9 @@ def main() -> None:
     else:
         print("[policy][WARN] deterministic actions — prone to frozen fixed points (sim: -13%% success)")
     rng = np.random.default_rng(args.goal_seed)
-    goal_quat = sample_goal_quat_mode(rng, args.goal_mode)
+    goal_delta = sample_goal_quat_mode(rng, args.goal_mode)
+    goal_quat = goal_delta  # placeholder until the first measured cube pose
+    goal_pending = True     # compose against the real orientation on step 0
     successes = 0
 
     # --- hand to home + cube placement (BEFORE the tracker: the ROI must be
@@ -1119,10 +1133,12 @@ def main() -> None:
     log = ({"obs": [], "action": [], "obj_pos": [], "obj_quat": [], "goal_quat": [], "t": [],
             "hand_q": [], "targets": []} if args.log_npz else None)
 
+    last_obj_quat = None
+
     def soft_reset():
         """Mimic the sim episode reset: ramp the hand open (cube settles back into
         the palm), clear the LSTM state, sample a fresh goal."""
-        nonlocal prev_targets, prev_action, hand_q, goal_quat
+        nonlocal prev_targets, prev_action, hand_q, goal_quat, last_obj_quat
         for _ in range(40):  # 2 s ramp to the open home pose + settle
             tg = prev_targets + np.clip(-prev_targets, -args.max_hand_step, args.max_hand_step)
             if hw is not None and args.execute:
@@ -1132,7 +1148,8 @@ def main() -> None:
             time.sleep(STEP_DT)
         policy.reset()
         prev_action = np.zeros(12, dtype=np.float32)
-        goal_quat = sample_goal_quat_mode(rng, args.goal_mode)
+        nonlocal_goal = sample_goal_quat_mode(rng, args.goal_mode)
+        goal_quat = goal_from_delta(nonlocal_goal, last_obj_quat) if last_obj_quat is not None else nonlocal_goal
         send_goal(-1.0)
         if receiver is not None:
             receiver.wait_fresh(args.max_pose_age, 3.0)
@@ -1224,11 +1241,17 @@ def main() -> None:
                 prev_targets = targets
                 prev_action = action
 
+                last_obj_quat = obj_quat
+                if goal_pending:
+                    goal_quat = goal_from_delta(goal_delta, obj_quat)
+                    goal_pending = False
+                    print(f"[goal] anchored to the measured cube pose: delta"
+                          f" {np.degrees(2 * math.asin(min(1.0, float(np.linalg.norm(goal_delta[1:]))))):.0f} deg")
                 rot_dist = rotation_distance(obj_quat, goal_quat)
                 send_goal(rot_dist)
                 if rot_dist <= args.success_tol:
                     successes += 1
-                    goal_quat = sample_goal_quat_mode(rng, args.goal_mode)
+                    goal_quat = goal_from_delta(sample_goal_quat_mode(rng, args.goal_mode), obj_quat)
                     last_event_t = time.perf_counter()
                     print(f"[goal] SUCCESS #{successes} at step {step}!"
                           f" next goal quat {np.array2string(goal_quat, precision=3)}")
