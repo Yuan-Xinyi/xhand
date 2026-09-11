@@ -119,9 +119,16 @@ def main() -> None:
                     help="also start arm_node.py: WASD keyboard jog of the real xArm7 TCP")
     ap.add_argument("--arm-args", default="",
                     help="extra args for arm_node.py, quoted string (e.g. \"--ip 192.168.1.205\")")
+    # glove perception instead of the camera
+    ap.add_argument("--manus", action="store_true",
+                    help="take joint targets from the MANUS gloves (manus_node.py) instead "
+                         "of the camera; the Unity bridge on the Windows box feeds it")
+    ap.add_argument("--glove-port", type=int, default=9881,
+                    help="UDP port the Unity bridge posts glove ergonomics to")
     # escape hatches for anything else
     ap.add_argument("--sim-args", default="", help="extra args for teleop_sim.py, quoted string")
     ap.add_argument("--perc-args", default="", help="extra args for perception_node.py, quoted string")
+    ap.add_argument("--manus-args", default="", help="extra args for manus_node.py, quoted string")
     args = ap.parse_args()
 
     link = ["--host", args.host, "--port", str(args.port)]
@@ -143,13 +150,18 @@ def main() -> None:
 
     arm_args = shlex.split(args.arm_args)
 
+    manus_args = link + ["--glove-port", str(args.glove_port)] + shlex.split(args.manus_args)
+
     if args.real:
         print(f"[teleop] REAL hand  ({PERC_ENV}): real_node.py {' '.join(real_args)}")
     else:
         print(f"[teleop] sim        ({SIM_ENV}): teleop_sim.py {' '.join(sim_args)}")
     if args.arm:
         print(f"[teleop] REAL arm   ({PERC_ENV}): arm_node.py {' '.join(arm_args)}")
-    print(f"[teleop] perception ({PERC_ENV}): perception_node.py {' '.join(perc_args)}")
+    if args.manus:
+        print(f"[teleop] gloves     ({PERC_ENV}): manus_node.py {' '.join(manus_args)}")
+    else:
+        print(f"[teleop] perception ({PERC_ENV}): perception_node.py {' '.join(perc_args)}")
 
     # a SIGTERM to the launcher must also tear the children down cleanly
     def _on_sigterm(*_):
@@ -166,7 +178,10 @@ def main() -> None:
             procs["sim"] = _spawn(SIM_ENV, "teleop_sim.py", sim_args)
         if args.arm:
             procs["arm"] = _spawn(PERC_ENV, "arm_node.py", arm_args)
-        procs["perception"] = _spawn(PERC_ENV, "perception_node.py", perc_args)
+        if args.manus:
+            procs["gloves"] = _spawn(PERC_ENV, "manus_node.py", manus_args)
+        else:
+            procs["perception"] = _spawn(PERC_ENV, "perception_node.py", perc_args)
 
         # babysit: if either side dies, tear the other down
         while True:
