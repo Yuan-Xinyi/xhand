@@ -34,6 +34,7 @@ public class ManusUdpBridge : MonoBehaviour
     UdpClient _udp;
     IPEndPoint _dst;
     float _next;
+    float _nextReport;
     int _sent;
     readonly StringBuilder _sb = new StringBuilder(512);
 
@@ -63,7 +64,13 @@ public class ManusUdpBridge : MonoBehaviour
         // with its fixed array and dataCount.  Only the inner ErgonomicsData
         // (isUserID + float[40]) comes straight from the SDK.
         var stream = CommunicationHub.ergonomicsData;
-        if (stream.data == null || stream.data.Count == 0) return;
+        if (stream.data == null || stream.data.Count == 0)
+        {
+            // Silence here is ambiguous -- asleep gloves, a dropped Manus Core
+            // link and "not in Play mode" all look identical from Linux. Say so.
+            Report("no ergonomics data (gloves asleep or Manus Core not streaming)");
+            return;
+        }
 
         int offset = rightHand ? 20 : 0;
         foreach (var ergo in stream.data)
@@ -73,7 +80,14 @@ public class ManusUdpBridge : MonoBehaviour
             bool any = false;
             for (int i = 0; i < 20; i++)
                 if (Mathf.Abs(ergo.data[offset + i]) > 1e-4f) { any = true; break; }
-            if (!any) continue;   // this glove carries no data for the requested hand
+            if (!any)
+            {
+                // All-zero for the hand we asked for. Usually means the glove
+                // being worn is the other one -- flip "Right Hand" to check.
+                Report($"{stream.data.Count} glove(s) streaming but all 20 " +
+                       $"{(rightHand ? "RIGHT" : "LEFT")} channels are zero");
+                continue;
+            }
 
             _sb.Clear();
             _sb.Append("{\"ergo\":[");
@@ -92,6 +106,15 @@ public class ManusUdpBridge : MonoBehaviour
                           $"indexStretch={ergo.data[offset + 5]:F1}");
             return;   // one glove per frame is enough
         }
+    }
+
+    // Throttled so a persistent fault states itself once a second instead of
+    // drowning the Console at frame rate.
+    void Report(string why)
+    {
+        if (!debugLog || Time.unscaledTime < _nextReport) return;
+        _nextReport = Time.unscaledTime + 1f;
+        Debug.LogWarning($"[ManusUdpBridge] not sending: {why}");
     }
 
     void OnDestroy()
