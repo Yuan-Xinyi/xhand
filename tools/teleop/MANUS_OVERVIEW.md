@@ -1,47 +1,14 @@
-# Manus 手套遥操 XHand — 技术概要
+# Manus 手套数据:Unity(Windows)→ Ubuntu 实时链路
 
-平台、通信、标定方法、结果。实现细节和踩坑记录见同目录 [`MANUS.md`](MANUS.md)。
-
----
-
-## 1. 这是什么
-
-一套遥操作管线:操作者戴 Manus 数据手套,实时驱动真实的 XHand 灵巧手。
-
-人手 20 维的关节数据映射到机械手的 12 个自由度,端到端延迟在一帧量级,下发频率 50 Hz。
-
-主要用途是**采集人类操作演示**,以及在开发阶段直接用人手验证机械手的能力边界 —— 有些问题(硬件能不能做到某个动作)让人亲手试一次,比反复调策略快得多。
+把 Manus Meta Gloves Pro 的手指数据实时送到 Ubuntu 上的完整方案。**含全部源码,照着做可复现。**
 
 ---
 
-## 2. 硬件与平台
+## 1. 为什么必须绕道 Unity
 
-### 机器人侧(Linux)
+通常的做法是直接用 Manus 官方 C++ SDK,但本套设备做不到。
 
-| 项 | 规格 |
-|---|---|
-| 操作系统 | **Ubuntu 22.04.5 LTS**,内核 5.15.0-174-generic |
-| CPU / GPU | Intel i7-13700KF / NVIDIA RTX 4090 24 GB(驱动 580.126.20) |
-| 灵巧手 | XHand(右手),**12 个驱动自由度** |
-| 手部通信 | RS-485 over USB(FTDI FT232R),`/dev/ttyUSB0` @ **3 Mbaud** |
-| 机械臂 | xArm7,以太网 `192.168.1.205` |
-| Python | 3.10.20(conda 环境),numpy 1.26.4 + pyserial 3.5 |
-
-### 手套侧(Windows)
-
-| 项 | 规格 |
-|---|---|
-| 操作系统 | Windows 10/11 64-bit(**Manus Core 不支持 Linux**) |
-| 手套 | Manus Meta Gloves Pro,无线 dongle |
-| Manus Core | 3.0.x |
-| Unity 插件 | ManusUnityPlugin **v3.1.1** |
-| Unity 编辑器 | **6000.0.83f1 (LTS)** |
-
----
-
-## 3. 为什么没有用官方 C++ SDK
-
-Manus 的授权按功能组件卖,绑定硬件 dongle。本套设备实测:
+Manus 的授权按功能组件出售,绑定硬件 dongle。实测激活情况:
 
 | 组件 | 状态 |
 |---|---|
@@ -50,221 +17,473 @@ Manus 的授权按功能组件卖,绑定硬件 dongle。本套设备实测:
 | **sdk**(C++ SDK 远程模式) | ❌ |
 | **integrated**(C++ SDK 直连 dongle) | ❌ |
 
-**官方 C++ SDK 两种模式都被授权拦住了。** `libManusSDK.so` 和 `libManusSDK_Integrated.so` 都用不了(integrated 模式实测能取到 110 Hz 数据后被拒),随 SDK 附带的 ROS2 包用的是同一个动态库,一样不可用。
+后果:
 
-Manus Core 只能跑 Windows,Unreal 插件要 40 GB+,MotionBuilder 是付费软件 —— 所以 **Unity 插件是唯一免费可行的出口**。
+- `libManusSDK.so`(远程模式,Linux SDK 连 Windows 上的 Manus Core)—— 被拒
+- `libManusSDK_Integrated.so`(dongle 直插 Linux,不需要 Manus Core)—— 实测能取到 110 Hz 数据**然后被 license 拒绝**
+- SDK 自带的 ROS2 包用的是同一个动态库,一样不可用
 
-**本方案没有 C++ 代码**:Unity 侧是 C#,机器人侧是 Python。
+加上 **Manus Core 只支持 Windows 10/11**(官方明确不支持 Linux),Unreal 插件要 40 GB+,MotionBuilder 是付费软件 —— **Unity 插件是唯一免费可行的数据出口**。
+
+于是方案变成:在 Unity 里写一个 C# 组件读插件的数据,用 UDP 发给 Ubuntu。
+
+> 先确认自己的授权状态再决定要不要照抄本方案:如果你的 license 激活了 `sdk` 或 `integrated`,直接用官方 C++ SDK 更简单。在 Manus Core 的 license 页面可以看到组件列表。
 
 ---
 
-## 4. 通信
+## 2. 环境版本
+
+### Windows 侧
+
+| 项 | 版本 |
+|---|---|
+| 操作系统 | Windows 10/11 64-bit |
+| Manus Core | 3.0.x |
+| Manus Unity 插件 | ManusUnityPlugin **v3.1.1** |
+| Unity 编辑器 | **6000.0.83f1 (LTS)** |
+
+> Unity 版本说明:Manus 插件官方支持 Unity 6 / 2022.3 / 2021.3 / 2020.3。但 2022.3 已过支持期,**免费 Personal 授权装不了**(需 Industry/Enterprise),所以实际只能用 Unity 6,选 `6000.0.x LTS` 最稳。
+
+### Ubuntu 侧
+
+| 项 | 版本 |
+|---|---|
+| 操作系统 | **Ubuntu 22.04.5 LTS**,内核 5.15.0-174-generic |
+| Python | 3.10(接收端只用标准库,3.8+ 都行) |
+
+### 网络
+
+两台机器在同一个局域网。本文示例中 Windows 是 `192.168.1.17`,Ubuntu 是 `192.168.1.x`(**会变,见 §5.3**),子网广播地址 `192.168.1.255`。
+
+---
+
+## 3. 架构
 
 ```
-        Windows                              Linux (Ubuntu 22.04)
- ┌─────────────────┐
- │   Manus Core    │◀── 无线 dongle ── 手套
- └────────┬────────┘
-          │ 进程内(C# 插件)
- ┌────────▼──────────────┐
- │  Unity 6000.0.83f1    │   JSON / UDP :9881
- │  ManusUdpBridge.cs    │ ─────────────────────▶  manus_node.py
- │  (20 通道关节角)        │      (子网广播)                │
- └───────────────────────┘                                │ 二进制 UDP :51234
-                                                          │ (61 字节/帧)
-                                                          ▼
-                                                    real_node.py
-                                              RS-485 @3M, /dev/ttyUSB0
-                                                          │
-                                                          ▼
-                                                     真实 XHand
+   手套 ──无线 dongle──▶ ┌──────────────┐
+                        │  Manus Core  │   Windows
+                        └──────┬───────┘
+                               │ 进程内
+                        ┌──────▼──────────────┐
+                        │  Unity 编辑器        │
+                        │  Manus 插件 (C#)     │
+                        │        ↓            │
+                        │  ManusUdpBridge.cs  │  ← 我们写的,§4
+                        └──────┬──────────────┘
+                               │  JSON / UDP :9881
+                               │  发往子网广播 192.168.1.255
+                               │  ~90 Hz
+                               ▼
+                        ┌─────────────────────┐
+                        │  Ubuntu 22.04       │
+                        │  Python 接收端       │  ← §5
+                        └─────────────────────┘
 ```
 
-### 4.1 Unity → Linux
+数据从手套到 Ubuntu 一共三跳,只有中间那跳需要自己写。
 
-约 90 Hz,JSON over UDP,发往**子网广播地址** `192.168.1.255`:
+---
+
+## 4. Unity 侧(Windows)
+
+### 4.1 装 Unity
+
+1. 装 Unity Hub,登录账号,**激活免费 Personal 许可证**(齿轮 → Licenses → Add → Get a free personal license)。不激活的话 Install Editor 按钮不出现。
+2. Hub → Settings → Installs → **Installs location 改到非 C 盘**
+3. ⚠️ **装之前先加杀毒排除项**(管理员 PowerShell):
+
+```powershell
+foreach ($p in @("D:\Unity", "$env:LOCALAPPDATA\Unity", "$env:APPDATA\UnityHub")) {
+    New-Item -ItemType Directory -Path $p -Force | Out-Null
+    Add-MpPreference -ExclusionPath $p
+}
+```
+
+4. Install Editor → **Unity 6000.0.x (LTS)** → **模块一个都不勾**(不需要 Visual Studio,Unity 自带 C# 编译器;不需要任何平台 Build Support;Documentation 尤其不要)
+5. 装完**先验证完整性**再建项目:
+
+```powershell
+Get-ChildItem (@("$env:ProgramFiles\Unity\Hub\Editor") + (Get-PSDrive -PSProvider FileSystem | % { $_.Name + ':\Unity' }) | ? { Test-Path $_ }) -Directory -EA 0 | % {
+    $p = $_.FullName + '\Editor\Data\Resources\PackageManager'
+    "$($_.Name)  Server=$(Test-Path ($p + '\Server\UnityPackageManager.exe'))  Templates=$(Test-Path ($p + '\ProjectTemplates'))"
+}
+```
+
+`Server` 和 `Templates` 都必须是 `True`。任何一个 `False` 说明文件被杀毒隔离了,重装。(这一步不验的话,后面建项目会报 `com.unity.template.3d not found`,很难联想到是杀毒干的。)
+
+### 4.2 建项目并导入 Manus 插件
+
+1. New Project → **3D (Built-In Render Pipeline)** → 位置选非 C 盘
+2. 菜单 `Assets` → `Import Package` → `Custom Package` → 选 `ManusUnityPlugin_v3.1.1.unitypackage` → `Import`
+3. 等编译完,Console 不该有红色错误
+
+**注意:插件不需要往场景里拖任何东西。** `CommunicationHub` 不是 MonoBehaviour(它自己的注释写着 *"This component should not be added to the scene manually"*),`ManusManager` 带 `[InitializeOnLoad]`,编辑器一加载就自动把通信跑起来了。
+
+### 4.3 桥接脚本
+
+在 `Assets/` 下新建 `ManusUdpBridge.cs`(文件名必须和类名一致):
+
+> Unity 6 把 `Create > C# Script` 挪到了 `Create > Scripting > MonoBehaviour Script`。更省事的做法是用记事本直接存一个 `.cs` 到 `Assets/` 目录,Unity 会自动认 —— 注意"保存类型"要选**所有文件**,否则会存成 `.txt`。
+
+```csharp
+// Forwards MANUS glove ergonomics to a listener on Linux over UDP.
+using System.Globalization;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using UnityEngine;
+using Manus;          // CommunicationHub / ManusManager
+
+public class ManusUdpBridge : MonoBehaviour
+{
+    [Tooltip("Where the Linux listener is. Prefer the subnet broadcast address " +
+             "(x.y.z.255) so a DHCP lease change on the Linux box cannot silently " +
+             "strand the stream -- the listener binds 0.0.0.0 and takes it either way.")]
+    public string linuxHost = "192.168.1.255";
+    public int linuxPort = 9881;
+    [Tooltip("Uncheck to stream the left glove instead")]
+    public bool rightHand = true;
+    [Tooltip("Send at most this many packets per second")]
+    public float sendRateHz = 90f;
+    [Tooltip("Log progress to the Console so you can verify movement")]
+    public bool debugLog = true;
+
+    UdpClient _udp;
+    IPEndPoint _dst;
+    float _next;
+    float _nextReport;
+    int _sent;
+    readonly StringBuilder _sb = new StringBuilder(512);
+
+    void Start()
+    {
+        // Without this the editor throttles Update() to a crawl the moment its
+        // window loses focus -- which is exactly when the operator looks at the
+        // robot -- and the stream looks like it disconnected.
+        Application.runInBackground = true;
+
+        // Touch the manager so the hub is definitely constructed and running
+        // before we start reading its static stream.
+        var hub = ManusManager.communicationHub;
+        _udp = new UdpClient();
+        _udp.EnableBroadcast = true;   // required if linuxHost is a .255 address
+        _dst = new IPEndPoint(IPAddress.Parse(linuxHost), linuxPort);
+        Debug.Log($"[ManusUdpBridge] hub={(hub != null ? "up" : "NULL")}, sending " +
+                  $"{(rightHand ? "RIGHT" : "LEFT")} hand to {linuxHost}:{linuxPort}");
+    }
+
+    void Update()
+    {
+        if (Time.unscaledTime < _next) return;
+        _next = Time.unscaledTime + 1f / Mathf.Max(1f, sendRateHz);
+
+        // NOTE: this is CommunicationHub.ErgonomicsStream, the plugin's own
+        // wrapper -- a List<CoreSDK.ErgonomicsData>, NOT the flat SDK struct
+        // with its fixed array and dataCount.  Only the inner ErgonomicsData
+        // (isUserID + float[40]) comes straight from the SDK.
+        var stream = CommunicationHub.ergonomicsData;
+        if (stream.data == null || stream.data.Count == 0)
+        {
+            // Silence here is ambiguous -- asleep gloves, a dropped Manus Core
+            // link and "not in Play mode" all look identical from Linux. Say so.
+            Report("no ergonomics data (gloves asleep or Manus Core not streaming)");
+            return;
+        }
+
+        int offset = rightHand ? 20 : 0;
+        foreach (var ergo in stream.data)
+        {
+            if (ergo.isUserID || ergo.data == null || ergo.data.Length < offset + 20) continue;
+
+            bool any = false;
+            for (int i = 0; i < 20; i++)
+                if (Mathf.Abs(ergo.data[offset + i]) > 1e-4f) { any = true; break; }
+            if (!any)
+            {
+                // All-zero for the hand we asked for. Usually means the glove
+                // being worn is the other one -- flip "Right Hand" to check.
+                Report($"{stream.data.Count} glove(s) streaming but all 20 " +
+                       $"{(rightHand ? "RIGHT" : "LEFT")} channels are zero");
+                continue;
+            }
+
+            _sb.Clear();
+            _sb.Append("{\"ergo\":[");
+            for (int i = 0; i < 20; i++)
+            {
+                if (i > 0) _sb.Append(',');
+                _sb.Append(ergo.data[offset + i].ToString("F3", CultureInfo.InvariantCulture));
+            }
+            _sb.Append("]}");
+
+            byte[] bytes = Encoding.ASCII.GetBytes(_sb.ToString());
+            _udp.Send(bytes, bytes.Length, _dst);
+            _sent++;
+            if (debugLog && _sent % 90 == 0)
+                Debug.Log($"[ManusUdpBridge] {_sent} packets, thumbStretch={ergo.data[offset + 1]:F1} " +
+                          $"indexStretch={ergo.data[offset + 5]:F1}");
+            return;   // one glove per frame is enough
+        }
+    }
+
+    // Throttled so a persistent fault states itself once a second instead of
+    // drowning the Console at frame rate.
+    void Report(string why)
+    {
+        if (!debugLog || Time.unscaledTime < _nextReport) return;
+        _nextReport = Time.unscaledTime + 1f;
+        Debug.LogWarning($"[ManusUdpBridge] not sending: {why}");
+    }
+
+    void OnDestroy()
+    {
+        _udp?.Close();
+        Debug.Log($"[ManusUdpBridge] stopped after {_sent} packets");
+    }
+}
+```
+
+### 4.4 挂到场景
+
+1. Hierarchy 空白处右键 → `Create Empty`
+2. 选中它 → Inspector → `Add Component` → 搜 `Manus Udp Bridge`(搜不到就把脚本从 Project 窗口**直接拖**到 Inspector 上)
+3. 确认 `Linux Host` = `192.168.1.255`、`Linux Port` = `9881`
+4. **Ctrl+S 保存场景** ← 别漏。Play 模式下建的物体退出 Play 时会被销毁;场景不存,重开 Unity 也会没。
+5. 按 ▶
+
+Console 应立即出现:
+
+```
+[ManusUdpBridge] hub=up, sending RIGHT hand to 192.168.1.255:9881
+```
+
+### 4.5 三处非显然的实现细节
+
+**① `Application.runInBackground = true`**
+不加的话,Unity 编辑器窗口一失去焦点就把 `Update()` 降到极低频。你切到 Ubuntu 终端看数据的那一刻流就停了,看起来像断联。
+
+**② 两个同名的 `ErgonomicsStream`**
+`CoreSDK.ErgonomicsStream` 是扁平的 marshalling 结构体(定长 `ErgonomicsData[32]` + `dataCount`);而 `CommunicationHub.ergonomicsData` 返回的是插件自己包装的 `CommunicationHub.ErgonomicsStream`(`List<CoreSDK.ErgonomicsData>`,**没有 `dataCount`**)。用错会编译不过(`.Count` vs `.Length`)。只有内层的 `ErgonomicsData` 是 SDK 原生类型。
+
+**③ 右手数据在 offset 20**
+`ErgonomicsData.data` 是 `float[40]`:前 20 个是左手,后 20 个是右手。
+
+---
+
+## 5. Ubuntu 侧
+
+### 5.1 数据格式
+
+UDP 载荷是一行 ASCII JSON,约 90 Hz:
 
 ```json
-{"ergo": [20 个浮点数, 单位度]}
+{"ergo": [20 个浮点数]}
 ```
 
-5 指 × (MCP 张开 / MCP 弯曲 / PIP 弯曲 / DIP 弯曲)。右手数据位于 SDK `float[40]` 的 offset 20。
+**单位是度。** 顺序固定为 5 指 × 4 通道,拇指在前:
 
-> 用广播而不是单播:Linux 的 DHCP 租约变更曾让整条链路静默中断,而每一层自查都显示正常。改广播后,操作者机器的 IP 不再位于关键路径上。
-
-### 4.2 Linux 内部
-
-```c
-struct {                    // 小端,无填充,共 61 字节
-    uint32  seq;            // 帧计数
-    float64 t;              // 发送时刻
-    uint8   valid;          // 1 = 本帧跟踪有效
-    float32 q[12];          // 12 个关节目标角(弧度)
-};
-```
-
-纯标准库实现。用 UDP 不用 TCP:遥操作只要最新的那一帧,丢包由下一帧补上,不能有队头阻塞。
-
-### 4.3 Linux → XHand
-
-| 项 | 值 |
+| 下标 | 含义 |
 |---|---|
-| 物理层 | RS-485 over USB(FTDI FT232R),3 Mbaud |
-| 帧头 | `0xAA55` |
-| 命令 | `0x02` = 位置控制(同一命令的响应回传实测关节角) |
-| 负载 | 12 × `FingerCommand`,每个 24 字节 |
-| 校验 | CRC16-XMODEM |
-| 回包 | 2208 字节(12 关节状态 + 5 指尖传感器) |
-| 下发频率 | 50 Hz |
+| 0–3 | thumb: MCPSpread, MCPStretch, PIPStretch, DIPStretch |
+| 4–7 | index: 同上 |
+| 8–11 | middle: 同上 |
+| 12–15 | ring: 同上 |
+| 16–19 | pinky: 同上 |
 
-> 固件对 `0x13`(版本查询)不响应,`0x02` 正常。判断手是否上电要用只读的 `--read`(零增益零力矩查询,不产生运动),不能靠 ping 不通就下结论。
+`MCPSpread` = 手指张开(侧摆),`MCPStretch` / `PIPStretch` / `DIPStretch` = 三个指节的弯曲。
+
+> ⚠️ 通道的**名字和它实际测量的东西不一定一致**,尤其是拇指。实测:`thumb.MCPSpread` 在拇指**抬离掌面**时最大(不是张开),`thumb.MCPStretch` 才是掌平面内的对掌动作。如果要把这些数映射到别的机械手上,**务必实测,不要照名字理解**。
+
+### 5.2 接收端(完整可运行)
+
+只用标准库,不依赖任何第三方包:
+
+```python
+#!/usr/bin/env python3
+"""Minimal receiver for the MANUS glove stream from Unity. Standard library only."""
+import argparse
+import json
+import socket
+import time
+
+FINGERS = ("thumb", "index", "middle", "ring", "pinky")
+CHANNELS = ("MCPSpread", "MCPStretch", "PIPStretch", "DIPStretch")
+LABELS = [f"{f}.{c}" for f in FINGERS for c in CHANNELS]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--bind", default="0.0.0.0",
+                    help="0.0.0.0 receives both unicast and subnet broadcast")
+    ap.add_argument("--port", type=int, default=9881)
+    ap.add_argument("--raw", action="store_true", help="print all 20 channels")
+    args = ap.parse_args()
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((args.bind, args.port))
+    sock.settimeout(1.0)
+    print(f"listening on udp://{args.bind}:{args.port}", flush=True)
+
+    n, t0 = 0, time.time()
+    while True:
+        try:
+            payload, addr = sock.recvfrom(4096)
+        except socket.timeout:
+            print("  no packets (is Unity in Play mode?)", flush=True)
+            continue
+        try:
+            ergo = json.loads(payload.decode("ascii"))["ergo"]
+        except (ValueError, KeyError, UnicodeDecodeError):
+            continue
+        n += 1
+
+        now = time.time()
+        if now - t0 >= 1.0:
+            print(f"\n{n} pkt/s from {addr[0]}", flush=True)
+            if args.raw:
+                for i in range(0, 20, 4):
+                    print("   " + "  ".join(f"{LABELS[i + k]:>16s}={ergo[i + k]:7.2f}"
+                                            for k in range(4)), flush=True)
+            else:
+                print("   " + "  ".join(f"{f}={ergo[4 * i + 2]:6.1f}deg"
+                                        for i, f in enumerate(FINGERS)), flush=True)
+            n, t0 = 0, now
+
+
+if __name__ == "__main__":
+    main()
+```
+
+跑:
+
+```bash
+python3 manus_recv_example.py --raw
+```
+
+正常输出:
+
+```
+listening on udp://0.0.0.0:9881
+
+90 pkt/s from 192.168.1.17
+    thumb.MCPSpread=   9.22  thumb.MCPStretch=  65.29  thumb.PIPStretch=  84.49  thumb.DIPStretch=  46.09
+    index.MCPSpread=   1.10  index.MCPStretch=  54.13  index.PIPStretch= 122.90  index.DIPStretch=  11.50
+    ...
+```
+
+### 5.3 为什么发广播而不是单播
+
+**这是本方案最重要的一个设计决定。**
+
+最初是单播到 Ubuntu 的固定 IP。某次 Ubuntu 的 WiFi DHCP 租约变更,地址从 `192.168.1.33` 变成 `.36`,Unity 仍然往 `.33` 发 —— 包进了虚空。
+
+麻烦的是**每一层从自己的角度看都是健康的**:
+
+- Manus Core:手套在线,数据在推
+- Unity Console:`hub=up`,还在打印发包计数
+- Ubuntu:"没收到包,Unity 在 Play 模式吗?"
+
+三边都"正常",排查花了很久。
+
+改发子网广播 `192.168.1.255` 后,接收端 bind `0.0.0.0` 就能收到,**操作者机器的 IP 不再位于关键路径上**。代价只是同网段其它机器会收到这些包(局域网内无所谓)。
+
+C# 侧必须设 `_udp.EnableBroadcast = true`,否则发 `.255` 会抛异常。
+
+### 5.4 UDP 缓冲区的坑
+
+如果接收端有"等待/倒计时"之类不读 socket 的阶段,**必须在等待期间持续排空 socket**:
+
+```python
+def drain(sock):
+    while True:
+        try:
+            sock.recv(65535)
+        except (BlockingIOError, OSError):
+            return
+```
+
+原因:Linux 的 UDP socket 缓冲区满了之后,内核丢弃的是**新到的包**、保留的是旧包。几秒不读就会塞满,之后拿到的全是陈旧数据,甚至整段采集为空。这个坑在本项目里踩了三次。
+
+遥操作只关心最新一帧,所以正确的读法是"排空到最后一个包,只用它":
+
+```python
+newest = None
+while True:
+    try:
+        newest = sock.recv(65535)
+    except (BlockingIOError, OSError):
+        break
+# 用 newest
+```
 
 ---
 
-## 5. 源码
+## 6. 验证与排障
 
-| 文件 | 语言 | 行数 | 职责 |
-|---|---|---|---|
-| `ManusUdpBridge.cs` | C# | 128 | Unity 插件 → UDP |
-| `manus_node.py` | Python | 240 | 20 通道 → 12 关节 |
-| `manus_teach.py` | Python | 358 | 标定(见下节) |
-| `protocol.py` | Python | 94 | 线协议,纯标准库 |
-| `real_node.py` | Python | 340 | RS-485 驱动 + 安全层 |
+### 6.1 分段验证
 
-约 1200 行,其中 C# 128 行。
-
----
-
-## 6. 标定方法
-
-### 6.1 问题
-
-手套给 20 个数,XHand 有 12 个关节。要建立 20 → 12 的映射,有三组未知量:
-
-- **归属** —— 哪个通道驱动哪个关节
-- **符号** —— 方向是正还是反
-- **量程** —— 人手转多少对应机械手转多少
-
-### 6.2 先后试过的方法
-
-| 方法 | 结果 |
+| 现象 | 结论 |
 |---|---|
-| 按 SDK 通道名称接线,量程用解剖学名义值 | 失败。名义量程比实测宽 5 倍,握拳只能到 1/3 行程;拇指方向错 |
-| 按机械手的 URDF 几何推方向 | 失败。手掌坐标系轴向判断错了,基于错轴推出的结论全部无效 |
-| 实测每个通道的真实行程 | 量程解决了,方向还是错 |
-| 按实测数据调换拇指的两个通道 | 还是错 |
+| Unity Console 没有 `hub=up` 那行 | 组件没在跑。检查 GameObject 是否激活、组件是否勾选、场景是否保存 |
+| 有 `hub=up`,但 Console 出现 `not sending: no ergonomics data` | 手套休眠或 Manus Core 没在推数据。**Manus 手套闲置会自动休眠**,动一动唤醒 |
+| 有 `hub=up`,Console 出现 `all 20 RIGHT channels are zero` | 戴的是另一只手套。Inspector 里改 `Right Hand` 勾选(Play 模式下可以直接改,立即生效) |
+| Unity 正常发包,Ubuntu 收不到 | 网络问题。见下 |
+| 一切正常但切到别的窗口就断 | 没加 `Application.runInBackground = true` |
 
-**这些方法有一个共同问题:都在推断手套那一侧的语义。** 三组未知量互相纠缠,而且"归属错"和"符号错"在真机上看起来一模一样,只能一个个试。每轮验证要几分钟,还得有人站在机器人前面。这是穷举,不是设计。
+### 6.2 网络排障
 
-### 6.3 采用的方法:机械手示教
+先用 PowerShell 直接发包,**绕开 Unity**,确认是网络还是 Unity 的问题:
 
-**把标定方向倒过来 —— 让机械手当老师。**
-
+```powershell
+$c = New-Object System.Net.Sockets.UdpClient
+$c.EnableBroadcast = $true
+$b = [Text.Encoding]::ASCII.GetBytes('{"ergo":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]}')
+1..60 | ForEach-Object { $c.Send($b, $b.Length, "192.168.1.255", 9881) | Out-Null; Start-Sleep -Milliseconds 100 }
+$c.Close()
 ```
-1. 程序把 XHand 摆到一个指定的关节角组合       ← 这个值是程序自己下发的,精确已知
-2. 操作者看着机械手,用戴手套的手摆成一样        ← 对应关系由人眼建立
-3. 记录这个姿势下手套的 20 个通道值
-4. 换下一个姿势,重复 19 次
-5. 用这 19 组数据拟合出 20 → 12 的映射
+
+Ubuntu 那边收到 → 网络通,问题在 Unity。收不到 → 检查防火墙、两台机是否真在同一网段。
+
+**双网卡同网段的坑:** 如果 Ubuntu 有两块网卡都在 `192.168.1.0/24`(比如有线 `.10` + 无线 `.36`),而 Windows 只在其中一侧,Ubuntu 主动发起的方向要手动加路由:
+
+```bash
+sudo ip route replace 192.168.1.17/32 dev wlo1 src 192.168.1.36
 ```
 
-归属、符号、量程、交叉耦合,**全部从这 19 组数据里解出来**,不需要任何关于手套通道的先验知识。
+(接收方向不受影响 —— 手套数据是单向 Windows→Ubuntu。)
 
-唯一需要的人工判断是"我的手看起来像不像那只机械手" —— 这恰好是人做得最可靠的事。
+### 6.3 Unity 侧的两个日常陷阱
 
-**19 个姿势**覆盖:全张开、握拳、四指各自单独弯曲、半弯、1/4 弯、食指侧摆两端、拇指三个自由度各自两端、拇指对掌、捏合、指点、勾状。原则是每个自由度都有单独动它的姿势,再加几个组合姿势提供真实的耦合关系。
+**改任何 `Assets/` 下的文件都会触发重编译,并自动退出 Play 模式。** 改完脚本记得重新按 ▶。
 
-**拟合用岭回归**,正则强度由留一交叉验证自动选。特征先标准化(不然各通道量纲差 10–130 度,正则强度会变成量纲的偶然产物)。原始数据一并存档,以后调整拟合参数可以离线重算,不用重新示教。
-
-**耗时:一个人约 2.5 分钟。**
+**Play 模式下创建的 GameObject,退出 Play 时会被销毁。** 一定要在非 Play 状态下建好、Ctrl+S 存场景。
 
 ---
 
-## 7. 结果
+## 7. 实测性能
 
-### 7.1 标定效果
-
-下表的 R² 可以直接理解为**"这个关节跟得有多准"**:1.0 = 完美跟随,0 = 完全跟不上。
-
-| 关节 | R² | 跟随质量 |
-|---|---|---|
-| `middle_joint1` | 0.985 | 很好 |
-| `ring_joint1` | 0.981 | 很好 |
-| `index_joint2` | 0.972 | 很好 |
-| `pinky_joint1` | 0.966 | 很好 |
-| `middle_joint0` | 0.954 | 很好 |
-| `ring_joint0` | 0.950 | 很好 |
-| `index_joint1` | 0.928 | 很好 |
-| `pinky_joint0` | 0.907 | 很好 |
-| `thumb_joint2` | 0.861 | 可用 |
-| `thumb_joint0` | 0.758 | 可用 |
-| `thumb_joint1` | 0.489 | 偏弱 |
-| `index_joint0` | 0.298 | 差 |
-
-**四个手指的 8 个关节都在 0.907 以上,跟随良好。** 拇指三个关节里两个可用、一个偏弱。
-
-### 7.2 一个额外的佐证:映射确实找对了
-
-看每个关节是被**哪些**手套通道决定的:
-
-```
-index_joint1  ← 食指的通道
-index_joint2  ← 食指的通道
-middle_joint0 ← 中指的通道
-middle_joint1 ← 中指的通道
-ring_joint0   ← 无名指的通道
-...
-```
-
-每根手指的关节,都是被**那根手指自己的**数据决定的。
-
-这件事的意义在于:**我从来没有告诉算法哪个通道属于哪根手指。** 这个对应关系是它自己从 19 组数据里找出来的。如果映射建错了,不可能出现这么整齐的结构。
-
-前面四次手写映射从来没达到过这个效果。
-
-### 7.3 两个跟不好的关节,原因清楚
-
-- **`index_joint0`(食指侧摆,R²=0.298)** —— 这个关节总共只能转 ±10°,机械手上肉眼几乎看不出区别,操作者没法照着摆。侧摆行程本身就小,对抓握影响有限。
-- **`thumb_joint1`(拇指第二关节,R²=0.489)** —— 人在模仿的时候容易连带整个拇指一起动,几个自由度混在一起了。重新示教时注意只动对应那一节,应该能提升。
-
-### 7.4 跟不好也不会出危险
-
-这个方法有个重要性质:**拟合不好表现为"这个关节动得少",而不是"反着动"。**
-
-回归不会产生和数据相反的方向,R² 低只是说响应弱。而前面手写映射的失效方式是**整个反向** —— 那种情况下机械手会朝错误方向发力,可能把物体顶飞。
-
-所以即使标定质量不理想,系统依然是安全的。
-
-### 7.5 链路性能
-
-| 环节 | 实测 |
+| 指标 | 实测 |
 |---|---|
-| Unity → Linux | 64–90 包/秒 |
-| 重定向 + 发布 | 60 Hz |
-| RS-485 下发 | 50 Hz |
-
-### 7.6 安全措施(始终启用)
-
-关节限位夹紧 · 速度限幅(默认 2.5 rad/s,首次运行建议 1.0)· 目标值平滑 · 首个目标取自实测手位(避免使能瞬间跳变)· 断流看门狗(超过 2 秒没数据就保持当前姿势,不松开也不抽搐)· 固件力矩上限(默认 300,首次运行建议 150)。
-
-### 7.7 当前状态
-
-**管线已打通,可以驱动真机。**
-
-待办:
-
-1. 特征标准化修好之后还没重新标定过
-2. `thumb_joint1` / `index_joint0` 的跟随质量待提升
-3. 真机驱动还没有轨迹记录,操作完没有数据可以事后分析
+| Unity → Ubuntu 包率 | 64–90 包/秒(由 `sendRateHz` 设定,实测能跑满) |
+| 单包大小 | 约 160 字节 ASCII |
+| 延迟 | 一帧量级,未单独测量 |
+| 稳定性 | 连续运行无丢流(前提是 `runInBackground` 已开、手套未休眠) |
 
 ---
 
-## 8. 结论
+## 8. 扩展:3D 骨架
 
-**标定的方向决定了出错的代价。**
+除了 20 个关节角,Manus 插件还能给**完整的 3D 手部骨架**(25 个节点,每个带位置和四元数),订阅方式:
 
-去推断手套那一侧的语义:出错只能上真机试,一轮几分钟,而且分不清错在归属还是符号。
+```csharp
+ManusManager.communicationHub.onRawSkeletonData.AddListener(OnRawSkeleton);
+// 节点语义(哪根手指、哪一节)另外查:
+ManusManager.communicationHub.GetRawSkeletonNodeInfo(gloveId, out CoreSDK.NodeInfo[] info);
+```
 
-让机械手示教:标签是程序自己下发的、精确已知,对应关系由人眼建立,剩下的交给回归。而且拟合不好只会表现为跟得迟钝,不会方向相反。
+⚠️ **原始骨架是父子相对的位姿树,不是世界坐标。** 每个非掌骨节点的位置读出来都是 `(0, 0, 骨节长度)`,x=y=0 —— 必须连同旋转和 `parentId` 一起取,在接收端做正运动学才能得到真实 3D 位置。
 
-这个方法不依赖手套型号,换别的数据手套、或者换别的多指灵巧手,都可以直接用。
+判据:合成正确的话,腕→中指尖约 0.18–0.21 m,食指根→小指根约 0.06–0.08 m。
+
+本仓库的 `ManusSkeletonBridge.cs` 和 `manus_skel_node.py` 实现了这条通路,可作参考。
