@@ -39,6 +39,11 @@ public class ManusUdpBridge : MonoBehaviour
 
     void Start()
     {
+        // Without this the editor throttles Update() to a crawl the moment its
+        // window loses focus -- which is exactly when the operator looks at the
+        // robot -- and the stream looks like it disconnected.
+        Application.runInBackground = true;
+
         // Touch the manager so the hub is definitely constructed and running
         // before we start reading its static stream.
         var hub = ManusManager.communicationHub;

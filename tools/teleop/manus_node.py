@@ -189,11 +189,17 @@ def main():
                 n_pkt = 0
                 t_report = now
     except KeyboardInterrupt:
-        print("\n[manus] stopped.")
+        pass
     finally:
-        rx.close()
-        if tx is not None:
-            tx.close()
+        # A second Ctrl-C lands here and would otherwise blow up the cleanup
+        # itself, leaving the sockets open and a traceback on screen.
+        try:
+            rx.close()
+            if tx is not None:
+                tx.close()
+        except KeyboardInterrupt:
+            pass
+        print("\n[manus] stopped.", flush=True)
 
 
 if __name__ == "__main__":
