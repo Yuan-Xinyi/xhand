@@ -647,7 +647,7 @@ def parse_args() -> argparse.Namespace:
                    help="exploration dither as a multiple of the policy's trained sigma "
                         "(1.0 = training-like, 0 = deterministic). Deterministic locks into "
                         "frozen fixed points: sim 79.7%% vs 93.0%% with dither.")
-    p.add_argument("--goal-mode", choices=["all", "easy", "yaw"], default="all",
+    p.add_argument("--goal-mode", choices=["all", "easy", "yaw"], default="yaw",
                    help="goal difficulty tier: yaw = vertical-axis 30-90 deg only (sim ~100%%), "
                         "easy = yaw + roll(x) (sim >=99.6%%), all = uniform random")
     p.add_argument("--cube-edge", type=float, default=0.06,
