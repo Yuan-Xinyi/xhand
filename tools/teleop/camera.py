@@ -135,8 +135,13 @@ def _is_if_variant(name: str) -> bool:
 
 def pick_realsense_serial(prefer: str | None = None):
     """Choose a RealSense serial. If `prefer` (name substring or serial) matches,
-    use it; else prefer a plain D435 over the D435IF (IR-filter variant, worse for
-    WiLoR). Returns (serial, name) or (None, None).
+    use it, else fall back to this rig's ordering. Returns (serial, name) or
+    (None, None).
+
+    On this rig the D405 faces the operator and the D435 faces the robot (it is
+    the FoundationPose cube tracker), so the D405 is what WiLoR wants.  Among
+    D435s prefer the plain one over the D435IF, whose IR-tinted colour hurts
+    detection.  Pass --rs-serial to override when the cameras get re-aimed.
     """
     devs = list_realsense()  # [(name, serial)]
     if not devs:
@@ -146,8 +151,14 @@ def pick_realsense_serial(prefer: str | None = None):
         for name, serial in devs:
             if p == serial.lower() or p in name.lower():
                 return serial, name
-    plain = [(n, s) for n, s in devs if not _is_if_variant(n)]
-    name, serial = plain[0] if plain else devs[0]
+
+    def rank(name):
+        n = name.lower().replace(" ", "")
+        if "d405" in n:
+            return 0
+        return 2 if _is_if_variant(n) else 1
+
+    name, serial = sorted(devs, key=lambda d: rank(d[0]))[0]
     return serial, name
 
 
