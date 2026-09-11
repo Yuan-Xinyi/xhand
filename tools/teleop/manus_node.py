@@ -62,6 +62,34 @@ def ranges_from_calibration(path):
     return rng
 
 
+def load_fit(path):
+    """A learned affine map from manus_teach.py: q = A e + b.
+
+    Preferred over the hand-written table -- assignment, sign, range and
+    cross-coupling all came out of poses the robot itself demonstrated, so
+    nothing about the MANUS channel semantics had to be assumed.
+    """
+    with open(path) as fh:
+        d = json.load(fh)
+    A = np.asarray(d["A"], dtype=float)
+    b = np.asarray(d["b"], dtype=float)
+    if A.shape != (12, 20) or b.shape != (12,):
+        raise SystemExit(f"[manus] {path}: expected A (12,20) and b (12,), "
+                         f"got {A.shape} and {b.shape}")
+    worst = min(d.get("r2", [1.0]))
+    print(f"[manus] learned map from {path} (alpha={d.get('alpha')}, "
+          f"worst joint R^2={worst:.3f})")
+    if worst < 0.6:
+        bad = [j for j, r in zip(d["joints"], d["r2"]) if r < 0.6]
+        print(f"[manus][WARN] poorly fitted joints: {bad} -- consider re-running "
+              f"manus_teach.py and matching those poses more carefully")
+    return A, b
+
+
+def retarget_fit(ergo_deg, A, b):
+    return np.clip(A @ ergo_deg + b, JOINT_LIMITS[:, 0], JOINT_LIMITS[:, 1])
+
+
 def retarget(ergo_deg: np.ndarray, invert=INVERT, ranges=HUMAN_RANGE_DEG) -> np.ndarray:
     """20 MANUS ergonomics channels (degrees) -> 12 XHand joint angles (rad)."""
     unit = {}
@@ -91,6 +119,9 @@ def main():
                     help="EMA on joint targets, 1.0 = no smoothing")
     ap.add_argument("--gain", type=float, default=1.0,
                     help="scale motion about the joint mid-range")
+    ap.add_argument("--fit", default="", metavar="manus_fit.json",
+                    help="learned affine map from manus_teach.py; replaces the "
+                         "hand-written channel table entirely")
     ap.add_argument("--calib", default="", metavar="cal.json",
                     help="per-channel ranges from a manus_calibrate.py capture; "
                          "overrides the shipped (also measured) defaults")
@@ -113,6 +144,8 @@ def main():
         if unknown:
             raise SystemExit(f"[manus] --invert names no such joint: {sorted(unknown)}")
     print(f"[manus] inverted joints: {sorted(invert) or '(none)'}")
+
+    fitted = load_fit(args.fit) if args.fit else None
 
     ranges = HUMAN_RANGE_DEG
     if args.calib:
@@ -160,7 +193,8 @@ def main():
                 if ergo.size != 20:
                     print(f"[manus][WARN] expected 20 channels, got {ergo.size}")
                     continue
-                q = retarget(ergo, invert, ranges)
+                q = (retarget_fit(ergo, *fitted) if fitted
+                     else retarget(ergo, invert, ranges))
                 if args.gain != 1.0:
                     q = np.clip(mid + (q - mid) * args.gain,
                                 JOINT_LIMITS[:, 0], JOINT_LIMITS[:, 1])
