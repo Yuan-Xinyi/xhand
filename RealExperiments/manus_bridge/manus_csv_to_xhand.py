@@ -77,6 +77,14 @@ RETARGET = {
     "pinky_joint1":  [(("pinky", "pipstretch"), 0.6), (("pinky", "dipstretch"), 0.4)],
 }
 
+# Joints whose URDF positive direction opposes the human channel's.  Verified by
+# forward-kinematicing the thumb in the palm frame: thumb_joint0 rising sweeps the
+# tip from x=+0.105 (splayed outboard of the index) in to x=+0.044, i.e. toward
+# the fingers -- the opposite of MANUS ThumbMCPSpread, which grows as the thumb
+# splays away.  thumb_joint1 rising lifts the tip +53 mm off the palm, while
+# ThumbMCPStretch grows as the thumb flexes down into it.
+INVERT = {"thumb_joint0", "thumb_joint1"}
+
 
 def norm_key(s):
     """Collapse a CSV header cell to comparable tokens."""
@@ -217,6 +225,8 @@ def main():
         # a missing channel parks the joint at its neutral: mid-range for the
         # index spread (which straddles zero), fully open for everything else
         u = acc / wsum if wsum > 0 else np.full(n, 0.5 if name == "index_joint0" else 0.0)
+        if name in INVERT:
+            u = 1.0 - u
         lo, hi = JOINT_LIMITS[j]
         q[:, j] = lo + u * (hi - lo)
 

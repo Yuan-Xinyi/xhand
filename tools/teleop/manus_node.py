@@ -35,7 +35,7 @@ from protocol import HAND_JOINT_NAMES, make_sender, pack
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "..", "RealExperiments", "manus_bridge"))
 from manus_csv_to_xhand import (  # noqa: E402
-    CHANNELS, FINGERS, HUMAN_RANGE_DEG, JOINT_LIMITS, JOINT_NAMES, RETARGET,
+    CHANNELS, FINGERS, HUMAN_RANGE_DEG, INVERT, JOINT_LIMITS, JOINT_NAMES, RETARGET,
 )
 
 assert tuple(JOINT_NAMES) == tuple(HAND_JOINT_NAMES), "joint order drifted apart"
@@ -45,7 +45,7 @@ ERGO_KEYS = [(f, c) for f in FINGERS for c in CHANNELS]
 assert len(ERGO_KEYS) == 20
 
 
-def retarget(ergo_deg: np.ndarray) -> np.ndarray:
+def retarget(ergo_deg: np.ndarray, invert=INVERT) -> np.ndarray:
     """20 MANUS ergonomics channels (degrees) -> 12 XHand joint angles (rad)."""
     unit = {}
     for i, key in enumerate(ERGO_KEYS):
@@ -56,8 +56,11 @@ def retarget(ergo_deg: np.ndarray) -> np.ndarray:
     for j, name in enumerate(JOINT_NAMES):
         acc = sum(w * unit[k] for k, w in RETARGET[name])
         wsum = sum(w for _, w in RETARGET[name])
+        u = acc / wsum
+        if name in invert:
+            u = 1.0 - u
         lo, hi = JOINT_LIMITS[j]
-        q[j] = lo + (acc / wsum) * (hi - lo)
+        q[j] = lo + u * (hi - lo)
     return q
 
 
@@ -71,12 +74,25 @@ def main():
                     help="EMA on joint targets, 1.0 = no smoothing")
     ap.add_argument("--gain", type=float, default=1.0,
                     help="scale motion about the joint mid-range")
+    ap.add_argument("--invert", default=None, metavar="J1,J2",
+                    help="comma-separated joints to flip, replacing the default set "
+                         f"({','.join(sorted(INVERT))}). Pass an empty string to flip none. "
+                         "Use this to chase a reversed joint live instead of editing code.")
     ap.add_argument("--timeout", type=float, default=1.0,
                     help="no glove packet for this long -> publish valid=0 (driver holds)")
     ap.add_argument("--rate", type=float, default=60.0, help="publish rate cap Hz")
     ap.add_argument("--print", dest="show", action="store_true", help="print joint values")
     ap.add_argument("--listen-only", action="store_true", help="decode only, publish nothing")
     args = ap.parse_args()
+
+    if args.invert is None:
+        invert = set(INVERT)
+    else:
+        invert = {s.strip() for s in args.invert.split(",") if s.strip()}
+        unknown = invert - set(JOINT_NAMES)
+        if unknown:
+            raise SystemExit(f"[manus] --invert names no such joint: {sorted(unknown)}")
+    print(f"[manus] inverted joints: {sorted(invert) or '(none)'}")
 
     rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -119,7 +135,7 @@ def main():
                 if ergo.size != 20:
                     print(f"[manus][WARN] expected 20 channels, got {ergo.size}")
                     continue
-                q = retarget(ergo)
+                q = retarget(ergo, invert)
                 if args.gain != 1.0:
                     q = np.clip(mid + (q - mid) * args.gain,
                                 JOINT_LIMITS[:, 0], JOINT_LIMITS[:, 1])
