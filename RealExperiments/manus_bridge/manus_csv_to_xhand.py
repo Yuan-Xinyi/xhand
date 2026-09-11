@@ -45,45 +45,72 @@ JOINT_LIMITS = np.array([
 FINGERS = ["thumb", "index", "middle", "ring", "pinky"]
 CHANNELS = ["mcpspread", "mcpstretch", "pipstretch", "dipstretch"]
 
-# Nominal human joint travel in degrees, used to normalise before mapping onto
-# the XHand limits.  Deliberately conservative: a clenched fist should reach the
-# XHand's limit, not overshoot it.
+# Human joint travel in degrees, used to normalise before mapping onto the XHand
+# limits.  MEASURED with manus_calibrate.py, not taken from anatomy tables: the
+# nominal figures were up to 5x too wide on the distal and spread channels
+# (dipstretch really moves 10-37 deg, not 80), so a full fist normalised to about
+# a third of travel and the robot never closed.  Re-run the calibration and pass
+# --calib for a different operator.
 HUMAN_RANGE_DEG = {
-    ("thumb", "mcpspread"): (-10.0, 55.0),
-    ("thumb", "mcpstretch"): (-25.0, 55.0),
-    ("thumb", "pipstretch"): (-10.0, 80.0),
-    ("thumb", "dipstretch"): (-10.0, 80.0),
+    ("thumb", "mcpspread"): (-8.0, 36.0),
+    ("thumb", "mcpstretch"): (19.8, 48.7),
+    ("thumb", "pipstretch"): (0.0, 70.3),
+    ("thumb", "dipstretch"): (-28.4, 33.7),
+    ("index", "mcpspread"): (-7.6, 10.1),
+    ("index", "mcpstretch"): (-12.1, 54.1),
+    ("index", "pipstretch"): (0.0, 122.9),
+    ("index", "dipstretch"): (-5.3, 11.5),
+    ("middle", "mcpspread"): (-6.9, 2.5),
+    ("middle", "mcpstretch"): (-8.6, 57.0),
+    ("middle", "pipstretch"): (0.0, 118.0),
+    ("middle", "dipstretch"): (-4.1, 18.1),
+    ("ring", "mcpspread"): (-17.9, 3.7),
+    ("ring", "mcpstretch"): (-11.5, 55.3),
+    ("ring", "pipstretch"): (0.0, 128.2),
+    ("ring", "dipstretch"): (-5.5, 4.0),
+    ("pinky", "mcpspread"): (-34.0, 3.8),
+    ("pinky", "mcpstretch"): (-7.5, 47.2),
+    ("pinky", "pipstretch"): (0.0, 105.5),
+    ("pinky", "dipstretch"): (-11.5, 25.2),
 }
-for _f in ("index", "middle", "ring", "pinky"):
-    HUMAN_RANGE_DEG[(_f, "mcpspread")] = (-20.0, 20.0)
-    HUMAN_RANGE_DEG[(_f, "mcpstretch")] = (-10.0, 90.0)
-    HUMAN_RANGE_DEG[(_f, "pipstretch")] = (0.0, 110.0)
-    HUMAN_RANGE_DEG[(_f, "dipstretch")] = (0.0, 80.0)
 
 # XHand joint <- weighted sum of normalised MANUS channels.
 # Weights inside one entry must sum to 1 so the result stays in [0,1].
+# The two thumb base channels are NOT what their names suggest.  Measured across
+# the calibration poses:
+#
+#             thumb_out  thumb_across  thumb_up     what it really tracks
+#   mcpspread     -7.3         +12.5     +36.0      lift out of the palm plane
+#   mcpstretch    +43.1         +19.8     +48.7      sweep across the palm plane
+#
+# So mcpstretch -- not mcpspread -- is the opposition axis that thumb_joint0
+# turns about, and mcpspread drives thumb_joint1's lift.  Wiring them by name
+# crossed the two, which no amount of sign flipping could fix.
+#
+# Distal joints take pip at 0.8: dipstretch measures only 10-37 deg of travel
+# against pip's 105-128, so an even blend mostly amplified its noise.
 RETARGET = {
-    "thumb_joint0":  [(("thumb", "mcpspread"), 1.0)],
-    "thumb_joint1":  [(("thumb", "mcpstretch"), 1.0)],
-    "thumb_joint2":  [(("thumb", "pipstretch"), 0.6), (("thumb", "dipstretch"), 0.4)],
+    "thumb_joint0":  [(("thumb", "mcpstretch"), 1.0)],
+    "thumb_joint1":  [(("thumb", "mcpspread"), 1.0)],
+    "thumb_joint2":  [(("thumb", "pipstretch"), 0.8), (("thumb", "dipstretch"), 0.2)],
     "index_joint0":  [(("index", "mcpspread"), 1.0)],
     "index_joint1":  [(("index", "mcpstretch"), 1.0)],
-    "index_joint2":  [(("index", "pipstretch"), 0.6), (("index", "dipstretch"), 0.4)],
+    "index_joint2":  [(("index", "pipstretch"), 0.8), (("index", "dipstretch"), 0.2)],
     "middle_joint0": [(("middle", "mcpstretch"), 1.0)],
-    "middle_joint1": [(("middle", "pipstretch"), 0.6), (("middle", "dipstretch"), 0.4)],
+    "middle_joint1": [(("middle", "pipstretch"), 0.8), (("middle", "dipstretch"), 0.2)],
     "ring_joint0":   [(("ring", "mcpstretch"), 1.0)],
-    "ring_joint1":   [(("ring", "pipstretch"), 0.6), (("ring", "dipstretch"), 0.4)],
+    "ring_joint1":   [(("ring", "pipstretch"), 0.8), (("ring", "dipstretch"), 0.2)],
     "pinky_joint0":  [(("pinky", "mcpstretch"), 1.0)],
-    "pinky_joint1":  [(("pinky", "pipstretch"), 0.6), (("pinky", "dipstretch"), 0.4)],
+    "pinky_joint1":  [(("pinky", "pipstretch"), 0.8), (("pinky", "dipstretch"), 0.2)],
 }
 
-# Joints whose URDF positive direction opposes the human channel's.  Verified by
-# forward-kinematicing the thumb in the palm frame: thumb_joint0 rising sweeps the
-# tip from x=+0.105 (splayed outboard of the index) in to x=+0.044, i.e. toward
-# the fingers -- the opposite of MANUS ThumbMCPSpread, which grows as the thumb
-# splays away.  thumb_joint1 rising lifts the tip +53 mm off the palm, while
-# ThumbMCPStretch grows as the thumb flexes down into it.
-INVERT = {"thumb_joint0", "thumb_joint1"}
+# Joints whose URDF positive direction opposes the channel now driving them.
+# thumb_joint0 rising sweeps the tip from x=+0.105 (splayed outboard of the index
+# at +0.026) in to x=+0.044, i.e. toward the fingers, while mcpstretch is HIGH
+# when the thumb is splayed out and LOW across the palm -- hence the flip.
+# thumb_joint1 rising lifts the tip +53 mm clear of the palm and mcpspread rises
+# on exactly that motion, so it needs no flip.
+INVERT = {"thumb_joint0"}
 
 
 def norm_key(s):

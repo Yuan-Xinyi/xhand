@@ -45,11 +45,28 @@ ERGO_KEYS = [(f, c) for f in FINGERS for c in CHANNELS]
 assert len(ERGO_KEYS) == 20
 
 
-def retarget(ergo_deg: np.ndarray, invert=INVERT) -> np.ndarray:
+def ranges_from_calibration(path):
+    """Per-channel (lo, hi) from a manus_calibrate.py capture of THIS operator."""
+    with open(path) as fh:
+        cal = json.load(fh)
+    mat = np.asarray([cal["poses"][k] for k in cal["poses"]])
+    rng = {}
+    for i, key in enumerate(ERGO_KEYS):
+        lo, hi = float(mat[:, i].min()), float(mat[:, i].max())
+        if hi - lo < 3.0:  # channel never moved; keep the shipped default
+            rng[key] = HUMAN_RANGE_DEG[key]
+            print(f"[manus][WARN] {key[0]}.{key[1]} spans only {hi - lo:.1f} deg "
+                  f"in {path}, keeping the default range")
+        else:
+            rng[key] = (lo, hi)
+    return rng
+
+
+def retarget(ergo_deg: np.ndarray, invert=INVERT, ranges=HUMAN_RANGE_DEG) -> np.ndarray:
     """20 MANUS ergonomics channels (degrees) -> 12 XHand joint angles (rad)."""
     unit = {}
     for i, key in enumerate(ERGO_KEYS):
-        lo, hi = HUMAN_RANGE_DEG[key]
+        lo, hi = ranges[key]
         unit[key] = float(np.clip((ergo_deg[i] - lo) / (hi - lo), 0.0, 1.0))
 
     q = np.zeros(12)
@@ -74,6 +91,9 @@ def main():
                     help="EMA on joint targets, 1.0 = no smoothing")
     ap.add_argument("--gain", type=float, default=1.0,
                     help="scale motion about the joint mid-range")
+    ap.add_argument("--calib", default="", metavar="cal.json",
+                    help="per-channel ranges from a manus_calibrate.py capture; "
+                         "overrides the shipped (also measured) defaults")
     ap.add_argument("--invert", default=None, metavar="J1,J2",
                     help="comma-separated joints to flip, replacing the default set "
                          f"({','.join(sorted(INVERT))}). Pass an empty string to flip none. "
@@ -93,6 +113,11 @@ def main():
         if unknown:
             raise SystemExit(f"[manus] --invert names no such joint: {sorted(unknown)}")
     print(f"[manus] inverted joints: {sorted(invert) or '(none)'}")
+
+    ranges = HUMAN_RANGE_DEG
+    if args.calib:
+        ranges = ranges_from_calibration(args.calib)
+        print(f"[manus] channel ranges from {args.calib}")
 
     rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -135,7 +160,7 @@ def main():
                 if ergo.size != 20:
                     print(f"[manus][WARN] expected 20 channels, got {ergo.size}")
                     continue
-                q = retarget(ergo, invert)
+                q = retarget(ergo, invert, ranges)
                 if args.gain != 1.0:
                     q = np.clip(mid + (q - mid) * args.gain,
                                 JOINT_LIMITS[:, 0], JOINT_LIMITS[:, 1])
